@@ -1,0 +1,275 @@
+#[doc("Compile stages that settle names: effect and type scopes, qualified references, and the access checks over the merged stream.")]
+
+import compiler.ast_decl
+import compiler.diag
+import compiler.site_ids
+import compiler.verdicts
+import compiler.effect_scope
+import compiler.effect_alias
+import compiler.type_scope
+import compiler.type_scope_check
+import compiler.ast
+import compiler.real_lit
+import compiler.written
+import compiler.symtab
+import compiler.diag_file
+import compiler.modules_homes
+import compiler.modules_segments
+import compiler.modules_qualtype
+import compiler.modules
+import compiler.missing_export
+import compiler.module_table
+import compiler.qual_head
+import compiler.driver_cli
+import compiler.infer_glue
+import compiler.infer_state
+import compiler.diag_type_text
+import compiler.infer_name_collisions
+import compiler.pub_access
+import compiler.name_uses
+import compiler.driver_core_load
+import compiler.driver_front
+import compiler.desugar_mangle
+import compiler.driver_load
+import compiler.front_chain
+import compiler.ast_ids
+import compiler.block_scope
+import compiler.core_cut
+import compiler.doc_attr
+import compiler.protos_check
+import compiler.scope_view
+
+pub(pkg) type Scoped = { json: Option[String], target_mod_name: String, roots: Roots, entry: SymId, own_tab: SymTab, docs: DocStrip,
+  doc_errs: Int, doc_decls: [Decl], import_hole_vd: Verdict, blocks: BlockPolicy, expanded: ExpandedProgram, tab0: SymTab, nsrcs: String,
+  npre: String, core_hit: Option[String], prunes: Bool, core_decls_whole: [Decl], surface_decls_whole: [Decl], lib_mods: [String],
+  pcut: Option[PreCut], emptied: [SymId], gone: [SymId], surface_decls: [Decl], core_segs: [CoreSegment], surface_fn_bounds: [FnBoundsRec],
+  stripped_laws: StrippedLaws, expanded_decls_raw: [Decl], n_imports_raw: Int, import_resolve_vd: Verdict, fn_bounds: [FnBoundsRec],
+  module_table: [ModuleEntry], diag_ctx: DiagFiles, mod_tabs: ModTables, mod_imps: [ModImports], sel_imports: [SelImport],
+  pkg_picks: [PkgPick], sym_views: FileViews, alias_res: AliasResolution, ts_coll: [TSEntry], ty_scope_vd: Verdict, eff_scope_vd: Verdict,
+  pat_qual_vd: Verdict, qh_vd: Verdict, qualtype_vd: Verdict, tab1: SymTab, cs_coll: [NEnt], rqc_fx: [RqcFx], vs_coll: [VSEntry],
+  qualified_core: [Decl], qualified_decls: [Decl], missing_exports: [Diagnostic] }
+
+pub(pkg) type Accessed = { json: Option[String], target_mod_name: String, roots: Roots, entry: SymId, own_tab: SymTab, docs: DocStrip,
+  doc_errs: Int, doc_decls: [Decl], import_hole_vd: Verdict, blocks: BlockPolicy, expanded: ExpandedProgram, tab0: SymTab, nsrcs: String,
+  npre: String, core_hit: Option[String], prunes: Bool, core_decls_whole: [Decl], surface_decls_whole: [Decl], lib_mods: [String],
+  pcut: Option[PreCut], emptied: [SymId], gone: [SymId], surface_decls: [Decl], core_segs: [CoreSegment], surface_fn_bounds: [FnBoundsRec],
+  stripped_laws: StrippedLaws, import_resolve_vd: Verdict, module_table: [ModuleEntry], diag_ctx: DiagFiles, mod_tabs: ModTables,
+  mod_imps: [ModImports], sel_imports: [SelImport], sym_views: FileViews, alias_res: AliasResolution, ts_coll: [TSEntry],
+  ty_scope_vd: Verdict, eff_scope_vd: Verdict, pat_qual_vd: Verdict, qh_vd: Verdict, qualtype_vd: Verdict, tab1: SymTab, cs_coll: [NEnt],
+  rqc_fx: [RqcFx], vs_coll: [VSEntry], qualified_core: [Decl], missing_exports: [Diagnostic], merged_raw: [Decl], pa_segs: [CoreSegment],
+  type_name_coll: [Diagnostic], pub_access_vd: Verdict, fn_name_coll: [Diagnostic], effect_name_coll: [Diagnostic],
+  const_name_coll: [Diagnostic], axiom_name_coll: [Diagnostic], kai_decl_vd: Verdict }
+
+pub(pkg) fn stage_scope(req: Req, cx: TablesRun) : Scoped / Console + File + Mutable {
+  let core_decls_l = cx.core_decls_l
+  let core_mods = req.core_mods
+  let diag_ctx = cx.diag_ctx
+  let expanded_decls = cx.expanded_decls
+  let mod_imps = cx.mod_imps
+  let mod_tabs = cx.mod_tabs
+  let module_table = cx.module_table
+  let package_name = req.package_name
+  let pkg_picks = cx.pkg_picks
+  let quiet = req.quiet
+  let seg_marks = cx.seg_marks
+  let sel_imports = cx.sel_imports
+  let sym_views = cx.sym_views
+  let tab0 = cx.tab0
+  let target_mod_name = cx.target_mod_name
+  let unstable_optins = req.unstable_optins
+  let es_coll = es_collect(list_append(core_decls_l, expanded_decls), tab0, target_mod_name)
+  let alias_res = resolve_alias_cands(collect_alias_cands(list_append(core_decls_l, expanded_decls), diag_ctx), tab0, sym_views, req.path)
+  let core_es = es_core_decls(core_decls_l, mod_tabs,
+    target_mod_name, tab0, sym_views, alias_syms(alias_res.aliases))
+  # Likewise two modules declaring the same nominal type: each
+  # gets a home-spelled one, and a qualified `m.T` picks the
+  # home while the qualifier is still written.
+  let ts_of = (eff) => ts_collect(list_append(core_es, eff), tab0, target_mod_name,
+                                  effect_names_of(list_append(core_es, eff), tab0))
+  let qt_core_q = qualtype_decls(core_es, tab0, [qualtype_list_mark(), ...module_table])
+  let qt_core = qh_decls(qt_core_q.decls, module_table)
+  # Key each free read of a colliding const name to the module that
+  # owns it, spanning core, imports and root; the effect ops rqc may
+  # defer to when a qualifier loses in the module table; and a bare
+  # function or constructor name two modules both export keyed to the
+  # home the reading module can actually see.
+  let post_of = (headed, qt) => {
+    let tab1 = st_extend(tab0, list_append(qt_core_q.rows, qt.rows))
+    ScopePost { tab1: tab1,
+                cs_coll: nu_const_coll(list_append(qt_core, headed), tab1, target_mod_name),
+                rqc_fx: rqc_collect_fx(list_append(qt_core, headed), tab1),
+                vs_coll: vs_collect(list_append(qt_core, headed), tab1, target_mod_name) }
+  }
+  let sc = ScopeCx { tab0: tab0, target: target_mod_name, mod_tabs: mod_tabs, mod_imps: mod_imps, sym_views: sym_views,
+                     cores: core_mod_names(core_mods, []), sel_imports: sel_imports, diag_ctx: diag_ctx, aliases: alias_syms(alias_res.aliases) }
+  let run = scope_segments(sc, seg_marks, expanded_decls, ts_of, post_of)
+  let eff_scoped = run.eff
+  let scoped_decls = run.scoped
+  let ts_coll = run.ts_coll
+  let tab1 = run.post.tab1
+  let cs_coll = run.post.cs_coll
+  let rqc_fx = run.post.rqc_fx
+  let vs_coll = run.post.vs_coll
+  let qualified_decls = run.qualified
+  # A bare type two imports both export is an error, decided
+  # against the symbol table before the ladder respells the
+  # declarations: past this point the use site no longer
+  # spells what the author wrote.
+  let ty_scope_vd = vd_render(tschk_segmented(seg_marks, eff_scoped, tab0, sym_views,
+    target_mod_name, diag_ctx))
+  let eff_scope_vd = vd_render(eschk_segmented(seg_marks, scoped_decls, es_coll,
+    mod_tabs, target_mod_name, tab0, sym_views, diag_ctx))
+  let pat_qual_vd = vd_render(list_append(pqchk_decls(core_es, module_table, diag_ctx),
+                                          pqchk_segmented(seg_marks, scoped_decls, mod_tabs, diag_ctx)))
+  let qh_vd = vd_render(list_append(qhchk_decls(core_es, module_table, diag_ctx),
+                                    qhchk_segmented(seg_marks, scoped_decls, mod_tabs, diag_ctx)))
+  let qualtype_vd = vd_render(list_append(qtchk_decls(core_es, tab0, module_table, diag_ctx),
+                                          qtchk_segmented(seg_marks, scoped_decls, tab0, mod_tabs, diag_ctx)))
+  let qualified_core = rqc_decls(nu_scope_const_decls(qt_core, cs_coll, target_mod_name, mtabs_build([], module_table)), module_table, rqc_fx, diag_ctx)
+  let missing_exports = list_append(mexp_decls(qualified_core, module_table, diag_ctx, target_mod_name, pkg_picks),
+    mexp_segmented(seg_marks, qualified_decls, mod_tabs, target_mod_name, diag_ctx, pkg_picks))
+  # Emit warnings for consumed `#unstable` exports the user
+  # hasn't opted into. Runs over the user
+  # decls only (cores are part of the stdlib and the
+  # consumer never owns them, but stdlib has no unstable
+  # decls today; including the core here keeps the
+  # behaviour consistent if that ever changes).
+  if quiet { () } else {
+    unstable_check_decls(qualified_decls, module_table,
+                         package_name, unstable_optins, diag_ctx)
+  }
+  # Mangle non-`pub` core DType names
+  # (`crypto.hash::SplitN`, `regexp::NB_FragR`, etc.) so
+  # the variant-table lookup cannot collide with a
+  # user-side redeclaration of the same bare name. The
+  # `core_segs` accumulator from `load_core_files`
+  # carries the per-file `(mod_name, decls)` split that
+  # the post-`load` flatten erases — we use it to
+  # establish each core decl's home module
+  # unambiguously, since `DType` has no `module_origin`
+  # field of its own and the streaming
+  # `decl_home_hint_reset` heuristic would carry the
+  # previous core's home into a DType at the head of
+  # the next file. The root-file decls
+  # (`qualified_decls`) are left untouched: they cannot
+  # reference a mangled core private type (those
+  # names are not exported) and the user is free to
+  # redeclare the same bare name.
+  Scoped { json: cx.json, target_mod_name: cx.target_mod_name, roots: cx.roots, entry: cx.entry, own_tab: cx.own_tab, docs: cx.docs,
+    doc_errs: cx.doc_errs, doc_decls: cx.doc_decls, import_hole_vd: cx.import_hole_vd, blocks: cx.blocks, expanded: cx.expanded,
+    tab0: cx.tab0, nsrcs: cx.nsrcs, npre: cx.npre, core_hit: cx.core_hit, prunes: cx.prunes, core_decls_whole: cx.core_decls_whole,
+    surface_decls_whole: cx.surface_decls_whole, lib_mods: cx.lib_mods, pcut: cx.pcut, emptied: cx.emptied, gone: cx.gone,
+    surface_decls: cx.surface_decls, core_segs: cx.core_segs, surface_fn_bounds: cx.surface_fn_bounds, stripped_laws: cx.stripped_laws,
+    expanded_decls_raw: cx.expanded_decls_raw, n_imports_raw: cx.n_imports_raw, import_resolve_vd: cx.import_resolve_vd,
+    fn_bounds: cx.fn_bounds, module_table: cx.module_table, diag_ctx: cx.diag_ctx, mod_tabs: cx.mod_tabs, mod_imps: cx.mod_imps,
+    sel_imports: cx.sel_imports, pkg_picks: cx.pkg_picks, sym_views: cx.sym_views, alias_res: alias_res, ts_coll: ts_coll,
+    ty_scope_vd: ty_scope_vd, eff_scope_vd: eff_scope_vd, pat_qual_vd: pat_qual_vd, qh_vd: qh_vd, qualtype_vd: qualtype_vd, tab1: tab1,
+    cs_coll: cs_coll, rqc_fx: rqc_fx, vs_coll: vs_coll, qualified_core: qualified_core, qualified_decls: qualified_decls,
+    missing_exports: missing_exports }
+}
+
+pub(pkg) fn stage_access(req: Req, cx: Scoped) : Accessed / Console + File + Mutable {
+  let core_mods = req.core_mods
+  let core_segs = cx.core_segs
+  let diag_ctx = cx.diag_ctx
+  let expanded = cx.expanded
+  let expanded_decls_raw = cx.expanded_decls_raw
+  let fn_bounds = cx.fn_bounds
+  let n_imports_raw = cx.n_imports_raw
+  let path = req.path
+  let pkg_picks = cx.pkg_picks
+  let qualified_core = cx.qualified_core
+  let qualified_decls = cx.qualified_decls
+  let surface_fn_bounds = cx.surface_fn_bounds
+  let tab1 = cx.tab1
+  let target_mod_name = cx.target_mod_name
+  let qualified_core_mangled =
+    mangle_core_segments(qualified_core, tab1, core_segs,
+                               list_length(qualified_core))
+  let merged_raw = list_append(qualified_core_mangled, qualified_decls)
+  # `pub` enforcement at module + core boundaries. After
+  # `rqc_decls` has rewritten every
+  # `EField(EName(mod), fn)` into `EModCall(mod, fn)`
+  # (which carries qualified-export gating via
+  # `me_has_export`), the remaining bare-name references
+  # are unqualified lookups. The validator consumes
+  # per-module segments with explicit homes: the core
+  # per-file split, the resolver's per-import marks, and
+  # the root file — no streaming home heuristics.
+  #
+  # Split `qualified_decls` into the imports-via-`import`
+  # head (first n_imports_raw entries) and the root-file
+  # tail (own decls, untagged-or-target-tagged).
+  let imports_decls = pae_take(qualified_decls, n_imports_raw)
+  let root_only_decls = pae_drop(qualified_decls, n_imports_raw)
+  # Segment views of the post-rqc streams: core segment
+  # lengths come from `core_segs` (rqc rewrites decls
+  # 1:1), import boundaries from the resolver's marks.
+  let import_seg_marks = match expanded { EP_Mod(_, _, _, _, sg, _, _, _, _, _) -> sg }
+  let pa_segs = list_append(
+    pa_reseg(core_segs, qualified_core),
+    list_append(
+      pa_import_segs(import_seg_marks, imports_decls),
+      [PSeg(target_mod_name, root_only_decls)]))
+  # Reject two `type T = ...` with the same name in the
+  # root file, and the reserved builtin type names. A name
+  # that merely collides with a core / imported module is
+  # NOT rejected — that is shadowing, resolved at the merge
+  # point where a local decl drops the core one.
+  # Runs before the pub-access walk for the same reason the
+  # fn-shadow check does: a redeclared builtin type makes every
+  # stdlib annotation naming it look like a private-access
+  # violation on the user's module.
+  let type_name_coll = validate_type_name_collisions_decls(
+    root_only_decls, tab1, path)
+  let pub_access_vd =
+    if type_name_coll != [] { vd_count(0) }
+    else { vd_render(validate_pub_access(pa_segs, tab1, list_append(fn_bounds, surface_fn_bounds), target_mod_name, core_mod_names(core_mods, []), diag_ctx, pkg_picks)) }
+  # Reject two `fn foo` decls in the same root file. Mirrors
+  # the type check above. The resolver's `register_one`
+  # prepends blindly so a second `fn foo` would otherwise
+  # silently shadow the first.
+  let fn_name_coll = validate_fn_name_collisions_decls(
+    root_only_decls, tab1, path)
+  # Same shape for `effect`, `const`, `axiom`.
+  # `register_one` prepends each kind blindly into the env,
+  # so a second decl silently shadows the first. Walks the
+  # root file only — cross-module shadowing is gated by
+  # `pub` + `use` and remains permitted.
+  #
+  # The const-name collision check walks the raw root decls
+  # (DConst survives unlowered now, but the raw split is the
+  # established input and mirrors the post-rqc split).
+  let root_only_decls_raw = pae_drop(expanded_decls_raw, n_imports_raw)
+  let effect_name_coll = validate_effect_name_collisions_decls(
+    root_only_decls, tab1, path)
+  let const_name_coll = validate_const_name_collisions_decls(
+    root_only_decls_raw, tab1, path)
+  let axiom_name_coll = validate_axiom_name_collisions_decls(
+    root_only_decls, tab1, path)
+  # A builtin is declared only by a module that may, judged by
+  # the file each declaration was read from: the root by its own
+  # path, an import by its entry's, never through a module name a
+  # user file can share with one of them.
+  let import_files = diag_files(module_files(match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _, _) -> mt }, []), path)
+  let kai_decl_vd = vd_render(list_append(
+    kai_builtin_decl_diags(qualified_core_mangled, tab1, diag_files(module_files(core_mods, []), path), declares_kai_builtins),
+    kai_builtin_decl_diags(qualified_decls, tab1, import_files, declares_kai_builtins)))
+  # Synthesise `__ref_pred_X` fn for every
+  # `type X = Base where pred` so match-arm narrowing
+  # `p : X` resolves cleanly (parse_optional_arm_refine
+  # emits an ECall to this name).
+  Accessed { json: cx.json, target_mod_name: cx.target_mod_name, roots: cx.roots, entry: cx.entry, own_tab: cx.own_tab, docs: cx.docs,
+    doc_errs: cx.doc_errs, doc_decls: cx.doc_decls, import_hole_vd: cx.import_hole_vd, blocks: cx.blocks, expanded: cx.expanded,
+    tab0: cx.tab0, nsrcs: cx.nsrcs, npre: cx.npre, core_hit: cx.core_hit, prunes: cx.prunes, core_decls_whole: cx.core_decls_whole,
+    surface_decls_whole: cx.surface_decls_whole, lib_mods: cx.lib_mods, pcut: cx.pcut, emptied: cx.emptied, gone: cx.gone,
+    surface_decls: cx.surface_decls, core_segs: cx.core_segs, surface_fn_bounds: cx.surface_fn_bounds, stripped_laws: cx.stripped_laws,
+    import_resolve_vd: cx.import_resolve_vd, module_table: cx.module_table, diag_ctx: cx.diag_ctx, mod_tabs: cx.mod_tabs,
+    mod_imps: cx.mod_imps, sel_imports: cx.sel_imports, sym_views: cx.sym_views, alias_res: cx.alias_res, ts_coll: cx.ts_coll,
+    ty_scope_vd: cx.ty_scope_vd, eff_scope_vd: cx.eff_scope_vd, pat_qual_vd: cx.pat_qual_vd, qh_vd: cx.qh_vd, qualtype_vd: cx.qualtype_vd,
+    tab1: cx.tab1, cs_coll: cx.cs_coll, rqc_fx: cx.rqc_fx, vs_coll: cx.vs_coll, qualified_core: cx.qualified_core,
+    missing_exports: cx.missing_exports, merged_raw: merged_raw, pa_segs: pa_segs, type_name_coll: type_name_coll,
+    pub_access_vd: pub_access_vd, fn_name_coll: fn_name_coll, effect_name_coll: effect_name_coll, const_name_coll: const_name_coll,
+    axiom_name_coll: axiom_name_coll, kai_decl_vd: kai_decl_vd }
+}
+

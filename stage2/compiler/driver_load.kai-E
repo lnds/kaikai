@@ -1,0 +1,419 @@
+#[doc("Compile stages that open a request: the lex and parse, and the import and core loading that follow.")]
+
+import compiler.ast_ids
+import compiler.core_reach
+import compiler.infer_index
+import compiler.ast_decl
+import compiler.driver_imports
+import compiler.diag
+import compiler.type_scope
+import compiler.util
+import compiler.package_id
+import compiler.verdicts
+import compiler.lex
+import compiler.ast
+import compiler.real_lit
+import compiler.written
+import compiler.symtab
+import compiler.diag_file
+import compiler.fn_index
+import compiler.parse_state
+import compiler.parse_decls
+import compiler.surface_lower
+import compiler.tparam_bind
+import compiler.core_builtins
+import compiler.scope_view
+import compiler.fmt
+import compiler.fmt_writer
+import compiler.mutate
+import compiler.mutate_splice
+import compiler.modules_paths
+import compiler.modules_homes
+import compiler.modules_segments
+import compiler.module_table
+import compiler.user_cache
+import compiler.typed_cut
+import compiler.driver_cli
+import compiler.block_scope
+import compiler.edition
+import compiler.infer_glue
+import compiler.infer_state
+import compiler.diag_type_text
+import compiler.protos_check
+import compiler.core_cut
+import compiler.doc_attr
+import compiler.driver_policy
+import compiler.driver_modes
+import compiler.driver_core_load
+import compiler.driver_exports
+import compiler.driver_front
+import compiler.front_chain
+
+pub(pkg) type Opened = { tokens: [Token], lexed: [Diagnostic], lex_errs: Int, json: Option[String], target_mod_name: String, roots: Roots,
+  entry: SymId, parsed: PParser, own_tab: SymTab, own_decls: [Decl] }
+
+pub(pkg) type Loaded = { json: Option[String], target_mod_name: String, roots: Roots, entry: SymId, parsed: PParser, own_tab: SymTab,
+  docs: DocStrip, doc_errs: Int, doc_decls: [Decl], import_hole_vd: Verdict, blocks: BlockPolicy, expanded: ExpandedProgram,
+  surface_decls: [Decl], tab0: SymTab }
+
+pub(pkg) type CutRun = { json: Option[String], target_mod_name: String, roots: Roots, entry: SymId, parsed: PParser, own_tab: SymTab,
+  docs: DocStrip, doc_errs: Int, doc_decls: [Decl], import_hole_vd: Verdict, blocks: BlockPolicy, expanded: ExpandedProgram, tab0: SymTab,
+  nsrcs: String, npre: String, core_hit: Option[String], prunes: Bool, core_decls_whole: [Decl], core_segs_whole: [CoreSegment],
+  surface_decls_whole: [Decl], lib_mods: [String], pcut: Option[PreCut], emptied: [SymId], gone: [SymId], core_decls: [Decl],
+  surface_decls: [Decl], core_segs: [CoreSegment] }
+
+pub(pkg) type TablesRun = { json: Option[String], target_mod_name: String, roots: Roots, entry: SymId, own_tab: SymTab, docs: DocStrip,
+  doc_errs: Int, doc_decls: [Decl], import_hole_vd: Verdict, blocks: BlockPolicy, expanded: ExpandedProgram, tab0: SymTab, nsrcs: String,
+  npre: String, core_hit: Option[String], prunes: Bool, core_decls_whole: [Decl], surface_decls_whole: [Decl], lib_mods: [String],
+  pcut: Option[PreCut], emptied: [SymId], gone: [SymId], surface_decls: [Decl], core_segs: [CoreSegment], surface_fn_bounds: [FnBoundsRec],
+  stripped_laws: StrippedLaws, expanded_decls_raw: [Decl], n_imports_raw: Int, import_resolve_vd: Verdict, expanded_decls: [Decl],
+  fn_bounds: [FnBoundsRec], module_table: [ModuleEntry], diag_ctx: DiagFiles, seg_marks: [ImportSeg], mod_tabs: ModTables,
+  mod_imps: [ModImports], core_decls_l: [Decl], sel_imports: [SelImport], pkg_picks: [PkgPick], sym_views: FileViews }
+
+pub(pkg) fn stage_open(req: Req) : Flow[Opened] / Console + File + Mutable {
+  let path = req.path
+  let mode = req.mode
+  let src = req.src
+  let test_roots = req.test_roots
+  let core_mods = req.core_mods
+  let tokens = tokenize(src)
+  let lexed = lex_diags(path, src, tokens)
+  let lex_errs = if list_is_empty(lexed) { 0 } else { 1 }
+  let json = diags_json_file(mode, path)
+  match mode {
+    MTokens -> {
+      dump_tokens(src, tokens)
+      Halt(lex_errs)
+    }
+    MHelp -> { usage(); Halt(0) }
+    MUsageError -> { usage(); Halt(2) }
+    _ -> {
+      if lex_errs != 0 { Halt(vd_exit(json, [Verdict(lex_errs, lexed)])) }
+      else {
+        # The root file's declarations are homed at the build target.
+        let target_mod_name = root_module_name(path)
+        let roots = roots_of(target_mod_name, map(test_roots, (r) => module_home(r, core_mods)))
+        # What the binary starts; every pass below is handed this one id.
+        let entry = entry_id(target_mod_name, runs_blocks(mode))
+        let parsed = parse_program(path, src, tokens, target_mod_name)
+        # The root file's own names, for the stages that stop before the
+        # program's table exists.
+        let own_tab = st_of_entries(parsed.names)
+        match parsed.decls {
+          None -> Halt(vd_exit(json, [Verdict(1, parse_diags(parsed))]))
+          Some(own_decls) ->
+            if is_early_mode(mode) { Halt(run_early_mode(req, tokens, own_decls, own_tab)) }
+            else {
+              Go(Opened { tokens: tokens, lexed: lexed, lex_errs: lex_errs, json: json,
+                          target_mod_name: target_mod_name, roots: roots, entry: entry, parsed: parsed,
+                          own_tab: own_tab, own_decls: own_decls })
+            }
+        }
+      }
+    }
+  }
+}
+
+fn is_early_mode(mode: Mode) : Bool = match mode {
+  MFmt(_) -> true
+  MFmtCheck(_) -> true
+  MMigrate -> true
+  MMutateList -> true
+  MMutateListJson -> true
+  MListTests(_) -> true
+  MMutateApply(_) -> true
+  _ -> false
+}
+
+# The modes that stop right after the parse: the program is never lowered.
+fn run_early_mode(req: Req, tokens: [Token], own_decls: [Decl], own_tab: SymTab) : Int / Console + File + Mutable {
+  let path = req.path
+  let src = req.src
+  let edition = req.edition
+  let search_paths = req.search_paths
+  match req.mode {
+    # `kai fmt`. Pretty-print right after parse, before any
+    # desugaring runs, so the formatted output
+    # mirrors the source as written (`var x = 1` stays
+    # `var x = 1`, not its handle-State desugaring). Short-
+    # circuit before the heavy semantic pipeline. MFmt prints
+    # to stdout; MFmtCheck prints iff different and exits 1.
+    MFmt(width) -> {
+      let cmts = collect_comments(src, tokens)
+      print(fmt_program(own_decls, own_tab, cmts, tokens, src, width))
+      0
+    }
+    MFmtCheck(width) -> {
+      let cmts = collect_comments(src, tokens)
+      let formatted = fmt_program(own_decls, own_tab, cmts, tokens, src, width)
+      # fmt_program strips the final newline (MFmt relies on
+      # print to re-add it); compare against the canonical
+      # on-disk shape, which carries exactly one.
+      if string_concat_all([formatted, "\n"]) == src { 0 } else { print(formatted); 1 }
+    }
+    # `kai migrate`. Same parse-then-fmt path as MFmt, with the
+    # rule set applied to the decls in between. The migrated
+    # source goes to stdout (bin/kai owns the safe write-back);
+    # the `manual:` report goes to stderr. Guards the never-
+    # emit-non-parsing invariant: the output is reparsed and,
+    # on failure, nothing is printed and the run fails.
+    MMigrate -> {
+      let cmts = collect_comments(src, tokens)
+      run_migrate(path, src, own_decls, own_tab, cmts, edition)
+    }
+    # `kai mutate`. Same parse-then-stop shape as MFmt, but the
+    # output is the site catalogue rather than source. The
+    # mutant itself (MMutateApply) is the original source with
+    # one token span rewritten — never a re-print, so a mutant
+    # differs from its parent by the mutation and nothing else.
+    MMutateList -> {
+      # `print` ends a line, so an empty catalogue must print nothing, not one empty record.
+      let sites = mutate_sites(own_decls, own_tab)
+      if not list_is_empty(sites) { print(mut_sites_text(path, sites)) }
+      0
+    }
+    MMutateListJson -> {
+      print(mut_sites_json(path, imported_module_path(path, search_paths), mutate_sites(own_decls, own_tab), tokens, src))
+      0
+    }
+    MListTests(label) -> {
+      let text = tlist_text(label, own_decls)
+      if text != "" { print(text) }
+      0
+    }
+    MMutateApply(i) -> run_mutate_apply(path, src, tokens, own_decls, own_tab, i)
+    _ -> 0
+  }
+}
+
+
+pub(pkg) fn stage_load(req: Req, cx: Opened) : Loaded / Console + File + Mutable {
+  let core_cache = req.core_cache
+  let core_mods = req.core_mods
+  let core_rows = req.core_rows
+  let core_segs = req.core_segs
+  let inputs_out = req.inputs_out
+  let mode = req.mode
+  let own_decls = cx.own_decls
+  let parsed = cx.parsed
+  let path = req.path
+  let search_paths = req.search_paths
+  let src = req.src
+  let target_mod_name = cx.target_mod_name
+  let test_own = req.test_own
+  let test_plan = req.test_plan
+  let test_roots = req.test_roots
+  let tokens = cx.tokens
+  let user_cache = req.user_cache
+  let docs = doc_strip_collect(path, src, own_decls)
+  let doc_errs = docs.errs
+  let doc_decls = docs.decls
+  # Report any `import ?name` holes BEFORE expand_imports
+  # walks the decls. The hole is inert
+  # for module loading (process_imports treats IkHole as
+  # a no-op), but we want the diagnostic to fire even
+  # when the hole is the only import-related issue.
+  let import_hole_vd = vd_render(import_hole_diags(path, doc_decls,
+                                                   dir_of(path),
+                                                   search_paths))
+  let own_decls_no_holes = strip_import_holes(doc_decls, [])
+  # expand_imports returns both the flat decl list and the
+  # module table; rqc_decls then walks every body and
+  # rewrites `EField(EName(mod), fn)` to `EModCall(mod, fn)`
+  # when `mod` is in the module table and not shadowed
+  # locally. Core-module paths feed into the resolver's
+  # `visited` set so `import encoding.toml`
+  # (or any other core-loaded module) does not load the
+  # same file twice.
+  let core_paths = collect_module_origins(core_mods, [])
+  let blocks = if runs_blocks(mode) { BlocksOwn(canon_paths(test_own)) } else { BlocksAll }
+  let expanded = expand_imports(path, src, tokens, search_paths, own_decls_no_holes, core_paths, core_mods, core_segs,
+                                if user_cache { tcut_cache_dir(core_cache.proj_dir, path) } else { "" },
+                                test_roots, blocks, inputs_out, req_plan(req))
+  match expanded {
+    EP_Mod(_, mods, _, _, _, scopes, _, _, _, _) ->
+      if test_plan != "" { let _w = write_file(test_plan, tplan_text(scopes, mods)) }
+  }
+  # Dissolve the parser's surface-fidelity nodes (contract
+  # clauses, `ensure where`, `:=` writes, anonymous rest
+  # binders, impl tparams) into their semantic lowerings.
+  # Runs on the flat post-import list so imported modules are
+  # covered; only `kai fmt` / `kai migrate` (which short-
+  # circuit above) ever see the surface shapes.
+  # Kept un-lowered for `--ast`: the dump must show the
+  # surface forms (tparam bounds, block lambdas, contracts)
+  # or an AST-equality gate over it is blind to their loss.
+  let surface_decls = match expanded { EP_Mod(ds, _, _, _, _, _, _, _, _, _) -> ds }
+  # The program's one symbol table: the rows the parser minted
+  # for every loaded file, with the core builtins. A pass that
+  # mints declarations hands its rows up and the table is
+  # extended; ids are derived, so none moves.
+  let tab0 = st_program(list_append(core_rows,
+    list_append(match expanded { EP_Mod(_, _, _, _, _, _, _, rows, _, _) -> rows }, parsed.names)),
+    target_mod_name, core_mod_names(core_mods, []))
+  Loaded { json: cx.json, target_mod_name: cx.target_mod_name, roots: cx.roots, entry: cx.entry, parsed: cx.parsed, own_tab: cx.own_tab,
+    docs: docs, doc_errs: doc_errs, doc_decls: doc_decls, import_hole_vd: import_hole_vd, blocks: blocks, expanded: expanded,
+    surface_decls: surface_decls, tab0: tab0 }
+}
+
+pub(pkg) fn stage_precut(req: Req, cx: Loaded) : CutRun / Console + File + Mutable {
+  let backend = req.backend
+  let core_cache = req.core_cache
+  let core_decls = req.core_decls
+  let core_mods = req.core_mods
+  let core_segs = req.core_segs
+  let edition = req.edition
+  let expanded = cx.expanded
+  let mode = req.mode
+  let path = req.path
+  let surface_decls = cx.surface_decls
+  let tab0 = cx.tab0
+  let nsrcs = native_core_srcs(backend, core_cache, core_mod_names(core_mods, []))
+  let npre = native_core_pre(core_cache, edition, nsrcs)
+  let core_hit = native_core_hit(core_cache, npre)
+  let prunes = core_prunes(mode, backend, core_cache, core_hit) and not is_core_file(path)
+  let core_decls_whole = core_decls
+  let core_segs_whole = core_segs
+  let surface_decls_whole = surface_decls
+  let lib_mods = if prunes { prunable_modules(path, match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _, _) -> mt }) } else { [] }
+  let imported_fns = precut_lib_fns(surface_decls, lib_mods)
+  let lib_fns = list_append(core_decls, imported_fns)
+  let pcut = if prunes { early_cut(core_cache.early_cut, lib_fns, imported_fns, tab0, false) } else { None }
+  let gone = match pcut { Some(pc) -> core_gone(pc, tab0, core_decls_whole, surface_decls_whole, lib_mods)  None -> CoreGone { syms: [], ix: idx_empty() } }
+  let emptied = match pcut { Some(pc) -> filter(precut_emptied(pc, lib_fns), (s) => not gone_has_sym(gone, s))  None -> [] }
+  let _pn = if core_cache.stats and is_some(pcut) { eprint("kaic2: core-precut: emptied #{list_length(emptied)} core functions, left out #{list_length(gone.syms)}") } else { () }
+  let core_decls = match pcut { Some(pc) -> filter(precut_decls(pc, core_decls), (d) => not gone_has(gone, d))  None -> core_decls }
+  let surface_decls = match pcut { Some(pc) -> precut_imported(pc, lib_mods, surface_decls)  None -> surface_decls }
+  let core_segs = match pcut {
+    Some(pc) -> map(core_segs, (s) => match s { PSeg(m, ds) -> PSeg(m, filter(precut_decls(pc, ds), (d) => not gone_has(gone, d))) })
+    None     -> core_segs
+  }
+  # Bounds are stripped by the lowering below; keep them for the
+  # monomorphiser, keyed by declaration once the symbols exist.
+  CutRun { json: cx.json, target_mod_name: cx.target_mod_name, roots: cx.roots, entry: cx.entry, parsed: cx.parsed, own_tab: cx.own_tab,
+    docs: cx.docs, doc_errs: cx.doc_errs, doc_decls: cx.doc_decls, import_hole_vd: cx.import_hole_vd, blocks: cx.blocks,
+    expanded: cx.expanded, tab0: cx.tab0, nsrcs: nsrcs, npre: npre, core_hit: core_hit, prunes: prunes, core_decls_whole: core_decls_whole,
+    core_segs_whole: core_segs_whole, surface_decls_whole: surface_decls_whole, lib_mods: lib_mods, pcut: pcut, emptied: emptied,
+    gone: gone.syms, core_decls: core_decls, surface_decls: surface_decls, core_segs: core_segs }
+}
+
+pub(pkg) fn stage_tables(req: Req, cx: CutRun) : TablesRun / Console + File + Mutable {
+  let core_decls = cx.core_decls
+  let core_mods = req.core_mods
+  let cover = req.cover
+  let entry = cx.entry
+  let expanded = cx.expanded
+  let mode = req.mode
+  let parsed = cx.parsed
+  let path = req.path
+  let quiet = req.quiet
+  let surface_decls = cx.surface_decls
+  let tab0 = cx.tab0
+  let target_mod_name = cx.target_mod_name
+  let surface_fn_bounds = list_append(collect_surface_bounds(core_decls, tab0),
+                                      collect_surface_bounds(surface_decls, tab0))
+  let lowered = lower_surface(if runs_blocks(mode) { cover } else { cover_none() },
+                              match expanded { EP_Mod(_, _, _, _, sg, _, _, _, _, _) -> sg },
+                              match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _, _) -> mt },
+                              tab0, surface_decls)
+  let stripped_laws = lowered.laws
+  let expanded_decls_raw = lowered.decls
+  let n_imports_raw = match expanded { EP_Mod(_, _, n, _, _, _, _, _, _, _) -> n }
+  # Count of import-resolution failures (e.g.
+  # `import nothing_here` whose file is missing on the search
+  # path). Folded into the exit-code aggregator below.
+  let import_resolve_vd = match expanded { EP_Mod(_, _, _, v, _, _, _, _, _, _) -> v }
+  # Register the target file itself in the module table under
+  # its own basename, mirroring what `load_core_file` does for
+  # core files. Without this, an intrinsic test block
+  # inside `stdlib/core/option.kai` cannot say
+  # `option.map(o, f)` — rqc rejects the qualifier when only
+  # core files are registered. Tag the target's DFns with
+  # `module_origin = Some(<basename>)` (skipping only the entry
+  # point, which stays in the root unit) so
+  # `add_decls_loop` registers them under the qualified key
+  # `<mod>::<fname>`, matching the core path. This makes
+  # self-qualified calls inside the target route through the
+  # qualified env without depending on bare-name shadow
+  # ordering.
+  let target_exports = collect_pub_exports(expanded_decls_raw, tab0, [])
+  let target_unstable = collect_unstable_exports(expanded_decls_raw, tab0, [])
+  let target_me = ME(target_mod_name, target_exports, path, target_unstable, pkg_of(req_plan(req), path))
+  let expanded_decls = if is_core_file(path) { tag_core_root_decls(expanded_decls_raw, target_mod_name, entry) }
+                       else { tag_target_decls_module_origin(expanded_decls_raw, target_mod_name, entry) }
+  # Free-fn protocol bounds for the root file. Stdlib/core
+  # bounded aggregates already dispatch their op via a `_loop`
+  # helper, so the existing post-mono validator covers them;
+  # only root-file fns whose body never dispatches the bound
+  # need this check. Re-key to the target module the same way
+  # `tag_target_decls_module_origin` re-keys the decls, so the
+  # records match the monomorphiser's `mo`.
+  let fn_bounds = rekey_fn_bounds(parsed.fn_bounds, target_mod_name)
+  # Every core file is also registered as a module under
+  # its basename, so qualified calls into the stdlib
+  # (`list.take(xs, n)`, `string.trim(s)`) resolve without an
+  # explicit `import list`. Core entries come first so an
+  # `import` of a same-named module can still shadow with rule
+  # B. The target's own ME comes last so its bare name shadows
+  # any same-named core (intentional: the file is
+  # "itself").
+  let module_table = list_append(
+    list_append(core_mods, match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _, _) -> mt }),
+    [target_me])
+  # The pre-typer passes walk one flat stream holding every
+  # imported module's decls, so a diagnostic takes its file
+  # from the decl it is walking, not from the root path.
+  let diag_files0 = df_with_ghosts(diag_files(module_files(module_table, []), path), map(list_reverse(cx.gone), (g) => written_text(sym_name(tab0, g))))
+  let diag_ctx = if quiet { df_quieted(diag_files0) } else { diag_files0 }
+  # Run rqc on the core decls with the same module table
+  # the main file uses, so `list.foo` calls inside a core
+  # file reach the EField->EModCall rewrite (otherwise the
+  # typer rejects them as "undefined name `list`"). Entries
+  # are collected before any core file is parsed so
+  # cross-core qualified calls (e.g. `set.kai` calling
+  # `list.length`) resolve.
+  # Rewrite qualified types `mod.T` to bare `T` (validated
+  # against module_table) before rqc walks the bodies. Runs
+  # before rqc so the qualifier-strip is
+  # complete before the EField->EModCall rewrite hits the
+  # same expressions. The companion `qtchk_decls` pass
+  # reports the heads that fail validation; `qualtype_decls`
+  # leaves those unresolvable.
+  # DConst now survives as DConst through the whole pipeline
+  # (no lowering to a disguised zero-arg fn). `qualtype_decl`
+  # handles the DConst arm directly, so the const reaches the
+  # qualified-type rewrite, the typer, and emit as a const.
+  # Core decls arrive parsed (possibly cache-restored), so
+  # they carry surface nodes too.
+  # The imported half of the stream resolves per segment: an
+  # alias belongs to the file that wrote it, so a consumer
+  # binding the same module under another name cannot displace
+  # it. `module_table` stays the fallback for the names every
+  # file sees without importing them (auto-loaded cores).
+  let mod_scopes = match expanded { EP_Mod(_, _, _, _, _, sc, _, _, _, _) -> sc }
+  let seg_marks = match expanded { EP_Mod(_, _, _, _, sg, _, _, _, _, _) -> sg }
+  let mod_tabs = mtabs_build(mod_scopes, module_table)
+  let mod_imps = scope_imports(mod_scopes, module_table)
+  let core_decls_l = tparam_bind_decls(surface_lower_decls(core_decls, tab0))
+  let sel_imports = sel_with_ctors(match expanded { EP_Mod(_, _, _, _, _, _, si, _, _, _) -> si },
+                                   mod_scopes, module_table, expanded_decls, tab0, target_mod_name)
+  let pkg_picks = package_picks(list_append(match expanded { EP_Mod(_, _, _, _, _, _, _, rows, _, _) -> rows }, parsed.names),
+                                module_table, pkg_of(req_plan(req), path), target_mod_name)
+  let sym_views = fv_build(mod_imps,
+                           sel_imports, mod_scopes, module_table,
+                           core_mod_names(core_mods, []),
+                           target_mod_name, pkg_picks)
+  # Every effect reference is settled to its declaration here, while
+  # a qualified head or perform still carries its qualifier; two
+  # modules declaring the same effect name each get a home-spelled one.
+  TablesRun { json: cx.json, target_mod_name: cx.target_mod_name, roots: cx.roots, entry: cx.entry, own_tab: cx.own_tab, docs: cx.docs,
+    doc_errs: cx.doc_errs, doc_decls: cx.doc_decls, import_hole_vd: cx.import_hole_vd, blocks: cx.blocks, expanded: cx.expanded,
+    tab0: cx.tab0, nsrcs: cx.nsrcs, npre: cx.npre, core_hit: cx.core_hit, prunes: cx.prunes, core_decls_whole: cx.core_decls_whole,
+    surface_decls_whole: cx.surface_decls_whole, lib_mods: cx.lib_mods, pcut: cx.pcut, emptied: cx.emptied, gone: cx.gone,
+    surface_decls: cx.surface_decls, core_segs: cx.core_segs, surface_fn_bounds: surface_fn_bounds, stripped_laws: stripped_laws,
+    expanded_decls_raw: expanded_decls_raw, n_imports_raw: n_imports_raw, import_resolve_vd: import_resolve_vd,
+    expanded_decls: expanded_decls, fn_bounds: fn_bounds, module_table: module_table, diag_ctx: diag_ctx, seg_marks: seg_marks,
+    mod_tabs: mod_tabs, mod_imps: mod_imps, core_decls_l: core_decls_l, sel_imports: sel_imports, pkg_picks: pkg_picks,
+    sym_views: sym_views }
+}
+

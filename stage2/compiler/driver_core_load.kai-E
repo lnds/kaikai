@@ -1,0 +1,434 @@
+#[doc("""
+Lexing and parsing one core module into its declarations and its module
+entry, and the files the core is made of.
+""")]
+
+import compiler.util
+import compiler.package_id
+import compiler.diag
+import compiler.lex
+import compiler.ast_decl
+import compiler.parse_decls
+import compiler.symtab
+import compiler.modules_paths
+import compiler.modules_segments
+import compiler.module_table
+import compiler.core_front
+import compiler.infer_name_collisions
+import compiler.doc_attr
+import compiler.driver_exports
+import compiler.cache
+import compiler.real_lit
+import compiler.written
+import compiler.infer_glue
+import compiler.infer_state
+import compiler.diag_type_text
+
+#[doc("Every `TkError` token, reported to stderr in source order.")]
+pub(pkg) fn lex_diags(path: String, src: String, ts: [Token]) : [Diagnostic] / Console = lex_diags_loop(path, src, ts, [])
+
+fn lex_diags_loop(path: String, src: String, ts: [Token], acc: [Diagnostic]) : [Diagnostic] / Console = match ts {
+  [] -> finalize_diags(acc)
+  [t, ...rest] -> match t.kind {
+    TkError(msg) -> {
+      diag_error_from_src(path, src, t.line, t.col, msg)
+      lex_diags_loop(path, src, rest, push_diag(acc, mk_diag(SevError, path, t.line, t.col, msg, [])))
+    }
+    _ -> lex_diags_loop(path, src, rest, acc)
+  }
+}
+
+#[doc("Returns 0 on success, 1 if any TkError tokens appeared (all reported to stderr).")]
+pub fn report_errors(path: String, src: String, tokens: [Token]) : Int / Console =
+  if list_is_empty(lex_diags(path, src, tokens)) { 0 } else { 1 }
+
+#[doc("""
+A core file's contribution to compile_source — its decls
+(concat'd into the global flat list) and a `ModuleEntry`
+registering its public surface under its file's
+basename so user code can call `list.take(xs, n)` without an
+explicit `import list`. Without this, qualified calls into the
+stdlib would error with "module 'list' is not imported". The rows are
+the table rows of those decls.
+""")]
+pub(pkg) type CoreLoaded = CoreL([Decl], ModuleEntry, [NEnt])
+
+#[doc("""
+Parse a core module file and return its decl list paired with a
+ModuleEntry. On any error report to stderr and return None.
+
+Every `DTest` / `DBench` / `DCheck` block authored in a core module
+file is dropped here. Without this filter `kai test
+<user.kai>` would also run every stdlib test block, since core
+modules are parsed and concatenated into the same flat decl stream
+the test runner walks — testing one file must never run another
+module's tests. The kaikai project's own intrinsic-test gate is
+unaffected: it passes the stdlib file as the *target* (which keeps
+its own test blocks intact through `compile_source`) and only the
+OTHER core modules are loaded as context.
+""")]
+pub(pkg) fn load_core_file(path: String) : Option[CoreLoaded] / Console + File {
+  match read_file(path) {
+    Err(msg) -> { eprint("kaic2: #{path}: #{msg}"); None }
+    Ok(src) -> {
+      let tokens = tokenize(src)
+      let errs = report_errors(path, src, tokens)
+      if errs != 0 { None }
+      else {
+        let mod_name = module_name_of_path(path)
+        let parsed = parse_program(path, src, tokens, mod_name)
+        match parsed.decls {
+          None -> None
+          Some(ds_raw) -> {
+            # Strip `#[doc(...)]` wrappers (and the module doc) at load
+            # time — core decls join the global stream doc-free.
+            # `kai doc` collects core docs on its own dedicated path.
+            let pre_docs = doc_strip_all(path, src, ds_raw)
+            if pre_docs.errs > 0 { None } else {
+            let ds = pre_docs.decls
+            let ftab = st_of_entries(parsed.names)
+            let kept = strip_core_tests(ds, [])
+            # Validate same-module name collisions before the module's
+            # decls join the global stream. Without this, a duplicate
+            # `fn foo` inside a stdlib module silently overwrites the
+            # first and surfaces as a cc-time "redefinition of …" deep
+            # in generated code (see `validate_module_same_module_collisions`
+            # for the json_hex_digit case study).
+            let mod_errs = validate_module_same_module_collisions(kept, ftab, path)
+            if mod_errs > 0 { None }
+            else {
+              let exports = collect_pub_exports(kept, ftab, [])
+              let unstable_exports = collect_unstable_exports(kept, ftab, [])
+              # Tag every DFn coming from this core file with
+              # `module_origin = Some(<basename>)` so the codegen mints
+              # `kai_<basename>__<name>` for it. Decls authored in the
+              # root file keep `None` (set by the parser).
+              let tagged = tag_decls_module_origin(kept, mod_name)
+              Some(CoreL(tagged, ME(mod_name, exports, path, unstable_exports, pkg_stdlib()), parsed.names))
+            }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+#[doc("""
+Drop every `test`/`bench`/`check` block from a core file's
+parsed decls. Public exports, types, effects, protocols,
+imports etc. all pass through untouched. Tail-recursive accumulator
+keeps the original order.
+""")]
+pub(pkg) fn strip_core_tests(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DTest(_, _, _, _, _)         -> strip_core_tests(rest, acc)
+    DBench(_, _, _, _, _)        -> strip_core_tests(rest, acc)
+    DCheck(_, _, _, _, _, _)     -> strip_core_tests(rest, acc)
+    _                          -> strip_core_tests(rest, [d, ...acc])
+  }
+}
+
+#[doc("""
+`segments` retains the per-file `(mod_name, decls)` split so the
+pub-access validator can treat each core as its own home module.
+Without this, the flat `decls` append loses the boundary between
+core files and a DType / DEffect at the head of one core
+inherits the previous core's tagged module via the streaming
+hint.
+""")]
+pub(pkg) type CoresLoaded = PLS([Decl], [ModuleEntry], [CoreSegment], [NEnt])
+
+# `CoreSegment` lives in compiler/modules.kai: it is the
+# per-core-file `(mod_name, decls)` split the pub-access validator
+# (also in modules.kai) consumes. The driver constructs `PSeg` values
+# here and passes them downward into `validate_pub_access`.
+
+#[doc("""
+Build the full absolute path list for the core module set,
+anchored at the compile-time `stdlib_path()`.
+""")]
+pub(pkg) fn core_module_paths() : [String] = {
+  let root = stdlib_path()
+  core_module_paths_loop(core_module_files(), root, [])
+}
+
+fn core_module_paths_loop(rels: [String], root: String, acc: [String]) : [String] = match rels {
+  [] -> list_reverse(acc)
+  [r, ...rest] -> core_module_paths_loop(rest, root,
+                    [string_concat(root, string_concat("/", r)), ...acc])
+}
+
+#[doc("The modules that may declare a builtin with `extern \"kai\"`: the core modules, `seq`, a pure type whose cell the runtime owns, and `ffi`, whose handles park values for C.")]
+pub(pkg) fn kai_builtin_module_paths() : [String] =
+  list_append(core_module_paths(), [string_concat(stdlib_path(), "/seq.kai"), string_concat(stdlib_path(), "/ffi.kai")])
+
+#[doc("""
+True when the file at `path` may declare a builtin. Decided by the
+resolved file, never by module name: any file can be named like one of
+those modules.
+""")]
+pub(pkg) fn declares_kai_builtins(path: String) : Bool = list_has(map(kai_builtin_module_paths(), abspath), abspath(path))
+
+#[doc("""
+The compiler's own copy of the file at `path` when `path` is a byte-identical
+copy of a core or builtin-declaring module (so the stdlib may sit anywhere
+without its core files turning into a second module); `path` otherwise.
+""")]
+pub(pkg) fn baked_twin(path: String, src: String) : String / File =
+  baked_twin_loop(path, src, list_append(core_module_files(), ["seq.kai", "ffi.kai"]))
+
+fn baked_twin_loop(path: String, src: String, rels: [String]) : String / File = match rels {
+  [] -> path
+  [rel, ...rest] -> {
+    if ends_with(path, string_concat("/", rel)) {
+      let own = abspath(string_concat(stdlib_path(), string_concat("/", rel)))
+      if own != path and read_file(own) == Ok(src) { own } else { baked_twin_loop(path, src, rest) }
+    }
+    else { baked_twin_loop(path, src, rest) }
+  }
+}
+
+#[doc("""
+A core module loaded through the cache, tagged with whether the blob
+hit (true: deserialised, lex+parse skipped) or the source was parsed.
+""")]
+pub(pkg) type CoreCacheLoaded = CclLoaded(CoreLoaded, Bool)
+
+#[doc("""
+Load one core module through the post-parse cache. A header-valid
+blob whose name matches the source content hash is deserialised
+(skipping lex+parse); any miss (absent blob, version/format drift,
+corruption, or a content edit that changed the hash) falls back to
+a full parse and writes the fresh blob. The decls a hit reconstructs
+and the decls a miss parses are identical (the write stores exactly
+load_core_file's post-parse output), so the merged stream - and the C
+the cascade+typer emit from it - is byte-identical warm vs cold.
+""")]
+pub(pkg) fn load_core_module(path: String, cache_dir: String)
+                    : Option[CoreCacheLoaded] / Console + File =
+  match read_file(path) {
+    Err(msg) -> { eprint("kaic2: #{path}: #{msg}"); None }
+    Ok(src) -> match cc_lookup(cache_dir, src) {
+      CcHit(decls, rows) -> {
+        # Reconstruct the ModuleEntry from the cached decls. The blob
+        # already holds the doc- and test-stripped, origin-tagged decls
+        # load_core_file produces, so only the export tables are rebuilt.
+        let mod_name = module_name_of_path(path)
+        let ftab = st_of_entries(rows)
+        let exports = collect_pub_exports(decls, ftab, [])
+        let unstable_exports = collect_unstable_exports(decls, ftab, [])
+        Some(CclLoaded(CoreL(decls, ME(mod_name, exports, path, unstable_exports, pkg_stdlib()), rows), true))
+      }
+      CcMiss(content_hex) -> match load_core_file(path) {
+        None -> None
+        Some(pl) -> match pl {
+          CoreL(ds, _, rows) -> {
+            let _w = cc_write(cache_dir, content_hex, ds, rows)
+            Some(CclLoaded(pl, false))
+          }
+        }
+      }
+    }
+  }
+
+#[doc("""
+Round-trip the full parse of `source_path` through a cache blob and
+print the verdict; exit 0 only on a byte-identical re-encoding.
+""")]
+pub(pkg) fn cache_roundtrip_file(source_path: String) : Int / Console + File =
+  match read_file(source_path) {
+    Err(msg) -> { eprint("kaic2: #{source_path}: #{msg}"); 1 }
+    Ok(src) -> {
+      let tokens = tokenize(src)
+      if report_errors(source_path, src, tokens) != 0 { 1 }
+      else { let parsed = parse_program(source_path, src, tokens, module_name_of_path(source_path))
+      match parsed.decls {
+        None -> 1
+        Some(ds) -> {
+          let r = cache_roundtrip_check(ds, parsed.names)
+          print(r)
+          match char_at(r, 0) {
+            Some('O') -> 0
+            _         -> 1
+          }
+        }
+      } }
+    }
+  }
+
+#[doc("""
+Lex+parse a single core source, strip its tests, tag every DFn
+with module_origin, then emit the KAB1 cache blob to stdout. The
+driver (bin/kai) captures stdout,
+writes it to a `.tmp` file, fsyncs, and renames atomically into the
+cache directory. `sha_arg` is the 64-char hex sha256 of the source
+(caller-supplied); empty string emits the all-zero placeholder.
+""")]
+pub(pkg) fn emit_core_cache_for(source_path: String, sha_arg: String) : Int / Console + File {
+  match read_file(source_path) {
+    Err(msg) -> { eprint("kaic2: #{source_path}: #{msg}"); 1 }
+    Ok(src) -> {
+      let tokens = tokenize(src)
+      let errs = report_errors(source_path, src, tokens)
+      if errs != 0 { 1 }
+      else {
+        let mod_name = module_name_of_path(source_path)
+        let parsed = parse_program(source_path, src, tokens, mod_name)
+        match parsed.decls {
+          None -> 1
+          Some(ds_raw) -> {
+            # Cache blobs never carry doc wrappers — strip them exactly
+            # like the non-cached `load_core_file` path so both loaders
+            # produce the same decl stream.
+            let pre_docs = doc_strip_all(source_path, src, ds_raw)
+            if pre_docs.errs > 0 { 1 } else {
+            let ds = pre_docs.decls
+            let kept = strip_core_tests(ds, [])
+            let tagged = tag_decls_module_origin(kept, mod_name)
+            let sha = if sha_arg == "" {
+              "0000000000000000000000000000000000000000000000000000000000000000"
+            } else if string_length(sha_arg) != 64 {
+              "0000000000000000000000000000000000000000000000000000000000000000"
+            } else { sha_arg }
+            let blob = cache_serialize_module(tagged, parsed.names, sha)
+            print(cache_bytes_text(blob, 0, array_length(blob)))
+            0
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Load the core module set: every program gets `core/*` + protocols +
+# effects + array, no negotiation. Mirrors load_core_files' return
+# shape so downstream callers (`PLS`, segments, module entries)
+# do not change.
+#
+# When `cache_dir` is non-empty, route the load through the
+# per-module post-parse cache (core_cache.kai). On a warm build every
+# core module deserialises from its blob instead of being re-lexed and
+# re-parsed. When the cache is off the default path is byte-for-byte
+# unchanged: it goes through `load_core_files` with no cache lookup.
+# `stats` prints the per-layer hit/miss line for this (parse) layer.
+pub(pkg) fn load_core(cache_dir: String, stats: Bool, root: String)
+             : Option[CoresLoaded] / Console + File = {
+  let paths = filter(core_module_paths(), (p) => abspath(p) != abspath(root))
+  let loaded = if cache_dir != "" {
+    load_core_cached(paths, cache_dir, stats, 0, 0, [], [], [], [])
+  } else {
+    let _s = if stats { eprint("kaic2: core-parse-cache: off") } else { () }
+    load_core_files(paths, [], [], [], [], [])
+  }
+  match loaded {
+    Some(PLS(ds, mods, segs, rows)) if list_length(paths) < list_length(core_module_paths()) ->
+      match load_core_file(root) {
+        Some(CoreL(_, me, _)) -> Some(PLS(ds, [me, ...mods], segs, rows))
+        None -> None
+      }
+    _ -> loaded
+  }
+}
+
+# The cached core loader. Per module: read the source, try the
+# post-parse cache (cc_lookup), and on a hit reconstruct the
+# ModuleEntry from the deserialised decls - exactly as
+# load_core_file_cached does. On a miss,
+# parse via load_core_file and write the resulting decls to the cache
+# (write-on-miss self-populates the blob the next build hits). The
+# accumulators mirror load_core_files so the PLS return shape and the
+# downstream cascade are identical to the non-cached path.
+fn load_core_cached(paths: [String], cache_dir: String,
+                    stats: Bool, n_hit: Int, n_miss: Int,
+                    acc_decls: [Decl], acc_mods: [ModuleEntry],
+                    acc_segs: [CoreSegment], acc_rows: [NEnt])
+                    : Option[CoresLoaded] / Console + File = match paths {
+  [] -> {
+    report_core_parse_cache(stats, n_hit, n_miss)
+    Some(PLS(acc_decls, acc_mods, acc_segs, acc_rows))
+  }
+  [p, ...rest] -> match load_core_module(p, cache_dir) {
+    None -> None
+    Some(CclLoaded(CoreL(ds, me, rows), was_hit)) -> {
+      let mod_name = match me { ME(m, _, _, _, _) -> m }
+      let n_hit1 = if was_hit { n_hit + 1 } else { n_hit }
+      let n_miss1 = if was_hit { n_miss } else { n_miss + 1 }
+      load_core_cached(rest, cache_dir, stats, n_hit1, n_miss1,
+                        list_append(acc_decls, ds),
+                        list_append(acc_mods, [me]),
+                        list_append(acc_segs, [PSeg(mod_name, ds)]),
+                        list_append(acc_rows, rows))
+    }
+  }
+}
+
+fn report_core_parse_cache(stats: Bool, n_hit: Int, n_miss: Int) : Unit / Console =
+  if not stats { () }
+  else if n_miss == 0 { eprint("kaic2: core-parse-cache: hit (#{n_hit} modules)") }
+  else { eprint("kaic2: core-parse-cache: miss (parsed #{n_miss} of #{n_hit + n_miss} modules)") }
+
+pub(pkg) fn load_core_files(paths: [String], caches: [String], acc_decls: [Decl],
+                   acc_mods: [ModuleEntry], acc_segs: [CoreSegment], acc_rows: [NEnt])
+                   : Option[CoresLoaded] / Console + File = match paths {
+  [] -> Some(PLS(acc_decls, acc_mods, acc_segs, acc_rows))
+  [p, ...rest] -> match caches {
+    [] -> match load_core_file(p) {
+      None -> None
+      Some(CoreL(ds, me, rows)) -> {
+        let mod_name = match me { ME(m, _, _, _, _) -> m }
+        load_core_files(rest, [],
+                       list_append(acc_decls, ds),
+                       list_append(acc_mods, [me]),
+                       list_append(acc_segs, [PSeg(mod_name, ds)]),
+                       list_append(acc_rows, rows))
+      }
+    }
+    [c, ...rest_caches] -> match load_core_file_cached(p, c) {
+      None -> None
+      Some(CoreL(ds, me, rows)) -> {
+        let mod_name = match me { ME(m, _, _, _, _) -> m }
+        load_core_files(rest, rest_caches,
+                       list_append(acc_decls, ds),
+                       list_append(acc_mods, [me]),
+                       list_append(acc_segs, [PSeg(mod_name, ds)]),
+                       list_append(acc_rows, rows))
+      }
+    }
+  }
+}
+
+# Try the cache file `cache_path` first; on any failure (empty path,
+# missing file, header mismatch,
+# truncated payload) fall back to the full parse via `load_core_file`.
+# The cache stores already-tagged decls with core tests stripped,
+# so reconstructing the `ModuleEntry` only needs `module_name_of_path`
+# + `collect_pub_exports` over the deserialised decls.
+fn load_core_file_cached(source_path: String, cache_path: String)
+                       : Option[CoreLoaded] / Console + File = {
+  if cache_path == "" {
+    load_core_file(source_path)
+  } else {
+    match file_read_bytes(cache_path) {
+      Err(_) -> load_core_file(source_path)
+      Ok(blob) -> match cache_deserialize_module(blob) {
+        None -> {
+          eprint("kaic2: cache miss (header/payload mismatch): #{cache_path} — re-parsing #{source_path}")
+          load_core_file(source_path)
+        }
+        Some(cds) -> match cds {
+          CDs(decls, rows, _) -> {
+            let mod_name = module_name_of_path(source_path)
+            let ftab = st_of_entries(rows)
+            let kept = strip_core_tests(decls, [])
+            let exports = collect_pub_exports(kept, ftab, [])
+            let unstable_exports = collect_unstable_exports(kept, ftab, [])
+            Some(CoreL(kept, ME(mod_name, exports, source_path, unstable_exports, pkg_stdlib()), rows))
+          }
+        }
+      }
+    }
+  }
+}

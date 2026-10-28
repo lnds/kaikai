@@ -1,0 +1,450 @@
+#[doc("""
+The front end's bookkeeping around the passes: the state import
+resolution threads through its loads, and what the resolved program
+hands the typer.
+""")]
+
+import compiler.util
+import compiler.diag
+import compiler.verdicts
+import compiler.kind_theory
+import compiler.lex
+import compiler.ast
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.written
+import compiler.symtab
+import compiler.diag_file
+import compiler.parse_state
+import compiler.parse_decls
+import compiler.resolve_program
+import compiler.scope_view
+import compiler.modules_segments
+import compiler.module_table
+import compiler.package_id
+import compiler.block_scope
+import compiler.modules_paths.{module_files_ahead}
+import compiler.import_uses
+import compiler.import_unit
+import compiler.user_cache
+import compiler.edition
+import compiler.infer_glue
+import compiler.infer_state
+import compiler.infer_head_dispatch
+import compiler.diag_type_text
+import compiler.impl_identity
+import compiler.type_home
+import compiler.protos
+import compiler.proto_ids
+import compiler.doc_attr
+
+#[doc("""
+`dep_memo` carries user-cache dependency closures across the whole
+resolve so a file imported by many modules is tokenised once. It is
+pure cache: dropping it changes speed, never the decls resolved.
+
+The `rev_` fields accumulate newest-first so a resolve step prepends
+instead of copying the whole accumulation; every read outside this
+record reverses once. `scopes` is deliberately not one of them: its
+owner list is short, and the two-level reversal a read would owe costs
+more than the per-owner append it would save.
+""")]
+pub type ResolveState = { visited: [String], in_progress: [String], rev_decls: [Decl], rev_segs: [ImportSeg], rev_modules: [ModuleEntry], scopes: [ModScope], rev_sels: [SelImport], errs: Int, diags: [Diagnostic], dep_memo: UcDepMemo, imports: ImportLedger, rev_rows: [[NEnt]], rev_tried: [ModuleTry], back: [BackEdge], rev_edges: [ImportEdge], looped: Bool, plan: PkgPlan }
+
+#[doc("An import that closed a cycle: the target's file, the file that wrote it, and the name it wrote. Its binding waits for the target's exports.")]
+pub type BackEdge = Deferred(String, String, String, String)
+
+#[doc("One import: the file that wrote it and the file it names.")]
+pub type ImportEdge = IE(String, String)
+
+#[doc("Note that the file `owner` wrote `written` for the file `target`, still being loaded.")]
+pub fn rs_defer(rs: ResolveState, target: String, owner: String, written: String, importer: String) : ResolveState =
+  ResolveState { ...rs, back: [Deferred(target, owner, written, importer), ...rs.back], looped: true }
+
+#[doc("The bindings waiting on the file `target`.")]
+pub fn rs_waiting(rs: ResolveState, target: String) : [BackEdge] =
+  filter(rs.back, (b) => match b { Deferred(t, _, _, _) -> t == target })
+
+#[doc("Drop the bindings waiting on the file `target`.")]
+pub fn rs_release(rs: ResolveState, target: String) : ResolveState =
+  ResolveState { ...rs, back: filter(rs.back, (b) => match b { Deferred(t, _, _, _) -> t != target }) }
+
+#[doc("Note that the file `from` imports the file `to`.")]
+pub fn rs_edge(rs: ResolveState, from: String, to: String) : ResolveState =
+  ResolveState { ...rs, rev_edges: [IE(from, to), ...rs.rev_edges] }
+
+#[doc("One module found: the directory of its importer, its dotted path, the file it was found at as tried and as canonicalised.")]
+pub type ModuleTry = MTry(String, String, String, String)
+
+#[doc("Note that a module was found.")]
+pub fn rs_tried(rs: ResolveState, t: ModuleTry) : ResolveState =
+  ResolveState { ...rs, rev_tried: [t, ...rs.rev_tried] }
+
+#[doc("""
+What the resolution read, in the order it read it: each module's file,
+and before it, with a leading `-`, the files tried for that module ahead
+of it. A build reads the same again while every listed file is still
+there and every `-` one still is not.
+""")]
+pub fn rs_inputs(rs: ResolveState, search_paths: [String]) : [String] =
+  flat_map(list_reverse(rs.rev_tried), (t) => match t {
+    MTry(base, mod, raw, abs) ->
+      list_append(map(module_files_ahead(base, mod, search_paths, raw), (f) => cat2("-", f)), [abs])
+  })
+
+#[doc("Whether the file `p` has been loaded.")]
+pub fn rs_has(rs: ResolveState, p: String) : Bool = list_has(rs.visited, p)
+
+#[doc("Whether the file `p` is being loaded, which makes an import of it a cycle.")]
+pub fn rs_in_progress(rs: ResolveState, p: String) : Bool = list_has(rs.in_progress, p)
+
+#[doc("The entry file: the outermost load.")]
+pub fn rs_root(rs: ResolveState) : String = match list_reverse(rs.in_progress) {
+  [f, ..._] -> f
+  []        -> ""
+}
+
+#[doc("The package that owns the file `path`.")]
+pub fn rs_pkg_of(rs: ResolveState, path: String) : PkgId = pkg_of(rs.plan, path)
+
+#[doc("The file whose imports are being resolved: the innermost load.")]
+pub fn rs_importer(rs: ResolveState) : String = match rs.in_progress {
+  [f, ..._] -> f
+  []        -> ""
+}
+
+#[doc("Enter the load of the file `p`.")]
+pub fn rs_push_in_progress(rs: ResolveState, p: String) : ResolveState =
+  ResolveState { visited: rs.visited, in_progress: [p, ...rs.in_progress], rev_decls: rs.rev_decls, rev_segs: rs.rev_segs, rev_modules: rs.rev_modules, scopes: rs.scopes, rev_sels: rs.rev_sels, errs: rs.errs, diags: rs.diags, dep_memo: rs.dep_memo, imports: rs.imports, rev_rows: rs.rev_rows, rev_tried: rs.rev_tried, back: rs.back, rev_edges: rs.rev_edges, looped: rs.looped, plan: rs.plan }
+
+#[doc("Leave the innermost load.")]
+pub fn rs_pop_in_progress(rs: ResolveState) : ResolveState = match rs.in_progress {
+  []           -> rs
+  [_, ...rest] -> ResolveState { visited: rs.visited, in_progress: rest, rev_decls: rs.rev_decls, rev_segs: rs.rev_segs, rev_modules: rs.rev_modules, scopes: rs.scopes, rev_sels: rs.rev_sels, errs: rs.errs, diags: rs.diags, dep_memo: rs.dep_memo, imports: rs.imports, rev_rows: rs.rev_rows, rev_tried: rs.rev_tried, back: rs.back, rev_edges: rs.rev_edges, looped: rs.looped, plan: rs.plan }
+}
+
+#[doc("Record the file `p` as loaded.")]
+pub fn rs_mark(rs: ResolveState, p: String) : ResolveState =
+  ResolveState { visited: [p, ...rs.visited], in_progress: rs.in_progress, rev_decls: rs.rev_decls, rev_segs: rs.rev_segs, rev_modules: rs.rev_modules, scopes: rs.scopes, rev_sels: rs.rev_sels, errs: rs.errs, diags: rs.diags, dep_memo: rs.dep_memo, imports: rs.imports, rev_rows: rs.rev_rows, rev_tried: rs.rev_tried, back: rs.back, rev_edges: rs.rev_edges, looped: rs.looped, plan: rs.plan }
+
+#[doc("`rows` are the table rows of the declarations `ds`, as the parser minted them.")]
+pub fn rs_append_decls(rs: ResolveState, mod: String, ds: [Decl], rows: [NEnt]) : ResolveState =
+  ResolveState { ...rs, rev_decls: rs_prepend_rev(ds, rs.rev_decls), rev_segs: [ISeg(mod, list_length(ds)), ...rs.rev_segs], rev_rows: [rows, ...rs.rev_rows] }
+
+#[doc("Record the entry of a loaded module.")]
+pub fn rs_add_module(rs: ResolveState, entry: ModuleEntry) : ResolveState =
+  ResolveState { visited: rs.visited, in_progress: rs.in_progress, rev_decls: rs.rev_decls, rev_segs: rs.rev_segs, rev_modules: [entry, ...rs.rev_modules], scopes: rs.scopes, rev_sels: rs.rev_sels, errs: rs.errs, diags: rs.diags, dep_memo: rs.dep_memo, imports: rs.imports, rev_rows: rs.rev_rows, rev_tried: rs.rev_tried, back: rs.back, rev_edges: rs.rev_edges, looped: rs.looped, plan: rs.plan }
+
+#[doc("""
+Record `entry` as a binding the file `owner` wrote. Bindings
+accumulate per owner so a qualifier resolves through the imports of
+the file that spelled it, never a sibling's.
+""")]
+pub fn rs_bind_in(rs: ResolveState, owner: String, entry: ModuleEntry) : ResolveState =
+  ResolveState { visited: rs.visited, in_progress: rs.in_progress, rev_decls: rs.rev_decls, rev_segs: rs.rev_segs, rev_modules: rs.rev_modules, scopes: scopes_bind(rs.scopes, owner, entry), rev_sels: rs.rev_sels, errs: rs.errs, diags: rs.diags, dep_memo: rs.dep_memo, imports: rs.imports, rev_rows: rs.rev_rows, rev_tried: rs.rev_tried, back: rs.back, rev_edges: rs.rev_edges, looped: rs.looped, plan: rs.plan }
+
+fn scopes_bind(scopes: [ModScope], owner: String, entry: ModuleEntry) : [ModScope] = match scopes {
+  [] -> [MScope(owner, [entry], [])]
+  [MScope(m, mt, opens), ...rest] ->
+    if m == owner { [MScope(m, list_append(mt, [entry]), opens), ...rest] }
+    else { [MScope(m, mt, opens), ...scopes_bind(rest, owner, entry)] }
+}
+
+#[doc("""
+Record that the file `owner` opens the module it binds as `written`:
+a plain `import m` makes the module's names visible bare in that file.
+""")]
+pub fn rs_open_in(rs: ResolveState, owner: String, written: String) : ResolveState =
+  ResolveState { ...rs, scopes: scopes_open(rs.scopes, owner, written) }
+
+fn scopes_open(scopes: [ModScope], owner: String, written: String) : [ModScope] = match scopes {
+  [] -> [MScope(owner, [], [written])]
+  [MScope(m, mt, opens), ...rest] ->
+    if m == owner { [MScope(m, mt, [written, ...opens]), ...rest] }
+    else { [MScope(m, mt, opens), ...scopes_open(rest, owner, written)] }
+}
+
+fn rs_prepend_rev(xs: [Decl], rev: [Decl]) : [Decl] = match xs {
+  []           -> rev
+  [x, ...rest] -> rs_prepend_rev(rest, [x, ...rev])
+}
+
+#[doc("""
+Read-side of the `rev_` fields: the write-order views the rest of the
+compiler consumes.
+""")]
+pub fn rs_decls(rs: ResolveState) : [Decl] = list_reverse(rs.rev_decls)
+#[doc("The import segments, in load order.")]
+pub fn rs_segs(rs: ResolveState) : [ImportSeg] = list_reverse(rs.rev_segs)
+#[doc("The loaded modules, in load order.")]
+pub fn rs_modules(rs: ResolveState) : [ModuleEntry] = list_reverse(rs.rev_modules)
+#[doc("The selective imports, in load order.")]
+pub fn rs_sels(rs: ResolveState) : [SelImport] = list_reverse(rs.rev_sels)
+#[doc("The table rows of every loaded declaration, in load order.")]
+pub fn rs_rows(rs: ResolveState) : [NEnt] = rows_in_load_order(rs.rev_rows, [])
+
+fn rows_in_load_order(rev: [[NEnt]], acc: [NEnt]) : [NEnt] = match rev {
+  []           -> acc
+  [r, ...rest] -> rows_in_load_order(rest, list_append(r, acc))
+}
+
+#[doc("""
+The resolved modules first, then the cores — the answer concatenating
+the two tables would give, without copying either. A path enters
+`rev_modules` at most once (`rs_has` gates the revisit), so the
+accumulation order does not change which entry matches.
+""")]
+pub fn rs_lookup_origin(rs: ResolveState, cores: [ModuleEntry], path: String) : Option[ModuleEntry] =
+  match mt_lookup_origin(rs.rev_modules, path) {
+    Some(me) -> Some(me)
+    None     -> mt_lookup_origin(cores, path)
+  }
+
+#[doc("Replace the dependency memo.")]
+pub fn rs_set_dep_memo(rs: ResolveState, m: UcDepMemo) : ResolveState =
+  ResolveState { visited: rs.visited, in_progress: rs.in_progress, rev_decls: rs.rev_decls, rev_segs: rs.rev_segs, rev_modules: rs.rev_modules, scopes: rs.scopes, rev_sels: rs.rev_sels, errs: rs.errs, diags: rs.diags, dep_memo: m, imports: rs.imports, rev_rows: rs.rev_rows, rev_tried: rs.rev_tried, back: rs.back, rev_edges: rs.rev_edges, looped: rs.looped, plan: rs.plan }
+
+#[doc("""
+Record one file's `import m.{A, B}`: the named list also decides which
+contested type a bare `A` means in that file.
+""")]
+pub fn rs_add_sel(rs: ResolveState, owner: String, written: String, names: [String]) : ResolveState =
+  ResolveState { visited: rs.visited, in_progress: rs.in_progress, rev_decls: rs.rev_decls, rev_segs: rs.rev_segs, rev_modules: rs.rev_modules, scopes: rs.scopes, rev_sels: [SelImport(owner, written, names), ...rs.rev_sels], errs: rs.errs, diags: rs.diags, dep_memo: rs.dep_memo, imports: rs.imports, rev_rows: rs.rev_rows, rev_tried: rs.rev_tried, back: rs.back, rev_edges: rs.rev_edges, looped: rs.looped, plan: rs.plan }
+
+#[doc("""
+Increment the error counter when an import fails to resolve.
+Callers fold this count into the compile-source exit-code
+aggregator so a missing module fails the build even when no
+downstream user references a name from it.
+""")]
+pub fn rs_bump_errs(rs: ResolveState) : ResolveState =
+  ResolveState { visited: rs.visited, in_progress: rs.in_progress, rev_decls: rs.rev_decls, rev_segs: rs.rev_segs, rev_modules: rs.rev_modules, scopes: rs.scopes, rev_sels: rs.rev_sels, errs: rs.errs + 1, diags: rs.diags, dep_memo: rs.dep_memo, imports: rs.imports, rev_rows: rs.rev_rows, rev_tried: rs.rev_tried, back: rs.back, rev_edges: rs.rev_edges, looped: rs.looped, plan: rs.plan }
+
+#[doc("Count `ds` as errors of the load and keep them for `--diags-json`.")]
+pub fn rs_report(rs: ResolveState, ds: [Diagnostic]) : ResolveState =
+  ResolveState { ...rs, errs: rs.errs + list_length(ds), diags: list_append(list_reverse(ds), rs.diags) }
+
+#[doc("Add `n` to the error count.")]
+pub fn rs_bump_errs_by(rs: ResolveState, n: Int) : ResolveState =
+  ResolveState { visited: rs.visited, in_progress: rs.in_progress, rev_decls: rs.rev_decls, rev_segs: rs.rev_segs, rev_modules: rs.rev_modules, scopes: rs.scopes, rev_sels: rs.rev_sels, errs: rs.errs + n, diags: rs.diags, dep_memo: rs.dep_memo, imports: rs.imports, rev_rows: rs.rev_rows, rev_tried: rs.rev_tried, back: rs.back, rev_edges: rs.rev_edges, looped: rs.looped, plan: rs.plan }
+
+#[doc("""
+Remember what a loaded module can be referred to by, for the import
+check of every file importing it.
+""")]
+pub fn rs_note_names(rs: ResolveState, origin: String, exports: [String], ds: [Decl]) : ResolveState =
+  ResolveState { ...rs, imports: ledger_note_names(rs.imports, origin, exports, ds) }
+
+#[doc("""
+Scan the imports of one file (the root, or a module just loaded) for
+the unit-wide verdict `report_imports` takes once resolution ends.
+""")]
+pub fn rs_scan_imports(rs: ResolveState, origin: String, file: String, src: String, tokens: [Token],
+                   decls: [Decl], owner: String) : ResolveState =
+  ResolveState { ...rs, imports: ledger_scan(rs.imports, origin, file, src, tokens, decls, ms_scope_table(rs.scopes, owner, [])) }
+
+#[doc("""
+Drop every DImport from a decl list; the pass is destructive
+because after resolution the imports carry no semantic weight —
+the imported decls are already inlined into the flat list.
+""")]
+pub fn non_import_decls(ds: [Decl]) : [Decl] {
+  match ds {
+    [] -> []
+    [d, ...rest] -> match d {
+      DImport(_, _, _) -> non_import_decls(rest)
+      _ -> [d, ...non_import_decls(rest)]
+    }
+  }
+}
+
+#[doc("""
+The post-doc-strip decls for a module plus the count of doc errors
+the strip surfaced (always 0 on a cache hit, since
+the cached stream is already doc-stripped). Carries exactly what
+resolve_module needs downstream so the cache hit and miss paths
+converge on one continuation.
+""")]
+pub type UcResolvedDecls = UCDcls([Decl], [NEnt], [Diagnostic]) | UCFailed([Diagnostic])
+
+#[doc("""
+Resolve a module's decls either from the user cache (hit) or by
+parsing + doc-stripping the source (miss). On a miss with the cache
+enabled, the freshly stripped decls are written back keyed by the
+composite key the lookup computed. Returns None when the source fails
+to parse (the caller counts it as an error and loads no decls). The KAB2 codec round-trips decls structurally,
+so a hit yields the same [Decl] the miss path would (the cold-vs-warm
+differential fixture is the gate on that equivalence).
+""")]
+pub fn uc_resolve_decls(cache_res: UcLookup, abs_path: String, home: String, src: String,
+                    tokens: [Token], cache_dir: String)
+                    : UcResolvedDecls / Console + File =
+  match cache_res {
+    UcHit(decls, rows) -> UCDcls(decls, rows, [])
+    UcMiss(content_hex, dep_hex) -> {
+      let parsed = parse_program(abs_path, src, tokens, home)
+      match parsed.decls {
+        None -> UCFailed(parse_diags(parsed))
+        Some(decls_raw) -> {
+          # Imported modules join the global decl stream doc-free -
+          # strip wrappers + module doc at load time, bumping the
+          # resolver error counter on a duplicate module doc.
+          let im_docs = doc_strip_all(abs_path, src, decls_raw)
+          let decls = im_docs.decls
+          let _w = if cache_dir != "" and content_hex != "" {
+            uc_write(cache_dir, content_hex, dep_hex, decls, parsed.names)
+          } else { () }
+          UCDcls(decls, parsed.names, im_docs.diags)
+        }
+      }
+    }
+  }
+
+#[doc("""
+`owner` is the module whose file these decls came from ("" for the
+root file) — every binding an import introduces is recorded against
+it, so the qualifier tables stay per-file.
+""")]
+pub fn import_diag(file: String, line: Int, col: Int, msg: String) : Diagnostic / Console + File = {
+  let d = mk_diag(SevError, file, line, col, msg, [])
+  render_diag(d)
+  d
+}
+
+#[doc("Whether the chain of imports being loaded has reached the depth limit.")]
+pub fn import_too_deep(rs: ResolveState) : Bool = list_length(rs.in_progress) >= import_chain_max()
+
+#[doc("The file whose import is being loaded; empty at the root.")]
+pub fn importer_file(rs: ResolveState) : String = match rs.in_progress {
+  []         -> ""
+  [f, ..._rest] -> f
+}
+
+#[doc("""
+Result of import expansion. `decls` is the flat
+topologically-sorted decl list (every DImport stripped, all
+imported modules' public + private decls inlined).
+`modules` is the module table — one entry per `import` statement
+at any level of the import graph; the qualified-call resolver uses
+it to rewrite `mod.fn` calls.
+`n_imports` is the count of imported decls at the head of `decls`
+so `validate_pub_access` can split the flat stream back into
+"imported from another module" vs "authored in the root file"
+without re-walking the import graph.
+`errs` is the count of import-resolution failures so
+`compile_source` can fold it into the exit code even when nothing
+downstream references a name from the missing module.
+The last slot is the import check's ledger: its verdict waits for the
+derives, whose expansions mention names no token of a file spells.
+""")]
+pub type ExpandedProgram = EP_Mod([Decl], [ModuleEntry], Int, Verdict, [ImportSeg], [ModScope], [SelImport], [NEnt], ImportLedger, [[String]])
+
+#[doc("""
+Re-key the root file's fn-bounds records (parser-supplied `mo = None`)
+to the target module, matching how `tag_target_decls_module_origin`
+re-keys the decls. A bare call surfaces a `mo = None` tuple and a
+self-qualified call a `Some(target)` tuple; the monomorphiser's
+`lookup_fn_bounds` treats a `None` tuple as the target module, so
+both resolve to these records without colliding with a same-named
+module fn.
+""")]
+pub fn rekey_fn_bounds(fbs: [FnBoundsRec], mod: String) : [FnBoundsRec] {
+  match fbs {
+    [] -> []
+    [f, ...rest] -> match f {
+      FBR(name, _, ftbs) -> [FBR(name, Some(mod), ftbs), ...rekey_fn_bounds(rest, mod)]
+    }
+  }
+}
+
+#[doc("What each core module can be referred to by, keyed by canonical origin.")]
+pub fn core_import_names(segs: [CoreSegment], cores: [ModuleEntry], acc: [ModNames]) : [ModNames] = match segs {
+  [] -> acc
+  [PSeg(name, ds), ...rest] -> match mt_lookup(cores, name) {
+    Some(ME(_, exports, origin, _, _)) -> core_import_names(rest, cores, [mod_names(origin, exports, ds), ...acc])
+    None                            -> core_import_names(rest, cores, acc)
+  }
+}
+
+#[doc("Each module entry with its origin made an absolute path.")]
+pub fn canon_module_origins(mes: [ModuleEntry]) : [ModuleEntry] = match mes {
+  []           -> []
+  [me, ...rest] -> match me {
+    ME(n, ex, origin, un, pk) -> [ME(n, ex, abspath(origin), un, pk), ...canon_module_origins(rest)]
+  }
+}
+
+#[doc("Each path made absolute.")]
+pub fn canon_paths(ps: [String]) : [String] = match ps {
+  []           -> []
+  [p, ...rest] -> [abspath(p), ...canon_paths(rest)]
+}
+
+#[doc("""
+The builtin effects (`Stdout`, `File`, `NetTcp`, `State`, ...) and
+their companion types are declared in surface kaikai under
+`stdlib/effects*.kai` and `stdlib/net/*.kai`, auto-loaded as part of
+the core set. Nothing to inject — the decls reach the typer through
+the normal module-load path.
+""")]
+pub fn inject_builtin_effects(decls: [Decl]) : [Decl] = decls
+
+#[doc("""
+A protocol registry whose impl targets carry the ids the typer stamps
+types with, beside the view of it the typer reads. `stamped_registry`
+is the only builder of either.
+""")]
+pub type StampedView = StampedView(ProtoView)
+#[doc("The stamped registry beside its view.")]
+pub type Stamped = { reg: ProtocolReg, view: StampedView }
+
+#[doc("""
+What a resolved program hands the typer in every mode, beside the
+stream it types.
+""")]
+pub type TyperFront = { df: DiagFiles, views: FileViews, target: String, roots: Roots,
+                    kind_theories: [KindTheory], edition: Edition, cycles: [[String]] }
+
+#[doc("""
+Each impl entry takes its target's identity from the resolver the typer
+stamps `TyCon`s with, over the same table, so dispatch compares
+identities of one origin.
+""")]
+pub fn stamped_registry(f: TyperFront, reg: ProtocolReg, decls: [Decl], tab: SymTab) : Stamped = {
+  let stamped = reg_with_target_ids(reg, tsh_homes(decls, tab, f.views, f.target, f.roots))
+  Stamped { reg: stamped, view: StampedView(pv_of(stamped)) }
+}
+
+#[doc("The view of the stamped registry of `decls`.")]
+pub fn stamped_view(f: TyperFront, reg: ProtocolReg, decls: [Decl], tab: SymTab) : StampedView =
+  stamped_registry(f, reg, decls, tab).view
+
+#[doc("""
+The typer's inputs for the stream `decls` of the program `f` fronts.
+The one place they are assembled: a mode that types a program asks
+here, so none types it against a partial view of it. The registry
+comes as its view, which carries no table: `Mutable` stays masked over
+the caller's own.
+""")]
+pub fn typer_in(f: TyperFront, protos: StampedView, decls: [Decl], tab: SymTab) : TyperIn = match protos {
+  StampedView(pv) -> TyperIn { df: f.df, protos: pv,
+                               head_owners: build_head_owner_map(decls, tab, f.target, f.edition),
+                               kind_theories: f.kind_theories, tab: tab, views: f.views, roots: f.roots, cycles: f.cycles }
+}
+
+#[doc("The modules `kai lint` reports on beside the root file: those loaded from `files`, the files the driver names as the package's own. A unit merges every module it imports into one decl stream, and a stdlib module or a dependency in it is not the package's code.")]
+pub fn lint_owned_mods(expanded: ExpandedProgram, files: [String]) : [SymId] =
+  bscope_file_ids(match expanded { EP_Mod(_, mt, _, _, _, _, _, _, _, _) -> mt }, canon_paths(files))
+
+#[doc("The names of the module entries, in order.")]
+pub fn core_mod_names(mods: [ModuleEntry], acc: [String]) : [String] = match mods {
+  [] -> list_reverse(acc)
+  [m, ...rest] -> match m { ME(nm, _, _, _, _) -> core_mod_names(rest, [nm, ...acc]) }
+}
+
+#[doc("""
+The names the effects `ds` declares were written with, for the scope
+tables keyed by what a file writes.
+""")]
+pub fn effect_names_of(ds: [Decl], tab: SymTab) : [String] =
+  map(collect_effect_ids(ds), (s) => written_text(decl_name(tab, s)))

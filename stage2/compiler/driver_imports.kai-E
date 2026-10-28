@@ -1,0 +1,275 @@
+#[doc("The import resolver: finds, loads and registers every module a program imports, and expands the root file's imports into one declaration stream.")]
+
+import compiler.ast_ids
+import compiler.ast_decl
+import compiler.driver_core_load
+import compiler.util
+import compiler.diag
+import compiler.lex
+import compiler.ast
+import compiler.symtab
+import compiler.modules_paths
+import compiler.modules_segments
+import compiler.module_table
+import compiler.package_id
+import compiler.infer_name_collisions
+import compiler.driver_exports
+import compiler.import_cycles
+import compiler.type_scope
+import compiler.verdicts
+import compiler.real_lit
+import compiler.written
+import compiler.resolve_names
+import compiler.resolve_program
+import compiler.import_unit
+import compiler.user_cache
+import compiler.block_scope
+import compiler.parse_state
+import compiler.infer_glue
+import compiler.infer_state
+import compiler.diag_type_text
+import compiler.parse_lexical
+import compiler.driver_front
+
+fn resolve_module(base_dir: String, mod_path: String, import_name: String, line: Int, col: Int, search_paths: [String], cores: [ModuleEntry], owner: String, cache_dir: String, rs: ResolveState) : ResolveState / Console + File {
+  let cf = find_module_file(base_dir, mod_path, search_paths)
+  match cf {
+    CF(raw_path, opt_src) -> {
+      # Canonicalise the resolver's candidate path so the `visited`
+      # dedup matches paths the core auto-load registered through
+      # `KAI_STDLIB_PATH` (always absolute) when the user passes
+      # `--path stdlib` (relative). Without abspath, a trampoline
+      # `import math.complex` resolves to `stdlib/math/complex.kai`
+      # (relative) and misses the already-loaded absolute path in
+      # visited — re-loading the same file and emitting duplicate
+      # impls. `abspath` returns the input unchanged when realpath
+      # fails (e.g. file does not exist), so the missing-file branch
+      # below still fires with a useful candidate path.
+      let abs_path = match opt_src { Some(src) -> baked_twin(abspath(raw_path), src)  None -> abspath(raw_path) }
+      let rs = if opt_src |> is_some() { rs_tried(rs, MTry(base_dir, mod_path, raw_path, abs_path)) } else { rs }
+      let rs = rs_edge(rs, importer_file(rs), abs_path)
+      if rs_in_progress(rs, abs_path) { report_import_cycle(rs, abs_path, mod_path, owner, import_name, line, col) }
+      else if rs_has(rs, abs_path) { rebind_loaded(rs, cores, abs_path, owner, import_name) }
+      else { load_fresh(base_dir, mod_path, import_name, line, col, search_paths, cores, owner, cache_dir, rs, abs_path, opt_src) }
+    }
+  }
+}
+
+# A module still loading is imported again: a cycle. Inside one package
+# it is legal and the binding waits for the target's exports, so no body
+# resolves against a half-loaded module.
+fn report_import_cycle(rs: ResolveState, abs_path: String, mod_path: String, owner: String, import_name: String, line: Int, col: Int) : ResolveState / Console + File {
+  if abspath(importer_file(rs)) == abs_path {
+    rs_report(rs, [import_diag(importer_file(rs), line, col,
+      "`#{mod_path}` is this file's own name, so it shadows the module it imports; rename the file")])
+  } else if abs_path != rs_root(rs) and pkg_same(rs_pkg_of(rs, importer_file(rs)), rs_pkg_of(rs, abs_path)) {
+    rs_defer(rs, abs_path, owner, import_name, importer_file(rs))
+  } else {
+    rs_report(rs, [import_diag(importer_file(rs), line, col,
+      "import cycle detected: #{format_cycle_chain(rs.in_progress, abs_path)}; cycles are allowed only between modules of one package (files under one kai.toml)")])
+  }
+}
+
+# Legitimate diamond import: A imports B and C, both of which
+# import D. D is already loaded, so its decls must not join the
+# stream twice — but this importer's own binding for it still has
+# to exist, and may differ from the name the first importer used.
+# Re-key the exports already recorded for that file under the name
+# this file wrote.
+#
+# The re-keyed entry goes to the importer's scope ONLY. Adding it
+# to the global table would leave the same file listed under both
+# names there, and the name codegen minted its symbols under is
+# whichever one got in first — an alias that landed globally would
+# be indistinguishable from it.
+fn rebind_loaded(rs: ResolveState, cores: [ModuleEntry], abs_path: String, owner: String, import_name: String) : ResolveState / Console + File =
+  match rs_lookup_origin(rs, cores, abs_path) {
+    None -> rs
+    Some(me) -> match me {
+      ME(_, exports, origin, unstable, pkg) ->
+        rs_bind_in(rs, owner, ME(import_name, me_exports_for(exports, unstable, rs_pkg_of(rs, importer_file(rs))), origin, unstable, pkg))
+    }
+  }
+
+fn load_fresh(base_dir: String, mod_path: String, import_name: String, line: Int, col: Int, search_paths: [String], cores: [ModuleEntry], owner: String, cache_dir: String, rs: ResolveState, abs_path: String, opt_src: Option[String]) : ResolveState / Console + File =
+  match home_taken_by(list_append(rs.rev_modules, cores), module_home(mod_path, cores), abs_path) {
+    Some(first) -> {
+      report_home_clash(rs_importer(rs), line, col, first, abs_path)
+      rs_bump_errs(rs)
+    }
+    None -> {
+      # Push before recursing; pop + mark visited after, on every
+      # branch of the load (missing file, lex error, parse error,
+      # or success), so the stack stays balanced.
+      let rs_in = rs_push_in_progress(rs, abs_path)
+      # The module's home keys its decls, its ids, its segment and the
+      # imports it owns; the importer's spelling is a per-file binding
+      # onto it.
+      let home = module_home(mod_path, cores)
+      let rs_done = match opt_src {
+        None -> {
+          # Counted even when nothing downstream uses a name from the
+          # missing module, so the compile still fails.
+          rs_report(rs_in, [import_diag(importer_file(rs), line, col,
+                                        "cannot open module '#{mod_path}' (tried #{abs_path}): no such file")])
+        }
+        Some(src) -> load_source(base_dir, mod_path, import_name, line, col, search_paths, cores, owner, cache_dir, rs, rs_in, abs_path, home, src)
+      }
+      rs_mark(rs_pop_in_progress(rs_done), abs_path)
+    }
+  }
+
+fn load_source(base_dir: String, mod_path: String, import_name: String, line: Int, col: Int, search_paths: [String], cores: [ModuleEntry], owner: String, cache_dir: String, rs: ResolveState, rs_in: ResolveState, abs_path: String, home: String, src: String) : ResolveState / Console + File {
+  let tokens = tokenize(src)
+  let lex_errs = report_errors(abs_path, src, tokens)
+  if lex_errs != 0 { rs_bump_errs(rs_in) }
+  else {
+    # When the user cache is on, look the module up by its
+    # composite (content + transitive-dep)
+    # key. A hit hands back the post-doc-strip decls the
+    # parse+doc_strip path below would produce, so the parse
+    # is skipped; process_imports still runs over the cached
+    # decls (their DImport nodes are preserved) so transitive
+    # loads happen exactly as on a miss.
+    let lm = if cache_dir != "" {
+      uc_lookup(cache_dir, abs_path, home, src, tokens, search_paths, rs_in.dep_memo)
+    } else { UcLM(UcMiss("", ""), rs_in.dep_memo) }
+    let cache_res = match lm { UcLM(r, _) -> r }
+    let rs_memo = match lm { UcLM(_, m) -> rs_set_dep_memo(rs_in, m) }
+    match uc_resolve_decls(cache_res, abs_path, home, src, tokens, cache_dir) {
+      UCFailed(ds) -> rs_report(rs_memo, ds)
+      UCDcls(decls, rows, doc_diags) ->
+        adopt_module(base_dir, mod_path, import_name, search_paths, cores, owner, cache_dir, rs, rs_report(rs_memo, doc_diags), abs_path, home, src, tokens, decls, rows)
+    }
+  }
+}
+
+# A module no declared root holds belongs to the package of the file that imported it.
+fn local_pkg(rs: ResolveState, abs_path: String) : PkgId = {
+  let own = rs_pkg_of(rs, abs_path)
+  if pkg_known(own) { own } else { rs_pkg_of(rs, importer_file(rs)) }
+}
+
+fn adopt_module(base_dir: String, mod_path: String, import_name: String, search_paths: [String], cores: [ModuleEntry], owner: String, cache_dir: String, rs: ResolveState, rs_doc: ResolveState, abs_path: String, home: String, src: String, tokens: [Token], decls: [Decl], rows: [NEnt]) : ResolveState / Console + File {
+  let ftab = st_of_entries(rows)
+  # The loaded file owns the imports it declares. Its
+  # segment in the flat stream is keyed by the name this
+  # importer bound it under, so the scope is keyed the
+  # same way for the per-segment lookup to match.
+  let rs2 = process_imports(base_dir, decls, search_paths, cores, home, cache_dir, rs_doc)
+  let kept = non_import_decls(decls)
+  # Validate same-module name collisions before the
+  # imported module's decls join the global stream.
+  # Mirrors the check in `load_core_file` for core
+  # auto-load — without it, an `import` of a module
+  # with a duplicate `fn foo` silently keeps the
+  # second definition and the codegen emits two C
+  # symbols for the same kaikai name.
+  let mod_errs = validate_module_same_module_collisions(kept, ftab, abs_path)
+  let rs2b = if mod_errs > 0 { rs_bump_errs_by(rs2, mod_errs) } else { rs2 }
+  # Tag every DFn coming from this module with its home so
+  # the codegen mints `kai_<home>__<name>`.
+  let tagged = tag_decls_module_origin(kept, home)
+  let exports = collect_pub_exports(kept, ftab, [])
+  let rs3 = rs_scan_imports(rs_note_names(rs_append_decls(rs2b, home, tagged, rows), abs_path, exports, kept),
+                            abs_path, abs_path, src, tokens, decls, home)
+  let pkg = local_pkg(rs, abs_path)
+  let unstable_exports = list_append(collect_unstable_exports(kept, ftab, []), package_markers(rows, pkg))
+  let entry = ME(home, exports, abs_path, unstable_exports, pkg)
+  let bound = ME(import_name, me_exports_for(exports, unstable_exports, rs_pkg_of(rs, importer_file(rs))), abs_path, unstable_exports, pkg)
+  # A module may qualify its own names by its file name,
+  # which is not its home once the path is nested.
+  let own = ME(last_segment(mod_path), exports, abs_path, unstable_exports, pkg)
+  let rs4 = rs_bind_in(rs_bind_in(rs_add_module(rs3, entry), owner, bound), home, own)
+  let released = foldl(rs_waiting(rs4, abs_path), rs4, (r, w) => match w {
+    Deferred(_, o, written, importer) ->
+      rs_bind_in(r, o, ME(written, me_exports_for(exports, unstable_exports, rs_pkg_of(r, importer)), abs_path, unstable_exports, pkg))
+  })
+  rs_release(released, abs_path)
+}
+
+fn process_imports(base_dir: String, decls: [Decl], search_paths: [String], cores: [ModuleEntry], owner: String, cache_dir: String, rs: ResolveState) : ResolveState / Console + File {
+
+  match decls {
+    [] -> rs
+    [d, ...rest] -> {
+      let rs1 = match d {
+        DImport(_, line, col) if import_too_deep(rs) ->
+          rs_report(rs, [import_diag(importer_file(rs), line, col, import_chain_msg())])
+        DImport(ik, il, ic) -> match ik {
+          # surface name = last segment of dotted path.
+          IkPath(p)         -> resolve_module(base_dir, p, last_segment(p), il, ic, search_paths, cores, owner, cache_dir,
+                                              rs_open_in(rs, owner, last_segment(p)))
+          # surface name = alias.
+          IkAlias(p, alias) -> resolve_module(if is_fmt_lib_import(ik) { stdlib_path() } else { base_dir }, p, alias, il, ic, search_paths, cores, owner, cache_dir, rs)
+          # surface name = last segment (selective imports keep the
+          # prefix surface binding, same as IkPath). The named list
+          # scopes unqualified names, and decides which contested type
+          # a bare one denotes here.
+          IkSelective(p, names) ->
+            resolve_module(base_dir, p, last_segment(p), il, ic, search_paths, cores, owner, cache_dir,
+                           rs_add_sel(rs, owner, last_segment(p), names))
+          # Import holes are not module loads — they are
+          # diagnostic-only. The symbol-index pass runs separately
+          # after process_imports completes.
+          IkHole(_)         -> rs
+        }
+        _ -> rs
+      }
+      process_imports(base_dir, rest, search_paths, cores, owner, cache_dir, rs1)
+    }
+  }
+}
+
+# Given a root file's path and its parsed decls, return the flat
+# decl list with every (transitively-)imported module's decls
+# prepended in topological order and with every DImport stripped,
+# plus the module table for the qualified-call resolver.
+#
+# `core_paths` carries the absolute paths of every core file
+# already merged into the program. Pre-seeding the resolver's
+# `visited` set with those paths makes any user `import X`
+# whose resolved file matches a core entry a no-op, instead of
+# concatenating the same module a second time and producing a
+# duplicate-symbol C output.
+pub(pkg) fn expand_imports(root_path: String, root_src: String, root_tokens: [Token], search_paths: [String], root_decls: [Decl], core_paths: [String], core_mods: [ModuleEntry], core_segs: [CoreSegment], cache_dir: String, test_roots: [String], blocks: BlockPolicy, inputs_out: String, plan: PkgPlan) : ExpandedProgram / Console + File {
+
+  let base_dir = dir_of(root_path)
+  # Canonicalise root + core paths so the resolver's `visited`
+  # dedup compares against the same shape `resolve_module` will
+  # produce for each import candidate (`abspath` of the raw path
+  # `find_module_file` returns). Without this, a core auto-loaded
+  # `/Users/.../stdlib/math/complex.kai` (absolute) and a user
+  # `import math.complex` resolving via `--path stdlib` to
+  # `stdlib/math/complex.kai` (relative) are treated as different
+  # files and the module gets loaded twice.
+  let canon_root = abspath(root_path)
+  let canon_cores = canon_paths(core_paths)
+  # Core entries are visible to the re-key lookup (an `import` of an
+  # already-loaded core module must be able to bind it under the alias
+  # the importer wrote) but never accumulate into `rev_modules` — the
+  # caller supplies the core table separately.
+  let cores = canon_module_origins(core_mods)
+  let rs0 = ResolveState { visited: [canon_root, ...canon_cores], in_progress: [canon_root], rev_decls: [], rev_segs: [], rev_modules: [], scopes: [], rev_sels: [], errs: 0, diags: [], dep_memo: uc_memo_empty(), imports: ledger_new(core_import_names(core_segs, cores, [])), rev_rows: [], rev_tried: [], back: [], rev_edges: [], looped: false, plan: plan }
+  let rs_roots = load_test_roots(base_dir, test_roots, search_paths, cores, cache_dir,
+                                 process_imports(base_dir, root_decls, search_paths, cores, "", cache_dir, rs0))
+  let rs1 = rs_scan_imports(rs_roots, canon_root, root_path, root_src, root_tokens, root_decls, "")
+  if inputs_out != "" { let _w = write_file(inputs_out, string_join(rs_inputs(rs1, search_paths), "\n")) }
+  # A grouped build's own diagnostics come from each test file built alone.
+  let ledger = if list_is_empty(test_roots) { rs1.imports } else { ledger_new([]) }
+  let mods = rs_modules(rs1)
+  let cycles = if rs1.looped { import_cycles(rs1, mods) } else { [] }
+  let ordered = if rs1.looped { cycles_reorder(rs1, mods, cycles, rs_segs(rs1), rs_decls(rs1)) } else { (rs_segs(rs1), rs_decls(rs1)) }
+  let cut = bscope_apply(blocks, ordered.fst, ordered.snd, rs1.scopes, mods, test_roots)
+  let n_imports = list_length(cut.decls)
+  let all_decls = list_append(cut.decls, non_import_decls(root_decls))
+  EP_Mod(all_decls, mods, n_imports, Verdict(rs1.errs, list_reverse(rs1.diags)), cut.segs, rs1.scopes, rs_sels(rs1), rs_rows(rs1), ledger, cycles)
+}
+
+# Each test root loads as if the root file imported it, after its own imports.
+fn load_test_roots(base_dir: String, roots: [String], search_paths: [String], cores: [ModuleEntry], cache_dir: String, rs: ResolveState) : ResolveState / Console + File =
+  match roots {
+    [] -> rs
+    [r, ...rest] -> load_test_roots(base_dir, rest, search_paths, cores, cache_dir,
+                                    resolve_module(base_dir, r, r, 0, 0, search_paths, cores, "", cache_dir, rs))
+  }
