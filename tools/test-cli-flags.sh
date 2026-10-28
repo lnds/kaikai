@@ -116,8 +116,8 @@ for order in "--emit=kir --test" "--test --emit=kir"; do
   # shellcheck disable=SC2086
   out="$("$ROOT/stage2/kaic2" --path "$ROOT/stdlib" $order "$fixture" 2>&1)" || true
   if printf '%s\n' "$out" | head -n1 | grep -q '^; kaikai KIR dump' \
-     && printf '%s\n' "$out" | grep -q '^fn own_main__main(' \
-     && ! printf '%s\n' "$out" | grep -q '^fn main('; then
+     && printf '%s\n' "$out" | grep -q '^fn kaiu_own_main__main(' \
+     && ! printf '%s\n' "$out" | grep -q '^fn kaiu_main('; then
     ok "$label"
   else
     fail "$label"

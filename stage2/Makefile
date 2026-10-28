@@ -2147,11 +2147,11 @@ test-issue-1214-nonliteral-init: $(TARGET) build
 	  || { echo "$$f DIFF"; diff $$exp build/$$f.out; exit 1; }; \
 	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --emit=kir $$src > build/$$f.kir \
 	  || { echo "$$f FAIL (kir dump)"; exit 1; }; \
-	awk '/^fn issue_1214_nonliteral_init__collatz/,/^}/' build/$$f.kir | grep -q "m__slot_[0-9][0-9]*: i64" \
+	awk '/^fn kaiu_issue_1214_nonliteral_init__collatz/,/^}/' build/$$f.kir | grep -q "m__slot_[0-9][0-9]*: i64" \
 	  || { echo "$$f FAIL (collatz m := n not promoted to raw i64)"; exit 1; }; \
-	awk '/^fn issue_1214_nonliteral_init__arith/,/^}/' build/$$f.kir | grep -q "m__slot_[0-9][0-9]*: i64" \
+	awk '/^fn kaiu_issue_1214_nonliteral_init__arith/,/^}/' build/$$f.kir | grep -q "m__slot_[0-9][0-9]*: i64" \
 	  || { echo "$$f FAIL (arith m := n*2+1 not promoted to raw i64)"; exit 1; }; \
-	awk '/^fn issue_1214_nonliteral_init__callinit/,/^}/' build/$$f.kir | grep -q "array_make" \
+	awk '/^fn kaiu_issue_1214_nonliteral_init__callinit/,/^}/' build/$$f.kir | grep -q "array_make" \
 	  || { echo "$$f FAIL (callinit m := twice(n) wrongly promoted — call init must keep the slot)"; exit 1; }; \
 	grep -Eq "r_acc__slot_[0-9]+ = t[0-9]+;" build/$$f.c \
 	  && grep -Eq "t[0-9]+ = kaix_core_array_make[(]" build/$$f.c \
@@ -5510,12 +5510,12 @@ test-m4c: $(TARGET) build
 	  $(KAIC2) $(TEST_CORE_CACHE) --emit=kir-noinline ../examples/effects/$$n.kai > build/s2-$$n.kir 2>/dev/null \
 	    || { echo "m4c FAIL $$n (kir dump)"; exit 1; }; \
 	done; \
-	grep -q "^fn m4c_run_with__run_with__mono__Int__Int(" build/s2-m4c_run_with.kir \
-	  && grep -q "^fn m4c_run_with__run_with__mono__String__Int(" build/s2-m4c_run_with.kir \
+	grep -q "^fn kaiu_m4c_run_with__run_with__mono__Int__Int(" build/s2-m4c_run_with.kir \
+	  && grep -q "^fn kaiu_m4c_run_with__run_with__mono__String__Int(" build/s2-m4c_run_with.kir \
 	  && echo "m4c OK m4c_run_with monomorph specialisations emitted" \
 	  || { echo "m4c FAIL m4c_run_with — specialisations missing"; exit 1; }; \
-	grep -q "^clause fn _kaiu_m4c_handler_in_body__process_with_log__mono__Int__Int__clause_" build/s2-m4c_handler_in_body.kir \
-	  && grep -q "^clause fn _kaiu_m4c_handler_in_body__process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.kir \
+	grep -q "^clause fn _kaiu_kaiu_m4c_handler_in_body__process_with_log__mono__Int__Int__clause_" build/s2-m4c_handler_in_body.kir \
+	  && grep -q "^clause fn _kaiu_kaiu_m4c_handler_in_body__process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.kir \
 	  && echo "m4c OK m4c_handler_in_body collision-free clause symbols" \
 	  || { echo "m4c FAIL m4c_handler_in_body — distinct clause symbols missing"; exit 1; }; \
 	grep -qE "= m4c_run_with__run_with__mono__Int__Int\(" build/s2-m4c_run_with.kir \
@@ -5528,10 +5528,10 @@ test-m4c: $(TARGET) build
 	  && echo "m4c OK m4c_handler_in_body call sites rewritten to mangled names" \
 	  || { echo "m4c FAIL m4c_handler_in_body — main still calls the polymorphic process_with_log"; exit 1; }; \
 	for t in Int String; do \
-	  grep -q "^fn m4c_flow_through__outer__mono__$$t(" build/s2-m4c_flow_through.kir \
-	    && grep -q "^fn m4c_flow_through__inner__mono__$$t(" build/s2-m4c_flow_through.kir \
+	  grep -q "^fn kaiu_m4c_flow_through__outer__mono__$$t(" build/s2-m4c_flow_through.kir \
+	    && grep -q "^fn kaiu_m4c_flow_through__inner__mono__$$t(" build/s2-m4c_flow_through.kir \
 	    || { echo "m4c FAIL m4c_flow_through — outer or inner spec missing"; exit 1; }; \
-	  awk -v f="^fn m4c_flow_through__outer__mono__$$t[(]" '$$0 ~ f { on = 1 } on && /^}/ { exit } on' build/s2-m4c_flow_through.kir \
+	  awk -v f="^fn kaiu_m4c_flow_through__outer__mono__$$t[(]" '$$0 ~ f { on = 1 } on && /^}/ { exit } on' build/s2-m4c_flow_through.kir \
 	    | grep -q "= m4c_flow_through__inner__mono__$$t(" \
 	    || { echo "m4c FAIL m4c_flow_through — outer__mono__$$t does not call inner__mono__$$t"; exit 1; }; \
 	done; \
@@ -6272,7 +6272,7 @@ test-closure-spec-1205: $(TARGET) bin-kai build
 	diff -q $$exp build/s2-cs1205.out > /dev/null \
 	  || { echo "closure-spec-1205 FAIL (output diff)"; diff $$exp build/s2-cs1205.out; exit 1; }; \
 	$(KAIC2) --emit=kir --path ../stdlib $$src > build/s2-cs1205.kir 2>/dev/null; \
-	awk '/^fn collections__vec__foldl_loop__cspec.*mono/,/^}/' build/s2-cs1205.kir > build/s2-cs1205-loop.kir; \
+	awk '/^fn kaiu_collections__vec__foldl_loop__cspec.*mono/,/^}/' build/s2-cs1205.kir > build/s2-cs1205-loop.kir; \
 	test -s build/s2-cs1205-loop.kir \
 	  || { echo "closure-spec-1205 FAIL (no specialised loop emitted — closure not specialised)"; exit 1; }; \
 	if grep -F -q 'call_ind' build/s2-cs1205-loop.kir; then \
@@ -6344,9 +6344,9 @@ test-closure-spec-self-homonym: $(TARGET) bin-kai build
 	    || { echo "closure-spec-self-homonym FAIL ($$be output diff)"; diff $$exp build/s2-cssh.out; exit 1; }; \
 	done; \
 	$(KAIC2) --emit=kir --path ../stdlib $$src > build/s2-cssh.kir 2>/dev/null; \
-	if grep -E -q '^fn (foldl|fold_seeded)__cspec' build/s2-cssh.kir; then \
+	if grep -E -q '^fn kaiu_(foldl|fold_seeded)__cspec' build/s2-cssh.kir; then \
 	  echo "closure-spec-self-homonym FAIL (a fn that hands its functional param to another fn was specialised)"; \
-	  grep -E '^fn (foldl|fold_seeded)__cspec' build/s2-cssh.kir; exit 1; \
+	  grep -E '^fn kaiu_(foldl|fold_seeded)__cspec' build/s2-cssh.kir; exit 1; \
 	fi; \
 	echo "closure-spec-self-homonym OK (homonym declined like its twin; c and native agree)"
 
@@ -6366,10 +6366,10 @@ test-collect-ground-1208: $(TARGET) bin-kai build
 	diff -q $$exp build/s2-cg1208.out > /dev/null \
 	  || { echo "collect-ground-1208 FAIL (output diff)"; diff $$exp build/s2-cg1208.out; exit 1; }; \
 	$(KAIC2) --emit=kir --path ../stdlib $$src > build/s2-cg1208.kir 2>/dev/null; \
-	awk '/^fn (protocols__)?rmcv_loop__cspec.*mono__Point/,/^}/' build/s2-cg1208.kir > build/s2-cg1208-loop.kir; \
+	awk '/^fn kaiu_(protocols__)?rmcv_loop__cspec.*mono__Point/,/^}/' build/s2-cg1208.kir > build/s2-cg1208-loop.kir; \
 	test -s build/s2-cg1208-loop.kir \
 	  || { echo "collect-ground-1208 FAIL (no grounded collect loop emitted — return-only tparam not grounded)"; exit 1; }; \
-	grep -E -q '^fn (protocols__)?rmcv_loop__cspec.*mono__Point\(i_[0-9]+: i64' build/s2-cg1208-loop.kir \
+	grep -E -q '^fn kaiu_(protocols__)?rmcv_loop__cspec.*mono__Point\(i_[0-9]+: i64' build/s2-cg1208-loop.kir \
 	  || { echo "collect-ground-1208 FAIL (collect loop index not unboxed to i64)"; head -1 build/s2-cg1208-loop.kir; exit 1; }; \
 	if grep -F -q 'call_ind' build/s2-cg1208-loop.kir; then \
 	  echo "collect-ground-1208 FAIL (grounded collect loop still has a per-element indirect call)"; \
@@ -8592,7 +8592,7 @@ test-kir-inline-trmc-1158: $(TARGET) bin-kai build
 	  || { echo "kir-inline-trmc-1158 FAIL (run crashed/hung — TRMC spine broke under the paste)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_inline_trmc_tail_1158.out.expected build/s2-1158trmc.out > /dev/null \
 	  || { echo "kir-inline-trmc-1158 FAIL (output diff)"; diff ../examples/perceus/kir_inline_trmc_tail_1158.out.expected build/s2-1158trmc.out; exit 1; }; \
-	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kir_inline_trmc_tail_1158__build/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kaiu_kir_inline_trmc_tail_1158__build/,/^}/'); \
 	echo "$$kir" | grep -q 'trmc-step' \
 	  || { echo "kir-inline-trmc-1158 FAIL (build lost its trmc-step terminator)"; exit 1; }; \
 	echo "$$kir" | grep -q 'classify' \
@@ -8611,7 +8611,7 @@ test-kir-while-slot-1158: $(TARGET) bin-kai build
 	  || { echo "kir-while-slot-1158 FAIL (run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_while_slot_1158.out.expected build/s2-1158wslot.out > /dev/null \
 	  || { echo "kir-while-slot-1158 FAIL (output diff)"; diff ../examples/perceus/kir_while_slot_1158.out.expected build/s2-1158wslot.out; exit 1; }; \
-	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn main/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kaiu_main/,/^}/'); \
 	echo "$$kir" | grep -qE 'install State|perform State' \
 	  && { echo "kir-while-slot-1158 FAIL (State dispatch survived in main)"; exit 1; } \
 	  || true; \
@@ -8631,7 +8631,7 @@ test-kir-while-param-slot-1173: $(TARGET) bin-kai build
 	  || { echo "kir-while-param-slot-1173 FAIL (run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_while_param_slot_1173.out.expected build/s2-1173wpslot.out > /dev/null \
 	  || { echo "kir-while-param-slot-1173 FAIL (output diff)"; diff ../examples/perceus/kir_while_param_slot_1173.out.expected build/s2-1173wpslot.out; exit 1; }; \
-	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kir_while_param_slot_1173__lcg/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kaiu_kir_while_param_slot_1173__lcg/,/^}/'); \
 	echo "$$kir" | grep -qE 'install State|perform State' \
 	  && { echo "kir-while-param-slot-1173 FAIL (State dispatch survived in lcg)"; exit 1; } \
 	  || true; \
@@ -8650,7 +8650,7 @@ test-kir-while-vcell-moved-set: $(TARGET) bin-kai build
 	  || { echo "kir-while-vcell-moved-set FAIL (run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_while_vcell_moved_set.out.expected build/s2-vcellmove.out > /dev/null \
 	  || { echo "kir-while-vcell-moved-set FAIL (output diff)"; diff ../examples/perceus/kir_while_vcell_moved_set.out.expected build/s2-vcellmove.out; exit 1; }; \
-	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn main/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kaiu_main/,/^}/'); \
 	echo "$$kir" | grep -qE 'install State|perform State' \
 	  && { echo "kir-while-vcell-moved-set FAIL (State dispatch survived in main)"; exit 1; } \
 	  || true; \
@@ -8670,7 +8670,7 @@ test-kir-var-escape-state-1173: $(TARGET) bin-kai build
 	  || { echo "kir-var-escape-state-1173 FAIL (run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/var_escapes_stays_state_1173.out.expected build/s2-1173vesc.out > /dev/null \
 	  || { echo "kir-var-escape-state-1173 FAIL (output diff)"; diff ../examples/perceus/var_escapes_stays_state_1173.out.expected build/s2-1173vesc.out; exit 1; }; \
-	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn main/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kaiu_main/,/^}/'); \
 	echo "$$kir" | grep -q 'install State' \
 	  || { echo "kir-var-escape-state-1173 FAIL (State install gone from main — an escaping var was demoted to a slot)"; exit 1; }; \
 	echo "kir-var-escape-state-1173 OK (surviving closure keeps the cell a dispatched State handler)"
@@ -8694,7 +8694,7 @@ test-kir-while-raw-cond-1414: $(TARGET) bin-kai build
 	  || { echo "kir-while-raw-cond-1414 FAIL (C run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_while_raw_cond_1414.out.expected build/s2-1414raw-c.out > /dev/null \
 	  || { echo "kir-while-raw-cond-1414 FAIL (C output diff)"; exit 1; }; \
-	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kir_while_raw_cond_1414__spin/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kaiu_kir_while_raw_cond_1414__spin/,/^}/'); \
 	echo "$$kir" | grep -q 'bool.box' \
 	  && { echo "kir-while-raw-cond-1414 FAIL (bool.box survived in spin — pred boxed again)"; exit 1; } \
 	  || true; \
@@ -8720,7 +8720,7 @@ test-kir-while-boxed-cond-1414: $(TARGET) bin-kai build
 	  || { echo "kir-while-boxed-cond-1414 FAIL (run errored)"; exit 1; }; \
 	diff -q ../examples/perceus/kir_while_boxed_cond_1414.out.expected build/s2-1414box.out > /dev/null \
 	  || { echo "kir-while-boxed-cond-1414 FAIL (output diff)"; diff ../examples/perceus/kir_while_boxed_cond_1414.out.expected build/s2-1414box.out; exit 1; }; \
-	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kir_while_boxed_cond_1414__spin/,/^}/'); \
+	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kaiu_kir_while_boxed_cond_1414__spin/,/^}/'); \
 	echo "$$kir" | grep -q ': box = prim !=' \
 	  || { echo "kir-while-boxed-cond-1414 FAIL (boxed != gone from spin — twin no longer negative)"; exit 1; }; \
 	echo "$$kir" | grep -q ': i1 = prim i!=' \

@@ -38,13 +38,13 @@ need '^unbox send shout#[0-9]+ shout@sink$'
 need '^unbox send Sink\.put#[0-9]+ Sink@sink$'
 need '^perceus send shout#[0-9]+ shout@sink$'
 need '^perceus send Sink\.put#[0-9]+ Sink@sink$'
-need '^kperform sink__send Sink\.put#[0-9]+ Sink@sink$'
+need '^kperform kaiu_sink__send Sink\.put#[0-9]+ Sink@sink$'
 
 id_of() {
   printf '%s\n' "$out" | grep -E "$1" | sed -E 's/.*#([0-9]+) .*/\1/'
 }
 
-[ "$(id_of '^perceus send Sink\.put#')" = "$(id_of '^kperform sink__send Sink\.put#')" ] \
+[ "$(id_of '^perceus send Sink\.put#')" = "$(id_of '^kperform kaiu_sink__send Sink\.put#')" ] \
   || fail "KPerform carries a different effect id than Perceus read"
 
 # An op written on a row alias carries the identity of the component that
@@ -56,23 +56,23 @@ ALIASFIX="$ROOT/examples/effects/perform_through_row_alias"
 out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
         --path "$ALIASFIX" --path "$ROOT/stdlib" "$ALIASFIX/main.kai")
 
-need '^kperform main__spoken Loud\.say#[0-9]+ Loud@main$'
-[ "$(printf '%s\n' "$out" | grep -cE '^kperform main__spoken Loud\.say#[0-9]+ Loud@main$')" = 2 ] \
+need '^kperform kaiu_main__spoken Loud\.say#[0-9]+ Loud@main$'
+[ "$(printf '%s\n' "$out" | grep -cE '^kperform kaiu_main__spoken Loud\.say#[0-9]+ Loud@main$')" = 2 ] \
   || fail "the alias-written and directly written performs do not both carry Loud's id"
-[ "$(printf '%s\n' "$out" | grep -E '^kperform main__spoken ' | sed -E 's/.*#([0-9-]+) .*/\1/' | sort -u | wc -l | tr -d ' ')" = 1 ] \
+[ "$(printf '%s\n' "$out" | grep -E '^kperform kaiu_main__spoken ' | sed -E 's/.*#([0-9-]+) .*/\1/' | sort -u | wc -l | tr -d ' ')" = 1 ] \
   || fail "the two performs of Loud.say carry different ids"
 
 # A capability passed as a value carries the same identity: the parameter's
 # annotation is a `TyCon` naming the effect, so the op dispatched against
 # that binder's evidence node must name the declaration the others do.
-need '^kperform main__through_cap Loud\.say#l_[0-9]+#[0-9]+ Loud@main$'
+need '^kperform kaiu_main__through_cap Loud\.say#l_[0-9]+#[0-9]+ Loud@main$'
 # A named instance used inside its handle body dispatches against that
 # handle's evidence node and names the effect its head resolved to.
-need '^kperform main__named Loud\.say#n_[0-9]+#[0-9]+ Loud@main$'
+need '^kperform kaiu_main__named Loud\.say#n_[0-9]+#[0-9]+ Loud@main$'
 
 # Every way of writing the op names one declaration: on the row alias, on
 # the effect, through a capability parameter, and through a named instance.
-[ "$(printf '%s\n' "$out" | grep -E '^kperform main__(spoken|through_cap|named) Loud\.say' | sed -E 's/.*#([0-9-]+) .*/\1/' | sort -u | wc -l | tr -d ' ')" = 1 ] \
+[ "$(printf '%s\n' "$out" | grep -E '^kperform kaiu_main__(spoken|through_cap|named) Loud\.say' | sed -E 's/.*#([0-9-]+) .*/\1/' | sort -u | wc -l | tr -d ' ')" = 1 ] \
   || fail "the four ways of writing Loud.say do not all carry one id"
 
 # Two modules each declare `effect Log`. A contested effect is spelled
@@ -84,16 +84,16 @@ HOMOFIX="$ROOT/examples/effects/homonym_perform_ids"
 out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
         --path "$HOMOFIX" --path "$ROOT/stdlib" "$HOMOFIX/main.kai" 2>/dev/null)
 
-need '^kperform ra__run Log__ra\.tally#[0-9]+ Log@ra$'
-need '^kperform rb__run Log__rb\.total#[0-9]+ Log@rb$'
-need '^kperform rb__run Log__rb\.tally#[0-9]+ Log@rb$'
+need '^kperform kaiu_ra__run Log__ra\.tally#[0-9]+ Log@ra$'
+need '^kperform kaiu_rb__run Log__rb\.total#[0-9]+ Log@rb$'
+need '^kperform kaiu_rb__run Log__rb\.tally#[0-9]+ Log@rb$'
 need '^own effect Log__ra#[0-9]+ Log@ra$'
 need '^own effect Log__rb#[0-9]+ Log@rb$'
-[ "$(id_of '^kperform ra__run Log__ra')" != "$(id_of '^kperform rb__run Log__rb\.total')" ] \
+[ "$(id_of '^kperform kaiu_ra__run Log__ra')" != "$(id_of '^kperform kaiu_rb__run Log__rb\.total')" ] \
   || fail "the performs of two homonymous effects carry one id"
-[ "$(id_of '^kperform rb__run Log__rb\.total')" = "$(id_of '^kperform rb__run Log__rb\.tally')" ] \
+[ "$(id_of '^kperform kaiu_rb__run Log__rb\.total')" = "$(id_of '^kperform kaiu_rb__run Log__rb\.tally')" ] \
   || fail "two ops of one effect carry different ids"
-[ "$(id_of '^kperform ra__run Log__ra')" = "$(id_of '^own effect Log__ra')" ] \
+[ "$(id_of '^kperform kaiu_ra__run Log__ra')" = "$(id_of '^own effect Log__ra')" ] \
   || fail "a perform carries a different id than the declaration it names"
 
 # The row label a perform adds carries the same id, and two ops of one
@@ -113,8 +113,8 @@ COREFIX="$ROOT/examples/effects/core_perform_id_under_root_homonym"
 out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
         --path "$COREFIX" --path "$ROOT/stdlib" "$COREFIX/main.kai" 2>/dev/null)
 
-need '^kperform mc__go Log\.info!?#[0-9]+ Log@effects$'
-need '^kperform main Log__main\.note!?#[0-9]+ Log@main$'
+need '^kperform kaiu_mc__go Log\.info!?#[0-9]+ Log@effects$'
+need '^kperform kaiu_main Log__main\.note!?#[0-9]+ Log@main$'
 
 # The core effect stays nameable from that root as `effects.Log`: a handle
 # head, a qualified perform and a row label each carry the core's id, and
@@ -123,14 +123,14 @@ QUALFIX="$ROOT/examples/effects/core_effect_named_qualified"
 out=$("$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --dump-symids \
         --path "$QUALFIX" --path "$ROOT/stdlib" "$QUALFIX/main.kai" 2>/dev/null)
 
-need '^kperform main__both Log\.info#[0-9]+ Log@effects$'
-need '^kperform main__both Log__main\.note#[0-9]+ Log@main$'
+need '^kperform kaiu_main__both Log\.info#[0-9]+ Log@effects$'
+need '^kperform kaiu_main__both Log__main\.note#[0-9]+ Log@main$'
 need '^unbox main with Log#[0-9]+ Log@effects$'
 need '^unbox main with Log__main#[0-9]+ Log@main$'
-need '^kperform ma__go Log__ma\.note#[0-9]+ Log@ma$'
-[ "$(row_id '^row both Log#')" = "$(id_of '^kperform main__both Log\.info')" ] \
+need '^kperform kaiu_ma__go Log__ma\.note#[0-9]+ Log@ma$'
+[ "$(row_id '^row both Log#')" = "$(id_of '^kperform kaiu_main__both Log\.info')" ] \
   || fail "a qualified row label carries a different id than the core effect"
-[ "$(row_id '^row main Stdout#')" = "$(id_of '^kperform ma__go Stdout\.print')" ] \
+[ "$(row_id '^row main Stdout#')" = "$(id_of '^kperform kaiu_ma__go Stdout\.print')" ] \
   || fail "a builtin's row label carries a different id than its core declaration"
 
 # A declaration keeps its identity through the typer's cache: a warm build
@@ -221,7 +221,7 @@ need '^efn pick__mono__String/1#[0-9]+ pick@spec_instance_ids raw=001>0$'
 MATFIX="$ROOT/examples/namespace-collisions/own_fn_call_forms_matrix"
 kir=$(cd "$MATFIX" && "$ROOT/stage2/kaic2" --edition "$(cat "$ROOT/EDITION")" --emit=kir \
         --path "$MATFIX" --path "$ROOT/stdlib" main.kai 2>/dev/null)
-direct=$(printf '%s\n' "$kir" | awk '/^fn pkg__direct\(/{on=1} on{print} on&&/^}/{exit}')
+direct=$(printf '%s\n' "$kir" | awk '/^fn kaiu_pkg__direct\(/{on=1} on{print} on&&/^}/{exit}')
 [ -n "$direct" ] || { out=$kir; fail "no pkg__direct in the KIR dump"; }
 has "$direct" 'int.unbox' \
   && { out=$direct; fail "pkg.direct re-unboxes its own callee's result"; }
@@ -398,12 +398,12 @@ EOF
   return 0
 }
 out=$(cell_dump cell_perform_ids)
-need '^kperform _kaiu_cell_perform_ids__stacked__clause_[0-9_]+_push State\.[a-z]+@xs_[0-9]+#[0-9]+ State@concurrent$'
-need '^kperform cell_perform_ids__reads Reader\.ask@env_[0-9]+#[0-9]+ Reader@concurrent$'
-need '^kperform _kaiu_lam_cell_perform_ids__reads_[0-9_]+ Reader\.ask@env_[0-9]+#[0-9]+ Reader@concurrent$'
+need '^kperform _kaiu_kaiu_cell_perform_ids__stacked__clause_[0-9_]+_push State\.[a-z]+@xs_[0-9]+#[0-9]+ State@concurrent$'
+need '^kperform kaiu_cell_perform_ids__reads Reader\.ask@env_[0-9]+#[0-9]+ Reader@concurrent$'
+need '^kperform _kaiu_lam_kaiu_cell_perform_ids__reads_[0-9_]+ Reader\.ask@env_[0-9]+#[0-9]+ Reader@concurrent$'
 cell_core cell_perform_ids
 out=$(cell_dump cell_perform_ids_stdlib)
-need '^kperform _kaiu_lam_cell_perform_ids_stdlib__captured_[0-9_]+ State\.[a-z]+(@c_[0-9]+)?#[0-9]+ State@concurrent$'
+need '^kperform _kaiu_lam_kaiu_cell_perform_ids_stdlib__captured_[0-9_]+ State\.[a-z]+(@c_[0-9]+)?#[0-9]+ State@concurrent$'
 cell_core cell_perform_ids_stdlib
 out=$(grep -rlE '(^|[^a-z_])var |with (State|Reader)' "$ROOT/examples" --include='*.kai' \
   | grep -v /negative/ \
