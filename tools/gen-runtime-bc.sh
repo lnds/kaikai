@@ -176,7 +176,7 @@ wasm_sysroot() {
   return 1
 }
 
-WASM_COMMON="--target=wasm32-wasip1 -mexception-handling -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID -D_DEFAULT_SOURCE"
+WASM_COMMON="--target=wasm32-wasip1 -mexception-handling -mtail-call -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID -D_DEFAULT_SOURCE"
 WASM_TARGETS="wasm32-wasi:-DKAI_HOST_JS=0 wasm32-browser:"
 
 gen_wasm_bc() {

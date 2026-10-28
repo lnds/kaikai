@@ -92,7 +92,7 @@ case "$TARGET_BACKEND" in
     fi
     [ "$WASM_BACKEND" = native ] && wasm_native_probe
     WASM_CC="${WASI_SDK:-}/bin/clang"
-    WASM_CFLAGS="--target=wasm32-wasip1 -O2 -mexception-handling -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID -lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-process-clocks -lwasi-emulated-getpid -lsetjmp -Wl,--export=__stack_pointer -Wl,--export-table -Wno-unused-command-line-argument"
+    WASM_CFLAGS="--target=wasm32-wasip1 -O2 -mexception-handling -mtail-call -mllvm -wasm-enable-sjlj -mllvm -wasm-use-legacy-eh=false -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID -lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-process-clocks -lwasi-emulated-getpid -lsetjmp -Wl,--export=__stack_pointer -Wl,--export-table -Wno-unused-command-line-argument"
     WASM_NODE_FLAGS="${WASM_NODE_FLAGS:-}"
     WASM_HOST="$ROOT/stage2/web/kai_host.mjs"
     export WASM_CC WASM_CFLAGS WASM_NODE_FLAGS WASM_HOST
