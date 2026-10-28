@@ -2153,7 +2153,8 @@ test-issue-1214-nonliteral-init: $(TARGET) build
 	  || { echo "$$f FAIL (arith m := n*2+1 not promoted to raw i64)"; exit 1; }; \
 	awk '/^fn issue_1214_nonliteral_init__callinit/,/^}/' build/$$f.kir | grep -q "array_make" \
 	  || { echo "$$f FAIL (callinit m := twice(n) wrongly promoted — call init must keep the slot)"; exit 1; }; \
-	grep -q "kaiv_acc__slot_[0-9][0-9]* = kai_core_array_make" build/$$f.c \
+	grep -Eq "r_acc__slot_[0-9]+ = t[0-9]+;" build/$$f.c \
+	  && grep -Eq "t[0-9]+ = kaix_core_array_make[(]" build/$$f.c \
 	  || { echo "$$f FAIL (String var lost its array slot)"; exit 1; }; \
 	echo "issue-1214-nonliteral-init OK (pure non-literal scalar inits promoted; call + String inits keep the slot)"
 
@@ -2660,9 +2661,9 @@ test-evf-passthrough: $(TARGET) build
 	@set -e; \
 	name=evf_frame_passthrough; \
 	$(KAIC2) --path ../stdlib ../examples/effects/$$name.kai > build/s2-$$name.c; \
-	grep -q 'kaiu_evf_frame_passthrough__walk(__evf, ' build/s2-$$name.c \
+	grep -q 'kaiu_evf_frame_passthrough__walk(r___evf, ' build/s2-$$name.c \
 	  || { echo "evf-passthrough FAIL (recursive call copies its own frame)"; exit 1; }; \
-	grep -q 'kaiu_evf_frame_passthrough__walk((KaiEvidence \*\[\]){' build/s2-$$name.c \
+	grep -q 'kaiu_evf_frame_passthrough__walk(kaix_evidence_fill_frame_l(' build/s2-$$name.c \
 	  || { echo "evf-passthrough FAIL (handler site lost its frame)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	./build/s2-$$name > build/s2-$$name.out; \
@@ -5503,32 +5504,38 @@ test-m4c: $(TARGET) build
 	    || { echo "m4c FAIL $$name (C binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
 	  echo "m4c OK $$name (C)"; \
 	done
-	@grep -q "kaiu_m4c_run_with__run_with__mono__Int__Int" build/s2-m4c_run_with.c \
-	  && grep -q "kaiu_m4c_run_with__run_with__mono__String__Int" build/s2-m4c_run_with.c \
+	@# The specialisations are asserted on the KIR before inlining: a
+	@# specialisation every call site inlines away has no C symbol left.
+	@for n in m4c_run_with m4c_handler_in_body m4c_flow_through; do \
+	  $(KAIC2) $(TEST_CORE_CACHE) --emit=kir-noinline ../examples/effects/$$n.kai > build/s2-$$n.kir 2>/dev/null \
+	    || { echo "m4c FAIL $$n (kir dump)"; exit 1; }; \
+	done; \
+	grep -q "^fn m4c_run_with__run_with__mono__Int__Int(" build/s2-m4c_run_with.kir \
+	  && grep -q "^fn m4c_run_with__run_with__mono__String__Int(" build/s2-m4c_run_with.kir \
 	  && echo "m4c OK m4c_run_with monomorph specialisations emitted" \
-	  || { echo "m4c FAIL m4c_run_with — specialisations missing"; exit 1; }
-	@grep -q "_kaiu_m4c_handler_in_body__process_with_log__mono__Int__Int__clause_" build/s2-m4c_handler_in_body.c \
-	  && grep -q "_kaiu_m4c_handler_in_body__process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.c \
+	  || { echo "m4c FAIL m4c_run_with — specialisations missing"; exit 1; }; \
+	grep -q "^clause fn _kaiu_m4c_handler_in_body__process_with_log__mono__Int__Int__clause_" build/s2-m4c_handler_in_body.kir \
+	  && grep -q "^clause fn _kaiu_m4c_handler_in_body__process_with_log__mono__String__Int__clause_" build/s2-m4c_handler_in_body.kir \
 	  && echo "m4c OK m4c_handler_in_body collision-free clause symbols" \
-	  || { echo "m4c FAIL m4c_handler_in_body — distinct clause symbols missing"; exit 1; }
-	@grep -qE "= (kai_take_[a-z0-9]+\()?kaiu_m4c_run_with__run_with__mono__Int__Int\(" build/s2-m4c_run_with.c \
-	  && grep -qE "= (kai_take_[a-z0-9]+\()?kaiu_m4c_run_with__run_with__mono__String__Int\(" build/s2-m4c_run_with.c \
-	  && echo "m4c OK m4c_run_with C call sites rewritten to mangled names" \
-	  || { echo "m4c FAIL m4c_run_with — main still calls polymorphic kai_run_with"; exit 1; }
-	@grep -qE "= (kai_take_[a-z0-9]+\()?kaiu_m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__Int__Int\(" build/s2-m4c_handler_in_body.c \
-	  && grep -qE "= (kai_take_[a-z0-9]+\()?kaiu_m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__String__Int\(" build/s2-m4c_handler_in_body.c \
-	  && echo "m4c OK m4c_handler_in_body C call sites rewritten to mangled names" \
-	  || { echo "m4c FAIL m4c_handler_in_body — main still calls polymorphic kai_process_with_log"; exit 1; }
-	@grep -q "kaiu_m4c_flow_through__outer__mono__Int" build/s2-m4c_flow_through.c \
-	  && grep -q "kaiu_m4c_flow_through__outer__mono__String" build/s2-m4c_flow_through.c \
-	  && grep -q "kaiu_m4c_flow_through__inner__mono__Int" build/s2-m4c_flow_through.c \
-	  && grep -q "kaiu_m4c_flow_through__inner__mono__String" build/s2-m4c_flow_through.c \
-	  && echo "m4c OK m4c_flow_through outer + inner specialisations emitted" \
-	  || { echo "m4c FAIL m4c_flow_through — outer or inner spec missing"; exit 1; }
-	@grep -A 2 "kaiu_m4c_flow_through__outer__mono__Int(" build/s2-m4c_flow_through.c | grep -q "kaiu_m4c_flow_through__inner__mono__Int(" \
-	  && grep -A 2 "kaiu_m4c_flow_through__outer__mono__String(" build/s2-m4c_flow_through.c | grep -q "kaiu_m4c_flow_through__inner__mono__String(" \
-	  && echo "m4c OK m4c_flow_through specs call matching specs (no flow-through to polymorphic inner)" \
-	  || { echo "m4c FAIL m4c_flow_through — outer__mono__T does not call inner__mono__T"; exit 1; }
+	  || { echo "m4c FAIL m4c_handler_in_body — distinct clause symbols missing"; exit 1; }; \
+	grep -qE "= m4c_run_with__run_with__mono__Int__Int\(" build/s2-m4c_run_with.kir \
+	  && grep -qE "= m4c_run_with__run_with__mono__String__Int\(" build/s2-m4c_run_with.kir \
+	  && ! grep -qE "= m4c_run_with__run_with\(" build/s2-m4c_run_with.kir \
+	  && echo "m4c OK m4c_run_with call sites rewritten to mangled names" \
+	  || { echo "m4c FAIL m4c_run_with — main still calls the polymorphic run_with"; exit 1; }; \
+	grep -qE "= m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__Int__Int\(" build/s2-m4c_handler_in_body.kir \
+	  && grep -qE "= m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__String__Int\(" build/s2-m4c_handler_in_body.kir \
+	  && echo "m4c OK m4c_handler_in_body call sites rewritten to mangled names" \
+	  || { echo "m4c FAIL m4c_handler_in_body — main still calls the polymorphic process_with_log"; exit 1; }; \
+	for t in Int String; do \
+	  grep -q "^fn m4c_flow_through__outer__mono__$$t(" build/s2-m4c_flow_through.kir \
+	    && grep -q "^fn m4c_flow_through__inner__mono__$$t(" build/s2-m4c_flow_through.kir \
+	    || { echo "m4c FAIL m4c_flow_through — outer or inner spec missing"; exit 1; }; \
+	  awk -v f="^fn m4c_flow_through__outer__mono__$$t[(]" '$$0 ~ f { on = 1 } on && /^}/ { exit } on' build/s2-m4c_flow_through.kir \
+	    | grep -q "= m4c_flow_through__inner__mono__$$t(" \
+	    || { echo "m4c FAIL m4c_flow_through — outer__mono__$$t does not call inner__mono__$$t"; exit 1; }; \
+	done; \
+	echo "m4c OK m4c_flow_through outer + inner specialisations emitted and matched"
 
 # m7a #9: régime-cost benchmark. Trivial-clause Counter.tick() loop
 # vs a C-direct call with the same side effect. Threshold 5× ns/op
@@ -5971,10 +5978,11 @@ test-tco-309: $(TARGET) build
 test-tco-perceus-wrap: $(TARGET) build
 	@set -e; \
 	$(KAIC2) $(TEST_CORE_CACHE) ../examples/perceus/unbox_bench.kai > build/tco-perceus.c; \
-	grep -F -q '_kai_unbox_bench__bench_loop_entry:;' build/tco-perceus.c \
-	  || { echo "tco-perceus-wrap FAIL (no _kai_bench_loop_entry label in emitted C)"; exit 1; }; \
-	grep -F -q 'goto _kai_unbox_bench__bench_loop_entry;' build/tco-perceus.c \
-	  || { echo "tco-perceus-wrap FAIL (no goto _kai_bench_loop_entry in emitted C)"; exit 1; }; \
+	body=$$(../tools/c-probe.sh fn build/tco-perceus.c unbox_bench__bench_loop); \
+	echo "$$body" | grep -qx 'L_entry:;' \
+	  || { echo "tco-perceus-wrap FAIL (no entry label in bench_loop)"; exit 1; }; \
+	echo "$$body" | grep -q 'goto L_entry;' \
+	  || { echo "tco-perceus-wrap FAIL (no back-edge to the entry label in bench_loop)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-perceus.c -o build/tco-perceus $(LDLIBS_M) ; \
 	./build/tco-perceus > build/tco-perceus.out; \
 	diff -q ../examples/perceus/unbox_bench.out.expected build/tco-perceus.out > /dev/null \
@@ -6834,7 +6842,7 @@ test-trmc-qualified-nullary: $(TARGET) build
 	dir=../examples/perceus/trmc_qualified_nullary; \
 	$(KAIC2) $(TEST_CORE_CACHE) --path $$dir --path ../stdlib $$dir/main.kai > build/s2-trmcqn.c \
 	  || { echo "trmc-qualified-nullary FAIL (kaic2 errored)"; exit 1; }; \
-	grep -q 'goto _kai_main__build_entry' build/s2-trmcqn.c \
+	../tools/c-probe.sh fn build/s2-trmcqn.c main__build | grep -q 'goto L_entry;' \
 	  || { echo "trmc-qualified-nullary FAIL (TRMC did not fire for build)"; exit 1; }; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-trmcqn.c -o build/s2-trmcqn $(LDLIBS_M); \
 	./build/s2-trmcqn > build/s2-trmcqn.out \
@@ -7852,13 +7860,12 @@ test-issue-1454-fixed-vec: $(TARGET) build
 	name=fixed_vec_inline_1454; \
 	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-1454fv.c \
 	  || { echo "issue-1454-fixed-vec FAIL (kaic2 errored)"; exit 1; }; \
-	grep -q 'typedef struct { double a\[3\]; } KaiFixedVec_Real_3;' build/s2-1454fv.c \
-	  || { echo "issue-1454-fixed-vec FAIL (no fixed typedef emitted)"; exit 1; }; \
-	grep -q '(kair_v_[0-9][0-9]*).a\[0\]' build/s2-1454fv.c \
-	  || { echo "issue-1454-fixed-vec FAIL (no inline field load — bounds not elided)"; exit 1; }; \
-	region=$$(sed -n '/KaiFixedVec_Real_3 kair_v_[0-9][0-9]*/,/});/p' build/s2-1454fv.c); \
-	echo "$$region" | grep -qE 'kai_core_vec_reserve|KaiVecMeta|kai_vec_bounds|kai_core_vec_get' \
-	  && { echo "issue-1454-fixed-vec FAIL (dynamic-vec op in fixed region — heap/len/bounds leaked)"; exit 1; } \
+	grep -q '__builtin_alloca(3 \* sizeof(double))' build/s2-1454fv.c \
+	  || { echo "issue-1454-fixed-vec FAIL (no inline [3 x double] local emitted)"; exit 1; }; \
+	grep -q '((double \*)r_v_[0-9][0-9]*)\[0\]' build/s2-1454fv.c \
+	  || { echo "issue-1454-fixed-vec FAIL (no inline element load — bounds not elided)"; exit 1; }; \
+	grep -qE 'kaix_core_vec_reserve|kaix_core_vec_push|kaix_core_vec_get|kaix_fixed_vec_idx' build/s2-1454fv.c \
+	  && { echo "issue-1454-fixed-vec FAIL (dynamic-vec op or bounds check in the fixed program)"; exit 1; } \
 	  || true; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-1454fv.c -o build/s2-1454fv $(LDLIBS_M); \
 	./build/s2-1454fv > build/s2-1454fv.out 2>&1 \
@@ -8466,9 +8473,10 @@ test-shape-fusion-1200: $(TARGET) build
 	name=shape_fusion_1200; \
 	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/perceus/$$name.kai > build/s2-$$name.c \
 	  || { echo "shape-fusion-1200 FAIL (kaic2 errored)"; exit 1; }; \
-	grep -q 'kai___pimpl_Sequence_Chain_foldl' build/s2-$$name.c \
-	  || { echo "shape-fusion-1200 FAIL (impl foldl not called — pipe did not dispatch)"; exit 1; }; \
-	if grep 'kaiu_build(100LL' build/s2-$$name.c | grep -q 'kaiu___pimpl_Sequence_Chain_map('; then \
+	body=$$(../tools/c-probe.sh fn build/s2-$$name.c kai_main); \
+	echo "$$body" | grep -q 'kaix_apply_borrow(r___fusev_' \
+	  || { echo "shape-fusion-1200 FAIL (the fused fold does not apply the stage inline — pipe did not fuse)"; exit 1; }; \
+	if echo "$$body" | grep -q '__pimpl_Sequence_Chain_map('; then \
 	  echo "shape-fusion-1200 FAIL (mapped chain materialised — not fused)"; exit 1; fi; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/s2-$$name.c -o build/s2-$$name $(LDLIBS_M); \
 	KAI_TRACE_RC=1 KAI_THREADS=1 ./build/s2-$$name > build/s2-$$name.out 2> build/s2-$$name.rc; \
@@ -9057,9 +9065,10 @@ test-native-check-runner: $(TARGET) bin-kai build
 test-tco-rule3-basic: $(TARGET) build
 	@set -e; \
 	$(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/rule3_basic.kai > build/tco-r3b.c; \
-	grep -F -q 'goto _kai_rule3_basic__walk_entry' build/tco-r3b.c \
+	body=$$(../tools/c-probe.sh fn build/tco-r3b.c rule3_basic__walk); \
+	echo "$$body" | grep -q 'goto L_entry;' \
 	  || { echo "tco-rule3-basic FAIL (no walk goto label)"; exit 1; }; \
-	if awk '/_kai_rule3_basic__walk_entry/,/__pcs_ret/' build/tco-r3b.c | grep -F -q 'kai_internal_drop(kai_xs)'; then \
+	if echo "$$body" | grep -qE 'KD\(r_xs_[0-9]+\)|kaix_decref\(r_xs_[0-9]+\)'; then \
 	  echo "tco-rule3-basic FAIL (rule 3 misfired on match scrutinee xs; would double-free under perceus tcrec-tail-always-sentinel early-decref)"; exit 1; \
 	fi; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-r3b.c -o build/tco-r3b $(LDLIBS_M) ; \
@@ -9078,9 +9087,10 @@ test-tco-rule3-basic: $(TARGET) build
 test-tco-rule3-no-misfire: $(TARGET) build
 	@set -e; \
 	$(KAIC2) $(TEST_CORE_CACHE) ../examples/tco/rule3_no_misfire.kai > build/tco-r3n.c; \
-	grep -F -q 'goto _kai_rule3_no_misfire__id_walk_entry' build/tco-r3n.c \
+	body=$$(../tools/c-probe.sh fn build/tco-r3n.c rule3_no_misfire__id_walk); \
+	echo "$$body" | grep -q 'goto L_entry;' \
 	  || { echo "tco-rule3-no-misfire FAIL (no id_walk goto label)"; exit 1; }; \
-	if awk '/_kai_rule3_no_misfire__id_walk_entry/,/__pcs_ret/' build/tco-r3n.c | grep -F -q 'kai_internal_drop(kai_xs)'; then \
+	if echo "$$body" | grep -qE 'KD\(r_xs_[0-9]+\)|kaix_decref\(r_xs_[0-9]+\)'; then \
 	  echo "tco-rule3-no-misfire FAIL (rule 3 misfired: kai_internal_drop(kai_xs) present in id_walk goto)"; exit 1; \
 	fi; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/tco-r3n.c -o build/tco-r3n $(LDLIBS_M) ; \
