@@ -43,17 +43,26 @@ TARGET_BACKEND="${TARGET_BACKEND:-native}"
 # in-process libLLVM emitter against its own baseline.
 WASM_BACKEND="${WASM_BACKEND:-c}"
 
-# SKIP, as the native leg does, when this kaic2 cannot emit WebAssembly.
+# SKIP, as the native leg does, only when this kaic2 has no WebAssembly target;
+# a hello world that fails to build for either wasm target is a failure.
 wasm_native_probe() {
-  local probe
+  local probe out t
   probe="$(mktemp)"; mv "$probe" "$probe.kai"; probe="$probe.kai"
-  printf 'fn main() : Int = 0\n' > "$probe"
-  if ! "$KAI" build --backend=native --target=wasm32-wasi "$probe" -o "${probe%.kai}.bin" >/dev/null 2>&1; then
-    echo "test-backend-parity: SKIP (no WebAssembly target in this kaic2; rebuild with make KAI_LLVM=1 against a libLLVM that has it)"
-    rm -f "$probe" "${probe%.kai}.bin" "${probe%.kai}.bin.wasm"
-    exit 0
-  fi
-  rm -f "$probe" "${probe%.kai}.bin" "${probe%.kai}.bin.wasm"
+  printf 'fn main() : Unit / Stdout = println("hola")\n' > "$probe"
+  for t in wasm32-wasi wasm32-browser; do
+    if ! out="$("$KAI" build --backend=native --target=$t "$probe" -o "${probe%.kai}.bin" 2>&1)"; then
+      rm -f "$probe" "${probe%.kai}".bin*
+      case "$out" in
+        *"without the WebAssembly LLVM target"*)
+          echo "test-backend-parity: SKIP (no WebAssembly target in this kaic2; rebuild with make KAI_LLVM=1 against a libLLVM that has it)"
+          exit 0 ;;
+      esac
+      echo "test-backend-parity: FAIL — hello world does not build for $t:"
+      echo "$out"
+      exit 1
+    fi
+  done
+  rm -f "$probe" "${probe%.kai}".bin*
 }
 
 case "$TARGET_BACKEND" in

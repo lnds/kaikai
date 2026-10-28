@@ -37,7 +37,7 @@ to a compiler on `PATH`.
 Programs that run to completion on one thread: pure code, records, sum
 types, handlers (exception handling, exnref encoding), `Seq`, fibers
 (`spawn`, `nursery`), actors and handlers that keep `resume`. The engine must
-ship exception handling with exnref: Chrome and Edge 137, Firefox 131,
+ship exception handling with exnref and tail calls: Chrome and Edge 137, Firefox 131,
 Safari 18.4. A program that spawns a fiber or keeps a continuation also
 needs JSPI (Chrome and Edge 137, Firefox 153, Safari 27); the host refuses
 to load it on an engine without.
