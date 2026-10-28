@@ -152,6 +152,18 @@ driver author calls the C destructor explicitly (`PQfinish` above). A
 handle may be threaded through any number of calls; passing it to two
 calls does not double-free it. Opaque handles work on BOTH backends.
 
+An opaque may take phantom type parameters, `extern "C" opaque Conn[t]`. The
+parameter tags the handle on the kaikai side only: the typer keeps `Conn[Db]`
+and `Conn[Cache]` apart, C never sees it, and the ABI stays `void *`.
+
+```kaikai-fragment
+type Db = | MkDb
+extern "C" opaque Conn[t]
+
+extern "C"("open_db")    fn open_db() : Conn[Db] / Ffi
+extern "C"("query_db")   fn query(c: Conn[Db], q: String) : Int / Ffi
+```
+
 A `char *` a C function returns while borrowing from a live handle
 (e.g. `PQgetvalue` tied to a `PGresult`) is COPIED at the boundary
 (same as a returned `String`), so it never dangles when the handle is
