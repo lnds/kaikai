@@ -297,7 +297,9 @@ KAI_RT_SHARED int kai_cell_pool_push(KaiValue *v) {
     return 0;
 }
 /* A pool this small is not worth trimming. */
+#ifndef KAI_CELL_POOL_TRIM_MIN
 #define KAI_CELL_POOL_TRIM_MIN 4096
+#endif
 __attribute__((noinline))
 KAI_RT_SHARED int kai_cell_pool_trimmable(void) {
     return kai_cell_pool_n > KAI_CELL_POOL_TRIM_MIN;
@@ -325,11 +327,6 @@ KAI_RT_SHARED void kai_cell_pool_trim(void) {
     free(kai_cell_pool);
     kai_cell_pool = NULL;
     kai_cell_pool_relief();
-#if defined(KAI_CELL_POOL_TRACE) && defined(__APPLE__)
-    malloc_statistics_t st;
-    malloc_zone_statistics(NULL, &st);
-    fprintf(stderr, "zone in_use=%zu allocated=%zu\n", st.size_in_use, st.size_allocated);
-#endif
 }
 
 /* Ticked by a thread that never parks (a main thread driving a foreign event

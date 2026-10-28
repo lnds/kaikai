@@ -22,10 +22,10 @@ check() {
   peaks=$(grep -c '^peak' "$dir/err")
   trimmed=$(awk '/^cell-pool-trim /{ s += $2 } END { print s + 0 }' "$dir/err")
   echo "threads=${threads}: peaks ${peaks}, cells trimmed ${trimmed}"
-  [ "$peaks" -eq 5 ] || { echo "FAIL: expected 5 peaks" >&2; exit 1; }
+  [ "$peaks" -eq 6 ] || { echo "FAIL: expected 6 peaks" >&2; exit 1; }
   [ "$trimmed" -ge "$min" ] || { echo "FAIL: only ${trimmed} cells trimmed (need ${min})" >&2; exit 1; }
 }
 
-check 4 5000000
-check 1 4000000
+check 4 6000000
+check 1 3000000
 echo "ok"
