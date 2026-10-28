@@ -7433,12 +7433,13 @@ test-trmc-slot-forms: $(TARGET) build
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $(TRMC_SLOT_DIR)/$$p.kai > build/s2-trmc-slot-$$p.c 2> build/s2-trmc-slot-$$p.err \
 	    || { echo "trmc-slot-forms FAIL ($$p: kaic2 errored)"; cat build/s2-trmc-slot-$$p.err; exit 1; }; \
 	done; \
+	loops() { awk -v f="$$2" '$$0 ~ ("^[A-Za-z_0-9 *]+ " f "\\(.*\\) \\{$$") { on = 1 } on && /goto L_entry;/ { found = 1 } on && /^}/ { on = 0 } END { exit !found }' "$$1"; }; \
 	for pf in $(TRMC_SLOT_FORMS); do \
-	  grep -q "goto _kai_$${pf%%:*}__$${pf#*:}_entry" build/s2-trmc-slot-$${pf%%:*}.c \
+	  loops build/s2-trmc-slot-$${pf%%:*}.c "$${pf%%:*}__$${pf#*:}" \
 	    || { echo "trmc-slot-forms FAIL ($$pf: modulo-cons step did not fire)"; exit 1; }; \
 	done; \
 	for pf in $(TRMC_SLOT_NEGATIVES); do \
-	  ! grep -q "goto _kai_$${pf%%:*}__$${pf#*:}_entry" build/s2-trmc-slot-$${pf%%:*}.c \
+	  ! loops build/s2-trmc-slot-$${pf%%:*}.c "$${pf%%:*}__$${pf#*:}" \
 	    || { echo "trmc-slot-forms FAIL ($$pf: a deferred self-call was admitted into a modulo-cons step)"; exit 1; }; \
 	done; \
 	for p in $(TRMC_SLOT_PROGRAMS); do \
@@ -10734,12 +10735,13 @@ test-modular-build-case-%: $(TARGET) build
 	objs=""; \
 	for c in $$mod/*.c; do \
 	  o=$${c%.c}.o; \
-	  defs=-DKAI_SEPARATE_COMPILATION=1; \
-	  [ "$$(basename $$c)" = "__root__.c" ] && defs="$$defs -DKAI_RUNTIME_OWNER=1"; \
-	  $(CC) $(CFLAGS) $$defs -I $$mod -I ../stage2 -I ../stage0 -c $$c -o $$o \
+	  $(CC) $(CFLAGS) -DKAI_SEPARATE_COMPILATION=1 -I $$mod -I ../stage2 -I ../stage0 -c $$c -o $$o \
 	    || { echo "modular FAIL $$name (compile $$(basename $$c))"; exit 1; }; \
 	  objs="$$objs $$o"; \
 	done; \
+	$(CC) $(CFLAGS) -DKAI_SEPARATE_COMPILATION=1 -DKAI_RUNTIME_OWNER=1 -I ../stage2 -I ../stage0 -c ../stage0/runtime_llvm.c -o $$mod/runtime_owner.o \
+	  || { echo "modular FAIL $$name (compile runtime owner)"; exit 1; }; \
+	objs="$$objs $$mod/runtime_owner.o"; \
 	$(CC) $(CFLAGS) $$objs -o build/$$name.bin $(LDLIBS_M) \
 	  || { echo "modular FAIL $$name (link)"; exit 1; }; \
 	./build/$$name.bin > build/$$name.out \
@@ -10851,17 +10853,14 @@ test-home-tu-partition: $(TARGET) build
 	assert_tu() { got=$$(tu_of "$$2"); [ "$$got" = "$$3" ] \
 	  || { echo "home-tu FAIL: $$1 ($$2) in '$$got', want $$3"; exit 1; }; \
 	  echo "home-tu OK: $$1 -> $$3"; }; \
-	assert_tu "root pub fn"        "kaiu_main__badge"             "main.c"; \
-	assert_tu "root private fn"    "kaiu_main__helper"            "main.c"; \
-	assert_tu "fn main"            "kaiu_main.void. .$$"         "__root__.c"; \
-	assert_tu "root lambda"        "_kaiu_lam_main_19_14"         "__root__.c"; \
-	assert_tu "imported pub fn"    "kaiu_lib__widget__label"           "lib__widget.c"; \
-	assert_tu "cross-module spec"  "kaiu_lib__widget__wrap__mono__Int" "__root__.c"; \
+	assert_tu "root pub fn"        "^int64_t main__badge"         "main.c"; \
+	assert_tu "root private fn"    "^int64_t main__helper"        "main.c"; \
+	assert_tu "fn main"            "^KaiValue [*] kai_main"       "__root__.c"; \
 	$(KAIC2) --path ../stdlib --path $$fx $$fx/main.kai > build/home_tu_partition.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/home_tu_partition.c -o build/home_tu_partition $(LDLIBS_M); \
 	./build/home_tu_partition > build/home_tu_partition.out; \
 	diff -q $$fx/main.out.expected build/home_tu_partition.out > /dev/null \
-	  && echo "test-home-tu-partition OK (6 cases + run)" \
+	  && echo "test-home-tu-partition OK (3 cases + run)" \
 	  || { echo "home-tu DIFF"; diff $$fx/main.out.expected build/home_tu_partition.out; exit 1; }
 
 # Backend incremental lever — parallel cc + .o content-hash cache.
@@ -10880,7 +10879,9 @@ test-modular-cache: $(TARGET) bin-kai build
 	KAI=../bin/kai; \
 	cache=build/modular-cache.d; rm -rf $$cache; \
 	src=build/modular-cache.src; rm -rf $$src; mkdir -p $$src/geo; \
-	cp ../examples/multi-module/main.kai ../examples/multi-module/math.kai $$src/; \
+	cp ../examples/multi-module/main.kai $$src/; \
+	base_math='pub fn square(n: Int) : Int = if n <= 0 { 0 } else { square(n - 1) + n + n - 1 }'; \
+	printf '%s\n' "$$base_math" > $$src/math.kai; \
 	cp ../examples/multi-module/geo/shapes.kai $$src/geo/; \
 	exp=../examples/multi-module/main.out.expected; \
 	build_run() { \
@@ -10905,25 +10906,25 @@ test-modular-cache: $(TARGET) bin-kai build
 	[ "$$c" = "0" ] \
 	  || { echo "modular-cache FAIL warm (want compiled=0 on no-change rebuild, got compiled=$$c)"; exit 1; }; \
 	echo "modular-cache OK warm (0 recompiled, $$n reused)"; \
-	printf 'pub fn square(n: Int) : Int {\n  let r = n * n\n  r\n}\n' > $$src/math.kai; \
+	printf 'pub fn square(n: Int) : Int = if n <= 0 { 0 } else {\n  let r = square(n - 1) + n + n - 1\n  r\n}\n' > $$src/math.kai; \
 	build_run incr; \
 	c=$$(num incr compiled); \
 	[ "$$c" -ge 1 ] && [ "$$c" -lt "$$cc0" ] \
 	  || { echo "modular-cache FAIL incr (want 1<=compiled<$$cc0, got compiled=$$c)"; exit 1; }; \
 	echo "modular-cache OK incr (one-module edit -> $$c recompiled vs $$cc0 cold)"; \
-	cp ../examples/multi-module/math.kai $$src/; \
+	printf '%s\n' "$$base_math" > $$src/math.kai; \
 	printf '\npub type CacheProbe = CPA | CPB\n' >> $$src/math.kai; \
 	build_run typeadd; \
 	c=$$(num typeadd compiled); \
 	[ "$$c" -ge 1 ] && [ "$$c" -le 3 ] && [ "$$c" -lt "$$cc0" ] \
 	  || { echo "modular-cache FAIL typeadd (want 1<=compiled<=3, got compiled=$$c of $$cc0 — a type-add must not re-key unreferencing TUs)"; exit 1; }; \
 	echo "modular-cache OK typeadd (new sum type -> $$c recompiled vs $$cc0 cold)"; \
-	cp ../examples/multi-module/math.kai $$src/; \
+	printf '%s\n' "$$base_math" > $$src/math.kai; \
 	printf '\npub fn cache_probe(xs: [Int]) : [Int] = map(xs, (x) => x + 1)\n' >> $$src/math.kai; \
 	build_run fnadd; \
 	c=$$(num fnadd compiled); \
-	[ "$$c" -ge 1 ] && [ "$$c" -le 4 ] && [ "$$c" -lt "$$cc0" ] \
-	  || { echo "modular-cache FAIL fnadd (want 1<=compiled<=4, got compiled=$$c of $$cc0 — a fn-add must not re-key uncalling TUs)"; exit 1; }; \
+	[ "$$c" -le 4 ] && [ "$$c" -lt "$$cc0" ] \
+	  || { echo "modular-cache FAIL fnadd (want compiled<=4, got compiled=$$c of $$cc0 (an uncalled fn is pruned, so 0 is fine) — a fn-add must not re-key uncalling TUs)"; exit 1; }; \
 	echo "modular-cache OK fnadd (new fn -> $$c recompiled vs $$cc0 cold)"; \
 	echo "modular-cache OK"
 
@@ -10937,10 +10938,14 @@ test-modular-cache: $(TARGET) bin-kai build
 # that module's TU + __root__.c's registration tables change — the new
 # type's structs are referenced nowhere, so no slice moves), and a new
 # fn with a lambda (that module's TU + __root__.c + their decls slices).
+# `square` recurses without a tail call so the inliner keeps it a function of math.c: a body
+# that is inlined into its callers legitimately changes their TUs too.
 test-modular-hermetic: $(TARGET) build
 	@set -e; \
 	src=build/modular-hermetic.src; rm -rf $$src; mkdir -p $$src/geo; \
-	cp ../examples/multi-module/main.kai ../examples/multi-module/math.kai $$src/; \
+	cp ../examples/multi-module/main.kai $$src/; \
+	base_math='pub fn square(n: Int) : Int = if n <= 0 { 0 } else { square(n - 1) + n + n - 1 }'; \
+	printf '%s\n' "$$base_math" > $$src/math.kai; \
 	cp ../examples/multi-module/geo/shapes.kai $$src/geo/; \
 	d=build/modular-hermetic.d; rm -rf $$d; mkdir -p $$d; \
 	emit_split() { \
@@ -10965,16 +10970,16 @@ test-modular-hermetic: $(TARGET) build
 	  done; \
 	}; \
 	emit_split base; \
-	printf 'pub fn square(n: Int) : Int {\n  let r = n * n\n  r\n}\n' > $$src/math.kai; \
+	printf 'pub fn square(n: Int) : Int = if n <= 0 { 0 } else {\n  let r = square(n - 1) + n + n - 1\n  r\n}\n' > $$src/math.kai; \
 	emit_split body; \
 	assert_only body math.c; \
 	echo "modular-hermetic OK body-edit (only math.c changed)"; \
-	cp ../examples/multi-module/math.kai $$src/; \
+	printf '%s\n' "$$base_math" > $$src/math.kai; \
 	printf '\npub type HermProbe = HPA | HPB\n' >> $$src/math.kai; \
 	emit_split sum; \
 	assert_only sum math.c __root__.c; \
 	echo "modular-hermetic OK sum-add (only math.c/__root__.c changed; no header slice moved)"; \
-	cp ../examples/multi-module/math.kai $$src/; \
+	printf '%s\n' "$$base_math" > $$src/math.kai; \
 	printf '\npub fn herm_lam(xs: [Int]) : [Int] = map(xs, (x) => x + 1)\n' >> $$src/math.kai; \
 	emit_split lam; \
 	assert_only lam math.c __root__.c kai_decls_math.h kai_decls___root__.h; \

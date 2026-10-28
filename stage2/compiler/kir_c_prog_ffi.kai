@@ -1,5 +1,6 @@
 #[doc("KIR to C printer: `extern \"C\"` shims and the C-ABI entries of exports.")]
 
+import compiler.emit_native_ffi
 import compiler.emit_native_fn
 import compiler.kir
 import compiler.kir_c_core
@@ -69,8 +70,6 @@ fn kcf_is_struct(k: KFfiKind) : Bool = match k {
   _ -> false
 }
 
-fn kcf_is_js(sym: String) : Bool = string_length(sym) > 7 and string_slice(sym, 0, 7) == "kai_js:"
-
 #[doc("The parameter list of an FFI shim of `n` boxed params, led by the evidence frame when the shim's fn carries one.")]
 pub fn kcf_boxed_params(evf: Bool, n: Int) : String =
   if n == 0 and not evf { "void" }
@@ -114,6 +113,48 @@ fn kcf_shim(evf: Bool, sym: String, csym: String, pks: [KFfiKind], rk: KFfiKind)
   ])
 }
 
+fn kcf_js_param_types(ks: [KFfiKind]) : [String] = flat_map(filter(ks, (k) => not js_is_unit(k)), (k) => match k {
+  KFfiString -> ["const char *", "uint32_t"]
+  _          -> [kcf_ctype(k)]
+})
+
+fn kcf_js_call_args(ks: [KFfiKind], i: Int, acc: [String]) : [String] = match ks {
+  [] -> list_reverse(acc)
+  [k, ...rest] -> {
+    let a = cat2("a", int_to_string(i))
+    match k {
+      KFfiUnit   -> kcf_js_call_args(rest, i + 1, acc)
+      KFfiString -> kcf_js_call_args(rest, i + 1, [kc_call("kaix_str_len32", [a]), kcf_unbox(k, a), ...acc])
+      _          -> kcf_js_call_args(rest, i + 1, [kcf_unbox(k, a), ...acc])
+    }
+  }
+}
+
+fn kcf_js_rebox(k: KFfiKind) : String = match k {
+  KFfiString  -> kc_call("kaix_js_take_str", ["r"])
+  KFfiForeign -> kc_call("kaix_foreign_js", ["r"])
+  _           -> if kcf_is_unit(k) { "kaix_unit()" } else { kcf_rebox(k, "r") }
+}
+
+fn kcf_js_shim(evf: Bool, sym: String, csym: String, pks: [KFfiKind], rk: KFfiKind) : String = {
+  let path = string_slice(csym, 7, string_length(csym) - 7)
+  let imp = concat_all([js_params_letters(pks), ":", js_letter(rk), ":", path])
+  let alias = cat2("kc_js_", kc_mangle(sym))
+  let rty = match rk { KFfiString -> "uint32_t"  _ -> kcf_ctype(rk) }
+  let ps = match kcf_js_param_types(pks) { [] -> "void"  tys -> string_join(tys, ", ") }
+  let call = kc_call(alias, kcf_js_call_args(pks, 0, []))
+  let head = concat_all(["KaiValue *", sym, "(", kcf_boxed_params(evf, list_length(pks)), ")"])
+  concat_all([
+    "#if defined(__wasm__)\n",
+    "extern ", rty, " ", alias, "(", ps, ") __attribute__((import_module(\"kai_js\"), import_name(", kc_cstr(imp), ")));\n",
+    head, " {\n",
+    if kcf_is_unit(rk) { concat_all(["    ", call, ";\n"]) } else { concat_all(["    ", rty, " r = ", call, ";\n"]) },
+    concat_all(kcf_decrefs(pks, 0)),
+    "    return ", kcf_js_rebox(rk), ";\n}\n",
+    "#else\n", head, " {\n    ", kc_unsupported("extern \"js\" needs a JavaScript host"), ";\n    return kaix_unit();\n}\n#endif\n"
+  ])
+}
+
 #[doc("The definition of the `extern \"C\"` shim `cx.cur`: it unboxes each argument, calls `csym`, drops the boxed inputs after the call and boxes the result. A struct by value, an unknown boundary type and a `kai_js:` import print a body that aborts at run time.")]
 pub fn kc_ffi_fn(cx: KcCx, f: KFn, csym: String, pks: [KFfiKind], rk: KFfiKind) : String = {
   let sym = cx.cur
@@ -123,8 +164,8 @@ pub fn kc_ffi_fn(cx: KcCx, f: KFn, csym: String, pks: [KFfiKind], rk: KFfiKind) 
     kcf_unsupported_shim(evf, sym, arity, cat2("unsupported FFI boundary type in ", csym))
   } else if any(pks, kcf_is_struct) or kcf_is_struct(rk) {
     kcf_unsupported_shim(evf, sym, arity, cat2("struct-by-value FFI is not supported: ", csym))
-  } else if kcf_is_js(csym) {
-    kcf_unsupported_shim(evf, sym, arity, cat2("extern js is not supported: ", csym))
+  } else if ffi_is_js(csym) {
+    kcf_js_shim(evf, sym, csym, pks, rk)
   } else {
     kcf_shim(evf, sym, csym, pks, rk)
   }

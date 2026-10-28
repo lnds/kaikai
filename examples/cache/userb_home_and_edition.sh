@@ -4,7 +4,7 @@
 #
 # 1. The HOME (module path) is part of the key. Two modules with byte-identical
 #    text under different homes must each come back with their own home, cold
-#    and warm: the emitted C names the functions of each after its own module.
+#    and warm: the KIR names the functions of each after its own module.
 # 2. The EDITION is not an input of the parser, but a change of edition in a
 #    project that already holds blobs must still build exactly as a plain
 #    build does, so this flips it over a warm cache and compares.
@@ -52,7 +52,12 @@ build "$PROJ/warm.c" "$EDITION" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 same "$PROJ/plain.c" "$PROJ/cold.c" "cold C differs from plain C"
 same "$PROJ/plain.c" "$PROJ/warm.c" "warm C differs from plain C"
 
-grep -q 'a__util__twice' "$PROJ/warm.c" && grep -q 'b__util__twice' "$PROJ/warm.c" || {
+"$KAIC2" --edition "$EDITION" --emit=kir-noinline --user-cache --user-cache-dir "$PROJ/.kai-cache" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/warm.kir" 2>"$PROJ/err" || {
+  echo "userb_home_and_edition: FAIL — the KIR dump over the warm cache exited non-zero"
+  cat "$PROJ/err"
+  exit 1
+}
+grep -q '^fn a__util__twice' "$PROJ/warm.kir" && grep -q '^fn b__util__twice' "$PROJ/warm.kir" || {
   echo "userb_home_and_edition: FAIL — a byte-identical module lost its own home (expected a__util__twice and b__util__twice)"
   exit 1
 }
