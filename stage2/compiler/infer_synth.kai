@@ -44,24 +44,29 @@ import compiler.infer_calls
 import compiler.infer_op_value
 import compiler.core_refs
 
-# route an expression through `check_match` when its
-# AST head is `EMatch`, otherwise fall back to synth. The post-hoc
-# unify in the caller (`infer_decl`, `synth_stmt` for SLet) handles
-# the non-match case; for match the propagation already happened
-# inside `check_match`.
-# extends to `EIf` via `check_if`.
-#[doc("Typer-internal helper `check_expr_against` shared across the infer modules.")]
+# `e` checked against the type its context expects. The expected type is
+# pushed into every position that carries a sub-expression of its own: match
+# arms, if branches, a block's tail, a call's arguments, record fields, a
+# lambda's body, list elements. A form with none synthesises.
+#[doc("Check an expression against the type its context expects.")]
 pub fn check_expr_against(st: InferState, e: Expr, expected: Ty, what: String, line: Int, col: Int) : Inferred / Console + File + Mutable =
   match e.kind {
     EMatch(scr, arms)       -> check_match(st, scr, arms, expected, e.line, e.col)
     EIf(c, t_, eo)          -> check_if(st, c, t_, eo, expected, e.line, e.col)
+    EBlock(stmts, Some(te)) -> check_block_against(st, e, stmts, te, expected, what)
     EList(els)              -> check_list_against(st, e, els, expected)
     EDispatchPipe(PoMap, _, _) -> check_map_pipe_against(st, e, expected)
-    ECall(callee, args_)    -> ctor_coerce_expected(ctor_check_or_synth(st, e, callee, args_, expected, line, col), expected)
+    ECall(callee, args_)    -> ctor_coerce_expected(check_call_against(st, e, callee, args_, expected, line, col), expected)
     EName(_)                -> nullary_ctor_check_or_synth(st, e, expected)
     ESym(_, _)              -> nullary_ctor_check_or_synth(st, e, expected)
     ERecordLit(rh, fis)     -> synth_record_lit(st, rh, fis, expected, e.line, e.col)
-    EBlock(stmts, Some(te)) -> check_block_against(st, e, stmts, te, expected, what)
+    ELambda(ps, body)       -> check_lambda_against(st, e, ps, body, expected)
+    EInt(_, _)              -> check_literal_against(st, e, expected, line, col)
+    EReal(_, _)             -> check_literal_against(st, e, expected, line, col)
+    EIntLit(_)              -> mint_textual_against(st, e, expected, line, col)
+    EDecimalLit(_)          -> mint_textual_against(st, e, expected, line, col)
+    EUnop(UoNeg, x)         -> check_negated_against(st, e, x, expected, line, col)
+    ELitUnit(_, _)          -> check_literal_against(st, e, expected, line, col)
     _                       -> w_synth(st, e)
   }
 
@@ -93,18 +98,36 @@ fn check_block_against(st: InferState, e: Expr, stmts: [Stmt], te: Expr, expecte
 }
 
 
-# A bare constructor call under an expected type that declares the
-# constructor is rewritten to a call of that constructor: the
-# expected type names the sum, so a same-named one never wins (a user
-# variant may shadow `Result.Ok` / `Option.Some`).
-fn ctor_check_or_synth(st: InferState, e: Expr, callee: Expr, args_: [Expr],
-                          expected: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable =
+# A call under an expected type: a bare constructor name settles to the one
+# the expected type declares (a user variant may shadow `Result.Ok` /
+# `Option.Some`), and the expected result fixes the parameters the arguments
+# are checked against.
+fn check_call_against(st: InferState, e: Expr, callee: Expr, args_: [Expr],
+                      expected: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable =
   match callee.kind {
+    EMark(_) -> w_synth(st, e)
     EName(w) -> match settle_name(st, None, w, expected, []) {
-      SetOne(c) -> w_synth(st, mk_expr(ECall(mk_sym(c, callee.line, callee.col), args_), line, col))
-      _         -> w_synth(st, e)
+      SetOne(c) -> synth_call_expecting(st, mk_sym(c, callee.line, callee.col), args_, Some(expected), line, col)
+      _         -> synth_call_expecting(st, callee, args_, Some(expected), line, col)
     }
-    _ -> w_synth(st, e)
+    _ -> synth_call_expecting(st, callee, args_, Some(expected), line, col)
+  }
+
+
+# A lambda at a function type takes that type's domains and checks its body
+# against the result.
+fn check_lambda_against(st: InferState, e: Expr, ps: [Param], body: Expr, expected: Ty) : Inferred / Console + File + Mutable =
+  match apply_ty(st.sub, expected) {
+    TyFnT(doms, ret, _) -> synth_lambda_checked(st, ps, body, doms, ret, e.line, e.col)
+    _                   -> w_synth(st, e)
+  }
+
+
+# `-n` against a numeric carrier coins like the literal it negates.
+fn check_negated_against(st: InferState, e: Expr, x: Expr, expected: Ty, line: Int, col: Int) : Inferred / Console + File + Mutable =
+  match x.kind {
+    EIntLit(_) -> mint_textual_against(st, e, expected, line, col)
+    _          -> w_synth(st, e)
   }
 
 
@@ -328,7 +351,7 @@ fn check_nested_list(st: InferState, ex: Expr, elem_ty: Ty, line: Int, col: Int)
 
 fn elem_synth_unify(st: InferState, ex: Expr, elem_ty: Ty,
                     line: Int, col: Int) : Inferred / Console + File + Mutable {
-  let r0 = synth_expecting(st, ex, elem_ty)
+  let r0 = check_expr_against(st, ex, elem_ty, "list element", ex.line, ex.col)
   let r = if not (rc_mentions(elem_ty) or rc_mentions_in(r0.st.sub, r0.ty)) { r0 } else {
     let m = refine_coerce(MintedExpr { st: r0.st, pair: ExprTy { expr: r0.expr, ty: r0.ty } }, elem_ty, "list element", ex.line, ex.col)
     mk_inferred(m.st, m.pair.ty, m.pair.expr)
@@ -338,15 +361,8 @@ fn elem_synth_unify(st: InferState, ex: Expr, elem_ty: Ty,
 }
 
 
-# same idea but threaded through an EBlock when the tail
-# is itself an EMatch. The fn-body case `fn f(...) : T = match { ... }`
-# parses as a bare EMatch (handled by `check_expr_against`), but
-# `fn f(...) : T { ...stmts... match { ... } }` parses as an EBlock
-# whose tail is an EMatch — synth_block ignores the expected type, so
-# we recreate just enough of synth_block here to route the tail
-# through check_match while the prefix stmts still synth normally.
-# A dimensioned literal body coins to the declared carrier, as it does
-# under a `let` annotation or in an argument slot.
+# A dimensioned literal body coins to the declared carrier, as it does under
+# a `let` annotation or in an argument slot.
 fn check_literal_against(st: InferState, body: Expr, expected: Ty,
                          line: Int, col: Int) : Inferred / Console + File + Mutable {
   let r = w_synth(st, body)
@@ -357,49 +373,9 @@ fn check_literal_against(st: InferState, body: Expr, expected: Ty,
 
 #[doc("Typer-internal helper `check_body_against_ret` shared across the infer modules.")]
 pub fn check_body_against_ret(st: InferState, body: Expr, expected: Ty, what: String, line: Int, col: Int) : Inferred / Console + File + Mutable =
-  match body.kind {
-    EMatch(scr, arms)   -> check_match(st, scr, arms, expected, body.line, body.col)
-    EIf(c, t_, eo)      -> check_if(st, c, t_, eo, expected, body.line, body.col)
-    ELitUnit(_, _)      -> check_literal_against(st, body, expected, line, col)
-    EBlock(stmts, Some(te)) -> check_body_block(st, body, stmts, te, expected, what)
-    EBlock(_, None)     -> w_synth(st, body)
-    ECall(_, _)         -> check_expr_against(st, body, expected, what, body.line, body.col)
-    EName(_)            -> check_expr_against(st, body, expected, what, body.line, body.col)
-    ESym(_, _)          -> check_expr_against(st, body, expected, what, body.line, body.col)
-    _                   -> if let_rhs_takes_expected(body) { check_expr_against(st, body, expected, what, body.line, body.col) } else { synth_expecting(st, body, expected) }
-  }
-
-# `expected` reaches a block tail that is a match, an if, or a bare constructor
-# reference (a call, or a name the resolver left written), so annotation-driven
-# disambiguation picks a user variant over the core builtin. Other tails keep
-# synthing the whole body.
-fn check_body_block(st: InferState, body: Expr, stmts: [Stmt], te: Expr, expected: Ty, what: String) : Inferred / Console + File + Mutable =
-  match te.kind {
-    EMatch(scr, arms) -> {
-      let is_ = w_synth_stmts(st, stmts)
-      block_with_tail(st, body, is_, check_match(is_.st, scr, arms, expected, te.line, te.col))
-    }
-    EIf(c, t_, eo)    -> {
-      let is_ = w_synth_stmts(st, stmts)
-      block_with_tail(st, body, is_, check_if(is_.st, c, t_, eo, expected, te.line, te.col))
-    }
-    ECall(_, _)       -> check_block_tail(st, stmts, te, expected, what, body)
-    EName(_)          -> check_block_tail(st, stmts, te, expected, what, body)
-    _                 -> if is_record_lit(te) or let_rhs_takes_expected(te) { check_block_tail(st, stmts, te, expected, what, body) } else { w_synth(st, body) }
-  }
+  check_expr_against(st, body, expected, what, line, col)
 
 fn block_with_tail(st: InferState, body: Expr, is_: InferredStmts, r: Inferred) : Inferred / Console + File + Mutable {
-  let st2 = st_restore_entries(st, r.st)
-  let ty = apply_ty(st2.sub, r.ty)
-  mk_inferred(st2, ty, with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty))
-}
-
-
-# The block `{ stmts; te }` with its tail checked against `expected`.
-fn check_block_tail(st: InferState, stmts: [Stmt], te: Expr, expected: Ty,
-                    what: String, body: Expr) : Inferred / Console + File + Mutable = {
-  let is_ = w_synth_stmts(st, stmts)
-  let r = check_expr_against(is_.st, te, expected, what, te.line, te.col)
   let st2 = st_restore_entries(st, r.st)
   let ty = apply_ty(st2.sub, r.ty)
   mk_inferred(st2, ty, with_ty(mk_expr(EBlock(is_.stmts, Some(r.expr)), body.line, body.col), ty))
@@ -825,20 +801,7 @@ fn synth_index_assign(st: InferState, b: Expr, i: Expr, v: Expr, line: Int, col:
 # numeric literal coins directly to the annotated carrier from its lexeme.
 #[doc("Check an annotated binding's initialiser against its annotation, minting literals.")]
 pub(pkg) fn let_rhs_checked(st: InferState, rhs: Expr, te: TypeExpr, label: String, line: Int, col: Int) : Inferred / Console + File + Mutable =
-  if let_rhs_takes_expected(rhs) { check_expr_against(st, rhs, st_annot_ty(st, te), label, line, col) }
-  else { synth_let_rhs_or_mint(st, rhs, te, line, col) }
-
-fn let_rhs_takes_expected(rhs: Expr) : Bool =
-  match rhs.kind {
-    EMatch(_, _)               -> true
-    EIf(_, _, _)               -> true
-    EList(_)                   -> true
-    EDispatchPipe(PoMap, _, _) -> true
-    ECall(_, _)                -> true
-    EName(_)                   -> true
-    ELocal(_)                  -> true
-    _                          -> false
-  }
+  check_expr_against(st, rhs, st_annot_ty(st, te), label, line, col)
 
 fn synth_let(st: InferState, pat: Pattern, ann: Option[TypeExpr], rhs: Expr) : OneStmt / Console + File + Mutable =
   match ann {

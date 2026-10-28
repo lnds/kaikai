@@ -12,7 +12,6 @@ import compiler.infer_env
 import compiler.infer_state
 import compiler.infer_clause_holes
 import compiler.infer_local_mutation
-import compiler.infer_arms_vec
 import compiler.infer_env_exhaust
 import compiler.diag_type_text
 import compiler.infer_apply
@@ -38,6 +37,7 @@ import compiler.infer_unit_tables
 import compiler.infer_unify_rows
 import compiler.infer_fuse_arith
 import compiler.infer_match
+import compiler.infer_expect
 
 #[doc("Typer-internal helper `synth_many` shared across the infer modules.")]
 pub fn synth_many(st: InferState, es: [Expr]) : InferredList / Console + File + Mutable {
@@ -75,13 +75,7 @@ pub fn synth_many_threaded(st: InferState, es: [Expr],
 
 fn synth_threaded_arg(st: InferState, x: Expr,
                        exp: Option[Ty]) : Inferred / Console + File + Mutable =
-  match exp {
-    Some(et) ->
-      if arg_wants_vec_context(x, et) {
-        w_check_against(st, x, et, "argument", x.line, x.col)
-      } else { synth_expecting(st, x, et) }
-    None -> w_synth(st, x)
-  }
+  vec_arg(st, x, exp)
 
 
 # `synth_many` with the callee's declared params threaded per position.
@@ -107,7 +101,7 @@ pub fn synth_many_vec_args(st: InferState, es: [Expr], param_tys: [Ty]) : Inferr
 
 fn vec_arg(st: InferState, x: Expr, exp: Option[Ty]) : Inferred / Console + File + Mutable =
   match exp {
-    Some(et) -> if arg_wants_vec_context(x, et) { w_check_against(st, x, et, "argument", x.line, x.col) } else { synth_expecting(st, x, et) }
+    Some(et) -> w_check_against(st, x, et, "argument", x.line, x.col)
     None     -> w_synth(st, x)
   }
 
@@ -127,7 +121,7 @@ pub fn synth_many_expecting(st: InferState, es: [Expr], param_tys: [Ty]) : Infer
   [x, ...rest] -> {
     let exp = match param_tys { [pt, ...] -> Some(apply_ty(st.sub, pt))  _ -> None }
     let r = match exp {
-      Some(et) -> synth_expecting(st, x, et)
+      Some(et) -> w_check_against(st, x, et, "argument", x.line, x.col)
       None     -> w_synth(st, x)
     }
     let prest = params_after_first(param_tys)
@@ -400,56 +394,60 @@ pub fn synth_call_site(st: InferState, callee: Expr, args_: [Expr], line: Int, c
 
 #[doc("Typer-internal helper `synth_call` shared across the infer modules.")]
 pub fn synth_call(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable =
+  synth_call_expecting(st, callee, args_, None, line, col)
+
+#[doc("A call whose result is expected at `exp`: the arguments are checked against the parameters that expectation fixes.")]
+pub fn synth_call_expecting(st: InferState, callee: Expr, args_: [Expr], exp: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable =
   match try_resume_call(st, callee, args_, line, col) {
     Some(inf) -> inf
-    None      -> synth_call_op(st, callee, args_, line, col)
+    None      -> synth_call_op(st, callee, args_, exp, line, col)
   }
 
-fn synth_call_op(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable =
+fn synth_call_op(st: InferState, callee: Expr, args_: [Expr], exp: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable =
   match try_op_call(st, callee, args_, line, col) {
     Some(inf) -> inf
-    None      -> synth_call_method(st, callee, args_, line, col)
+    None      -> synth_call_method(st, callee, args_, exp, line, col)
   }
 
-fn synth_call_method(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable =
+fn synth_call_method(st: InferState, callee: Expr, args_: [Expr], exp: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable =
   match try_method_call(st, callee, args_, line, col) {
     Some(inf) -> inf
-    None      -> synth_call_ctor(st, callee, args_, line, col)
+    None      -> synth_call_ctor(st, callee, args_, exp, line, col)
   }
 
-fn synth_call_ctor(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable =
+fn synth_call_ctor(st: InferState, callee: Expr, args_: [Expr], exp: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable =
   match try_constructor_call(st, callee, args_, line, col) {
     Some(inf) -> inf
-    None      -> synth_call_record(st, callee, args_, line, col)
+    None      -> synth_call_record(st, callee, args_, exp, line, col)
   }
 
-fn synth_call_record(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable =
+fn synth_call_record(st: InferState, callee: Expr, args_: [Expr], exp: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable =
   match try_record_type_call(st, callee, args_, line, col) {
     Some(inf) -> inf
-    None      -> synth_call_narrow(st, callee, args_, line, col)
+    None      -> synth_call_narrow(st, callee, args_, exp, line, col)
   }
 
-fn synth_call_narrow(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable =
+fn synth_call_narrow(st: InferState, callee: Expr, args_: [Expr], exp: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable =
   match try_bare_call_narrow(st, callee, args_, line, col) {
     Some(inf) -> inf
-    None      -> synth_call_plain(st, callee, args_, line, col)
+    None      -> synth_call_plain(st, callee, args_, exp, line, col)
   }
 
-fn synth_call_plain(st: InferState, callee: Expr, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable = {
+fn synth_call_plain(st: InferState, callee: Expr, args_: [Expr], exp: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable = {
   let rc = nullary_op_noted(synth_callee(st, callee), args_, line, col)
   let callee_ty = apply_ty(rc.st.sub, rc.ty)
   match cont_parts(callee_ty) {
     Some(cp) -> synth_cont_call(rc, cp, args_, line, col)
-    None     -> synth_call_applied(rc, callee, callee_ty, args_, line, col)
+    None     -> synth_call_applied(rc, callee, callee_ty, args_, exp, line, col)
   }
 }
 
-# Each arg is paired with its declared param so a Vec-typed param mints an
-# EList or collects a map-pipe chain.
-fn synth_call_applied(rc: Inferred, callee: Expr, callee_ty: Ty, args_: [Expr], line: Int, col: Int) : Inferred / Console + File + Mutable = {
+# Each arg is checked against its declared param, with the type variables the
+# expected result fixes already read through.
+fn synth_call_applied(rc: Inferred, callee: Expr, callee_ty: Ty, args_: [Expr], exp: Option[Ty], line: Int, col: Int) : Inferred / Console + File + Mutable = {
   let vparams = match callee_ty {
-    TyFnT(ps, _, _) -> ps
-    _               -> []
+    TyFnT(ps, res, _) -> params_under_result(rc.st, ps, res, exp)
+    _                 -> []
   }
   let ra = synth_many_vec_args(rc.st, args_, vparams)
   let rv = st_fresh_ty(ra.st)
