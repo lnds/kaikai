@@ -180,6 +180,33 @@ static void kai_sched_check_deadlock(void) {
     kai_exit(1);
 }
 
+#ifdef KAI_CELL_POOL_ACTIVE
+/* Wait out one grace period on the park lock; true when nothing woke the
+ * worker meanwhile. */
+static int kai_worker_idle_grace(KaiSchedSlot *s) {
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += KAI_CELL_POOL_IDLE_NS;
+    if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+    int rc = 0;
+    while (!atomic_load(&s->permit) && !kai_sched_shutting_down && rc == 0)
+        rc = pthread_cond_timedwait(&s->park_cv, &s->park_mu, &until);
+    return rc != 0 && !atomic_load(&s->permit);
+}
+
+/* Called with the park lock held. A worker idle for a whole grace period
+ * gives its cell pool back (lock dropped meanwhile so wakers never wait on
+ * the free); a short park keeps the pool hot. A second grace period lets the
+ * allocator release pages once every peer has freed its own pool. */
+static void kai_worker_idle_trim(KaiSchedSlot *s) {
+    if (!kai_cell_pool_trimmable() || !kai_worker_idle_grace(s)) return;
+    pthread_mutex_unlock(&s->park_mu);
+    kai_cell_pool_trim();
+    pthread_mutex_lock(&s->park_mu);
+    if (kai_worker_idle_grace(s)) kai_cell_pool_relief();
+}
+#endif
+
 /* Park this worker until a waker hands it a permit or shutdown begins.
  * Returns a fiber the final recheck found, else NULL once woken.
  *
@@ -189,8 +216,6 @@ static void kai_sched_check_deadlock(void) {
  * either seen by the recheck or its producer sees this worker parked and
  * delivers a permit. A permit is consumed by exchange, which acquires the
  * push of every waker that found it already pending. */
-#define KAI_CELL_POOL_IDLE_NS 50000000L
-
 static KaiFiber *kai_worker_park(KaiWorker *w) {
     KaiSchedSlot *s = &kai_sched_slots[w->id];
     atomic_store(&s->parked, 1);
@@ -206,18 +231,7 @@ static KaiFiber *kai_worker_park(KaiWorker *w) {
         kai_sched_check_deadlock();
         pthread_mutex_lock(&s->park_mu);
 #ifdef KAI_CELL_POOL_ACTIVE
-        /* A worker idle for a whole grace period gives its cell pool back;
-         * a short park keeps it hot. */
-        if (kai_cell_pool_trimmable()) {
-            struct timespec until;
-            clock_gettime(CLOCK_REALTIME, &until);
-            until.tv_nsec += KAI_CELL_POOL_IDLE_NS;
-            if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
-            int rc = 0;
-            while (!atomic_load(&s->permit) && !kai_sched_shutting_down && rc == 0)
-                rc = pthread_cond_timedwait(&s->park_cv, &s->park_mu, &until);
-            if (rc != 0 && !atomic_load(&s->permit)) kai_cell_pool_trim();
-        }
+        kai_worker_idle_trim(s);
 #endif
         while (!atomic_load(&s->permit) && !kai_sched_shutting_down)
             pthread_cond_wait(&s->park_cv, &s->park_mu);

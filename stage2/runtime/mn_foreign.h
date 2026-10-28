@@ -68,6 +68,9 @@ KAI_SCHED_FN KaiValue *kai_export_call(const char *name, KaiFn thunk, KaiValue *
     KaiExportCall c = { .name = name, .thunk = thunk, .args = args, .n = n, .result = NULL, .done = 0 };
     if (kai_worker_here()->sched) {
         kai_export_guarded(&c, 0);
+#ifdef KAI_CELL_POOL_ACTIVE
+        kai_cell_pool_tick();
+#endif
         return c.result;
     }
     if (kai_nthreads <= 1 || kai_sched_shutting_down) {
@@ -90,6 +93,9 @@ KAI_SCHED_FN KaiValue *kai_export_call(const char *name, KaiFn thunk, KaiValue *
     kai_decref(cell);
     pthread_cond_destroy(&c.cv);
     pthread_mutex_destroy(&c.mu);
+#ifdef KAI_CELL_POOL_ACTIVE
+    kai_cell_pool_tick();
+#endif
     return c.result;
 }
 #endif

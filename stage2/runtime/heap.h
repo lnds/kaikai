@@ -302,8 +302,19 @@ __attribute__((noinline))
 KAI_RT_SHARED int kai_cell_pool_trimmable(void) {
     return kai_cell_pool_n > KAI_CELL_POOL_TRIM_MIN;
 }
-/* Return the whole pool, cells and table, to libc; the next push re-creates
- * the table lazily. */
+/* Ask the allocator to hand freed pages back to the OS. */
+__attribute__((noinline))
+KAI_RT_SHARED void kai_cell_pool_relief(void) {
+#ifndef KAI_CELL_POOL_NO_RELIEF
+#if defined(__APPLE__)
+    malloc_zone_pressure_relief(NULL, 0);
+#elif defined(__GLIBC__)
+    malloc_trim(0);
+#endif
+#endif
+}
+/* Return the whole pool, cells and table, to libc and ask the allocator to
+ * hand the freed pages to the OS; the next push re-creates the table lazily. */
 __attribute__((noinline))
 KAI_RT_SHARED void kai_cell_pool_trim(void) {
     if (!kai_cell_pool) return;
@@ -313,6 +324,37 @@ KAI_RT_SHARED void kai_cell_pool_trim(void) {
     while (kai_cell_pool_n > 0) free(kai_cell_pool[--kai_cell_pool_n]);
     free(kai_cell_pool);
     kai_cell_pool = NULL;
+    kai_cell_pool_relief();
+#if defined(KAI_CELL_POOL_TRACE) && defined(__APPLE__)
+    malloc_statistics_t st;
+    malloc_zone_statistics(NULL, &st);
+    fprintf(stderr, "zone in_use=%zu allocated=%zu\n", st.size_in_use, st.size_allocated);
+#endif
+}
+
+/* Ticked by a thread that never parks (a main thread driving a foreign event
+ * loop, a foreign thread calling in): a pool that stays trimmable across the
+ * idle span is returned. */
+#define KAI_CELL_POOL_IDLE_NS 50000000L
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KAI_TLS int64_t kai_cell_pool_since;
+#  if defined(KAI_RUNTIME_OWNER)
+KAI_TLS int64_t kai_cell_pool_since = 0;
+#  endif
+#else
+static KAI_TLS int64_t kai_cell_pool_since = 0;
+#endif
+__attribute__((noinline))
+KAI_RT_SHARED void kai_cell_pool_tick(void) {
+    if (kai_cell_pool_n <= KAI_CELL_POOL_TRIM_MIN) { kai_cell_pool_since = 0; return; }
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    int64_t now = (int64_t) t.tv_sec * 1000000000L + t.tv_nsec;
+    if (kai_cell_pool_since == 0) { kai_cell_pool_since = now; return; }
+    if (now - kai_cell_pool_since >= KAI_CELL_POOL_IDLE_NS) {
+        kai_cell_pool_trim();
+        kai_cell_pool_since = 0;
+    }
 }
 __attribute__((noinline))
 KAI_RT_SHARED KaiValue *kai_var_block_pool_pop(int n) {
