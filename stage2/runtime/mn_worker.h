@@ -189,6 +189,8 @@ static void kai_sched_check_deadlock(void) {
  * either seen by the recheck or its producer sees this worker parked and
  * delivers a permit. A permit is consumed by exchange, which acquires the
  * push of every waker that found it already pending. */
+#define KAI_CELL_POOL_IDLE_NS 50000000L
+
 static KaiFiber *kai_worker_park(KaiWorker *w) {
     KaiSchedSlot *s = &kai_sched_slots[w->id];
     atomic_store(&s->parked, 1);
@@ -203,6 +205,20 @@ static KaiFiber *kai_worker_park(KaiWorker *w) {
         if (atomic_fetch_add(&kai_sched_idle_count, 1) + 1 == kai_nthreads) kai_flush_stdout();
         kai_sched_check_deadlock();
         pthread_mutex_lock(&s->park_mu);
+#ifdef KAI_CELL_POOL_ACTIVE
+        /* A worker idle for a whole grace period gives its cell pool back;
+         * a short park keeps it hot. */
+        if (kai_cell_pool_trimmable()) {
+            struct timespec until;
+            clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_nsec += KAI_CELL_POOL_IDLE_NS;
+            if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+            int rc = 0;
+            while (!atomic_load(&s->permit) && !kai_sched_shutting_down && rc == 0)
+                rc = pthread_cond_timedwait(&s->park_cv, &s->park_mu, &until);
+            if (rc != 0 && !atomic_load(&s->permit)) kai_cell_pool_trim();
+        }
+#endif
         while (!atomic_load(&s->permit) && !kai_sched_shutting_down)
             pthread_cond_wait(&s->park_cv, &s->park_mu);
         pthread_mutex_unlock(&s->park_mu);
