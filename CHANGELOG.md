@@ -84,6 +84,41 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.185.0 (2026-10-29)
+
+### BREAKING CHANGE
+
+- the eight bare file operations no longer exist; use
+the `fs.file` operations (`kai migrate` rewrites them).
+- string.slice takes byte offsets; callers that counted
+codepoints move to string.char_slice.
+- string.slice takes byte offsets; callers that counted
+codepoints move to string.char_slice.
+- json.get and json.at return Option[JsonValue]
+instead of JsonValue. Chain them with `||` into the as_* extractors.
+- fs.file read/write/append returned String/Unit and panicked on I/O failure; they now return Result[String, String] / Result[Unit, String] like read_bytes, delete and rename. Callers unwrap with ! or match.
+
+### Added
+
+- **stdlib**: one public name per file operation, fs.file
+
+### Fixed
+
+- **migrate**: decide each file-operation call by the resolver, not by spelling
+- **migrate**: leave a function the file declares or imports under a core file operation name alone
+- restore the files a directory checkout reverted
+- keep the compiler on the core file operations
+- **stdlib**: move codepoint-indexed slice callers in tests to char_slice
+- **stdlib**: slice counts bytes; codepoint slicing is char_slice
+- **test**: keep fs_file_result to the Err cases that run on wasm
+- **stdlib**: json.get and json.at return Option instead of JNull
+- **stdlib**: file.read, file.write and file.append return Result
+
+### Changed
+
+- **stdlib**: add internal __file_* file operations and use them in core
+- call the file operations through fs.file
+
 ## v0.184.0 (2026-10-29)
 
 ### BREAKING CHANGE
