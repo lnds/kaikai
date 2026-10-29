@@ -334,8 +334,8 @@ and arguments fit both — the call is rejected as an `ambiguous effect
 instance`, never resolved by handler order.
 
 ```kaikai
-effect Box[T] {
-  peek() : T
+effect Box[t] {
+  peek() : t
 }
 
 fn pair() : String / Box[Int] + Box[String] = {

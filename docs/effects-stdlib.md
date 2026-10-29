@@ -1098,7 +1098,7 @@ unable to open an IP socket.
 ### What the family adds over TCP
 
 - **Access control is the filesystem's.** `listen(path, mode)` creates
-  the socket file already carrying `mode` (`owner_only` is `0600`).
+  the socket file already carrying `mode` (`OWNER_ONLY` is `0600`).
   The socket is bound inside a fresh `0700` directory beside `path`,
   given its mode, and only then `link(2)`ed into place, so no client
   can reach it through a wider mode first. The process umask is not
@@ -1420,9 +1420,9 @@ See `docs/editions.md` for the migration note.
 ### Declaration
 
 ```kaikai-fragment
-effect State[T] {
-  get()      : T
-  set(v: T)  : Unit
+effect State[t] {
+  get()      : t
+  set(v: t)  : Unit
 }
 ```
 
@@ -1478,12 +1478,12 @@ declaration — not sugar over `State[T]` — so diagnostics say
 handlers can be specialised independently.
 
 ```kaikai-fragment
-effect Reader[T] {
-  ask() : T
+effect Reader[t] {
+  ask() : t
 }
 
-effect Writer[W] {
-  tell(w: W) : Unit
+effect Writer[w] {
+  tell(w: w) : Unit
 }
 ```
 
@@ -1492,15 +1492,15 @@ reader`) and `with_writer` (`stdlib/writer.kai`, `import writer`)
 are ordinary kaikai:
 
 ```kaikai
-fn with_reader[T, S](env: T, body: () -> S / Reader[T]) : S = {
-  handle { body() } with Reader[T](env) {
+fn with_reader[t, s](env: t, body: () -> s / Reader[t]) : s = {
+  handle { body() } with Reader[t](env) {
     ask(resume) -> resume(state)
     return(x)   -> x
   }
 }
 
-fn with_writer[W](body: () -> Unit / Writer[W]) : [W] = {
-  handle { body() } with Writer[W]([]) {
+fn with_writer[w](body: () -> Unit / Writer[w]) : [w] = {
+  handle { body() } with Writer[w]([]) {
     tell(w, resume) -> resume((), [w, ...log])   # `log` is the handler state
     return(x)       -> list_reverse(log)
   }
@@ -1588,14 +1588,14 @@ any other effect.
 
 ```kaikai-fragment
 effect Mutable {
-  array_make[T](n: Int, init: T)               : Array[T]
-  array_length[T](a: Array[T])                 : Int
-  array_get[T](a: Array[T], i: Int)            : T
-  array_set[T](a: Array[T], i: Int, v: T)      : Array[T]
-  array_grow[T](a: Array[T], n: Int, init: T)  : Array[T]
-  ref_make[T](init: T)                         : Ref[T]
-  ref_get[T](r: Ref[T])                        : T
-  ref_set[T](r: Ref[T], v: T)                  : Unit
+  array_make[t](n: Int, init: t)               : Array[t]
+  array_length[t](a: Array[t])                 : Int
+  array_get[t](a: Array[t], i: Int)            : t
+  array_set[t](a: Array[t], i: Int, v: t)      : Array[t]
+  array_grow[t](a: Array[t], n: Int, init: t)  : Array[t]
+  ref_make[t](init: t)                         : Ref[t]
+  ref_get[t](r: Ref[t])                        : t
+  ref_set[t](r: Ref[t], v: t)                  : Unit
 }
 ```
 
@@ -1781,7 +1781,7 @@ fn main() : Unit / Stdout = draw_buffer(array_make(3, 1), 5)
 #### Example 4 — Mutation through a callback, IS observable, REQUIRES `Mutable`
 
 ```kaikai
-fn apply[T](x: T, f: (T) -> Unit / Mutable) : Unit / Mutable = f(x)
+fn apply[t](x: t, f: (t) -> Unit / Mutable) : Unit / Mutable = f(x)
 
 fn poke(a: Array[Int]) : Unit / Mutable = apply(a, (arr) => { arr[0] := 7 })
 
@@ -2058,10 +2058,10 @@ Here we only pin the effect signature so the catalog is complete.
 ```kaikai-fragment
 effect Spawn {
   yield()                         : Unit
-  spawn[T](thunk: () -> T / e)    : Fiber[T]
-  await[T](fiber: Fiber[T])       : T
-  select[T](fibers: [Fiber[T]])   : T
-  cancel[T](fiber: Fiber[T])      : Unit
+  spawn[t](thunk: () -> t / e)    : Fiber[t]
+  await[t](fiber: Fiber[t])       : t
+  select[t](fibers: [Fiber[t]])   : t
+  cancel[t](fiber: Fiber[t])      : Unit
   set_trap_exit(on: Bool)         : Unit
   scope_enter()                   : Unit
   scope_exit()                    : Unit

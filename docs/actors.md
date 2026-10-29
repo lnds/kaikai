@@ -47,11 +47,11 @@ load-tested and composes with fibers.
 ### Declaration
 
 ```kaikai-fragment
-effect Actor[Msg] {
-  self()                       : Pid[Msg]
-  send[T](pid: Pid[T], msg: T) : Unit
-  receive()                    : Msg
-  receive_timeout(nanos: Int)  : Option[Msg]
+effect Actor[msg] {
+  self()                       : Pid[msg]
+  send[t](pid: Pid[t], msg: t) : Unit
+  receive()                    : msg
+  receive_timeout(nanos: Int)  : Option[msg]
 }
 ```
 
@@ -196,10 +196,10 @@ fn main() : Int / Spawn = {
 state is the mailbox's pid:
 
 ```kaikai-fragment
-pub fn spawn_actor[Msg, e](body: () -> Unit / Actor[Msg] + e) : Pid[Msg] / Spawn = {
+pub fn spawn_actor[msg, e](body: () -> Unit / Actor[msg] + e) : Pid[msg] / Spawn = {
   let mb = mailbox_alloc_unowned()
   let f  = spawn_actor_fiber(mb, () => {
-    let _ = handle { body() } with Actor[Msg](mb) {
+    let _ = handle { body() } with Actor[msg](mb) {
       self(resume)                -> resume(state)
       send(p, m, resume)          -> { mailbox_send(p, m); resume(()) }
       receive(resume)             -> resume(mailbox_recv(state))
@@ -305,7 +305,7 @@ explicitly:
 ```kaikai
 import actor
 
-fn receive_matching[Msg](p: (Msg) -> Bool) : Msg / Actor[Msg] = {
+fn receive_matching[msg](p: (msg) -> Bool) : msg / Actor[msg] = {
   let msg = Actor.receive()
   if p(msg) { msg }
   else {
