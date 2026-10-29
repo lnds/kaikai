@@ -203,7 +203,7 @@ assembled from one list rather than reconstructed from git.
    actually used" exemption for that class (`examples/org-pkgs` is
    full of them).
 
-- **Binder case is one table** (`stage2/compiler/parse_naming.kai`).
+- **Binder case is one table** (`stage2/compiler/parse_naming.kai`), applied by one post-parse pass over every binder position of the AST (`ast_binders.kai`).
   A `var` or `let` binder and every pattern binder is `snake_case`, a
   sum-type variant is `PascalCase`, a type parameter is lowercase
   (`fn id[a](x: a)`), and a `const` is `UPPER_SNAKE_CASE`; each

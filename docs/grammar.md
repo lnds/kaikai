@@ -68,9 +68,9 @@ treated as a comment.
 Source identifiers must match `[A-Za-z_][A-Za-z0-9_]*`.
 
 Naming conventions. One table (`stage2/compiler/parse_naming.kai`)
-maps each kind of name to the case it must be written in, and every
-parser site that reads a name consults it, so a binder cannot skip the
-check. A name spelled against its row is a parse error that says which
+maps each kind of name to the case it must be written in, and one
+post-parse pass (`ast_binders.kai`) walks every binder position of the
+AST against it, so a binder cannot skip the check. A name spelled against its row is a parse error that says which
 convention applies (record fields of `extern "C" type` mirror C members
 and are exempt):
 

@@ -1,0 +1,315 @@
+#[doc("""
+The one walk over every binder position of a parsed program, and the
+naming pass built on it. Every match here is exhaustive, so a new AST
+node that binds a name or holds a type cannot be added without deciding
+what it contributes.
+""")]
+
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.expr_positions
+import compiler.parse_naming
+import compiler.symtab
+import compiler.util
+import compiler.written
+
+#[doc("What the walk finds: a name with the kind of binder it is and where it stands, a type parameter where it is declared, and a use bound to one.")]
+pub(pkg) type AstFact =
+  | FBind(NameKind, String, Int, Int)
+  | FTParam(TLocalId, String, Bool, Int, Int)
+  | FTyUse(TLocalId, Int, Int)
+
+#[doc("A name spelled against the convention of its kind: where, and the diagnostic.")]
+pub(pkg) type Violation = Violation(Int, Int, String)
+
+#[doc("The first binder, in source order, spelled against the naming table; `legacy` lets the migratable kinds through.")]
+pub(pkg) fn binder_violation(legacy: Bool, ds: [Decl], tab: SymTab) : Option[Violation] =
+  foldl(flat_map(ds, (d) => decl_facts(d, tab)), None, (best, f) => earliest(best, fact_violation(legacy, f)))
+
+fn fact_violation(legacy: Bool, f: AstFact) : Option[Violation] = match f {
+  FBind(k, name, l, c) ->
+    if name_bad(k, name) and not (legacy and name_migratable(k)) { Some(Violation(l, c, name_msg(k))) } else { None }
+  FTParam(_, _, _, _, _) -> None
+  FTyUse(_, _, _) -> None
+}
+
+fn earliest(a: Option[Violation], b: Option[Violation]) : Option[Violation] = match a {
+  None -> b
+  Some(Violation(al, ac, _)) -> match b {
+    None -> a
+    Some(Violation(bl, bc, _)) -> if bl < al or (bl == al and bc < ac) { b } else { a }
+  }
+}
+
+fn name_of(tab: SymTab, s: SymId) : String = written_text(sym_name(tab, s))
+
+#[doc("Every fact of a declaration; `tab` names the symbols the declaration was minted for.")]
+pub(pkg) fn decl_facts(d: Decl, tab: SymTab) : [AstFact] = match d {
+  DFn(_, f, tps, ps, rt, row, body, l, c, _) ->
+    cat([[FBind(NkFn, name_of(tab, fnid_sym(f)), l, c)], tparam_facts(tps, l, c), flat_map(ps, param_facts),
+         opt_ty_facts(rt), row_facts(row), expr_facts(body)])
+  DType(_, s, tps, body, l, c, _, _) ->
+    cat([[FBind(NkType, name_of(tab, s), l, c)], tparam_facts(tps, l, c), body_facts(tab, body, l, c)])
+  DTest(_, body, _, _, _) -> expr_facts(body)
+  DBench(_, body, _, _, _) -> expr_facts(body)
+  DCheck(_, ps, body, _, _, _) -> list_append(flat_map(ps, param_facts), expr_facts(body))
+  DImport(_, _, _) -> []
+  DEffect(_, s, tps, ops, dfl, l, c, _) ->
+    cat([[FBind(NkEffect, name_of(tab, s), l, c)], tparam_facts(tps, l, c), flat_map(ops, effect_op_facts), default_facts(dfl)])
+  DProtocol(_, s, tps, ops, l, c, _) ->
+    cat([[FBind(NkProtocol, name_of(tab, s), l, c)], tparam_facts(tps, l, c), flat_map(ops, proto_op_facts)])
+  DImpl(_, targs, tgt, ds, l, c, tps, _) ->
+    cat([flat_map(targs, ty_facts), ty_facts(tgt), tparam_facts(tps, l, c), flat_map(ds, (x) => decl_facts(x, tab))])
+  DDerive(_, inner, _, _) -> decl_facts(inner, tab)
+  DUnstable(inner, _, _) -> decl_facts(inner, tab)
+  DConstructor(inner, _, _) -> decl_facts(inner, tab)
+  DProtoLaws(_, inner, _, _, _) -> decl_facts(inner, tab)
+  DImplAxiom(_, inner, _, _, _) -> decl_facts(inner, tab)
+  DDoc(_, _, inner, _, _) -> decl_facts(inner, tab)
+  DAttr(_, inner, _, _) -> decl_facts(inner, tab)
+  DModuleDoc(_, _, _, _) -> []
+  DUnit(_, _, _, _, _, _, _) -> []
+  DUse(n, l, c) -> [FBind(NkUseEffect, n, l, c)]
+  DUseKind(_, _, _, _) -> []
+  DAxiom(_, abi, n, _, tps, ps, ty, row, l, c) ->
+    cat([axiom_name_facts(abi, n, l, c), tparam_facts(tps, l, c), flat_map(ps, param_facts), ty_facts(ty), row_facts(row)])
+  DConst(_, s, ty, body, _, l, c) -> cat([[FBind(NkConst, name_of(tab, s), l, c)], ty_facts(ty), expr_facts(body)])
+  DExternType(_, _, body, l, c, _) -> extern_type_facts(body, l, c)
+  DTheory(n, _, l, c, _) -> [FBind(NkTheory, n, l, c)]
+  DKind(_, n, _, _, _, l, c, _) -> [FBind(NkKind, n, l, c)]
+}
+
+fn cat(xs: [[AstFact]]) : [AstFact] = flat_map(xs, (x) => x)
+
+fn axiom_name_facts(abi: Option[ExternAbi], n: String, l: Int, c: Int) : [AstFact] = match abi {
+  Some(_) -> [FBind(NkFn, n, l, c)]
+  None -> []
+}
+
+fn extern_type_facts(body: ExternTypeBody, l: Int, c: Int) : [AstFact] = match body {
+  ETStruct(fs) -> flat_map(fs, field_type_facts)
+  ETOpaque(tps) -> tparam_facts(tps, l, c)
+  ETOpaqueJs -> []
+}
+
+fn body_facts(tab: SymTab, body: TypeBody, l: Int, c: Int) : [AstFact] = match body {
+  TBAlias(ty) -> ty_facts(ty)
+  TBRecord(fs) -> flat_map(fs, (f) => field_facts(f, l, c))
+  TBSum(vs) -> flat_map(vs, (v) => variant_facts(tab, v, l, c))
+  TBEffectAlias(ls) -> flat_map(ls, label_facts)
+}
+
+fn field_facts(f: FieldDecl, l: Int, c: Int) : [AstFact] = match f {
+  FD(_, n, ty, _) -> [FBind(NkField, n, l, c), ...ty_facts(ty)]
+}
+
+fn field_type_facts(f: FieldDecl) : [AstFact] = match f {
+  FD(_, _, ty, _) -> ty_facts(ty)
+}
+
+fn variant_facts(tab: SymTab, v: Variant, l: Int, c: Int) : [AstFact] = match v {
+  Var(s, args) -> {
+    let n = name_of(tab, s)
+    list_append(if string_find(n, ".") >= 0 { [] } else { [FBind(NkVariant, n, l, c)] }, flat_map(args, ty_facts))
+  }
+}
+
+fn effect_op_facts(op: EffectOp) : [AstFact] = match op {
+  EffOp(n, tps, ps, rt, l, c) -> cat([[FBind(NkEffectOp, n, l, c)], tparam_facts(tps, l, c), flat_map(ps, param_facts), ty_facts(rt)])
+}
+
+fn proto_op_facts(op: ProtoOp) : [AstFact] = match op {
+  POp(_, tps, ps, rt, l, c) -> cat([tparam_facts(tps, l, c), flat_map(ps, param_facts), ty_facts(rt)])
+}
+
+fn default_facts(dfl: Option[DefaultBlock]) : [AstFact] = match dfl {
+  None -> []
+  Some(DBlk(cls, oret, _, _)) -> list_append(flat_map(cls, clause_facts), ret_facts(oret))
+}
+
+fn tparam_facts(tps: [TBinder], l: Int, c: Int) : [AstFact] =
+  flat_map(tps, (b) => tparam_fact(b, l, c))
+
+fn tparam_fact(b: TBinder, l: Int, c: Int) : [AstFact] = {
+  let n = written_text(b.name)
+  list_append(if b.implicit { [] } else { [FBind(NkTypeParam, n, l, c)] }, [FTParam(b.id, n, b.implicit, l, c)])
+}
+
+fn param_facts(p: Param) : [AstFact] =
+  [FBind(NkParam, written_text(p.binder.name), p.pline, p.pcol), ...opt_ty_facts(p.ptype)]
+
+fn clause_facts(h: HClause) : [AstFact] = match h {
+  HC(_, ps, body, _, _) -> list_append(flat_map(ps, param_facts), expr_facts(body))
+}
+
+fn ret_facts(r: Option[HReturn]) : [AstFact] = match r {
+  None -> []
+  Some(HR(_, body, _, _)) -> expr_facts(body)
+}
+
+fn opt_ty_facts(t: Option[TypeExpr]) : [AstFact] = match t {
+  None -> []
+  Some(ty) -> ty_facts(ty)
+}
+
+fn ty_facts(t: TypeExpr) : [AstFact] = match t.tkind {
+  TyName(_, args) -> flat_map(args, ty_facts)
+  TyList(inner) -> ty_facts(inner)
+  TyFn(ps, r, row) -> cat([flat_map(ps, ty_facts), ty_facts(r), row_facts(row)])
+  TyDim(base, _) -> ty_facts(base)
+  TyRefine(base, pred) -> list_append(ty_facts(base), expr_facts(pred))
+  TyRow(row) -> row_facts(row)
+  TySurface(ts) -> type_surface_facts(ts)
+  TyParam(id, args) -> [FTyUse(id, t.line, t.col), ...flat_map(args, ty_facts)]
+}
+
+fn type_surface_facts(ts: TypeSurface) : [AstFact] = match ts {
+  TsTuple(tys) -> flat_map(tys, ty_facts)
+  TsUnitSpan(_, ty) -> ty_facts(ty)
+}
+
+fn row_facts(r: RowExpr) : [AstFact] = match r {
+  REmpty -> []
+  RClosed(ls) -> flat_map(ls, label_facts)
+  ROpen(_, ls) -> flat_map(ls, label_facts)
+}
+
+fn label_facts(l: RowLabel) : [AstFact] = match l {
+  RL(_, args) -> flat_map(args, ty_facts)
+}
+
+fn bind_fact(b: Binder, k: NameKind, line: Int, col: Int) : [AstFact] = [FBind(k, written_text(b.name), line, col)]
+
+fn pat_facts(p: Pattern) : [AstFact] = match p.pkind {
+  PWild -> []
+  PLit(_) -> []
+  PRange(_, _) -> []
+  PHole(_) -> []
+  PBind(b) -> bind_fact(b, NkPatBinder, p.line, p.col)
+  PList(ps, rest) -> list_append(flat_map(ps, pat_facts), rest_fact(rest, p))
+  PVariant(_, ps) -> flat_map(ps, pat_facts)
+  PVariantRecord(_, fs) -> flat_map(fs, pfield_facts)
+  PRecord(fs) -> flat_map(fs, pfield_facts)
+  PAs(b, sub) -> list_append(bind_fact(b, NkPatBinder, p.line, p.col), pat_facts(sub))
+  PSurface(sp) -> pat_surface_facts(sp, p)
+  PNarrow(b, ty) -> list_append(bind_fact(b, NkPatBinder, p.line, p.col), ty_facts(ty))
+}
+
+fn rest_fact(rest: Option[Binder], p: Pattern) : [AstFact] = match rest {
+  None -> []
+  Some(b) -> bind_fact(b, NkPatBinder, p.line, p.col)
+}
+
+fn pfield_facts(f: PField) : [AstFact] = match f {
+  PField(_, sub, _) -> pat_facts(sub)
+}
+
+fn pat_surface_facts(sp: PatSurface, p: Pattern) : [AstFact] = match sp {
+  PsTuple(ps) -> flat_map(ps, pat_facts)
+  PsQualified(_, sub) -> pat_facts(sub)
+  PsAs(n, sub) -> [FBind(NkPatBinder, n, p.line, p.col), ...pat_facts(sub)]
+  PsRefine(n, ty) -> [FBind(NkPatBinder, n, p.line, p.col), ...ty_facts(ty)]
+  PsAnonRest(ps, _) -> flat_map(ps, pat_facts)
+}
+
+fn stmt_facts(s: Stmt) : [AstFact] = match s {
+  SLet(pat, ty, _) -> list_append(pat_facts(pat), opt_ty_facts(ty))
+  SAssert(_, _) -> []
+  SExprStmt(_) -> []
+  SIndexAssign(_, _, _, _, _) -> []
+  SAssign(_, _, _, _) -> []
+  SVar(b, ty, _, l, c) -> list_append(bind_fact(b, NkVar, l, c), opt_ty_facts(ty))
+  SUse(n, l, c) -> [FBind(NkUseEffect, n, l, c)]
+}
+
+fn arm_facts(a: Arm) : [AstFact] = match a {
+  Arm(p, _, _) -> pat_facts(p)
+}
+
+fn mm_arm_facts(a: MMArm) : [AstFact] = match a {
+  MMArm(ps, _, _) -> flat_map(ps, pat_facts)
+}
+
+#[doc("Every fact of an expression and of everything below it.")]
+pub(pkg) fn expr_facts(e: Expr) : [AstFact] =
+  list_append(expr_own(e), flat_map(xp_positions(e), (x) => match x { XP(_, child) -> expr_facts(child) }))
+
+fn expr_own(e: Expr) : [AstFact] = match e.kind {
+  EInt(_, _) -> []
+  EReal(_, _) -> []
+  EFixed(_, _) -> []
+  EIntLit(_) -> []
+  EDecimalLit(_) -> []
+  EBool(_) -> []
+  EChar(_) -> []
+  EStr(_, _) -> []
+  EUnit -> []
+  EName(_) -> []
+  ESym(_, _) -> []
+  EUnder -> []
+  EPlaceholder -> []
+  ECall(_, _) -> []
+  EField(_, _) -> []
+  EIndex(_, _) -> []
+  EBinop(_, _, _) -> []
+  EUnop(_, _) -> []
+  EIf(_, _, _) -> []
+  EMatch(_, arms) -> flat_map(arms, arm_facts)
+  ELambda(ps, _) -> flat_map(ps, param_facts)
+  ERecordLit(_, _) -> []
+  EList(_) -> []
+  ERange(_, _, _) -> []
+  EBlock(ss, _) -> flat_map(ss, stmt_facts)
+  EPipe(_, _) -> []
+  EDispatchPipe(_, _, _) -> []
+  EHole(_) -> []
+  ETodo(_) -> []
+  EExternBody(_, _) -> []
+  EBang(_) -> []
+  EHandle(_, _, targs, _, alias, cls, oret) ->
+    cat([flat_map(targs, ty_facts), alias_facts(alias, e), flat_map(cls, clause_params_facts), ret_binder_facts(oret)])
+  ELitUnit(_, _) -> []
+  EVariantsOf(ty, _) -> ty_facts(ty)
+  EModCall(_, _) -> []
+  EIntrinsic(_, _) -> []
+  ESurface(sf) -> surface_own(sf)
+  EMark(_) -> []
+  ELocal(_) -> []
+  EOp(_) -> []
+}
+
+fn alias_facts(alias: Option[Binder], e: Expr) : [AstFact] = match alias {
+  None -> []
+  Some(b) -> bind_fact(b, NkCapBinder, e.line, e.col)
+}
+
+fn clause_params_facts(h: HClause) : [AstFact] = match h {
+  HC(_, ps, _, _, _) -> flat_map(ps, param_facts)
+}
+
+fn ret_binder_facts(r: Option[HReturn]) : [AstFact] = match r {
+  None -> []
+  Some(HR(_, _, _, _)) -> []
+}
+
+fn surface_own(sf: SurfaceForm) : [AstFact] = match sf {
+  SfContract(_, _, _) -> []
+  SfEnsure(_, _) -> []
+  SfLamBlock(_, _) -> []
+  SfTuple(_) -> []
+  SfHandleInit(_) -> []
+  SfBigIntLit(_) -> []
+  SfMapLit(_, _) -> []
+  SfSetLit(_, _) -> []
+  SfRefMake(_) -> []
+  SfDeref(_) -> []
+  SfMultiMatch(_, arms) -> flat_map(arms, mm_arm_facts)
+  SfCaseBlock(arms) -> flat_map(arms, mm_arm_facts)
+  SfFieldPun(_) -> []
+  SfSteppedRange(_, _, _) -> []
+  SfEndlessRange(_, _) -> []
+  SfLazy(_) -> []
+  SfInterp(_, _, _, _) -> []
+}
