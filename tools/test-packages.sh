@@ -284,6 +284,10 @@ run_positive "build_sub_package"      "build_sub_package"      "build_sub_packag
 run_positive "build_sub_package-sub"  "build_sub_package/sub"  "build_sub_package/sub/main.out.expected"
 run_positive "build_module_qualified" "build_module_qualified" "build_module_qualified/main.out.expected"
 
+# A library that spawns its argument is held to the spawn rule the same way
+# for a one-file and a many-file caller, as a file or as a package.
+run_check_script "spawn_in_fiber" "spawn_in_fiber/check.sh"
+
 # A module reads the fields of a record its import-cycle partner declares, whichever sorts first.
 run_check_script "cycle_field_read" "cycle_field_read/check.sh"
 

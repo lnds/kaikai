@@ -309,7 +309,7 @@ pub fn infer_program_collect(file: String, decls: [Decl], tin: TyperIn, verbose:
 
 
 #[doc("infer: what a module's declarations alone give the typer: its program data over the inherited env, the sums, records and hold marks it adds, and the `ModuleEnvDelta` it contributes. No body is read.")]
-pub type ModuleFront = { data: ProgramData, sums_here: [SumInfo], recs_here: [RecInfo], holds: [HoldAt], delta: ModuleEnvDelta, crossing: [SpawnParam] }
+pub type ModuleFront = { data: ProgramData, sums_here: [SumInfo], recs_here: [RecInfo], holds: [HoldAt], delta: ModuleEnvDelta }
 
 fn pool_env(env: TyEnv, sh: TcShared) : TyEnv = {
   let pool = sh.pool
@@ -347,11 +347,9 @@ pub fn module_front(file: String, mod: ModuleDecls, inherited: ModuleEnvDelta, h
     sums:           sums_here,
     op_to_eff:      inf_collect_op_to_eff(data.decls_a),
     unit_aliases:   collect_unit_alias_table(mod.decls),
-    constructors:   collect_constructors(data.decls_a, sh.homes, []),
-    spawn_params:   []
+    constructors:   collect_constructors(data.decls_a, sh.homes, [])
   }
-  ModuleFront { data: data, sums_here: sums_here, recs_here: recs_here, holds: holds, delta: delta,
-                crossing: inherited.spawn_params }
+  ModuleFront { data: data, sums_here: sums_here, recs_here: recs_here, holds: holds, delta: delta }
 }
 
 #[doc("infer: typecheck one module against an inherited `ModuleEnvDelta`, returning its typed program plus the delta it contributes. `df` attributes each diagnostic to the file declaring the decl it fires on; `file` stays the root and keeps naming the target module.")]
@@ -373,10 +371,8 @@ pub fn typecheck_unit(file: String, df: DiagFiles, ms: [ModuleDecls], inherited:
                       kind_theories: [KindTheory], tab: SymTab, sh: TcShared,
                       verbose: Bool) : [TypecheckedModule] / Console + File + Mutable = {
   let deltas = unit_deltas(file, ms, inherited, head_owners, tab, sh, [])
-  spawn_finish(df, tab, sh, all_program_decls,
-               unit_members(file, df, ms, deltas, [], [], inherited, all_program_decls, protos, head_owners,
-                            kind_theories, tab, sh, verbose),
-               inherited.spawn_params)
+  unit_members(file, df, ms, deltas, [], [], inherited, all_program_decls, protos, head_owners,
+               kind_theories, tab, sh, verbose)
 }
 
 fn unit_deltas(file: String, ms: [ModuleDecls], inh: ModuleEnvDelta, head_owners: [HeadOwnerEntry],
@@ -399,12 +395,21 @@ fn unit_members(file: String, df: DiagFiles, ms: [ModuleDecls], after: [ModuleEn
       let inh = foldl(others, inherited, (a, d) => merge_env_deltas(a, d))
       let shm = foldl(others, sh, (s, d) => tc_shared_extend(s, d))
       let fr = module_front(file, m, inh, head_owners, tab, shm)
-      let tm = module_bodies_unchecked(file, df, m, fr, all_program_decls, protos, kind_theories, tab, shm, verbose)
+      let tm = module_bodies(file, df, m, fr, all_program_decls, protos, kind_theories, tab, shm, verbose)
       unit_members(file, df, rest, later, [own, ...before], [tm, ...done], inherited, all_program_decls, protos,
                    head_owners, kind_theories, tab, sh, verbose)
     }
     [] -> list_reverse(done)
   }
+}
+
+#[doc("infer: the spawn-boundary check over a whole typed program, so a call is held to the marks of every function it reaches however and whenever that function was typed.")]
+pub fn spawn_check_program(df: DiagFiles, tab: SymTab, sh: TcShared, all_program_decls: [Decl],
+                           tp: TypedProgram) : TypedProgram / Console + File = {
+  let facts = spawn_facts_of(tp.decls)
+  let all_decls = if not list_is_empty(all_program_decls) { all_program_decls } else { tp.decls }
+  let ds = check_spawn_rows(df, tab, sh.cell_carriers, spawn_params_from(facts), facts, all_decls)
+  TypedProgram { ...tp, errs: tp.errs + list_length(ds), diags: list_append(tp.diags, ds) }
 }
 
 #[doc("infer: the body half of `typecheck_module`, over the front the module's declarations gave.")]
@@ -413,38 +418,7 @@ pub fn module_bodies(file: String, df: DiagFiles, mod: ModuleDecls, fr: ModuleFr
                      protos: ProtoView,
                      kind_theories: [KindTheory],
                      tab: SymTab, sh: TcShared,
-                     verbose: Bool) : TypecheckedModule / Console + File + Mutable =
-  match spawn_finish(df, tab, sh, all_program_decls, [module_bodies_unchecked(file, df, mod, fr, all_program_decls, protos, kind_theories, tab, sh, verbose)], fr.crossing) {
-    [tm, ..._] -> tm
-    []         -> panic("module_bodies: no module")
-  }
-
-# The spawn-boundary check runs once per import-cycle unit over every
-# member's typed decls, so the order the members were typed in never decides
-# which spawns are seen.
-fn spawn_finish(df: DiagFiles, tab: SymTab, sh: TcShared, all_program_decls: [Decl],
-                tms: [TypecheckedModule], known: [SpawnParam]) : [TypecheckedModule] / Console + File = {
-  let facts = map(tms, (tm) => spawn_facts_of(tm.typed.decls))
-  let unit_facts = foldl(facts, [], (a, fs) => list_append(a, fs))
-  let unit_marks = spawn_params_from(unit_facts, known)
-  let marks = list_append(unit_marks, known)
-  let all_decls = if not list_is_empty(all_program_decls) { all_program_decls }
-                  else { foldl(tms, [], (a, tm) => list_append(a, tm.typed.decls)) }
-  zip_with(tms, facts, (tm, fs) => {
-    let ds = check_spawn_rows(df, tab, sh.cell_carriers, marks, fs, all_decls)
-    TypecheckedModule {
-      typed: TypedProgram { ...tm.typed, errs: tm.typed.errs + list_length(ds), diags: list_append(tm.typed.diags, ds) },
-      delta: ModuleEnvDelta { ...tm.delta, spawn_params: spawn_params_in(unit_marks, tm.typed.decls) }
-    }
-  })
-}
-
-fn module_bodies_unchecked(file: String, df: DiagFiles, mod: ModuleDecls, fr: ModuleFront,
-                           all_program_decls: [Decl],
-                           protos: ProtoView,
-                           kind_theories: [KindTheory],
-                           tab: SymTab, sh: TcShared,
-                           verbose: Bool) : TypecheckedModule / Console + File + Mutable = {
+                     verbose: Bool) : TypecheckedModule / Console + File + Mutable = {
   let data = fr.data
   let n_inh = match sh.inh {
     TEP(_, _, _, n) -> n
@@ -531,7 +505,7 @@ fn typecheck_program_loop(file: String, df: DiagFiles, modules: [ModuleDecls],
                             toplevel_len_acc: Int) : TypedProgram / Console + File + Mutable {
 
   match modules {
-    [] -> TypedProgram {
+    [] -> spawn_check_program(df, tab, sh, all_program_decls, TypedProgram {
       decls: list_reverse(acc_decls), errs: acc_errs,
       insts: list_reverse(acc_insts), holes: list_reverse(acc_holes),
       row_holes: list_reverse(acc_row_holes),
@@ -540,7 +514,7 @@ fn typecheck_program_loop(file: String, df: DiagFiles, modules: [ModuleDecls],
       module_doc: doc_module_doc_text(all_program_decls),
       diags: list_reverse(acc_diags),
       op_res: list_reverse(acc_op_res)
-    }
+    })
     [m, ...rest] -> {
       let r = typecheck_module(file, df, m, acc_delta, all_program_decls,
                                   protos, head_owners, kind_theories, tab, sh, verbose)
