@@ -203,6 +203,17 @@ assembled from one list rather than reconstructed from git.
    actually used" exemption for that class (`examples/org-pkgs` is
    full of them).
 
+- **Binder case is one table** (`stage2/compiler/parse_naming.kai`).
+  A `var` or `let` binder and every pattern binder is `snake_case`, a
+  sum-type variant is `PascalCase`, a type parameter is lowercase
+  (`fn id[a](x: a)`), and a `const` is `UPPER_SNAKE_CASE`; each
+  violation is a parse error naming the convention. Migration: `kai
+  migrate` renames a lowercase `const` to `UPPER_SNAKE_CASE` together
+  with every use the resolver binds to it, and never a homonym; a
+  renamed `pub const` is a breaking change for the importing package
+  (`real_pi` → `REAL_PI`, `owner_only` → `OWNER_ONLY`, …). Uppercase
+  type parameters are renamed by hand (`[T]` → `[t]`).
+
 - **Core helpers superseded by surface features** (audit in the
   closed issue #1807; scheduled, not yet removed). Seven core helpers
   remain callable although their replacement shipped:

@@ -67,12 +67,27 @@ treated as a comment.
 
 Source identifiers must match `[A-Za-z_][A-Za-z0-9_]*`.
 
-Naming conventions. The parser rejects an uppercase function, parameter or record-field name and a lowercase effect name (record fields of `extern "C" type` mirror C members and are exempt):
+Naming conventions. One table (`stage2/compiler/parse_naming.kai`)
+maps each kind of name to the case it must be written in, and every
+parser site that reads a name consults it, so a binder cannot skip the
+check. A name spelled against its row is a parse error that says which
+convention applies (record fields of `extern "C" type` mirror C members
+and are exempt):
 
-- `snake_case` — functions, variables, fields, parameters,
-  module names, capability binders.
-- `PascalCase` — type constructors, sum-type variants, protocols,
-  effects, units of measure.
+| Kind of name | Case |
+|---|---|
+| functions, parameters, lambda parameters, record fields, `var` and `let` binders, every pattern binder, module names, capability binders (`with E as name`) | `snake_case` (starts lowercase) |
+| type parameters (`[t, e]`) | lowercase; a kind annotation (`[u: Measure]`) is unaffected |
+| `const` names | `UPPER_SNAKE_CASE` (`[A-Z][A-Z0-9_]*`) |
+| types, sum-type variants, protocols, effects, units, kinds, theories | `PascalCase` (starts uppercase) |
+| effect operations | lowercase |
+
+A constant is `UPPER_SNAKE_CASE` because it can appear in a pattern,
+where a lowercase one would be indistinguishable from a binder. For the
+same reason a bare uppercase pattern (`let Foo = 1`, `[Head, ...rest]`)
+reads as a constructor or constant, and when none exists the error says
+that a pattern binder must be lowercase.
+
 - `_` alone is the wildcard pattern token (`UNDERSCORE`), not an
   identifier.
 - `_name` (leading underscore on an identifier) — convention for
