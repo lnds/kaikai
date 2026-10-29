@@ -104,6 +104,20 @@ expect_line "a flag is never a plugin" 2 "kai: error: unknown command: --hello" 
   env PATH="$TMP/plugins:$PATH" "$KAI" --hello
 expect_line "help" 0 " _      _ _      _" "$KAI" help
 expect_line "--version" 0 "kaikai $(cat "$ROOT/VERSION") - $(cat "$ROOT/EDITION") (stage 2, self-hosted)" "$KAI" --version
+ver="$("$KAI" --version)"
+case "$ver" in
+  *"demos baseline"*|*"native p2"*|*"home:"*) fail "--version leaks internal fields: $ver" ;;
+  *"backend: "*) ok "--version: user-facing fields only" ;;
+  *) fail "--version has no backend line: $ver" ;;
+esac
+if "$KAI" help | grep -Eq 'issue #[0-9]|Lane [0-9]'; then fail "help leaks internal history"; else ok "help: no issue or lane references"; fi
+for verb in build run test check; do
+  if "$KAI" "$verb" --help 2>&1 | grep -Eq 'issue #[0-9]|Lane [0-9]'; then fail "$verb --help leaks internal history"; fi
+done
+expect_line "doc: a core effect by name" 0 "# effects.Stdout   (effects.kai)" "$KAI" doc Stdout
+mkdir -p "$TMP/initpkg"
+( cd "$TMP/initpkg" && "$KAI" init demo > /dev/null )
+if [ -f "$TMP/initpkg/main.kai" ]; then ok "init: writes main.kai"; else fail "init: no main.kai"; fi
 expect_line "info --list" 0 "$(ls "$ROOT/docs/info" | sed -n 's/\.md$//p' | LC_ALL=C sort | sed -n 1p)" "$KAI" info --list
 expect "fmt --stdin" 0 "fn main() : Int = 0" sh -c 'printf "fn main()   :  Int = 0\n" | "$1" fmt --stdin' _ "$KAI"
 expect "fmt --stdin --check: unformatted is exit 1, nothing printed" 1 "" \
@@ -406,11 +420,11 @@ expect "env: installed prefix" 0 "KAIKAI_HOME=$P
 KAI_STDLIB=$P/share/kaikai/stdlib
 KAI_TOOLCHAIN_ID=$ptid
 KAI_KAIC2=$P/libexec/kaikai/kaic2" env KAIKAI_HOME="$TMP/home" "$P/bin/kai" env
-got="$("$P/bin/kai" --version | sed -n 's/^native p2: *//p')"
-if [ "$got" = "optout (this installation ships no runtime bitcode)" ]; then
-  ok "--version: an installation without the bitcode says so"
+got="$("$P/bin/kai" --version | sed -n 's/^backend: *//p')"
+if [ "$got" = "c" ]; then
+  ok "--version: an installation without the bitcode reports the c backend"
 else
-  fail "--version p2 line in an installation: '$got'"
+  fail "--version backend line in an installation: '$got'"
 fi
 # Every name a release installs is reserved, whether or not this prefix has it.
 for name in $(sed -n -E 's#.*"\$STAGE/(bin|libexec/kaikai)/([^"]+)".*#\2#p' "$ROOT/scripts/build-release.sh" \
