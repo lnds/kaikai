@@ -1124,4 +1124,20 @@ static inline __attribute__((always_inline)) KaiValue *kaix_vec_set_f64(KaiValue
 static inline __attribute__((always_inline)) KaiValue *kaix_vec_set_i64(KaiValue *v, int64_t i, int64_t x) {return kai_vec_set_bits(v, i, x, KAI_INT); }
 static inline __attribute__((always_inline)) KaiValue *kaix_vec_set_rec_bits(KaiValue *v, int64_t i, int64_t n, const int64_t *bits, const char *kinds) {return kai_vec_set_rec_bits(v, i, n, bits, kinds); }
 static inline KaiValue *kaix_vec_set_rec_raw(KaiValue *v, KaiValue *i, int64_t n, KaiValue **xs) {return kai_vec_set_rec_raw(v, i, n, xs); }
+KaiValue *kaix_core___file_read(KaiValue *p);
+KaiValue *kaix_core___file_write(KaiValue *p, KaiValue *c);
+KaiValue *kaix_core___file_append(KaiValue *p, KaiValue *c);
+KaiValue *kaix_core___file_exists(KaiValue *p);
+KaiValue *kaix_core___file_delete(KaiValue *p);
+KaiValue *kaix_core___file_rename(KaiValue *f, KaiValue *t);
+KaiValue *kaix_core___file_read_bytes(KaiValue *p);
+KaiValue *kaix_core___file_write_bytes(KaiValue *p, KaiValue *b);
+KaiValue *kaix___file_read_thunk(KaiValue *s, KaiValue **a, int n);
+KaiValue *kaix___file_write_thunk(KaiValue *s, KaiValue **a, int n);
+KaiValue *kaix___file_append_thunk(KaiValue *s, KaiValue **a, int n);
+KaiValue *kaix___file_exists_thunk(KaiValue *s, KaiValue **a, int n);
+KaiValue *kaix___file_delete_thunk(KaiValue *s, KaiValue **a, int n);
+KaiValue *kaix___file_rename_thunk(KaiValue *s, KaiValue **a, int n);
+KaiValue *kaix___file_read_bytes_thunk(KaiValue *s, KaiValue **a, int n);
+KaiValue *kaix___file_write_bytes_thunk(KaiValue *s, KaiValue **a, int n);
 #endif

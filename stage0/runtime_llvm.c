@@ -458,6 +458,20 @@ KAIX_CORE_THUNK0(program_name)
 KaiValue *kaix_core_program_name_thunk(KaiValue *s, KaiValue **a, int n) { (void)s; (void)a; (void)n; return kai_core_program_name(); }
 KAIX_CORE_THUNK0(stdlib_path)
 KAIX_CORE_THUNK1(abspath)
+#define KAIX_FILE_THUNK1(nm, rt) \
+    KaiValue *kaix___file_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) n; return rt(a[0]); }
+#define KAIX_FILE_THUNK2(nm, rt) \
+    KaiValue *kaix___file_##nm##_thunk(KaiValue *s, KaiValue **a, int n) \
+    { (void) s; (void) n; return rt(a[0], a[1]); }
+KAIX_FILE_THUNK1(read, kai_core_read_file)
+KAIX_FILE_THUNK2(write, kai_core_write_file)
+KAIX_FILE_THUNK2(append, kai_core_file_append)
+KAIX_FILE_THUNK1(exists, kai_core_file_exists)
+KAIX_FILE_THUNK1(delete, kai_core_file_delete)
+KAIX_FILE_THUNK2(rename, kai_core_file_rename)
+KAIX_FILE_THUNK1(read_bytes, kai_core_file_read_bytes)
+KAIX_FILE_THUNK2(write_bytes, kai_core_file_write_bytes)
 KAIX_CORE_THUNK1(read_file)
 KAIX_CORE_THUNK2(write_file)
 KAIX_CORE_THUNK2(file_append)
@@ -1313,6 +1327,14 @@ KaiValue *kaix_core_file_rename(KaiValue *f, KaiValue *t){ return kai_core_file_
  * in runtime.h; the LLVM emit references the `kaix_` names. */
 KaiValue *kaix_core_file_read_bytes(KaiValue *p)              { return kai_core_file_read_bytes(p); }
 KaiValue *kaix_core_file_write_bytes(KaiValue *p, KaiValue *b){ return kai_core_file_write_bytes(p, b); }
+KaiValue *kaix_core___file_read(KaiValue *p)               { return kai_core_read_file(p); }
+KaiValue *kaix_core___file_write(KaiValue *p, KaiValue *c) { return kai_core_write_file(p, c); }
+KaiValue *kaix_core___file_append(KaiValue *p, KaiValue *c){ return kai_core_file_append(p, c); }
+KaiValue *kaix_core___file_exists(KaiValue *p)             { return kai_core_file_exists(p); }
+KaiValue *kaix_core___file_delete(KaiValue *p)             { return kai_core_file_delete(p); }
+KaiValue *kaix_core___file_rename(KaiValue *f, KaiValue *t){ return kai_core_file_rename(f, t); }
+KaiValue *kaix_core___file_read_bytes(KaiValue *p)              { return kai_core_file_read_bytes(p); }
+KaiValue *kaix_core___file_write_bytes(KaiValue *p, KaiValue *b){ return kai_core_file_write_bytes(p, b); }
 KaiValue *kaix_core_dir_list_dir(KaiValue *p)            { return kai_core_dir_list_dir(p); }
 KaiValue *kaix_core_dir_create_dir(KaiValue *p)          { return kai_core_dir_create_dir(p); }
 KaiValue *kaix_core_dir_remove_dir(KaiValue *p)          { return kai_core_dir_remove_dir(p); }
