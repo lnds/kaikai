@@ -32,36 +32,91 @@ import compiler.spawn_capture
 import compiler.spawn_cross
 import compiler.util
 import compiler.spawn_param
+import compiler.infer_env_exhaust
+import compiler.infer_index
+import compiler.expr_positions
 import compiler.core_types
 
-#[doc("Reject a spawned thunk the child fiber cannot honour: an effect it cannot resolve, or a captured value it would mutate as a copy. Each diagnostic names the file declaring the decl it fires on; `tab` names what it reports; `carriers` are the types whose capture is a mutation the child cannot share; `facts` are the calls each function makes at the spawn boundary.")]
-pub fn check_spawn_rows(df: DiagFiles, tab: SymTab, carriers: [SymId], crossing: [SpawnParam],
-                         facts: [SpawnFacts], all_decls: [Decl]) : [Diagnostic] / Console + File =
-  concat_diags(map(facts, (f) => match f {
-    SF(d, spawns, calls, _) -> {
-      let site = SpawnSite { file: decl_diag_file(d, df), tab: tab, owner: d }
-      concat_diags(list_append(
-        map(spawns, (e) => match e.kind {
-          ECall(_, args_) -> check_spawned_thunk(site, carriers, all_decls, args_)
-          _               -> []
-        }),
-        map(calls, (e) => check_crossing_args(site, crossing, all_decls, e))))
+#[doc("Reject a spawned thunk the child fiber cannot honour: an effect it cannot resolve, or a captured value it would mutate as a copy. Each diagnostic names the file declaring the decl it fires on; `tab` names what it reports; `carriers` are the types whose capture is a mutation the child cannot share; `edges` are the instantiations the typer recorded.")]
+pub fn check_spawn_rows(df: DiagFiles, tab: SymTab, carriers: [SymId], edges: [ResolvedCS], typed: [Decl], all_decls: [Decl]) : [Diagnostic] / Console + File = {
+  let sites = spawn_sites(edges)
+  if list_is_empty(sites) { [] }
+  else {
+    let reqs = spawn_reqs_of(edges, sites)
+    list_append(
+      foldl(edges, [], (acc, c) => list_append(acc, check_read(df, tab, reqs, typed, all_decls, c))),
+      check_spawn_owners(df, tab, carriers, typed, all_decls, spawn_owners(sites)))
+  }
+}
+
+
+# What a read of a function instantiates a spawn-reaching row variable with
+# is held to the same rule as a thunk handed to `spawn`, whether the function
+# is called there or passed on as a value.
+fn check_read(df: DiagFiles, tab: SymTab, reqs: SpawnReqs, typed: [Decl], decls: [Decl], c: ResolvedCS) : [Diagnostic] / Console + File = match c {
+  RCS(s, line, col, _, _, _, _, owner) -> match req_vars(reqs, s) {
+    []   -> []
+    vars -> match find_fn_decl(typed, owner) {
+      None    -> []
+      Some(d) -> {
+        let site = SpawnSite { file: decl_diag_file(d, df), tab: tab, owner: d }
+        foldl(read_rows(c, vars), [], (acc, r) => list_append(acc, check_crossing_labels(site, decls, line, col, r.labels, false)))
+      }
     }
-  }))
+  }
+}
 
 
-fn concat_diags(xs: [[Diagnostic]]) : [Diagnostic] = foldl(list_reverse(xs), [], (a, r) => list_append(r, a))
+fn find_fn_decl(ds: [Decl], f: SymId) : Option[Decl] = match ds {
+  []           -> None
+  [d, ...rest] -> match d {
+    DFn(_, fid, _, _, _, _, _, _, _, _) -> if sym_raw(fnid_sym(fid)) == sym_raw(f) { Some(d) } else { find_fn_decl(rest, f) }
+    DUnstable(inner, _, _)              -> find_fn_decl([inner, ...rest], f)
+    DProtoLaws(_, inner, _, _, _)       -> find_fn_decl([inner, ...rest], f)
+    DImplAxiom(_, inner, _, _, _)       -> find_fn_decl([inner, ...rest], f)
+    DConstructor(inner, _, _)           -> find_fn_decl([inner, ...rest], f)
+    _                                   -> find_fn_decl(rest, f)
+  }
+}
 
 
-# An argument passed where the callee spawns it is held to the same rule
-# as a thunk handed to `spawn`.
-fn check_crossing_args(site: SpawnSite, crossing: [SpawnParam], decls: [Decl],
-                        e: Expr) : [Diagnostic] / Console + File =
-  if list_is_empty(crossing) { [] } else { match call_target(e) {
-  None             -> []
-  Some((s, args_)) -> foldl(args_at(args_, spawn_params_for(crossing, s)), [],
-                            (acc, a) => list_append(acc, check_crossing_arg(site, decls, a, false, spawn_answered_for(crossing, s))))
-} }
+# A thunk handed straight to a fiber is judged from its own typed row; only
+# the functions that contain such a read are walked.
+fn check_spawn_owners(df: DiagFiles, tab: SymTab, carriers: [SymId], typed: [Decl], decls: [Decl], owners: [SymId]) : [Diagnostic] / Console + File =
+  if list_is_empty(owners) { [] }
+  else { check_owner_decls(df, tab, carriers, decls, typed, foldl(owners, idx_empty(), (ix, o) => idx_prepend_sym(ix, o, o)), []) }
+
+
+fn check_owner_decls(df: DiagFiles, tab: SymTab, carriers: [SymId], all_decls: [Decl], ds: [Decl], owners: NameIndex[SymId],
+                     acc: [Diagnostic]) : [Diagnostic] / Console + File = match ds {
+  []           -> acc
+  [d, ...rest] -> match d {
+    DFn(_, fid, _, _, _, _, body, _, _, _) ->
+      if list_is_empty(idx_chain_sym(owners, fnid_sym(fid))) { check_owner_decls(df, tab, carriers, all_decls, rest, owners, acc) }
+      else {
+        let site = SpawnSite { file: decl_diag_file(d, df), tab: tab, owner: d }
+        let ds1 = foldl(spawn_calls(body, []), [], (a, e) => match e.kind {
+          ECall(_, args_) -> list_append(a, check_spawned_thunk(site, carriers, all_decls, args_))
+          _               -> a
+        })
+        check_owner_decls(df, tab, carriers, all_decls, rest, owners, list_append(acc, ds1))
+      }
+    DUnstable(inner, _, _)        -> check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc)
+    DProtoLaws(_, inner, _, _, _) -> check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc)
+    DImplAxiom(_, inner, _, _, _) -> check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc)
+    DConstructor(inner, _, _)     -> check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc)
+    _                             -> check_owner_decls(df, tab, carriers, all_decls, rest, owners, acc)
+  }
+}
+
+
+fn spawn_calls(e: Expr, acc: [Expr]) : [Expr] = {
+  let here = match e.kind {
+    ECall(callee, _) -> if callee_is_spawn(callee) { [e, ...acc] } else { acc }
+    _                -> acc
+  }
+  foldl(xp_positions(e), here, (x, p) => match p { XP(_, c) -> spawn_calls(c, x) })
+}
 
 
 # The two halves of the boundary: the row the child cannot resolve, and
@@ -178,7 +233,10 @@ pub(pkg) fn spawn_thunk_arg(args_: [Expr]) : Option[Expr] {
 fn check_spawned_thunk_row(site: SpawnSite, decls: [Decl], args_: [Expr]) : [Diagnostic] / Console + File {
   match spawn_thunk_arg(args_) {
     None      -> []
-    Some(thk) -> check_crossing_arg(site, decls, thk, true, [])
+    Some(thk) -> match thk.ty {
+      Some(TyFnT(_, _, row)) -> check_crossing_labels(site, decls, thk.line, thk.col, row.labels, true)
+      _                      -> []
+    }
   }
 }
 
@@ -187,13 +245,9 @@ fn check_spawned_thunk_row(site: SpawnSite, decls: [Decl], args_: [Expr]) : [Dia
 # something a child fiber resolves on its own.
 # A write through an argument is the capture check's to report, once the call
 # is specialised to the type it writes through.
-fn check_crossing_arg(site: SpawnSite, decls: [Decl], arg: Expr, mutable_too: Bool, answered: [SymId]) : [Diagnostic] / Console + File =
-  match arg.ty {
-    Some(TyFnT(_, _, row)) ->
-      report_spawn_row_labels(site, decls, if mutable_too { row.labels } else { filter(row.labels, (l) => not effect_is(l.sym, CeMutable) and not any(answered, (a) => sym_raw(a) == sym_raw(l.sym))) },
-                              arg.line, arg.col, [])
-    _                      -> []
-  }
+fn check_crossing_labels(site: SpawnSite, decls: [Decl], line: Int, col: Int, labels: [Label], mutable_too: Bool) : [Diagnostic] / Console + File =
+  report_spawn_row_labels(site, decls, if mutable_too { labels } else { filter(labels, (l) => not effect_is(l.sym, CeMutable)) },
+                          line, col, [])
 
 
 # An effect crosses a spawn when the runtime installs it for the child:
