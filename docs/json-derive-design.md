@@ -28,9 +28,9 @@ import encoding.json_bind.{JsonValue}
 type Person = { name: String, age: Int, active: Bool }
 
 fn person_of(v: JsonValue) : Option[Person] = {
-  let name   = json.as_string(json.get(v, "name"))!     # one such line per field
-  let age    = json.as_int(json.get(v, "age"))!
-  let active = json.as_bool(json.get(v, "active"))!
+  let name   = (json.get(v, "name") || (x) => json.as_string(x))!     # one such line per field
+  let age    = (json.get(v, "age") || (x) => json.as_int(x))!
+  let active = (json.get(v, "active") || (x) => json.as_bool(x))!
   Some(Person { name: name, age: age, active: active })
 }
 
