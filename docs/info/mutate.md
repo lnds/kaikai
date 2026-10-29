@@ -69,6 +69,7 @@ reparsed first and the site is reported as unresolvable instead.
 | `negate` | `if c` → `if not (c)` | an inverted guard changes no observed output |
 | `literal` | `0` → `1` | a seed or base case is unexercised |
 | `call` | `f(x)` → `x` | a step could do nothing and no test would care |
+| `return` | a function's result → a neutral value of its type | a function's result is never looked at |
 
 `arm` comes first because it is the highest-value operator on most
 codebases and by far the highest on a compiler, which is mostly `match`.

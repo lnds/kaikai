@@ -72,8 +72,8 @@ fn cat_sites(a: [MutSite], b: [MutSite]) : [MutSite] = list_append(a, b)
 # `check` bodies are deliberately excluded: mutating the oracle is not
 # a measurement of the oracle.
 fn mut_decl_sites(d: Decl, tab: SymTab, q: String) : [MutSite] = match d {
-  DFn(_, f, _, ps, _, _, body, _, _, _) ->
-    mut_scoped(mut_expr(body), concat_all([q, mut_sym_text(tab, fnid_sym(f)), "/", int_to_string(list_length(ps))]))
+  DFn(_, f, _, ps, rt, _, body, l, c, _) ->
+    mut_scoped(mut_fn_body(tab, body, rt, l, c), concat_all([q, mut_sym_text(tab, fnid_sym(f)), "/", int_to_string(list_length(ps))]))
   DConst(_, s, _, body, _, _, _) -> mut_scoped(mut_expr(body), string_concat(q, mut_sym_text(tab, s)))
   DImpl(p, pargs, ty, ds, _, _, _, _) -> mut_decls_in(ds, tab, mut_impl_scope(tab, p, pargs, ty))
   DDerive(_, inner, _, _) -> mut_decl_sites(inner, tab, q)
@@ -109,6 +109,124 @@ fn mut_scoped(sites: [MutSite], scope: String) : [MutSite] =
 
 fn mut_with_scope(s: MutSite, scope: String) : MutSite = match s {
   MS(o, l, c, f, t, _) -> MS(o, l, c, f, t, scope)
+}
+
+# --- function result --------------------------------------------------
+
+# The result of a function is the final expression of its body: the tail
+# of a block body, or the whole body of a `= expr` one. The site carries
+# the declaration's position in its end slot, which the splicer uses to
+# tell where the expression stops.
+fn mut_fn_body(tab: SymTab, body: Expr, rt: Option[TypeExpr], l: Int, c: Int) : [MutSite] = match body.kind {
+  EBlock(stmts, tail) -> list_append(flatten_sites(map(stmts, mut_stmt)), mut_final_opt(tab, tail, rt, l, c))
+  _ -> mut_final(tab, body, rt, l, c)
+}
+
+fn mut_final_opt(tab: SymTab, tail: Option[Expr], rt: Option[TypeExpr], l: Int, c: Int) : [MutSite] = match tail {
+  None -> []
+  Some(x) -> mut_final(tab, x, rt, l, c)
+}
+
+fn mut_final(tab: SymTab, e: Expr, rt: Option[TypeExpr], l: Int, c: Int) : [MutSite] =
+  list_append(mut_return_site(tab, e, rt, l, c), mut_expr(e))
+
+fn mut_return_site(tab: SymTab, e: Expr, rt: Option[TypeExpr], l: Int, c: Int) : [MutSite] = match rt {
+  None -> []
+  Some(ty) -> match mut_neutral(tab, ty, Some(e)) {
+    None -> []
+    Some(v) -> if mut_has_value(e) { [mut_return_at(e, v, l, c)] } else { [] }
+  }
+}
+
+fn mut_has_value(e: Expr) : Bool = match e.kind {
+  EHole(_) -> false
+  ETodo(_) -> false
+  EExternBody(_, _) -> false
+  _ -> true
+}
+
+fn mut_return_at(e: Expr, v: String, l: Int, c: Int) : MutSite = match mut_leftmost(e) {
+  MPos(pl, pc) -> MS(MOpReturn, pl, pc, mut_pos_key(l, c), v, "")
+}
+
+# The value written in place of `eo`, a guess-free one for the type, or
+# None when the type has no such value or `eo` already is it. `eo` is the
+# expression the value would replace; Int, Real and Bool answer the other
+# value instead of None, since they have two to pick from.
+fn mut_neutral(tab: SymTab, ty: TypeExpr, eo: Option[Expr]) : Option[String] = match ty.tkind {
+  TyList(_) -> if mut_is_empty_list(eo) { None } else { Some("[]") }
+  TyName(r, targs) -> mut_neutral_named(mut_ty_head(tab, r), tab, targs, eo)
+  _ -> None
+}
+
+fn mut_ty_head(tab: SymTab, r: DeclRef) : String = match r {
+  DrWritten(None, n) -> written_text(n)
+  DrWritten(Some(_), _) -> ""
+  DrSym(s) ->
+    if core_ty_is(s, CtOption) { "Option" }
+    else if core_ty_is(s, CtResult) { "Result" }
+    else { mut_sym_text(tab, s) }
+}
+
+fn mut_neutral_named(head: String, tab: SymTab, targs: [TypeExpr], eo: Option[Expr]) : Option[String] =
+  if head == "Int" { Some(if mut_is_literal(eo, "0") { "1" } else { "0" }) }
+  else if head == "Real" { Some(if mut_is_literal(eo, "0.0") { "1.0" } else { "0.0" }) }
+  else if head == "Bool" { Some(mut_other_bool(eo)) }
+  else if head == "String" { if mut_is_literal(eo, "\"\"") { None } else { Some("\"\"") } }
+  else if head == "Option" { if mut_is_name(eo, "None") { None } else { Some("None") } }
+  else if head == "Result" and list_length(targs) == 2 { mut_neutral_ok(tab, targs, eo) }
+  else { None }
+
+fn mut_neutral_ok(tab: SymTab, targs: [TypeExpr], eo: Option[Expr]) : Option[String] =
+  match targs {
+    [] -> None
+    [t, ..._] -> match mut_neutral(tab, t, mut_ok_arg(eo)) {
+      None -> None
+      Some(v) -> Some(concat_all(["Ok(", v, ")"]))
+    }
+  }
+
+fn mut_ok_arg(eo: Option[Expr]) : Option[Expr] = match eo {
+  None -> None
+  Some(e) -> match e.kind {
+    ECall(callee, [arg]) -> if mut_is_name(Some(callee), "Ok") { Some(arg) } else { None }
+    _ -> None
+  }
+}
+
+fn mut_is_literal(eo: Option[Expr], raw: String) : Bool = match eo {
+  None -> false
+  Some(e) -> match e.kind {
+    EInt(_, r) -> r == raw or (r == "" and raw == "0")
+    EIntLit(r) -> r == raw
+    EReal(_, r) -> r == raw
+    EStr(r, _) -> r == raw
+    _ -> false
+  }
+}
+
+fn mut_is_name(eo: Option[Expr], text: String) : Bool = match eo {
+  None -> false
+  Some(e) -> match e.kind {
+    EName(w) -> written_text(w) == text
+    _ -> false
+  }
+}
+
+fn mut_is_empty_list(eo: Option[Expr]) : Bool = match eo {
+  None -> false
+  Some(e) -> match e.kind {
+    EList(els) -> list_is_empty(els)
+    _ -> false
+  }
+}
+
+fn mut_other_bool(eo: Option[Expr]) : String = match eo {
+  Some(e) -> match e.kind {
+    EBool(b) -> if b { "false" } else { "true" }
+    _ -> "false"
+  }
+  None -> "false"
 }
 
 # --- expression walk --------------------------------------------------
@@ -174,7 +292,7 @@ fn mut_pos_key(l: Int, c: Int) : String =
 # deletes a prefix has to anchor on the real start or it splices into
 # the middle of the expression.
 fn mut_leftmost(e: Expr) : MutPos = match e.kind {
-  ECall(callee, _) -> mut_leftmost(callee)
+  ECall(callee, cargs) -> mut_leftmost_call(callee, cargs)
   EBinop(_, a, _) -> mut_leftmost(a)
   EField(base, _) -> mut_leftmost(base)
   EIndex(a, _) -> mut_leftmost(a)
@@ -182,6 +300,15 @@ fn mut_leftmost(e: Expr) : MutPos = match e.kind {
   EDispatchPipe(_, a, _) -> mut_leftmost(a)
   ELitUnit(inner, _) -> mut_leftmost(inner)
   _ -> MPos(e.line, e.col)
+}
+
+# A marked call (`a ?? b`) sits at its operator; the expression starts at its first operand.
+fn mut_leftmost_call(callee: Expr, cargs: [Expr]) : MutPos = match callee.kind {
+  EMark(_) -> match cargs {
+    [a, ..._] -> mut_leftmost(a)
+    [] -> mut_leftmost(callee)
+  }
+  _ -> mut_leftmost(callee)
 }
 
 # Dropping an arm is the operator this tool exists for. The last arm is
@@ -392,6 +519,7 @@ pub(pkg) type MutOp
   | MOpNegate     # invert a condition
   | MOpLiteral    # perturb a literal
   | MOpCall       # elide a call, keeping its first argument
+  | MOpReturn     # replace a function's result with a neutral value
 
 #[doc("Stable short name of an operator, used in reports and in the known-equivalent file's key.")]
 pub(pkg) fn mut_op_name(o: MutOp) : String = match o {
@@ -401,6 +529,7 @@ pub(pkg) fn mut_op_name(o: MutOp) : String = match o {
   MOpNegate  -> "negate"
   MOpLiteral -> "literal"
   MOpCall    -> "call"
+  MOpReturn  -> "return"
 }
 
 #[doc("One-line description of what an operator breaks, shown by `kai mutate --list`.")]
@@ -411,6 +540,7 @@ pub(pkg) fn mut_op_blurb(o: MutOp) : String = match o {
   MOpNegate  -> "invert a condition"
   MOpLiteral -> "perturb a literal"
   MOpCall    -> "elide a call"
+  MOpReturn  -> "replace a function's result"
 }
 
 # --- per-operator replacement rules -----------------------------------
