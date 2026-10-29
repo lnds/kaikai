@@ -643,29 +643,28 @@ static void _kai_pcg32_ensure_seeded(void) {
     }
 }
 
-/* Doc B §`Random`: int_range(lo, hi) returns a value in [lo, hi).
- * lo >= hi is a panic — there is no meaningful value. The PRNG draw
- * uses the `% delta` shortcut; for delta well under 2^32 (e.g. 52
- * for a card deck) the modulo bias is negligible. Rejection sampling
- * is a future polish. */
+/* int_range(lo, hi) returns a value in [lo, hi] (inclusive). lo > hi
+ * is a panic. The draw reduces modulo the span; for spans well under
+ * 2^32 the modulo bias is negligible. */
 static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue *hi, KaiCont *k) {
     (void) self;
     int64_t lo_v = (kai_is_int(lo)) ? kai_intf(lo) : 0;
     int64_t hi_v = (kai_is_int(hi)) ? kai_intf(hi) : 0;
-    if (lo_v >= hi_v) {
-        kai_eprintf("kai: Random.int_range: lo (%lld) >= hi (%lld)\n",
+    if (lo_v > hi_v) {
+        kai_eprintf("kai: Random.int_range: lo (%lld) > hi (%lld)\n",
                 (long long) lo_v, (long long) hi_v);
         kai_exit(1);
     }
     _kai_pcg32_ensure_seeded();
-    uint64_t delta = (uint64_t) (hi_v - lo_v);
+    uint64_t span = (uint64_t) (hi_v - lo_v) + 1ULL;
     uint64_t draw;
-    if (delta <= 0xFFFFFFFFULL) {
-        draw = (uint64_t) _kai_pcg32_next() % delta;
+    if (span != 0 && span <= 0xFFFFFFFFULL) {
+        draw = (uint64_t) _kai_pcg32_next() % span;
     } else {
         uint64_t hi32 = (uint64_t) _kai_pcg32_next();
         uint64_t lo32 = (uint64_t) _kai_pcg32_next();
-        draw = ((hi32 << 32) | lo32) % delta;
+        draw = (hi32 << 32) | lo32;
+        if (span != 0) draw %= span;
     }
     return kai_cont_resume(k, kai_int(lo_v + (int64_t) draw));
 }

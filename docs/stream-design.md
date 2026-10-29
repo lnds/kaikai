@@ -174,7 +174,7 @@ with a generator handler; no other referent has that escape hatch.
 ```text
 # -- sources ---------------------------------------------------------
 pub fn from_list[t, e](xs: [t])     : Stream[t, e]                  # pure: row stays free
-pub fn read_lines(path: String)     : Stream[String, File + ReadFault]
+pub fn read_lines[e](path: String)  : Stream[String, File + ReadFault + e]
 
 # -- stages (pipe-canonical: `|` `||` `|?` dispatch on these) --------
 pub fn map[a, b, e](s: Stream[a, e], f: (a) -> b / e)            : Stream[b, e]
@@ -384,13 +384,11 @@ could silently escape the mock. (A mocked `FileHandle` is built with
 
 **(g) A grep-ish main, end to end**
 
-Not accepted today: `read_lines` returns a stream whose row is closed at
-`File + ReadFault`, and `each`'s callback must have exactly the stream's
-row, so a callback that adds `Stdout` is a type mismatch. The proposed
-form:
+`read_lines` leaves its row open (`File + ReadFault + e`), so a sink
+callback may add effects of its own, such as `Stdout`:
 
 ```text
-fn main() : Unit / Console + Env + File = {
+fn main() : Unit / Stdout + Env + File = {
   let needle = list.nth(args(), 0) |> option.unwrap_or("ERROR")
   handle {
     stream.read_lines("app.log")
