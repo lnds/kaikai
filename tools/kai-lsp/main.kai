@@ -1195,8 +1195,8 @@ fn symbol_kind_code(k: String) : Int {
 #
 # textDocument/completion handler. Sends a `# @probe complete L:C`
 # to kaic2, parses the resulting candidates, and returns them as
-# CompletionItem[]. We do NOT filter by prefix server-side: the
-# editor's fuzzy matcher handles that.
+# CompletionItem[], keeping the names that start with the identifier
+# typed before the cursor (case-insensitive).
 fn handle_completion(state: ServerState, kaic2: String, msg: String, id: Option[Int])
   : String / File + Process = {
   match extract_uri(msg) {
@@ -1212,7 +1212,7 @@ fn handle_completion(state: ServerState, kaic2: String, msg: String, id: Option[
               match probe_run(kaic2, text, "complete", l + 1, c + 1) {
                 None -> reply_null(id)
                 Some(blob) -> {
-                  let items = decode_completions(blob)
+                  let items = decode_completions(blob, cursor_prefix(text, l, c))
                   envelope_result(id, items)
                 }
               }
@@ -1225,14 +1225,42 @@ fn handle_completion(state: ServerState, kaic2: String, msg: String, id: Option[
   }
 }
 
-fn decode_completions(blob: String) : String = {
+fn line_offset(text: String, line: Int, from: Int) : Int =
+  if line <= 0 { from }
+  else {
+    let nl = string_index_of_from(text, "\n", from)
+    if nl < 0 { string_length(text) } else { line_offset(text, line - 1, nl + 1) }
+  }
+
+fn is_ident_char(c: Char) : Bool =
+  (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
+
+fn prefix_start(text: String, pos: Int, floor: Int) : Int =
+  if pos <= floor { pos }
+  else {
+    match char_at(text, pos - 1) {
+      Some(c) -> if is_ident_char(c) { prefix_start(text, pos - 1, floor) } else { pos }
+      None -> pos
+    }
+  }
+
+fn cursor_prefix(text: String, line: Int, col: Int) : String = {
+  let start = line_offset(text, line, 0)
+  let pos = min_int(start + col, string_length(text))
+  let from = prefix_start(text, pos, start)
+  string.to_lower(string_slice(text, from, pos - from))
+}
+
+fn min_int(a: Int, b: Int) : Int = if a < b { a } else { b }
+
+fn decode_completions(blob: String, prefix: String) : String = {
   let m = "\"completions\": ["
   let s0 = string_index_of(blob, m)
   let start = if s0 < 0 { 0 } else { s0 + string_length(m) }
-  string_concat("[", string_concat(decode_completions_loop(blob, start, ""), "]"))
+  string_concat("[", string_concat(decode_completions_loop(blob, start, prefix, ""), "]"))
 }
 
-fn decode_completions_loop(blob: String, start: Int, acc: String) : String {
+fn decode_completions_loop(blob: String, start: Int, prefix: String, acc: String) : String {
   let i = match find_completion_entry(blob, start) {
     Some(p) -> p
     None    -> 0 - 1
@@ -1243,9 +1271,13 @@ fn decode_completions_loop(blob: String, start: Int, acc: String) : String {
     if close < 0 { acc }
     else {
       let entry = string_slice(blob, i, (close + 1) - i)
-      let one = decode_one_completion(entry)
-      let sep = if string_length(acc) == 0 { "" } else { "," }
-      decode_completions_loop(blob, close + 1, string_concat(acc, string_concat(sep, one)))
+      if string_starts_with(string.to_lower(completion_name(entry)), prefix) {
+        let one = decode_one_completion(entry)
+        let sep = if string_length(acc) == 0 { "" } else { "," }
+        decode_completions_loop(blob, close + 1, prefix, string_concat(acc, string_concat(sep, one)))
+      } else {
+        decode_completions_loop(blob, close + 1, prefix, acc)
+      }
     }
   }
 }
@@ -1261,6 +1293,12 @@ fn find_completion_entry(blob: String, start: Int) : Option[Int] {
   }
 }
 
+fn completion_name(entry: String) : String =
+  match extract_first_string_field(entry, "\"name\": \"") {
+    Some(n) -> n
+    None -> extract_first_string_field(entry, "\"name\":\"") ?? ""
+  }
+
 fn decode_one_completion(entry: String) : String = {
   let kind_str =
     match extract_first_string_field(entry, "\"kind\": \"") {
@@ -1270,14 +1308,7 @@ fn decode_one_completion(entry: String) : String = {
         None    -> "Function"
       }
     }
-  let name =
-    match extract_first_string_field(entry, "\"name\": \"") {
-      Some(n) -> n
-      None    -> match extract_first_string_field(entry, "\"name\":\"") {
-        Some(n) -> n
-        None    -> ""
-      }
-    }
+  let name = completion_name(entry)
   let detail =
     match extract_first_string_field(entry, "\"detail\": \"") {
       Some(d) -> d

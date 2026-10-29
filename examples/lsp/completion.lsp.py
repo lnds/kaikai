@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke test for textDocument/completion (issue #447 v3)."""
+"""Smoke test for textDocument/completion ."""
 import json, os, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,6 +27,7 @@ def recv():
 
 src = "fn greet(name: String) : Unit / Stdout = print(string_concat(\"hi \", name))\n"
 src += "fn twice[e](f: () -> Unit / e) : Unit / e = { f(); f() }\n"
+src += "\n"
 
 send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
 init = recv()
@@ -40,9 +41,10 @@ send({"jsonrpc":"2.0","method":"textDocument/didOpen",
 recv()  # publishDiagnostics
 
 send({"jsonrpc":"2.0","id":2,"method":"textDocument/completion",
-      "params":{"textDocument":{"uri":URI},"position":{"line":0,"character":50}}})
+      "params":{"textDocument":{"uri":URI},"position":{"line":2,"character":0}}})
 r = recv()
 items = r["result"]
+full = len(json.dumps(items))
 labels = {it["label"] for it in items}
 
 # User-defined fn shows up
@@ -60,10 +62,22 @@ assert greet["detail"] == "(name: String) -> Unit / Stdout", greet
 twice = next(it for it in items if it["label"] == "twice")
 assert twice["detail"] == "(f: () -> Unit / e) -> Unit / e", twice
 
+# The typed prefix narrows the list, ignoring case.
+typed = src + "# TWI"
+send({"jsonrpc":"2.0","method":"textDocument/didChange",
+      "params":{"textDocument":{"uri":URI,"version":2},"contentChanges":[{"text":typed}]}})
+recv()
+send({"jsonrpc":"2.0","id":4,"method":"textDocument/completion",
+      "params":{"textDocument":{"uri":URI},"position":{"line":2,"character":5}}})
+narrow = recv()["result"]
+assert [it["label"] for it in narrow] == ["twice"], [it["label"] for it in narrow]
+narrow_bytes = len(json.dumps(narrow))
+
 send({"jsonrpc":"2.0","id":3,"method":"shutdown","params":None}); recv()
 send({"jsonrpc":"2.0","method":"exit"})
 proc.stdin.close(); proc.wait(timeout=5)
 
 print("completion: OK")
 print(f"  total candidates: {len(items)}")
+print(f"  bytes: {full} unfiltered, {narrow_bytes} with prefix")
 print(f"  greet detail: {greet['detail']}")
