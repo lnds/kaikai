@@ -288,6 +288,10 @@ run_positive "build_module_qualified" "build_module_qualified" "build_module_qua
 # for a one-file and a many-file caller, as a file or as a package.
 run_check_script "spawn_in_fiber" "spawn_in_fiber/check.sh"
 
+# A function value reaching a fiber through a record, list, closure or helper is
+# judged by the row the caller instantiates, not by its shape.
+run_check_script "spawn_by_types" "spawn_by_types/check.sh"
+
 # A module reads the fields of a record its import-cycle partner declares, whichever sorts first.
 run_check_script "cycle_field_read" "cycle_field_read/check.sh"
 

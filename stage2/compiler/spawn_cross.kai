@@ -1,207 +1,102 @@
 #[doc("""
-Which parameters of a function reach a spawned fiber, read from one walk of each
-function that also feeds the spawn-boundary check.
+The row variables of each function's scheme that a spawned fiber runs, read
+from the call-site instantiations the typer recorded.
 
-A child fiber does not see the handlers around its spawner, so an
-effect a function runs in a child on its caller's behalf is covered only
-if the caller's argument is checked where it is passed. A parameter
-reaches a spawn when the value it holds is read inside a spawned thunk,
-or is passed to a parameter that does. Reading it through a local that
-was bound from it counts.
+A child fiber does not see the handlers around its spawner, so an effect
+it runs through a row variable of its spawner's scheme is covered only if
+what the caller instantiates that variable with is checked where the call
+is made. A read that hands a thunk to a fiber seeds the variables of the
+function it sits in; a read of a function that has such variables passes
+them on to its own caller.
 """)]
 
 import compiler.ast
 import compiler.ast_decl
 import compiler.ast_ids
 import compiler.util
-import compiler.expr_positions
-import compiler.handler_alias
 import compiler.spawn_capture
 import compiler.spawn_param
+import compiler.infer_index
+import compiler.infer_env_exhaust
 
-#[doc("A local bound to an expression.")]
-pub type LetBind = LB(LocalId, Expr)
+#[doc("The call-site instantiations that matter at the spawn boundary: those that bind a row variable, and the reads that hand a thunk to a fiber without binding anything.")]
+pub fn spawn_edges(insts: [ResolvedCS]) : [ResolvedCS] = filter(insts, (c) => match c {
+  RCS(_, _, _, tys, units, rows, _, _) -> not list_is_empty(rows) or (list_is_empty(tys) and list_is_empty(units))
+})
 
-#[doc("What one function does at the spawn boundary: its declaration, the calls that start a fiber, the other calls into a function, and the locals it binds.")]
-pub type SpawnFacts = SF(Decl, [Expr], [Expr], [LetBind])
+#[doc("The reads among `edges` that hand a thunk to a fiber.")]
+pub fn spawn_sites(edges: [ResolvedCS]) : [ResolvedCS] = filter(edges, (c) => match c {
+  RCS(s, _, _, _, _, _, _, _) -> sym_hands_thunk(s)
+})
 
-type FactAcc = FA([Expr], [Expr], [LetBind])
+#[doc("The spawn-reaching row variables of every function, indexed by the function's declaration.")]
+pub type SpawnReqs = { ix: NameIndex[SpawnParam], n: Int }
 
-#[doc("The spawn facts of every function in `decls`, each read in a single walk.")]
-pub fn spawn_facts_of(decls: [Decl]) : [SpawnFacts] = map(fn_decls(decls, []), spawn_facts)
-
-fn spawn_facts(d: Decl) : SpawnFacts = match d {
-  DFn(_, _, _, _, _, _, body, _, _, _) -> match collect_facts(body, FA([], [], [])) {
-    FA(sp, cs, ls) -> SF(d, list_reverse(sp), list_reverse(cs), ls)
-  }
-  _ -> SF(d, [], [], [])
+#[doc("The spawn-reaching row variables of every function whose reads are in `edges`, seeded by the reads `sites` that hand a thunk to a fiber.")]
+pub fn spawn_reqs_of(edges: [ResolvedCS], sites: [ResolvedCS]) : SpawnReqs = {
+  let seeded = foldl(sites, SpawnReqs { ix: idx_empty(), n: 0 }, seed_edge)
+  if seeded.n == 0 { seeded } else { reqs_fix(edges, seeded) }
 }
 
-fn collect_facts(e: Expr, a: FactAcc) : FactAcc =
-  foldl(xp_positions(e), fact_here(e, a), (x, p) => match p { XP(_, c) -> collect_facts(c, x) })
-
-fn fact_here(e: Expr, a: FactAcc) : FactAcc = match a {
-  FA(sp, cs, ls) -> match e.kind {
-    ECall(callee, _) -> if callee_is_spawn(callee) { FA([e, ...sp], cs, ls) } else { fact_call(e, a) }
-    EPipe(_, _)      -> fact_call(e, a)
-    EBlock(stmts, _) -> FA(sp, cs, foldl(stmts, ls, (l, s) => match s {
-      SLet(pat, _, rhs) -> match pat.pkind { PBind(b) -> [LB(b.id, rhs), ...l]  _ -> l }
-      _                 -> l
-    }))
-    _ -> a
-  }
+fn seed_edge(r: SpawnReqs, c: ResolvedCS) : SpawnReqs = match c {
+  RCS(_, _, _, _, _, rows, _, owner) -> foldl(rows, r, (a, b) => req_add_tail(a, owner, b))
 }
 
-fn fact_call(e: Expr, a: FactAcc) : FactAcc = match a {
-  FA(sp, cs, ls) -> match call_target(e) {
-    Some(_) -> FA(sp, [e, ...cs], ls)
-    None    -> a
-  }
+fn reqs_fix(edges: [ResolvedCS], prev: SpawnReqs) : SpawnReqs = {
+  let next = foldl(edges, prev, pass_on)
+  if next.n == prev.n { next } else { reqs_fix(edges, next) }
 }
 
-#[doc("The reaching parameters of every function in `facts`.")]
-pub fn spawn_params_from(facts: [SpawnFacts]) : [SpawnParam] =
-  spawn_params_fix(facts, [])
-
-#[doc("The positions of the parameters of `f` that reach a spawned fiber.")]
-pub fn spawn_params_for(table: [SpawnParam], f: SymId) : [Int] = match table {
-  []                  -> []
-  [SPm(s, ps, _), ...rest] -> if sym_raw(s) >= 0 and sym_raw(s) == sym_raw(f) { ps } else { spawn_params_for(rest, f) }
-}
-
-#[doc("The effects `f` answers inside the fiber for the values it receives, so a caller need not keep them out of its arguments.")]
-pub fn spawn_answered_for(table: [SpawnParam], f: SymId) : [SymId] = match table {
-  []                  -> []
-  [SPm(s, _, answered), ...rest] -> if sym_raw(s) >= 0 and sym_raw(s) == sym_raw(f) { answered } else { spawn_answered_for(rest, f) }
-}
-
-#[doc("The function a call or a pipe into a function reaches, with the arguments it passes.")]
-pub fn call_target(e: Expr) : Option[(SymId, [Expr])] = match e.kind {
-  ECall(callee, args_) -> match callee.kind {
-    ESym(s, _) -> Some((s, args_))
-    _          -> None
-  }
-  EPipe(a, b) -> match b.kind {
-    ESym(s, _) -> Some((s, [a]))
-    ECall(callee, rest) -> match callee.kind {
-      ESym(s, _) -> Some((s, [a, ...rest]))
-      _          -> None
-    }
-    _ -> None
-  }
-  _ -> None
-}
-
-#[doc("The arguments of `args_` at the positions in `idxs`.")]
-pub fn args_at(args_: [Expr], idxs: [Int]) : [Expr] = args_at_from(args_, idxs, 0)
-
-fn args_at_from(args_: [Expr], idxs: [Int], i: Int) : [Expr] = match args_ {
-  []           -> []
-  [a, ...rest] -> if any(idxs, (x) => x == i) { [a, ...args_at_from(rest, idxs, i + 1)] } else { args_at_from(rest, idxs, i + 1) }
-}
-
-fn fn_decls(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
-  []           -> list_reverse(acc)
-  [d, ...rest] -> match d {
-    DFn(_, _, _, _, _, _, _, _, _, _) -> fn_decls(rest, [d, ...acc])
-    DUnstable(inner, _, _)            -> fn_decls([inner, ...rest], acc)
-    DProtoLaws(_, inner, _, _, _)     -> fn_decls([inner, ...rest], acc)
-    DImplAxiom(_, inner, _, _, _)     -> fn_decls([inner, ...rest], acc)
-    DConstructor(inner, _, _)         -> fn_decls([inner, ...rest], acc)
-    _                                 -> fn_decls(rest, acc)
+fn pass_on(r: SpawnReqs, c: ResolvedCS) : SpawnReqs = match c {
+  RCS(s, _, _, _, _, rows, _, owner) -> match idx_chain_sym(r.ix, s) {
+    []    -> r
+    chain -> foldl(chain, r, (a, m) => match m {
+      SPm(_, v) -> match bind_of(rows, v) {
+        Some(b) -> req_add_tail(a, owner, b)
+        None    -> a
+      }
+    })
   }
 }
 
-fn spawn_params_fix(facts: [SpawnFacts], prev: [SpawnParam]) : [SpawnParam] = {
-  let next = filter(map(facts, (f) => fn_spawn_params(prev, f)), (m) => match m { SPm(_, ps, _) -> not list_is_empty(ps) })
-  if spawn_params_size(next) == spawn_params_size(prev) { next } else { spawn_params_fix(facts, next) }
-}
-
-fn spawn_params_size(t: [SpawnParam]) : Int = foldl(t, 0, (n, m) => match m { SPm(_, ps, _) -> n + list_length(ps) })
-
-fn fn_spawn_params(table: [SpawnParam], f: SpawnFacts) : SpawnParam = match f {
-  SF(d, sp, cs, lets) -> match d {
-    DFn(_, fid, _, params, _, _, _, _, _, _) -> {
-      let thunks = foldl(sp, [], (a, e) => list_append(spawn_thunk_of(e), a))
-      let calls = foldl(cs, [], (a, e) => list_append(marked_args(table, e), a))
-      let reaching = reaching_params(params, list_append(thunks, calls), lets, 0, [])
-      if list_is_empty(reaching) { SPm(fnid_sym(fid), [], []) }
-      else { SPm(fnid_sym(fid), reaching, answered_params(params, reaching, thunks, calls, lets)) }
-    }
-    _ -> SPm(sym_none(), [], [])
+fn req_add_tail(r: SpawnReqs, owner: SymId, b: RowBind) : SpawnReqs = match b {
+  RwB(_, row) -> match row.tail {
+    Some(v) -> if sym_raw(owner) < 0 { r } else { req_add(r, owner, v) }
+    None    -> r
   }
 }
 
-fn spawn_thunk_of(e: Expr) : [Expr] = match e.kind {
-  ECall(_, args_) -> last_arg(args_)
-  _               -> []
+fn req_add(r: SpawnReqs, f: SymId, v: Int) : SpawnReqs =
+  if any(idx_chain_sym(r.ix, f), (m) => match m { SPm(_, x) -> x == v }) { r }
+  else { SpawnReqs { ix: idx_prepend_sym(r.ix, f, SPm(f, v)), n: r.n + 1 } }
+
+#[doc("The row variables of `f`'s scheme that a spawned fiber runs.")]
+pub fn req_vars(r: SpawnReqs, f: SymId) : [Int] = map(idx_chain_sym(r.ix, f), (m) => match m { SPm(_, v) -> v })
+
+#[doc("What the read `c` of a function instantiates the row variables `vars` with.")]
+pub fn read_rows(c: ResolvedCS, vars: [Int]) : [Row] = match c {
+  RCS(_, _, _, _, _, rows, _, _) -> foldl(vars, [], (acc, v) => match bind_of(rows, v) {
+    Some(b) -> match b { RwB(_, row) -> [row, ...acc] }
+    None    -> acc
+  })
 }
 
-fn reaching_params(params: [Param], sinks: [Expr], lets: [LetBind], i: Int, acc: [Int]) : [Int] = match params {
-  []           -> list_reverse(acc)
-  [p, ...rest] ->
-    if any(sinks, (s) => reads_through(p.binder.id, s, lets)) { reaching_params(rest, sinks, lets, i + 1, [i, ...acc]) }
-    else { reaching_params(rest, sinks, lets, i + 1, acc) }
-}
-
-# What every reaching parameter's value performs that the fiber's thunk does
-# not: the function answers it before the fiber runs it.
-fn answered_params(params: [Param], reaching: [Int], thunks: [Expr], calls: [Expr], lets: [LetBind]) : [SymId] =
-  unwrap_or(foldl(reaching, None, (acc, i) => match nth_param(params, i) {
-    Some(p) -> meet_syms(acc, answered_of(p.binder.id, thunks, calls, lets))
-    None    -> meet_syms(acc, [])
-  }), [])
-
-fn nth_param(params: [Param], i: Int) : Option[Param] = match params {
+fn bind_of(binds: [RowBind], v: Int) : Option[RowBind] = match binds {
   []           -> None
-  [p, ...rest] -> if i == 0 { Some(p) } else { nth_param(rest, i - 1) }
+  [b, ...rest] -> match b {
+    RwB(x, _) -> if x == v { Some(b) } else { bind_of(rest, v) }
+  }
 }
 
-# A value passed on to another function, or reached through a local, is
-# answered nowhere the caller can rely on.
-fn answered_of(l: LocalId, thunks: [Expr], calls: [Expr], lets: [LetBind]) : [SymId] =
-  if any(calls, (c) => reads_through(l, c, lets)) { [] }
-  else { unwrap_or(foldl(filter(thunks, (t) => reads_through(l, t, lets)), None,
-                         (acc, t) => meet_syms(acc, answered_in(l, t))), []) }
-
-fn answered_in(l: LocalId, thunk: Expr) : [SymId] =
-  unwrap_or(foldl(local_reads(l, thunk), None,
-                  (acc, r) => meet_syms(acc, minus_syms(row_syms(r.ty), row_syms(thunk.ty)))), [])
-
-fn local_reads(l: LocalId, e: Expr) : [Expr] = match e.kind {
-  ELocal(x) -> if local_eq(x, l) { [e] } else { [] }
-  _         -> foldl(xp_positions(e), [], (a, p) => match p { XP(_, c) -> list_append(a, local_reads(l, c)) })
-}
-
-fn row_syms(t: Option[Ty]) : [SymId] = match t {
-  Some(TyFnT(_, _, row)) -> map(row.labels, .sym)
-  _                      -> []
-}
-
-fn minus_syms(xs: [SymId], ys: [SymId]) : [SymId] = filter(xs, (x) => not any(ys, (y) => sym_raw(y) == sym_raw(x)))
-
-fn meet_syms(acc: Option[[SymId]], xs: [SymId]) : Option[[SymId]] = match acc {
-  None     -> Some(xs)
-  Some(ys) -> Some(minus_syms(ys, minus_syms(ys, xs)))
-}
-
-fn reads_through(l: LocalId, e: Expr, lets: [LetBind]) : Bool =
-  expr_reads_local(l, e) or any(lets, (b) => match b {
-    LB(x, rhs) -> expr_reads_local(x, e) and reads_through(l, rhs, lets_without(lets, x))
+#[doc("The functions that contain a read handing a thunk to a fiber.")]
+pub fn spawn_owners(sites: [ResolvedCS]) : [SymId] =
+  foldl(sites, [], (acc, c) => match c {
+    RCS(_, _, _, _, _, _, _, owner) ->
+      if sym_raw(owner) >= 0 and not any(acc, (o) => sym_raw(o) == sym_raw(owner)) { [owner, ...acc] } else { acc }
   })
 
-fn lets_without(lets: [LetBind], x: LocalId) : [LetBind] =
-  filter(lets, (b) => match b { LB(y, _) -> not local_eq(x, y) })
-
-fn marked_args(table: [SpawnParam], e: Expr) : [Expr] =
-  if list_is_empty(table) { [] }
-  else { match call_target(e) {
-    Some((s, args_)) -> args_at(args_, spawn_params_for(table, s))
-    None             -> []
-  } }
-
-fn last_arg(args_: [Expr]) : [Expr] = match args_ {
-  []           -> []
-  [a]          -> [a]
-  [_, ...rest] -> last_arg(rest)
+#[doc("The module a function was declared in.")]
+pub fn decl_module_origin(d: Decl) : Option[String] = match d {
+  DFn(_, _, _, _, _, _, _, _, _, mo) -> mo
+  _                                  -> None
 }

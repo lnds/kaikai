@@ -32,6 +32,8 @@ import compiler.infer_apply
 import compiler.infer_unify_rows
 import compiler.infer_head_dispatch
 import compiler.scope_view
+import compiler.spawn_capture
+import compiler.core_types
 
 #[doc("infer: resolve a type under a tparam binding, each nominal head stamped from `hv`.")]
 pub fn resolve_ty_with_tparams(t: TypeExpr, binds: [TPBind], hv: TyHomeView) : Ty {
@@ -695,12 +697,12 @@ pub fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes / Mutable
       # propagate the bumped row_fresh into the returned state.
       let st_env = st_set_env(st, inst.env)
       let mid = match rvars {
-        [] -> TyInstRes { st: st_env, ty: inst.ty, fresh: fresh, unit_fresh: [] }
+        [] -> TyInstRes { st: st_env, ty: inst.ty, fresh: fresh, unit_fresh: [], row_fresh: [] }
         _  -> {
           let frs = mk_fresh_row_subst(rvars, st_env.sub)
           let body1 = apply_ty(frs.temp, inst.ty)
           let st_out = st_set_sub(st_env, frs.sub)
-          TyInstRes { st: st_out, ty: body1, fresh: fresh, unit_fresh: [] }
+          TyInstRes { st: st_out, ty: body1, fresh: fresh, unit_fresh: [], row_fresh: frs.pairs }
         }
       }
       # also fresh-instantiate unit-vars. Same shape as the
@@ -718,7 +720,7 @@ pub fn st_instantiate_report(st: InferState, sc: TyScheme) : TyInstRes / Mutable
           let sub2 = subst_add_unit_kinds(fus.sub, fus.fresh_ids, ukinds)
           let st_out2 = st_set_sub(mid.st, sub2)
           TyInstRes { st: st_out2, ty: body2, fresh: mid.fresh,
-                      unit_fresh: fus.fresh_ids }
+                      unit_fresh: fus.fresh_ids, row_fresh: mid.row_fresh }
         }
       }
     }
@@ -821,8 +823,8 @@ fn sym_read_with(st: InferState, sy: SymId, e: Expr, as_value: Bool) : Inferred 
   match env_sym(st.env, sy) {
     Some(sc) -> {
       let r = st_instantiate_report(st, sc)
-      let st2 = if r.fresh == [] and r.unit_fresh == [] { r.st }
-                else { st_push_inst(r.st, CS(sy, e.line, e.col, r.fresh, r.unit_fresh, None)) }
+      let st2 = if r.fresh == [] and r.unit_fresh == [] and r.row_fresh == [] and not sym_hands_thunk(sy) { r.st }
+                else { st_push_inst(r.st, CS(sy, e.line, e.col, r.fresh, r.unit_fresh, r.row_fresh, None)) }
       if as_value { open_closed_row(st2, r.ty, e) } else { inferred_leaf(st2, r.ty, e) }
     }
     None -> inferred_leaf(st, tag_union_ty(st, sy), e)
@@ -894,12 +896,21 @@ pub fn synth_mark_read(st: InferState, m: Mark, e: Expr) : Inferred / Console + 
 }
 
 
+# The read of a `Spawn` op with a row variable (only `spawn` has one) is recorded like the read of
+# a function, so the spawn check finds it among the instantiations.
+#[doc("Typer-internal helper `note_spawn_op` shared across the infer modules.")]
+pub fn note_spawn_op(r: TyInstRes, eff: SymId, line: Int, col: Int) : TyInstRes =
+  if effect_is(eff, CeSpawn) and not list_is_empty(r.row_fresh) {
+    TyInstRes { ...r, st: st_push_inst(r.st, CS(eff, line, col, r.fresh, r.unit_fresh, r.row_fresh, None)) }
+  } else { r }
+
+
 # An operation read as a value types as its declared scheme.
 #[doc("Typer-internal helper `synth_op_read` shared across the infer modules.")]
 pub fn synth_op_read(st: InferState, r: OpRef, e: Expr) : Inferred / Console + File + Mutable =
   match env_op(st.env, r.eff, r.op) {
     Some(sc) -> {
-      let i = st_instantiate_report(st, sc)
+      let i = note_spawn_op(st_instantiate_report(st, sc), r.eff, e.line, e.col)
       inferred_leaf(i.st, i.ty, e)
     }
     None -> inferred_leaf(st, TyAny, e)
