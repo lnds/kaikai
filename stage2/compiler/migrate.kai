@@ -11,7 +11,8 @@ import compiler.ast_decl
 import compiler.ast_ids
 import compiler.written
 import compiler.symtab
-import compiler.util.{list_is_empty}
+import compiler.util.{list_is_empty, list_has}
+import compiler.emit_shared_alias.{map_expr_kind}
 
 # --- rewrite pass over decls ------------------------------------------
 
@@ -172,14 +173,46 @@ fn lookup_file_op(ps: [Pair[String, String]], name: String) : Option[String] = m
   [p, ...rest] -> if p.fst == name { Some(p.snd) } else { lookup_file_op(rest, name) }
 }
 
-fn file_op_method(callee: Expr) : Option[String] = match callee.kind {
-  EName(w) -> lookup_file_op(file_op_pairs(), written_text(w))
+# A name the file declares or imports selectively is the file's own, never the core operation.
+fn file_op_method(own: [String], callee: Expr) : Option[String] = match callee.kind {
+  EName(w) -> if list_has(own, written_text(w)) { None } else { lookup_file_op(file_op_pairs(), written_text(w)) }
   _ -> None
 }
 
-fn qualify_file_op(callee: Expr) : Expr = match file_op_method(callee) {
+fn qualify_file_op(own: [String], callee: Expr) : Expr = match file_op_method(own, callee) {
   Some(m) -> with_kind(callee, EField(with_kind(callee, EName(written("file"))), m))
   None -> callee
+}
+
+fn qualify_expr(own: [String], e: Expr) : Expr = {
+  let k = map_expr_kind(e.kind, (x) => qualify_expr(own, x))
+  match k {
+    ECall(callee, cargs) -> with_kind(e, ECall(qualify_file_op(own, callee), cargs))
+    _ -> with_kind(e, k)
+  }
+}
+
+#[doc("Rewrite each bare call of a core file operation to `file.<op>`, leaving a function the file declares or imports under the same name alone.")]
+pub(pkg) fn mig_qualify_file_ops(tab: SymTab, decls: [Decl]) : [Decl] = {
+  let own = flat_map(decls, (d) => decl_own_names(tab, d))
+  map(decls, (d) => decl_map_bodies(d, (body) => qualify_expr(own, body)))
+}
+
+fn decl_own_names(tab: SymTab, d: Decl) : [String] = match d {
+  DFn(_, fid, _, _, _, _, _, _, _, _) -> [written_text(sym_name(tab, fnid_sym(fid)))]
+  DImport(IkSelective(_, names), _, _) -> names
+  DAttr(_, inner, _, _) -> decl_own_names(tab, inner)
+  DDoc(_, _, inner, _, _) -> decl_own_names(tab, inner)
+  _ -> []
+}
+
+# A qualified call of a file operation: the program already needs `import fs.file`.
+fn is_qualified_file_op(mm: Pair[String, String]) : Bool =
+  mm.fst == "file" and has_file_method(file_op_pairs(), mm.snd)
+
+fn has_file_method(ps: [Pair[String, String]], m: String) : Bool = match ps {
+  [] -> false
+  [p, ...rest] -> if p.snd == m { true } else { has_file_method(rest, m) }
 }
 
 #[doc("Add `import fs.file` after the last import (or after any leading module doc) when the program does not already import it.")]
@@ -233,7 +266,7 @@ fn rename_callee(callee: Expr, new_method: String) : Expr = match callee.kind {
 # callee in place when a rule matches (manual-only and no-match cases
 # leave the node untouched — the scan pass reports the manual ones).
 fn mig_apply_call(ft: Bool, e: Expr, callee: Expr, cargs: [Expr]) : Expr = match call_mod_method(callee) {
-  None -> with_kind(e, ECall(qualify_file_op(callee), cargs))
+  None -> with_kind(e, ECall(callee, cargs))
   Some(mm) -> match migrate_rule_for(mm.fst, mm.snd) {
     Some(CRl(new_method)) -> with_kind(e, ECall(rename_callee(callee, new_method), cargs))
     None -> with_kind(e, ECall(callee, cargs))
@@ -397,12 +430,11 @@ pub(pkg) fn mig_count_renames(reps: [MigRep]) : Int = list_length(filter(reps, i
 
 fn is_rename(r: MigRep) : Bool = match r {
   MRRename -> true
-  MRFileOp -> true
-  MRManual(_) -> false
+  _ -> false
 }
 
-#[doc("True when an event list holds a bare file-operation call that `fs.file` now owns.")]
-pub(pkg) fn mig_has_file_op(reps: [MigRep]) : Bool = not list_is_empty(filter(reps, is_file_op))
+#[doc("The number of qualified `fs.file` operation calls in an event list.")]
+pub(pkg) fn mig_file_op_count(reps: [MigRep]) : Int = list_length(filter(reps, is_file_op))
 
 fn is_file_op(r: MigRep) : Bool = match r {
   MRFileOp -> true
@@ -432,11 +464,8 @@ fn scan_callee(callee: Expr) : [MigRep] = scan_expr(callee)
 # already-computed arg count. The recursive scan of the arguments is
 # emitted by the ECall arm, so this handles only the head.
 fn scan_call_head(e: Expr, callee: Expr, argc: Int) : [MigRep] = match call_mod_method(callee) {
-  None -> match file_op_method(callee) {
-    Some(_) -> [MRFileOp]
-    None -> []
-  }
-  Some(mm) -> scan_head_rule(e, mm, argc)
+  None -> []
+  Some(mm) -> if is_qualified_file_op(mm) { [MRFileOp] } else { scan_head_rule(e, mm, argc) }
 }
 
 fn scan_head_rule(e: Expr, mm: Pair[String, String], argc: Int) : [MigRep] = match migrate_rule_for(mm.fst, mm.snd) {
