@@ -84,6 +84,16 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.186.0 (2026-10-29)
+
+### Added
+
+- **stdlib**: Show for Triple and Quad
+
+### Fixed
+
+- **typer**: check spawn arguments over the whole program
+
 ## v0.185.0 (2026-10-29)
 
 ### BREAKING CHANGE
