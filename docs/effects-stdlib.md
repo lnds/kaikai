@@ -585,7 +585,7 @@ need to write `handle { ... } with File { ... }` itself.
 
 ### Chunked / streaming IO
 
-The bulk `read_file` / `write_file` pair materialises a whole file
+The bulk `file.read` / `file.write` pair materialises a whole file
 as one `String`. For unbounded input (logs, data files) the five
 chunked ops keep an OS file descriptor open across calls so a
 consumer can pull a large file piece-by-piece without holding it
@@ -665,20 +665,21 @@ this — doing so would shadow the consumer's skip-or-abort policy.
 > `close_file`) is a known limitation, same honesty treatment as
 > the non-atomic `append`; the cancel-aware bracket is post-MVP.
 
-### Overwrite semantics for `write_file`
+### Overwrite semantics for `file.write`
 
-`write_file(path, contents)` truncates and rewrites `path` if it
+`file.write(path, contents)` truncates and rewrites `path` if it
 exists, or creates it if it does not. Matches `fopen(path, "w")`
 and matches Python/JS expectations. Appending is
-`file_append(path, contents)`; "create only if missing" is not
+`file.append(path, contents)`; "create only if missing" is not
 provided.
 
 ### Helpers beside the ops
 
 The `File` row also covers core functions outside the effect
-declaration (`stdlib/effects.kai`): `file_exists`, `file_append`,
-`file_delete`, `file_rename`, `file_read_bytes` / `file_write_bytes`
-(binary IO over `Array[Byte]`), and `dir_list_dir`, `dir_create_dir`,
+declaration, reached qualified through `fs.file`: `file.exists`,
+`file.append`, `file.delete`, `file.rename`, `file.read_bytes` /
+`file.write_bytes` (binary IO over `Array[Byte]`); the bare spellings
+do not exist. Beside them, the core `dir_list_dir`, `dir_create_dir`,
 `dir_remove_dir`, `dir_walk` (`dir_walk` does not follow symlinks).
 `fs.file.metadata(path) : Result[FileMetadata, String]` reads a
 file's metadata.
@@ -1934,7 +1935,9 @@ handler. The handler runs for its side effects and does not
 `resume`, so the fiber unwinds out of the wrapped block:
 
 ```kaikai
-fn append_tmp(path: String, line: String) : Unit / File = match file_append(path, "#{line}\n") {
+import fs.file
+
+fn append_tmp(path: String, line: String) : Unit / File = match file.append(path, "#{line}\n") {
   Ok(_)  -> ()
   Err(_) -> ()
 }

@@ -472,14 +472,6 @@ KAIX_FILE_THUNK1(delete, kai_core_file_delete)
 KAIX_FILE_THUNK2(rename, kai_core_file_rename)
 KAIX_FILE_THUNK1(read_bytes, kai_core_file_read_bytes)
 KAIX_FILE_THUNK2(write_bytes, kai_core_file_write_bytes)
-KAIX_CORE_THUNK1(read_file)
-KAIX_CORE_THUNK2(write_file)
-KAIX_CORE_THUNK2(file_append)
-KAIX_CORE_THUNK1(file_exists)
-KAIX_CORE_THUNK1(file_delete)
-KAIX_CORE_THUNK2(file_rename)
-KAIX_CORE_THUNK1(file_read_bytes)
-KAIX_CORE_THUNK2(file_write_bytes)
 KAIX_CORE_THUNK1(dir_list_dir)
 KAIX_CORE_THUNK1(dir_create_dir)
 KAIX_CORE_THUNK1(dir_remove_dir)
@@ -1316,17 +1308,9 @@ KaiValue *kaix_core_stdlib_path(void)                    { return kai_core_stdli
 KaiValue *kaix_core_abspath(KaiValue *p)                 { return kai_core_abspath(p); }
 KaiValue *kaix_core_exit(KaiValue *v)                    { return kai_core_exit(v); }
 /* kaix_core_panic is defined above near kaix_match_panic. */
-KaiValue *kaix_core_read_file(KaiValue *p)               { return kai_core_read_file(p); }
-KaiValue *kaix_core_write_file(KaiValue *p, KaiValue *c) { return kai_core_write_file(p, c); }
-KaiValue *kaix_core_file_append(KaiValue *p, KaiValue *c){ return kai_core_file_append(p, c); }
-KaiValue *kaix_core_file_exists(KaiValue *p)             { return kai_core_file_exists(p); }
-KaiValue *kaix_core_file_delete(KaiValue *p)             { return kai_core_file_delete(p); }
-KaiValue *kaix_core_file_rename(KaiValue *f, KaiValue *t){ return kai_core_file_rename(f, t); }
 /* Issue #513: Array[Byte] file round-trip. Same shape as the
  * exists/delete/rename wrappers above — the C-side statics live
  * in runtime.h; the LLVM emit references the `kaix_` names. */
-KaiValue *kaix_core_file_read_bytes(KaiValue *p)              { return kai_core_file_read_bytes(p); }
-KaiValue *kaix_core_file_write_bytes(KaiValue *p, KaiValue *b){ return kai_core_file_write_bytes(p, b); }
 KaiValue *kaix_core___file_read(KaiValue *p)               { return kai_core_read_file(p); }
 KaiValue *kaix_core___file_write(KaiValue *p, KaiValue *c) { return kai_core_write_file(p, c); }
 KaiValue *kaix_core___file_append(KaiValue *p, KaiValue *c){ return kai_core_file_append(p, c); }
