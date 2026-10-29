@@ -1,0 +1,143 @@
+#[doc("The type parameters `kai migrate` respells lowercase: each declaring bracket and every use inside the declaration it opens.")]
+
+import compiler.lex
+import compiler.parse_naming
+import compiler.parse_state
+import compiler.util
+
+#[doc("A span of source to respell: byte offset, length and replacement.")]
+pub(pkg) type Span = Span(Int, Int, String)
+
+#[doc("""
+The spans that respell every uppercase type parameter of the source.
+A declaring bracket is the one after `fn`/`type`/`effect`/`protocol`/
+`axiom` NAME or `impl`, or an operation head inside an effect or
+protocol; its scope is the declaration, by indentation. A name after a
+`.` or before a `(` is not a type and is left alone.
+""")]
+pub(pkg) fn tparam_spans(src: String, toks: [Token]) : [Span] = match toks {
+  [] -> []
+  [t0, ..._] -> scan_heads(src, toks, t0.col, TkNewline, t0.col, false, [])
+}
+
+fn scan_heads(src: String, ts: [Token], base: Int, prev: TokKind, line_col: Int, ep: Bool, acc: [Span]) : [Span] = match ts {
+  [] -> acc
+  [t, ...rest] ->
+    if tk_is(t.kind, TkNewline) { scan_heads(src, rest, base, TkNewline, line_col, ep, acc) }
+    else {
+      let first = tk_is(prev, TkNewline)
+      let lc = if first { t.col } else { line_col }
+      let ep1 = if first and t.col == base { opens_ep_block(t, rest) } else { ep }
+      scan_heads(src, rest, base, t.kind, lc, ep1, list_append(acc, head_spans(src, t, rest, first and ep1, lc)))
+    }
+}
+
+fn opens_ep_block(t: Token, rest: [Token]) : Bool =
+  is_ep_kw(t.kind) or (tk_is(t.kind, TkPub) and starts_with_ep(rest))
+
+fn is_ep_kw(k: TokKind) : Bool = tk_is(k, TkEffect) or tk_is(k, TkProtocol)
+
+fn starts_with_ep(ts: [Token]) : Bool = match ts {
+  [n, ..._] -> is_ep_kw(n.kind)
+  [] -> false
+}
+
+fn is_decl_kw(k: TokKind) : Bool =
+  tk_is(k, TkFn) or tk_is(k, TkType) or tk_is(k, TkEffect) or tk_is(k, TkProtocol) or tk_is(k, TkAxiom)
+
+fn head_spans(src: String, t: Token, rest: [Token], op_head: Bool, lc: Int) : [Span] = match rest {
+  [n, br, ...after] ->
+    if is_decl_kw(t.kind) and tk_is(n.kind, TkIdent) and tk_is(br.kind, TkLbracket) { bracket_spans(src, [n, br, ...after], after, lc, false) }
+    else if tk_is(t.kind, TkImpl) { head_impl(src, [n, br, ...after], lc) }
+    else if op_head and tk_is(t.kind, TkIdent) and tk_is(n.kind, TkLbracket) { bracket_spans(src, rest, [br, ...after], lc, true) }
+    else { [] }
+  [n] -> []
+  [] -> []
+}
+
+fn head_impl(src: String, rest: [Token], lc: Int) : [Span] = match rest {
+  [br, ...after] -> if tk_is(br.kind, TkLbracket) { bracket_spans(src, rest, after, lc, false) } else { [] }
+  [] -> []
+}
+
+# `scope` starts at the token after the head's last keyword token; `inside` is the tokens after the `[`.
+fn bracket_spans(src: String, scope: [Token], inside: [Token], lc: Int, needs_paren: Bool) : [Span] =
+  match items_of(inside, 0, true, []) {
+    None -> []
+    Some(done) ->
+      if needs_paren and not starts_with_kind(done.snd, TkLparen) { [] }
+      else { respell_scope(src, scope, lc, plan_renames(src, done.fst)) }
+  }
+
+fn starts_with_kind(ts: [Token], k: TokKind) : Bool = match ts {
+  [t, ..._] -> tk_is(t.kind, k)
+  [] -> false
+}
+
+# The item-leading identifiers of a bracket and the tokens after its `]`; None when an item starts with anything else.
+fn items_of(ts: [Token], depth: Int, at_start: Bool, acc: [Token]) : Option[Pair[[Token], [Token]]] = match ts {
+  [] -> None
+  [t, ...rest] -> match t.kind {
+    TkNewline -> items_of(rest, depth, at_start, acc)
+    TkRbracket -> items_close(rest, depth, acc)
+    TkLbracket -> items_of(rest, depth + 1, false, acc)
+    TkLparen -> items_of(rest, depth + 1, false, acc)
+    TkRparen -> items_of(rest, depth - 1, false, acc)
+    TkComma -> items_of(rest, depth, depth == 0, acc)
+    TkIdent -> items_of(rest, depth, false, if at_start { [t, ...acc] } else { acc })
+    _ -> if at_start { None } else { items_of(rest, depth, false, acc) }
+  }
+}
+
+fn items_close(rest: [Token], depth: Int, acc: [Token]) : Option[Pair[[Token], [Token]]] =
+  if depth == 0 { Some(Pair { fst: list_reverse(acc), snd: rest }) } else { items_of(rest, depth - 1, false, acc) }
+
+# Old spelling and new spelling of each uppercase parameter; a new spelling clashing with a sibling gets a trailing `_`.
+fn plan_renames(src: String, names: [Token]) : [Pair[String, String]] =
+  flat_map(names, (t) => rename_of(tok_source(src, t), map(names, (n) => tok_source(src, n))))
+
+fn rename_of(name: String, siblings: [String]) : [Pair[String, String]] =
+  if name_bad(NkTypeParam, name) { [Pair { fst: name, snd: fresh_name(snake_of(name), siblings) }] } else { [] }
+
+fn fresh_name(candidate: String, siblings: [String]) : String =
+  if list_has(siblings, candidate) { fresh_name("#{candidate}_", siblings) } else { candidate }
+
+fn snake_of(name: String) : String =
+  if to_upper(name) == name { to_lower(name) } else { snake_chars(name, 0, []) }
+
+fn snake_chars(name: String, i: Int, acc: [String]) : String = match char_at(name, i) {
+  None -> concat_all(list_reverse(acc))
+  Some(c) ->
+    if c >= 'A' and c <= 'Z' {
+      let lower = to_lower(string_slice(name, i, 1))
+      snake_chars(name, i + 1, [if i == 0 { lower } else { "_#{lower}" }, ...acc])
+    } else { snake_chars(name, i + 1, [string_slice(name, i, 1), ...acc]) }
+}
+
+fn respell_scope(src: String, scope: [Token], lc: Int, renames: [Pair[String, String]]) : [Span] =
+  if list_is_empty(renames) { [] } else { scope_spans(src, scope, TkIdent, lc, renames, []) }
+
+# Walks the declaration's tokens: it ends at the first token that starts a line at or left of the head's indentation, a closing brace or paren included.
+fn scope_spans(src: String, ts: [Token], prev: TokKind, lc: Int, renames: [Pair[String, String]], acc: [Span]) : [Span] = match ts {
+  [] -> acc
+  [t, ...rest] ->
+    if tk_is(t.kind, TkNewline) { scope_spans(src, rest, TkNewline, lc, renames, acc) }
+    else if tk_is(prev, TkNewline) and t.col <= lc { acc }
+    else {
+      let next = next_kind(rest)
+      scope_spans(src, rest, t.kind, lc, renames, list_append(acc, use_span(src, t, prev, next, renames)))
+    }
+}
+
+fn use_span(src: String, t: Token, prev: TokKind, next: TokKind, renames: [Pair[String, String]]) : [Span] =
+  if tk_is(t.kind, TkIdent) and not tk_is(prev, TkDot) and not tk_is(next, TkLparen) {
+    match find(renames, (r) => r.fst == tok_source(src, t)) {
+      Some(r) -> [Span(t.start, t.length, r.snd)]
+      None -> []
+    }
+  } else { [] }
+
+fn next_kind(ts: [Token]) : TokKind = match ts {
+  [n, ..._] -> n.kind
+  [] -> TkEof
+}

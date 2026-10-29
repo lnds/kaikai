@@ -211,8 +211,10 @@ assembled from one list rather than reconstructed from git.
   migrate` renames a lowercase `const` to `UPPER_SNAKE_CASE` together
   with every use the resolver binds to it, and never a homonym; a
   renamed `pub const` is a breaking change for the importing package
-  (`real_pi` → `REAL_PI`, `owner_only` → `OWNER_ONLY`, …). Uppercase
-  type parameters are renamed by hand (`[T]` → `[t]`).
+  (`real_pi` → `REAL_PI`, `owner_only` → `OWNER_ONLY`, …). The same
+  rule respells uppercase type parameters (`[T]` → `[t]`) with every use
+  in their declaration; a legacy sibling module parses as written during
+  the run.
 
 - **Core helpers superseded by surface features** (audit in the
   closed issue #1807; scheduled, not yet removed). Seven core helpers
