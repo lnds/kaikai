@@ -9192,6 +9192,27 @@ test-issue-1588-main-exit-status: $(TARGET) bin-kai build
 	  || { echo "issue-1588 DIFF Process.exit (C backend, stdout not flushed)"; exit 1; }; \
 	echo "issue-1588 OK (C backend: Int main exits 3 with stdout flushed, Unit main exits 0, Process.exit(3) flushes and exits 3)"
 
+# Random.int_range with lo > hi exits non-zero with a diagnostic on stderr.
+test-random-inverted-range: $(TARGET) bin-kai build
+	@set -e; \
+	../bin/kai build --backend=c ../examples/random_inverted_range/inverted_range_exits.kai -o build/random-inv-c 2> build/random-inv-c.err \
+	  || { echo "random-inverted-range BUILD FAIL (C backend)"; cat build/random-inv-c.err; exit 1; }; \
+	st=0; ./build/random-inv-c > build/random-inv-c.out 2> build/random-inv-c.run || st=$$?; \
+	[ $$st -eq 1 ] || { echo "random-inverted-range FAIL (C backend): exit status $$st, expected 1"; exit 1; }; \
+	grep -q "Random.int_range: lo (5) > hi (3)" build/random-inv-c.run \
+	  || { echo "random-inverted-range FAIL (C backend): diagnostic missing"; cat build/random-inv-c.run; exit 1; }; \
+	echo "random-inverted-range OK (C backend)"
+
+test-random-inverted-range-native: $(TARGET) bin-kai build
+	@set -e; \
+	../bin/kai build --backend=native ../examples/random_inverted_range/inverted_range_exits.kai -o build/random-inv-n 2> build/random-inv-n.err \
+	  || { echo "random-inverted-range BUILD FAIL (native)"; cat build/random-inv-n.err; exit 1; }; \
+	st=0; ./build/random-inv-n > build/random-inv-n.out 2> build/random-inv-n.run || st=$$?; \
+	[ $$st -eq 1 ] || { echo "random-inverted-range FAIL (native): exit status $$st, expected 1"; exit 1; }; \
+	grep -q "Random.int_range: lo (5) > hi (3)" build/random-inv-n.run \
+	  || { echo "random-inverted-range FAIL (native): diagnostic missing"; cat build/random-inv-n.run; exit 1; }; \
+	echo "random-inverted-range OK (native)"
+
 # Issue #1590 — Stdout/Stderr/Stdin.is_tty() bridging to isatty(3).
 # Under a pipe/redirection all three answer false (the deterministic
 # half a harness can gate). The true half runs under a pseudo-TTY via
