@@ -335,6 +335,26 @@ boot seed emit "$out" 2>/dev/null || fail "seed emit after a failed cc failed"
 grep -q 'bootstrap/stage2.c' "$HOP_LOG" || fail "a seed whose cc failed was reused as cached"
 ok "a seed whose cc dies half way is relinked, never taken as cached"
 
+# ---- seed tags are fetched, or their absence warned about --------------
+up="$work/upstream.git"
+git init -q --bare "$up"
+g push -q "$up" --tags
+g remote add origin "$up"
+g tag -d bootstrap-seed-v9.9.9 >/dev/null
+boot seed emit "$out" 2>/dev/null
+case "$(boot_of)" in "seed bootstrap-seed-v9.9.9 "*) ;; *) fail "a seed tag only upstream was not fetched: [$(boot_of)]" ;; esac
+ok "seed boot fetches the seed tags it lacks"
+
+g tag -d bootstrap-seed-v9.9.9 >/dev/null
+g remote set-url origin "$work/missing.git"
+boot seed emit "$out" 2>"$work/seed.err"
+case "$(boot_of)" in "seed bootstrap-seed-v9.9.8 "*) ;; *) fail "an unreachable remote booted [$(boot_of)]" ;; esac
+grep -q 'warning: cannot fetch bootstrap-seed-v' "$work/seed.err" || fail "an unreachable remote was not warned about"
+ok "an unreachable remote warns and boots the newest local seed"
+g remote remove origin
+g fetch -q "$up" 'refs/tags/bootstrap-seed-v*:refs/tags/bootstrap-seed-v*'
+boot seed emit "$out" 2>/dev/null
+
 echo 9.9.8 > "$root/VERSION"
 is_stale seed "a seed following VERSION"
 boot seed emit "$out" 2>/dev/null

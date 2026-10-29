@@ -9,7 +9,9 @@
 #
 # The boot comes from $KAIC_BOOT (docs/build-system.md §KAIC_BOOT):
 #   release (or unset)  the kaic2 of the newest published release up to VERSION
-#   seed                the newest bootstrap-seed-v* tag up to VERSION, built by cc
+#   seed                the newest bootstrap-seed-v* tag up to VERSION, built by cc;
+#                       the tags are fetched from $KAIC_BOOT_SEED_REMOTE (default
+#                       origin) first, KAIC_BOOT_SEED_FETCH=0 skips the fetch
 #   kaic1               the stage0 -> stage1 chain
 #   auto                a kaic2 this tree sealed, else release, else seed, else kaic1
 #   <path>              any kaic1- or kaic2-class binary
@@ -197,8 +199,18 @@ seed_cached() {
     && [ "$(field kaic2 "$1/boot.id")" = "$(sha_of "$1/kaic2" 2>/dev/null)" ]
 }
 
+# Seed tags point off main, so a clone never receives new ones by itself.
+# An unreachable remote is only a warning: the seeds already here still boot.
+fetch_seed_tags() {
+  [ "${KAIC_BOOT_SEED_FETCH:-1}" != 0 ] || return 0
+  remote="${KAIC_BOOT_SEED_REMOTE:-origin}"
+  git -C "$ROOT" fetch -q --no-tags "$remote" 'refs/tags/bootstrap-seed-v*:refs/tags/bootstrap-seed-v*' 2>/dev/null \
+    || say "warning: cannot fetch bootstrap-seed-v* tags from '$remote'; the newest seed may be stale"
+}
+
 boot_seed() {
   command -v git >/dev/null 2>&1 || { say "git not found"; return 1; }
+  fetch_seed_tags
   ver="$(seed_version)"
   [ -n "$ver" ] || { say "no bootstrap-seed-v* tag up to v$(cat "$ROOT/VERSION"); fetch them with" \
     "git fetch https://github.com/kaikailang-org/kaikai.git 'refs/tags/bootstrap-seed-v*:refs/tags/bootstrap-seed-v*'"; return 1; }
