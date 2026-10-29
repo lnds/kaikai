@@ -59,25 +59,20 @@ fn fact_call(e: Expr, a: FactAcc) : FactAcc = match a {
   }
 }
 
-#[doc("The reaching parameters of every function in `facts`, given those already known for the functions they call.")]
-pub fn spawn_params_from(facts: [SpawnFacts], known: [SpawnParam]) : [SpawnParam] =
-  spawn_params_fix(facts, known, [])
-
-#[doc("The entries of `table` that belong to functions declared in `decls`.")]
-pub fn spawn_params_in(table: [SpawnParam], decls: [Decl]) : [SpawnParam] = {
-  let own = fn_decls(decls, [])
-  filter(table, (m) => match m {
-    SPm(s, _) -> any(own, (d) => match d {
-      DFn(_, fid, _, _, _, _, _, _, _, _) -> sym_raw(fnid_sym(fid)) == sym_raw(s)
-      _                                   -> false
-    })
-  })
-}
+#[doc("The reaching parameters of every function in `facts`.")]
+pub fn spawn_params_from(facts: [SpawnFacts]) : [SpawnParam] =
+  spawn_params_fix(facts, [])
 
 #[doc("The positions of the parameters of `f` that reach a spawned fiber.")]
 pub fn spawn_params_for(table: [SpawnParam], f: SymId) : [Int] = match table {
   []                  -> []
-  [SPm(s, ps), ...rest] -> if sym_raw(s) >= 0 and sym_raw(s) == sym_raw(f) { ps } else { spawn_params_for(rest, f) }
+  [SPm(s, ps, _), ...rest] -> if sym_raw(s) >= 0 and sym_raw(s) == sym_raw(f) { ps } else { spawn_params_for(rest, f) }
+}
+
+#[doc("The effects `f` answers inside the fiber for the values it receives, so a caller need not keep them out of its arguments.")]
+pub fn spawn_answered_for(table: [SpawnParam], f: SymId) : [SymId] = match table {
+  []                  -> []
+  [SPm(s, _, answered), ...rest] -> if sym_raw(s) >= 0 and sym_raw(s) == sym_raw(f) { answered } else { spawn_answered_for(rest, f) }
 }
 
 #[doc("The function a call or a pipe into a function reaches, with the arguments it passes.")]
@@ -117,23 +112,23 @@ fn fn_decls(ds: [Decl], acc: [Decl]) : [Decl] = match ds {
   }
 }
 
-fn spawn_params_fix(facts: [SpawnFacts], known: [SpawnParam], prev: [SpawnParam]) : [SpawnParam] = {
-  let table = list_append(prev, known)
-  let next = filter(map(facts, (f) => fn_spawn_params(table, f)), (m) => match m { SPm(_, ps) -> not list_is_empty(ps) })
-  if spawn_params_size(next) == spawn_params_size(prev) { next } else { spawn_params_fix(facts, known, next) }
+fn spawn_params_fix(facts: [SpawnFacts], prev: [SpawnParam]) : [SpawnParam] = {
+  let next = filter(map(facts, (f) => fn_spawn_params(prev, f)), (m) => match m { SPm(_, ps, _) -> not list_is_empty(ps) })
+  if spawn_params_size(next) == spawn_params_size(prev) { next } else { spawn_params_fix(facts, next) }
 }
 
-fn spawn_params_size(t: [SpawnParam]) : Int = foldl(t, 0, (n, m) => match m { SPm(_, ps) -> n + list_length(ps) })
+fn spawn_params_size(t: [SpawnParam]) : Int = foldl(t, 0, (n, m) => match m { SPm(_, ps, _) -> n + list_length(ps) })
 
 fn fn_spawn_params(table: [SpawnParam], f: SpawnFacts) : SpawnParam = match f {
   SF(d, sp, cs, lets) -> match d {
     DFn(_, fid, _, params, _, _, _, _, _, _) -> {
-      let sinks = list_append(foldl(sp, [], (a, e) => list_append(spawn_thunk_of(e), a)),
-                              foldl(cs, [], (a, e) => list_append(marked_args(table, e), a)))
-      if list_is_empty(sinks) { SPm(fnid_sym(fid), []) }
-      else { SPm(fnid_sym(fid), reaching_params(params, sinks, lets, 0, [])) }
+      let thunks = foldl(sp, [], (a, e) => list_append(spawn_thunk_of(e), a))
+      let calls = foldl(cs, [], (a, e) => list_append(marked_args(table, e), a))
+      let reaching = reaching_params(params, list_append(thunks, calls), lets, 0, [])
+      if list_is_empty(reaching) { SPm(fnid_sym(fid), [], []) }
+      else { SPm(fnid_sym(fid), reaching, answered_params(params, reaching, thunks, calls, lets)) }
     }
-    _ -> SPm(sym_none(), [])
+    _ -> SPm(sym_none(), [], [])
   }
 }
 
@@ -147,6 +142,47 @@ fn reaching_params(params: [Param], sinks: [Expr], lets: [LetBind], i: Int, acc:
   [p, ...rest] ->
     if any(sinks, (s) => reads_through(p.binder.id, s, lets)) { reaching_params(rest, sinks, lets, i + 1, [i, ...acc]) }
     else { reaching_params(rest, sinks, lets, i + 1, acc) }
+}
+
+# What every reaching parameter's value performs that the fiber's thunk does
+# not: the function answers it before the fiber runs it.
+fn answered_params(params: [Param], reaching: [Int], thunks: [Expr], calls: [Expr], lets: [LetBind]) : [SymId] =
+  unwrap_or(foldl(reaching, None, (acc, i) => match nth_param(params, i) {
+    Some(p) -> meet_syms(acc, answered_of(p.binder.id, thunks, calls, lets))
+    None    -> meet_syms(acc, [])
+  }), [])
+
+fn nth_param(params: [Param], i: Int) : Option[Param] = match params {
+  []           -> None
+  [p, ...rest] -> if i == 0 { Some(p) } else { nth_param(rest, i - 1) }
+}
+
+# A value passed on to another function, or reached through a local, is
+# answered nowhere the caller can rely on.
+fn answered_of(l: LocalId, thunks: [Expr], calls: [Expr], lets: [LetBind]) : [SymId] =
+  if any(calls, (c) => reads_through(l, c, lets)) { [] }
+  else { unwrap_or(foldl(filter(thunks, (t) => reads_through(l, t, lets)), None,
+                         (acc, t) => meet_syms(acc, answered_in(l, t))), []) }
+
+fn answered_in(l: LocalId, thunk: Expr) : [SymId] =
+  unwrap_or(foldl(local_reads(l, thunk), None,
+                  (acc, r) => meet_syms(acc, minus_syms(row_syms(r.ty), row_syms(thunk.ty)))), [])
+
+fn local_reads(l: LocalId, e: Expr) : [Expr] = match e.kind {
+  ELocal(x) -> if local_eq(x, l) { [e] } else { [] }
+  _         -> foldl(xp_positions(e), [], (a, p) => match p { XP(_, c) -> list_append(a, local_reads(l, c)) })
+}
+
+fn row_syms(t: Option[Ty]) : [SymId] = match t {
+  Some(TyFnT(_, _, row)) -> map(row.labels, .sym)
+  _                      -> []
+}
+
+fn minus_syms(xs: [SymId], ys: [SymId]) : [SymId] = filter(xs, (x) => not any(ys, (y) => sym_raw(y) == sym_raw(x)))
+
+fn meet_syms(acc: Option[[SymId]], xs: [SymId]) : Option[[SymId]] = match acc {
+  None     -> Some(xs)
+  Some(ys) -> Some(minus_syms(ys, minus_syms(ys, xs)))
 }
 
 fn reads_through(l: LocalId, e: Expr, lets: [LetBind]) : Bool =
