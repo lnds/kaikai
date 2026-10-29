@@ -11,7 +11,7 @@ import compiler.ast_decl
 import compiler.ast_ids
 import compiler.written
 import compiler.symtab
-import compiler.util.{list_is_empty, list_has}
+import compiler.util.{list_is_empty}
 import compiler.emit_shared_alias.{map_expr_kind}
 
 # --- rewrite pass over decls ------------------------------------------
@@ -168,43 +168,41 @@ fn file_op_pairs() : [Pair[String, String]] = [
 #[doc("The `fs.file` method that replaces the bare file operation `name`, when it is one.")]
 pub(pkg) fn file_op_replacement(name: String) : Option[String] = lookup_file_op(file_op_pairs(), name)
 
+#[doc("The bare names of the core file operations.")]
+pub(pkg) fn file_op_names() : [String] = map(file_op_pairs(), .fst)
+
 fn lookup_file_op(ps: [Pair[String, String]], name: String) : Option[String] = match ps {
   [] -> None
   [p, ...rest] -> if p.fst == name { Some(p.snd) } else { lookup_file_op(rest, name) }
 }
 
-# A name the file declares or imports selectively is the file's own, never the core operation.
-fn file_op_method(own: [String], callee: Expr) : Option[String] = match callee.kind {
-  EName(w) -> if list_has(own, written_text(w)) { None } else { lookup_file_op(file_op_pairs(), written_text(w)) }
-  _ -> None
+#[doc("A call site the resolver left bound to nothing: a bare core file operation, at its line and column.")]
+pub(pkg) type CoreSite = CSite(Int, Int)
+
+fn is_core_site(sites: [CoreSite], callee: Expr) : Bool = match sites {
+  [] -> false
+  [CSite(l, c), ...rest] -> if l == callee.line and c == callee.col { true } else { is_core_site(rest, callee) }
 }
 
-fn qualify_file_op(own: [String], callee: Expr) : Expr = match file_op_method(own, callee) {
-  Some(m) -> with_kind(callee, EField(with_kind(callee, EName(written("file"))), m))
-  None -> callee
+fn qualify_file_op(sites: [CoreSite], callee: Expr) : Expr = match callee.kind {
+  EName(w) -> match lookup_file_op(file_op_pairs(), written_text(w)) {
+    Some(m) -> if is_core_site(sites, callee) { with_kind(callee, EField(with_kind(callee, EName(written("file"))), m)) } else { callee }
+    None -> callee
+  }
+  _ -> callee
 }
 
-fn qualify_expr(own: [String], e: Expr) : Expr = {
-  let k = map_expr_kind(e.kind, (x) => qualify_expr(own, x))
+fn qualify_expr(sites: [CoreSite], e: Expr) : Expr = {
+  let k = map_expr_kind(e.kind, (x) => qualify_expr(sites, x))
   match k {
-    ECall(callee, cargs) -> with_kind(e, ECall(qualify_file_op(own, callee), cargs))
+    ECall(callee, cargs) -> with_kind(e, ECall(qualify_file_op(sites, callee), cargs))
     _ -> with_kind(e, k)
   }
 }
 
-#[doc("Rewrite each bare call of a core file operation to `file.<op>`, leaving a function the file declares or imports under the same name alone.")]
-pub(pkg) fn mig_qualify_file_ops(tab: SymTab, decls: [Decl]) : [Decl] = {
-  let own = flat_map(decls, (d) => decl_own_names(tab, d))
-  map(decls, (d) => decl_map_bodies(d, (body) => qualify_expr(own, body)))
-}
-
-fn decl_own_names(tab: SymTab, d: Decl) : [String] = match d {
-  DFn(_, fid, _, _, _, _, _, _, _, _) -> [written_text(sym_name(tab, fnid_sym(fid)))]
-  DImport(IkSelective(_, names), _, _) -> names
-  DAttr(_, inner, _, _) -> decl_own_names(tab, inner)
-  DDoc(_, _, inner, _, _) -> decl_own_names(tab, inner)
-  _ -> []
-}
+#[doc("Rewrite each call of a core file operation, as the resolver found them, to `file.<op>`; a name the file binds itself or imports is never in `sites`.")]
+pub(pkg) fn mig_qualify_file_ops(sites: [CoreSite], decls: [Decl]) : [Decl] =
+  map(decls, (d) => decl_map_bodies(d, (body) => qualify_expr(sites, body)))
 
 # A qualified call of a file operation: the program already needs `import fs.file`.
 fn is_qualified_file_op(mm: Pair[String, String]) : Bool =

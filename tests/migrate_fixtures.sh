@@ -41,7 +41,7 @@ for input in "$ROOT"/examples/migrate/*.input.kai; do
   fi
 
   # 1. rewrite matches the golden
-  if ! "$KAIC2" --migrate --edition hanga-roa "$input" > "$tmp/out.kai" 2> "$tmp/err"; then
+  if ! "$KAIC2" --path "$ROOT/stdlib" --migrate --edition hanga-roa "$input" > "$tmp/out.kai" 2> "$tmp/err"; then
     echo "  FAIL $name — migrate rejected input:"
     sed 's/^/      /' "$tmp/err"
     fail=$((fail + 1)); continue
@@ -54,7 +54,7 @@ for input in "$ROOT"/examples/migrate/*.input.kai; do
 
   # 2. idempotency: the second run sees a package the first run moved
   #    to orongo, and must be a byte-for-byte no-op.
-  if ! "$KAIC2" --migrate --edition orongo "$expected" > "$tmp/out2.kai" 2> "$tmp/err"; then
+  if ! "$KAIC2" --path "$ROOT/stdlib" --migrate --edition orongo "$expected" > "$tmp/out2.kai" 2> "$tmp/err"; then
     echo "  FAIL $name — migrate rejected expected (idempotency):"
     sed 's/^/      /' "$tmp/err"
     fail=$((fail + 1)); continue
@@ -74,7 +74,7 @@ for input in "$ROOT"/examples/migrate/*.input.kai; do
 
   # 4. optional: the `manual:` report matches the golden
   if [ -f "$report" ]; then
-    "$KAIC2" --migrate "$input" > /dev/null 2> "$tmp/rep"
+    "$KAIC2" --path "$ROOT/stdlib" --migrate "$input" > /dev/null 2> "$tmp/rep"
     if ! diff -u "$report" "$tmp/rep" > "$tmp/diff"; then
       echo "  FAIL $name — manual report != expected:"
       sed 's/^/      /' "$tmp/diff"
@@ -94,7 +94,7 @@ done
 # paths run the fmt-writer, so this isolates the rewrite from layout.
 err_first="$ROOT/examples/migrate/result_ok_first.input.kai"
 "$KAIC2" --fmt "$err_first" > "$tmp/orongo.want" 2> /dev/null
-if "$KAIC2" --migrate --edition orongo "$err_first" > "$tmp/orongo.kai" 2> "$tmp/err"; then
+if "$KAIC2" --path "$ROOT/stdlib" --migrate --edition orongo "$err_first" > "$tmp/orongo.kai" 2> "$tmp/err"; then
   if diff -u "$tmp/orongo.want" "$tmp/orongo.kai" > "$tmp/diff"; then
     echo "  OK   edition-gate (no Result flip under orongo)"
     pass=$((pass + 1))
