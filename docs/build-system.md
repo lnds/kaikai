@@ -337,6 +337,7 @@ Each runs in seconds with a built kaic2. Run the ones a change can touch; a red 
 | `make test-symid-names-static` | a name's text kept beside an id; a `written_text` read not in `tools/baselines/symid-written-readers/` | key by the id; list a legitimate read with its reason (the file header defines them) |
 | `tools/compiler-lint-ratchet.sh` | a new `kai lint` finding in the compiler | fix the finding; its entry file goes with it |
 | `make test-walker-catchall-audit` | a new `match` over many AST constructors closed by `_` | explicit arms for a walker; a pure recognizer gets an entry in `tools/baselines/walker-catchall/` with its reason |
+| `make test-binder-case-audit` | a parser function that mints a binder without consulting the naming table (`tok_bad` / `name_bad`) | call the table in it; a function whose caller or collector checks is pinned in `tools/baselines/binder-case/` with its reason |
 | `make test-diag-channel-audit` | a function printing an `error:`/`warning:` line itself instead of building the diagnostic with `mk_diag` and printing it with `render_diag` | return the `Diagnostic`; a function that must print by hand is pinned in `tools/baselines/diag-channel/` with its reason |
 | `tools/test-check-parity.sh` | `--diags-json` disagreeing with `kai build` on a negative fixture | report the same diagnostic on both paths |
 | `make test-km-new-files` | a new file below `km score` C- | simplify or split along a cohesive seam |
