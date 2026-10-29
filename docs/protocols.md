@@ -529,7 +529,11 @@ fn main() : Unit / Stdout = {
 ```
 
 Refined types `T where P` inherit `impl P` from their base type
-unless the user provides a more specific impl.
+unless the user provides a more specific impl. A refinement alias is
+nominal for impls: `impl Show for Email` belongs to `Email`, so a value
+typed `Email` uses it, while a plain `String`, and a `String where`
+written inline (even with the same predicate), use `String`'s impl. An
+op the alias does not implement falls back to the base type's impl.
 
 ### With effects
 
