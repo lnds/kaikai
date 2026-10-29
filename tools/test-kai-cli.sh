@@ -373,7 +373,7 @@ PY
 else
   echo "test-kai-cli: warning: python3 not found; skipping the mutate JSON roundtrip" >&2
 fi
-expect_line "mutate: --apply names a site the module does not have" 1 "mutate: no site 99 (the file has 7)" \
+expect_line "mutate: --apply names a site the module does not have" 1 "mutate: no site 99 (the file has 8)" \
   sh -c 'cd "$1" && "$2" mutate --apply 99 --module greet.kai' _ "$U" "$KAI"
 # `enclosing` names the module by its path in the package, so two files of
 # one name in different directories never share a key.

@@ -13,6 +13,12 @@ than every binary operator, so a bare prefix is well-formed only on an
 atom. `make -C stage2 test-mutate-negate-shapes` pins the catalogue and
 `--check`s every `negate` mutant.
 
+`return_shapes.kai` carries one function per result type the `return`
+operator writes a value for (`Int`, `Real`, `Bool`, `String`, lists,
+`Option`, `Result`), the ones whose result already is that value, and
+the types it leaves alone. `make -C stage2 test-mutate-return-shapes`
+pins the catalogue and `--check`s every `return` mutant.
+
 `no_sites.kai` has nothing to mutate: its catalogue
 (`no_sites.sites.expected`) is empty and a run counts no mutant.
 `tools/test-kai-cli.sh` checks both through `kai mutate`.
@@ -51,7 +57,7 @@ diff <(./stage2/kaic2 --mutate-list examples/mutate/operators.kai --path stdlib)
 Two invariants the golden pins, both of which a passing diff proves:
 
 - **Every operator finds its construct.** A site list missing `arm`,
-  `compare`, `connect`, `negate`, `literal` or `call` means an operator
+  `compare`, `connect`, `negate`, `literal`, `call` or `return` means an operator
   stopped matching the shape it targets.
 - **The last arm of a `match` is never a site.** Dropping it makes the
   match non-exhaustive, so the mutant is a compile error rather than a
