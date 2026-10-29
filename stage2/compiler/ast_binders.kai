@@ -24,7 +24,14 @@ pub(pkg) type Violation = Violation(Int, Int, String)
 
 #[doc("The first binder, in source order, spelled against the naming table; `legacy` lets the migratable kinds through.")]
 pub(pkg) fn binder_violation(legacy: Bool, ds: [Decl], tab: SymTab) : Option[Violation] =
-  foldl(flat_map(ds, (d) => decl_facts(d, tab)), None, (best, f) => earliest(best, fact_violation(legacy, f)))
+  if any(ds, (d) => decl_suspect(legacy, d, tab)) {
+    foldl(flat_map(ds, (d) => decl_facts(d, tab)), None, (best, f) => earliest(best, fact_violation(legacy, f)))
+  } else { None }
+
+# A cheap scan first: the heads of a declaration, then its bodies without allocating a node list.
+fn decl_suspect(legacy: Bool, d: Decl, tab: SymTab) : Bool =
+  any(decl_facts_with(false, d, tab), (f) => is_some(fact_violation(legacy, f))) or
+    any(decl_exprs(d), (e) => xp_exists(e, false, (x) => any(expr_own(x), (f) => is_some(fact_violation(legacy, f)))))
 
 fn fact_violation(legacy: Bool, f: AstFact) : Option[Violation] = match f {
   FBind(k, name, l, c) ->
@@ -44,40 +51,45 @@ fn earliest(a: Option[Violation], b: Option[Violation]) : Option[Violation] = ma
 fn name_of(tab: SymTab, s: SymId) : String = written_text(sym_name(tab, s))
 
 #[doc("Every fact of a declaration; `tab` names the symbols the declaration was minted for.")]
-pub(pkg) fn decl_facts(d: Decl, tab: SymTab) : [AstFact] = match d {
+pub(pkg) fn decl_facts(d: Decl, tab: SymTab) : [AstFact] = decl_facts_with(true, d, tab)
+
+# `bodies` off leaves the expressions of a declaration's bodies to the caller.
+fn decl_facts_with(bodies: Bool, d: Decl, tab: SymTab) : [AstFact] = match d {
   DFn(_, f, tps, ps, rt, row, body, l, c, _) ->
     cat([[FBind(NkFn, name_of(tab, fnid_sym(f)), l, c)], tparam_facts(tps), flat_map(ps, param_facts),
-         opt_ty_facts(rt), row_facts(row), expr_facts(body)])
+         opt_ty_facts(rt), row_facts(row), run_body_facts(bodies, body)])
   DType(_, s, tps, body, l, c, _, _) ->
     cat([[FBind(NkType, name_of(tab, s), l, c)], tparam_facts(tps), body_facts(tab, body, l, c)])
-  DTest(_, body, _, _, _) -> expr_facts(body)
-  DBench(_, body, _, _, _) -> expr_facts(body)
-  DCheck(_, ps, body, _, _, _) -> list_append(flat_map(ps, param_facts), expr_facts(body))
+  DTest(_, body, _, _, _) -> run_body_facts(bodies, body)
+  DBench(_, body, _, _, _) -> run_body_facts(bodies, body)
+  DCheck(_, ps, body, _, _, _) -> list_append(flat_map(ps, param_facts), run_body_facts(bodies, body))
   DImport(_, _, _) -> []
   DEffect(_, s, tps, ops, dfl, l, c, _) ->
     cat([[FBind(NkEffect, name_of(tab, s), l, c)], tparam_facts(tps), flat_map(ops, effect_op_facts), default_facts(dfl)])
   DProtocol(_, s, tps, ops, l, c, _) ->
     cat([[FBind(NkProtocol, name_of(tab, s), l, c)], tparam_facts(tps), flat_map(ops, proto_op_facts)])
   DImpl(_, targs, tgt, ds, l, c, tps, _) ->
-    cat([flat_map(targs, ty_facts), ty_facts(tgt), tparam_facts(tps), flat_map(ds, (x) => decl_facts(x, tab))])
-  DDerive(_, inner, _, _) -> decl_facts(inner, tab)
-  DUnstable(inner, _, _) -> decl_facts(inner, tab)
-  DConstructor(inner, _, _) -> decl_facts(inner, tab)
-  DProtoLaws(_, inner, _, _, _) -> decl_facts(inner, tab)
-  DImplAxiom(_, inner, _, _, _) -> decl_facts(inner, tab)
-  DDoc(_, _, inner, _, _) -> decl_facts(inner, tab)
-  DAttr(_, inner, _, _) -> decl_facts(inner, tab)
+    cat([flat_map(targs, ty_facts), ty_facts(tgt), tparam_facts(tps), flat_map(ds, (x) => decl_facts_with(bodies, x, tab))])
+  DDerive(_, inner, _, _) -> decl_facts_with(bodies, inner, tab)
+  DUnstable(inner, _, _) -> decl_facts_with(bodies, inner, tab)
+  DConstructor(inner, _, _) -> decl_facts_with(bodies, inner, tab)
+  DProtoLaws(_, inner, _, _, _) -> decl_facts_with(bodies, inner, tab)
+  DImplAxiom(_, inner, _, _, _) -> decl_facts_with(bodies, inner, tab)
+  DDoc(_, _, inner, _, _) -> decl_facts_with(bodies, inner, tab)
+  DAttr(_, inner, _, _) -> decl_facts_with(bodies, inner, tab)
   DModuleDoc(_, _, _, _) -> []
   DUnit(_, _, _, _, _, _, _) -> []
   DUse(n, l, c) -> [FBind(NkUseEffect, n, l, c)]
   DUseKind(_, _, _, _) -> []
   DAxiom(_, abi, n, _, tps, ps, ty, row, l, c) ->
     cat([axiom_name_facts(abi, n, l, c), tparam_facts(tps), flat_map(ps, param_facts), ty_facts(ty), row_facts(row)])
-  DConst(_, s, ty, body, _, l, c) -> cat([[FBind(NkConst, name_of(tab, s), l, c)], ty_facts(ty), expr_facts(body)])
+  DConst(_, s, ty, body, _, l, c) -> cat([[FBind(NkConst, name_of(tab, s), l, c)], ty_facts(ty), run_body_facts(bodies, body)])
   DExternType(_, _, body, l, c, _) -> extern_type_facts(body, l, c)
   DTheory(n, _, l, c, _) -> [FBind(NkTheory, n, l, c)]
   DKind(_, n, _, _, _, l, c, _) -> [FBind(NkKind, n, l, c)]
 }
+
+fn run_body_facts(on: Bool, e: Expr) : [AstFact] = if on { expr_facts(e) } else { [] }
 
 fn cat(xs: [[AstFact]]) : [AstFact] = flat_map(xs, (x) => x)
 
