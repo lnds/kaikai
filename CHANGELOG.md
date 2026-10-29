@@ -84,6 +84,24 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.184.0 (2026-10-29)
+
+### BREAKING CHANGE
+
+- userdata calls need `Ffi` in the caller's row (exported
+callbacks list `/ Ffi`) and `Userdata` is written `Userdata[T]`.
+
+### Added
+
+- **stdlib**: type FFI userdata and require Ffi
+
+### Fixed
+
+- **test**: restore the numeric div-by-zero native gate row
+- **runtime**: trap when a userdata index no longer fits the handle
+- **runtime**: classify the userdata table globals for the global audit
+- **runtime**: pin the fiber during exported callbacks and chain the previous SIGSEGV handler
+
 ## v0.183.0 (2026-10-28)
 
 ### Added
