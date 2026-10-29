@@ -11,6 +11,7 @@ import compiler.ast_decl
 import compiler.ast_ids
 import compiler.written
 import compiler.symtab
+import compiler.util.{list_is_empty}
 
 # --- rewrite pass over decls ------------------------------------------
 
@@ -151,6 +152,76 @@ fn call_mod_method_field(obj: Expr, method: String) : Option[Pair[String, String
   _ -> None
 }
 
+# The bare file operations are reached as `file.<method>` after `import fs.file`.
+fn file_op_pairs() : [Pair[String, String]] = [
+  Pair { fst: "read_file",        snd: "read"        },
+  Pair { fst: "write_file",       snd: "write"       },
+  Pair { fst: "file_append",      snd: "append"      },
+  Pair { fst: "file_exists",      snd: "exists"      },
+  Pair { fst: "file_delete",      snd: "delete"      },
+  Pair { fst: "file_rename",      snd: "rename"      },
+  Pair { fst: "file_read_bytes",  snd: "read_bytes"  },
+  Pair { fst: "file_write_bytes", snd: "write_bytes" }
+]
+
+#[doc("The `fs.file` method that replaces the bare file operation `name`, when it is one.")]
+pub(pkg) fn file_op_replacement(name: String) : Option[String] = lookup_file_op(file_op_pairs(), name)
+
+fn lookup_file_op(ps: [Pair[String, String]], name: String) : Option[String] = match ps {
+  [] -> None
+  [p, ...rest] -> if p.fst == name { Some(p.snd) } else { lookup_file_op(rest, name) }
+}
+
+fn file_op_method(callee: Expr) : Option[String] = match callee.kind {
+  EName(w) -> lookup_file_op(file_op_pairs(), written_text(w))
+  _ -> None
+}
+
+fn qualify_file_op(callee: Expr) : Expr = match file_op_method(callee) {
+  Some(m) -> with_kind(callee, EField(with_kind(callee, EName(written("file"))), m))
+  None -> callee
+}
+
+#[doc("Add `import fs.file` after the last import (or after any leading module doc) when the program does not already import it.")]
+pub(pkg) fn mig_ensure_file_import(decls: [Decl]) : [Decl] =
+  if list_is_empty(filter(decls, is_file_import)) { insert_file_import(decls) } else { decls }
+
+fn is_file_import(d: Decl) : Bool = match d {
+  DImport(IkPath(p), _, _) -> p == "fs.file"
+  DImport(IkAlias(p, _), _, _) -> p == "fs.file"
+  _ -> false
+}
+
+fn insert_file_import(ds: [Decl]) : [Decl] = {
+  let last_imp = last_import_index(ds)
+  let at = if last_imp >= 0 { last_imp + 1 } else { leading_doc_count(ds, 0) }
+  let line = match nth(ds, last_imp) { Some(d) -> import_line(d) + 1  None -> 0 }
+  list_append(take(ds, at), [DImport(IkPath("fs.file"), line, 1), ...drop(ds, at)])
+}
+
+fn import_line(d: Decl) : Int = match d {
+  DImport(_, l, _) -> l
+  _ -> 0
+}
+
+fn last_import_index(ds: [Decl]) : Int = last_import_loop(ds, 0, -1)
+
+fn last_import_loop(ds: [Decl], i: Int, acc: Int) : Int = match ds {
+  [] -> acc
+  [d, ...rest] -> match d {
+    DImport(_, _, _) -> last_import_loop(rest, i + 1, i)
+    _ -> last_import_loop(rest, i + 1, acc)
+  }
+}
+
+fn leading_doc_count(ds: [Decl], n: Int) : Int = match ds {
+  [] -> n
+  [d, ...rest] -> match d {
+    DModuleDoc(_, _, _, _) -> leading_doc_count(rest, n + 1)
+    _ -> n
+  }
+}
+
 fn rename_callee(callee: Expr, new_method: String) : Expr = match callee.kind {
   EField(obj, _) -> with_kind(callee, EField(obj, new_method))
   _ -> callee
@@ -162,7 +233,7 @@ fn rename_callee(callee: Expr, new_method: String) : Expr = match callee.kind {
 # callee in place when a rule matches (manual-only and no-match cases
 # leave the node untouched — the scan pass reports the manual ones).
 fn mig_apply_call(ft: Bool, e: Expr, callee: Expr, cargs: [Expr]) : Expr = match call_mod_method(callee) {
-  None -> with_kind(e, ECall(callee, cargs))
+  None -> with_kind(e, ECall(qualify_file_op(callee), cargs))
   Some(mm) -> match migrate_rule_for(mm.fst, mm.snd) {
     Some(CRl(new_method)) -> with_kind(e, ECall(rename_callee(callee, new_method), cargs))
     None -> with_kind(e, ECall(callee, cargs))
@@ -306,7 +377,7 @@ fn is_array_sentinel(modname: String, method: String, argc: Int) : Bool =
   } else { false }
 
 #[doc("One migration report event: an automatic rename (counted), or a change that needs a human, pinned to its source pointer.")]
-pub(pkg) type MigRep = MRRename | MRManual(MigrateManual)
+pub(pkg) type MigRep = MRRename | MRFileOp | MRManual(MigrateManual)
 
 # Flatten a list of per-element report lists via the `reduce` prim,
 # which runs in the runtime — so no AST 2nd-field binder ever feeds a
@@ -326,7 +397,16 @@ pub(pkg) fn mig_count_renames(reps: [MigRep]) : Int = list_length(filter(reps, i
 
 fn is_rename(r: MigRep) : Bool = match r {
   MRRename -> true
+  MRFileOp -> true
   MRManual(_) -> false
+}
+
+#[doc("True when an event list holds a bare file-operation call that `fs.file` now owns.")]
+pub(pkg) fn mig_has_file_op(reps: [MigRep]) : Bool = not list_is_empty(filter(reps, is_file_op))
+
+fn is_file_op(r: MigRep) : Bool = match r {
+  MRFileOp -> true
+  _ -> false
 }
 
 #[doc("The `manual:` pointers in an event list, in source order.")]
@@ -336,8 +416,8 @@ pub(pkg) fn mig_manuals(reps: [MigRep]) : [MigrateManual] =
 fn cat_manuals(acc: [MigrateManual], x: [MigrateManual]) : [MigrateManual] = list_append(acc, x)
 
 fn rep_manual(r: MigRep) : [MigrateManual] = match r {
-  MRRename -> []
   MRManual(m) -> [m]
+  _ -> []
 }
 
 # --- scan pass: Expr -> [MigRep] --------------------------------------
@@ -352,7 +432,10 @@ fn scan_callee(callee: Expr) : [MigRep] = scan_expr(callee)
 # already-computed arg count. The recursive scan of the arguments is
 # emitted by the ECall arm, so this handles only the head.
 fn scan_call_head(e: Expr, callee: Expr, argc: Int) : [MigRep] = match call_mod_method(callee) {
-  None -> []
+  None -> match file_op_method(callee) {
+    Some(_) -> [MRFileOp]
+    None -> []
+  }
   Some(mm) -> scan_head_rule(e, mm, argc)
 }
 

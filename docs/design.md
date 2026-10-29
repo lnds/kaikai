@@ -259,7 +259,7 @@ cc stage0/*.c -o kaic0
 - Immutable lists.
 - Tagged sum types (for AST representation): `type Expr = Lit(Int) | Add(Expr, Expr)`.
 - Basic records.
-- Minimal file IO (`read_file`, `write_file`, `print`).
+- Minimal file IO (`file.read`, `file.write`, `print`).
 - `Result[T, E]` and `Option[T]` for error handling.
 - Pattern matching over sum types and lists.
 - Mandatory type annotations (no inference yet).

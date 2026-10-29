@@ -6,7 +6,7 @@ kaikai bridges to C through two distinct mechanisms:
    the standard library (libm, filesystem, process, time, …).
    Implemented in the runtime and declared with `extern "kai"`
    in a core stdlib module, which makes them globally available. Users do not see them; the
-   compiler-dev does. This is how `real_sqrt`, `read_file`,
+   compiler-dev does. This is how `real_sqrt`, `__file_read`,
    `int_to_string`, etc. reach C code.
 
 2. **`extern "C"` declarations** (FFI v1) — user-facing FFI.
