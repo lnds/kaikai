@@ -355,17 +355,16 @@ The principle: a user planning to upgrade can read the release
 notes, run `kai migrate`, and have a working build. Worst case,
 the migration leaves diagnostics that explain what to fix.
 
-`kai migrate` supports only `hanga-roa → orongo`, and `--write` also
-stamps the target edition into `kai.toml`. Its rule set today:
+`kai migrate` supports `tongariki → orongo` and `hanga-roa → orongo`, and
+`--write` also stamps the target edition into `kai.toml`. Its rule set today:
 
 - `map.from_pairs`, `hashmap.from_pairs`, `set.from_list`,
   `hashset.from_list` → `.from`;
 - `stream.fold`, `map.fold` → `foldl`; `string_builder.len` → `length`;
 - the two type arguments of every `Result[_, _]` annotation are
-  swapped (only when the source edition is `hanga-roa`). Hanga Roa's
-  `Result` is already Ok-first (`Result[T, E]`), so this rule turns
-  well-typed Hanga Roa source into source that no longer type-checks;
-  review its output before `--write`;
+  swapped, only when the source edition is `tongariki`, whose `Result`
+  is Err-first. Hanga Roa's `Result` is already Ok-first
+  (`Result[T, E]`), so a `hanga-roa` source keeps its annotations;
 - `array.from` / `array.copy` with a `default` argument → reported as
   `manual:`.
 
