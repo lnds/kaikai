@@ -197,7 +197,7 @@ fn parse(s: String) : Int / Stdout + Fail = match string_to_int(s) {
 }
 
 # Polymorphic row
-fn apply_all[A, B, e](xs: [A], f: (A) -> B / e) : [B] / e = xs | f
+fn apply_all[a, b, e](xs: [a], f: (a) -> b / e) : [b] / e = xs | f
 
 fn main() : Int = 0
 ```
@@ -276,9 +276,9 @@ effect Fail {
   fail(msg: String) : Nothing
 }
 
-effect State[T] {
-  get() : T
-  set(v: T) : Unit
+effect State[t] {
+  get() : t
+  set(v: t) : Unit
 }
 
 fn main() : Int = 0
@@ -678,7 +678,7 @@ fn parse_int(s: String) : Int / Fail = match string_to_int(s) {
   None    -> Fail.fail("not a number: #{s}")
 }
 
-fn map[A, B, e](xs: [A], f: (A) -> B / e) : [B] / e {
+fn map[a, b, e](xs: [a], f: (a) -> b / e) : [b] / e {
   match xs {
     []           -> []
     [h, ...rest] -> [f(h), ...map(rest, f)]
@@ -706,9 +706,9 @@ the body without exposing mutation to the user. Declaration
 repeated here for convenience:
 
 ```kaikai
-effect State[T] {
-  get() : T
-  set(v: T) : Unit
+effect State[t] {
+  get() : t
+  set(v: t) : Unit
 }
 
 fn main() : Int = 0
@@ -721,9 +721,9 @@ second argument: `resume(value, new_state)` resumes the body with
 leaves state unchanged.
 
 ```kaikai
-effect State[T] {
-  get() : T
-  set(v: T) : Unit
+effect State[t] {
+  get() : t
+  set(v: t) : Unit
 }
 
 fn sum(xs: [Int]) : Int {
@@ -764,9 +764,9 @@ Eff) calls *handler-scope* masking.
 ### Composed handlers
 
 ```kaikai
-effect State[T] {
-  get() : T
-  set(v: T) : Unit
+effect State[t] {
+  get() : t
+  set(v: t) : Unit
 }
 
 effect Fail {

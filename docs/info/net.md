@@ -39,7 +39,7 @@ fn serve(l: Listener) : Int / NetUnix + Process =
     }
   }
 
-fn main() : Int / NetUnix + Process = match listen("/tmp/demo.sock", owner_only) {
+fn main() : Int / NetUnix + Process = match listen("/tmp/demo.sock", OWNER_ONLY) {
   Err(_) -> 1
   Ok(l)  -> {
     let rc = serve(l)
@@ -49,7 +49,7 @@ fn main() : Int / NetUnix + Process = match listen("/tmp/demo.sock", owner_only)
 }
 ```
 
-- `mode` is the socket file's permission bits; `owner_only` is
+- `mode` is the socket file's permission bits; `OWNER_ONLY` is
   `0600` (kaikai has no octal literal). The file carries it from the
   moment it is reachable — no `chmod` afterwards.
 - `listen` replaces a socket nobody listens on (a crash leftover) and

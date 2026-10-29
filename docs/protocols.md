@@ -82,7 +82,7 @@ every op.
 
 ```kaikai
 type Point = { x: Int, y: Int }
-type Tagged[T] = { tag: String, value: T }
+type Tagged[t] = { tag: String, value: t }
 
 impl Show for Point {
   fn show(p: Point) : String = "(#{p.x}, #{p.y})"
@@ -92,8 +92,8 @@ impl Eq for Point {
   fn eq(a: Point, b: Point) : Bool = a.x == b.x and a.y == b.y
 }
 
-impl[T] Show for Tagged[T] {
-  fn show(t: Tagged[T]) : String = "<#{t.tag}>"
+impl[t] Show for Tagged[t] {
+  fn show(t: Tagged[t]) : String = "<#{t.tag}>"
 }
 
 fn main() : Unit / Stdout = {
@@ -115,10 +115,10 @@ to know `T` itself implements `Show`. An impl-site bound makes that
 requirement explicit:
 
 ```kaikai
-type Bag[T] = { items: [T] }
+type Bag[t] = { items: [t] }
 
-impl[T : Show] Show for Bag[T] {
-  fn show(b : Bag[T]) : String = match b.items {
+impl[t : Show] Show for Bag[t] {
+  fn show(b : Bag[t]) : String = match b.items {
     []           -> "Bag()"
     [x, ...rest] -> "Bag(" ++ show(x) ++ ", +" ++ show(length(rest)) ++ ")"
   }
@@ -130,10 +130,10 @@ fn main() : Unit / Stdout = Stdout.print(show(Bag { items: [1, 2, 3] }))
 Bounds stack with `+`:
 
 ```kaikai
-type Bag[T] = { items: [T] }
+type Bag[t] = { items: [t] }
 
-impl[T : Show + Eq] Show for Bag[T] {
-  fn show(b : Bag[T]) : String = match b.items {
+impl[t : Show + Eq] Show for Bag[t] {
+  fn show(b : Bag[t]) : String = match b.items {
     [x, y, ..._] -> if x == y { "Bag(" ++ show(x) ++ " twice)" } else { "Bag(..)" }
     _            -> "Bag(..)"
   }
@@ -176,10 +176,10 @@ protocol op on `T`) do not need a bound and continue to work as
 before:
 
 ```kaikai
-type Bag[T] = { items: [T] }
+type Bag[t] = { items: [t] }
 
-impl[T] Show for Bag[T] {
-  fn show(b : Bag[T]) : String = "bag-of-something"   # OK, no dispatch on T
+impl[t] Show for Bag[t] {
+  fn show(b : Bag[t]) : String = "bag-of-something"   # OK, no dispatch on T
 }
 
 fn main() : Unit / Stdout = Stdout.print(show(Bag { items: [(x: Int) => x] }))
@@ -342,8 +342,8 @@ impl Default for Int    { fn default() : Int    = 0 }
 impl Default for Real   { fn default() : Real   = 0.0 }
 impl Default for Bool   { fn default() : Bool   = false }
 impl Default for String { fn default() : String = "" }
-impl[T] Default for [T]       { fn default() : [T]       = [] }
-impl[T] Default for Option[T] { fn default() : Option[T] = None }
+impl[t] Default for [t]       { fn default() : [t]       = [] }
+impl[t] Default for Option[t] { fn default() : Option[t] = None }
 
 fn main() : Unit = ()
 ```
@@ -359,7 +359,7 @@ single dispatch resolves it the same way `Serialize.from_string` and
 `let x : T = default()` annotation. A generic helper carries the bound:
 
 ```kaikai
-fn make[T : Default]() : T = default()
+fn make[t : Default]() : t = default()
 
 fn main() : Unit / Stdout = {
   let n : Int = default()

@@ -67,7 +67,7 @@ type Color = Red | Green | Blue
 # Declares 4 types: Red, Green, Blue (auto-declared unit-like) and
 # Color = Red | Green | Blue.
 
-type Tree[A] = Leaf | Node(A, Tree[A], Tree[A])
+type Tree[a] = Leaf | Node(a, Tree[a], Tree[a])
 # Declares Leaf (auto-declared unit) and Node[A] (auto-declared
 # record { 0: A, 1: Tree[A], 2: Tree[A] }) and Tree.
 

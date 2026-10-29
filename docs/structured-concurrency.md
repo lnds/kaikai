@@ -254,7 +254,7 @@ the `m8x_8_brand_dump.brands.expected` golden under tier 1.
 import spawn
 
 # Polymorphic over whatever effect the worker carries.
-pub fn pmap[A, B, e](xs: [A], f: (A) -> B / e) : [B] / Spawn + Cancel + e {
+pub fn pmap[a, b, e](xs: [a], f: (a) -> b / e) : [b] / Spawn + Cancel + e {
   nursery { n ->
     xs | (x) => n.spawn { f(x) } | n.await
   }
@@ -345,7 +345,7 @@ contract this enforces.
 ```kaikai
 import spawn
 
-pub fn race[T, e](options: [() -> T / e]) : T / Spawn + Cancel + e {
+pub fn race[t, e](options: [() -> t / e]) : t / Spawn + Cancel + e {
   nursery { n ->
     let fibers = options | (f) => n.spawn(f)
     n.select(fibers)
@@ -371,14 +371,14 @@ of waiting out work whose result nobody can observe.
 import spawn
 import time
 
-type Outcome[T] =
-  | Value(T)
+type Outcome[t] =
+  | Value(t)
   | Timeout
 
-pub fn with_timeout[T, e](
+pub fn with_timeout[t, e](
   ms:   Int,
-  task: () -> T / e
-) : Option[T] / Spawn + Cancel + Clock + e {
+  task: () -> t / e
+) : Option[t] / Spawn + Cancel + Clock + e {
   nursery { n ->
     let winner = n.spawn { Value(task()) }
     let timer  = n.spawn { time.sleep(time.millis(ms)); Timeout }

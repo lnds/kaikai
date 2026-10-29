@@ -265,9 +265,9 @@ Per-op type generics are handled in §*Per-op type generics*.
 A parameterised effect declaration like
 
 ```kaikai
-effect State[T] {
-  get() : T
-  set(v: T) : Unit
+effect State[t] {
+  get() : t
+  set(v: t) : Unit
 }
 
 fn main() : Int = 0
@@ -1071,9 +1071,9 @@ An excerpt of `Mutable` in `stdlib/effects.kai`:
 
 ```kaikai-fragment
 effect Mutable {
-  array_make[T](n: Int, init: T) : Array[T]
-  array_get[T](a: Array[T], i: Int) : T
-  array_set[T](a: Array[T], i: Int, v: T) : Array[T]
+  array_make[t](n: Int, init: t) : Array[t]
+  array_get[t](a: Array[t], i: Int) : t
+  array_set[t](a: Array[t], i: Int, v: t) : Array[t]
 }
 ```
 
