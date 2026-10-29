@@ -788,7 +788,8 @@ effect Random {
 ```
 
 `int_range(lo, hi)` returns a uniformly-distributed value in the
-half-open interval `[lo, hi)`. Calling with `lo >= hi` stops the
+closed interval `[lo, hi]`, like ranges and `SecureRandom`;
+`lo == hi` returns `lo`. Calling with `lo > hi` stops the
 program — there is no meaningful value to return; the inferencer
 does not catch this.
 
@@ -818,7 +819,7 @@ a fixed seed, in the same shape as the `Stdout` capture pattern.
 
 ### Error model
 
-PRNG ops are infallible. `int_range(l, h)` with `l >= h` is a
+PRNG ops are infallible. `int_range(l, h)` with `l > h` is a
 panic (programming error), not a recoverable fault.
 
 ### Helpers
