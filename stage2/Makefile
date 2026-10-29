@@ -1300,7 +1300,7 @@ test-numeric-decimal-rational: $(TARGET) build
 	|| { echo "decimal-rational $$f DIFF"; diff ../examples/numeric/$$f.out.expected build/$$f.out; exit 1; }; \
 	done
 
-# A take or release of a released userdata handle traps, also once its slot is reused.
+# A take or release of a released userdata handle traps, also once its slot is reused; a retain past the index range traps.
 test-ffi-userdata-traps: $(TARGET) build
 	@set -e; \
 	for name in take_after_release release_after_release; do \
@@ -1313,7 +1313,17 @@ test-ffi-userdata-traps: $(TARGET) build
 	  grep -q "released or invalid" build/$$name.err \
 	    && echo "ffi-userdata-traps OK $$name" \
 	    || { echo "ffi-userdata-traps FAIL $$name (want 'released or invalid' on stderr)"; cat build/$$name.err; exit 1; }; \
-	done
+	done; \
+	name=too_many_handles; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/ffi_userdata/$$name.kai > build/$$name.c; \
+	$(CC) $(CFLAGS) -DKAI_UD_IDX_MAX=3 $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
+	rc=0; ./build/$$name > build/$$name.out 2> build/$$name.err || rc=$$?; \
+	[ $$rc -ne 0 ] || { echo "ffi-userdata-traps FAIL $$name (exit 0 — did not trap)"; exit 1; }; \
+	diff -q ../examples/ffi_userdata/$$name.out.expected build/$$name.out > /dev/null \
+	  || { echo "ffi-userdata-traps DIFF $$name (stdout)"; diff ../examples/ffi_userdata/$$name.out.expected build/$$name.out; exit 1; }; \
+	grep -q "too many live userdata handles" build/$$name.err \
+	  && echo "ffi-userdata-traps OK $$name" \
+	  || { echo "ffi-userdata-traps FAIL $$name (want 'too many live userdata handles' on stderr)"; cat build/$$name.err; exit 1; }
 
 # `/` on the non-primitive numeric types traps on a zero divisor — the
 # same failure class as an out-of-range index (a program bug, not an

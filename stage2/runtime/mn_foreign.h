@@ -109,6 +109,9 @@ KAI_SCHED_FN KaiValue *kai_export_call(const char *name, KaiFn thunk, KaiValue *
 #if !KAI_SCHED_DECL_ONLY
 #define KAI_UD_HALF   ((unsigned) (sizeof(uintptr_t) * 4))
 #define KAI_UD_CHUNK  1024
+#ifndef KAI_UD_IDX_MAX
+#define KAI_UD_IDX_MAX (((uintptr_t) 1 << KAI_UD_HALF) - 1)
+#endif
 
 typedef struct { KaiValue *v; uintptr_t gen; uintptr_t next; } KaiUdSlot;
 
@@ -145,6 +148,10 @@ KAI_SCHED_FN KaiValue *kai_ffi_retain(KaiValue *v)
     if (idx) {
         kai_ud_free = kai_ud_slot(idx)->next;
     } else {
+        if (kai_ud_count >= KAI_UD_IDX_MAX) {
+            pthread_mutex_unlock(&kai_ud_mu);
+            kai_trap_abort("retain_userdata: too many live userdata handles");
+        }
         if (kai_ud_count == kai_ud_nchunks * KAI_UD_CHUNK) {
             kai_ud_chunks = (KaiUdSlot **) realloc(kai_ud_chunks, (kai_ud_nchunks + 1) * sizeof *kai_ud_chunks);
             kai_ud_chunks[kai_ud_nchunks++] = (KaiUdSlot *) calloc(KAI_UD_CHUNK, sizeof(KaiUdSlot));
