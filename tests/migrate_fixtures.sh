@@ -10,8 +10,9 @@
 # stderr `manual:` report matches, proving un-migratable changes are
 # reported, not silently dropped.
 #
-# The rewrite runs as `--edition hanga-roa` (the origin edition of the
-# migration); the idempotency step re-runs it the way a user's second
+# The rewrite runs as `--edition tongariki` (the Err-first origin of the
+# Result flip) unless the fixture carries a <name>.edition file naming
+# another source edition; the idempotency step re-runs it the way a user's second
 # `kai migrate` reaches the compiler — over a package that the first
 # run moved to orongo. That gate is what keeps the positional Result
 # flip from undoing itself.
@@ -40,8 +41,11 @@ for input in "$ROOT"/examples/migrate/*.input.kai; do
     continue
   fi
 
+  from=tongariki
+  [ ! -f "${input%.input.kai}.edition" ] || from=$(cat "${input%.input.kai}.edition")
+
   # 1. rewrite matches the golden
-  if ! "$KAIC2" --path "$ROOT/stdlib" --migrate --edition hanga-roa "$input" > "$tmp/out.kai" 2> "$tmp/err"; then
+  if ! "$KAIC2" --path "$ROOT/stdlib" --migrate --edition "$from" "$input" > "$tmp/out.kai" 2> "$tmp/err"; then
     echo "  FAIL $name — migrate rejected input:"
     sed 's/^/      /' "$tmp/err"
     fail=$((fail + 1)); continue
@@ -86,7 +90,7 @@ for input in "$ROOT"/examples/migrate/*.input.kai; do
   pass=$((pass + 1))
 done
 
-# The edition gate itself: the Result flip is a hanga-roa -> orongo
+# The edition gate itself: the Result flip is a tongariki -> orongo
 # rewrite, so un-migrated Err-first source must pass through untouched
 # when the declared edition is already orongo. Without this the flip
 # would run on any input and could never converge.
@@ -118,7 +122,7 @@ fi
 KAI="$ROOT/bin/kai"
 pkg="$tmp/driver-pkg"
 mkdir -p "$pkg"
-printf 'name = "repro"\nversion = "0.1.0"\nedition = "hanga-roa"\n' > "$pkg/kai.toml"
+printf 'name = "repro"\nversion = "0.1.0"\nedition = "tongariki"\n' > "$pkg/kai.toml"
 cat > "$pkg/main.kai" <<'EOF'
 fn parse(s: String) : Result[String, Int] = Ok(1)
 
@@ -154,7 +158,7 @@ fi
 # dot-slash file emits the same rewrite as the bare filename.
 dsp="$tmp/dotslash-pkg"
 mkdir -p "$dsp"
-printf 'name = "repro"\nversion = "0.1.0"\nedition = "hanga-roa"\n' > "$dsp/kai.toml"
+printf 'name = "repro"\nversion = "0.1.0"\nedition = "tongariki"\n' > "$dsp/kai.toml"
 cat > "$dsp/main.kai" <<'EOF'
 fn parse(s: String) : Result[String, Int] = Ok(1)
 
@@ -229,6 +233,22 @@ if ( cd "$nmp" &&
   pass=$((pass + 1))
 else
   echo "  FAIL relative-no-manifest — driver hung or errored on a relative path with no kai.toml"
+  fail=$((fail + 1))
+fi
+
+# A hanga-roa package is already Ok-first: the driver must leave its
+# Result annotations alone.
+hrp="$tmp/hanga-roa-pkg"
+mkdir -p "$hrp"
+printf 'name = "repro"\nversion = "0.1.0"\nedition = "hanga-roa"\n' > "$hrp/kai.toml"
+cp "$ROOT/examples/migrate/result_hanga_roa.input.kai" "$hrp/main.kai"
+if ( cd "$hrp" && "$KAI" migrate main.kai > "$tmp/hr.out" 2>/dev/null ) \
+   && diff -u "$ROOT/examples/migrate/result_hanga_roa.expected.kai" "$tmp/hr.out" > "$tmp/diff"; then
+  echo "  OK   hanga-roa-package (Ok-first source keeps its Result order)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL hanga-roa-package — Result order changed:"
+  sed 's/^/      /' "$tmp/diff"
   fail=$((fail + 1))
 fi
 
