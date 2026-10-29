@@ -1,8 +1,19 @@
-#[doc("The calls `kai migrate` rewrites to `fs.file`: the root file's calls of a core file operation name that the resolver bound to nothing, so no local, own, picked or imported declaration claims them.")]
+#[doc("The sites `kai migrate` rewrites through the resolver: the root file's calls of a core file operation name that the resolver bound to nothing, and its constants spelled against the naming convention with every use the resolver bound to them.")]
 
+import compiler.ast
+import compiler.ast_decl
+import compiler.ast_ids
 import compiler.diag
+import compiler.diag_file
+import compiler.expr_positions
+import compiler.lex
 import compiler.migrate
+import compiler.parse_naming
+import compiler.parse_state
 import compiler.resolve_names
+import compiler.symtab
+import compiler.util
+import compiler.written
 
 #[doc("The positions in `file` where the resolver reported a bare file-operation name as unbound.")]
 pub(pkg) fn migrate_core_sites(diags: [Diagnostic], file: String) : [CoreSite] =
@@ -15,4 +26,114 @@ fn diag_site(d: Diagnostic, file: String) : [CoreSite] = match d {
 fn is_unbound_file_op(msg: String, names: [String]) : Bool = match names {
   [] -> false
   [n, ...rest] -> if msg == unbound_msg(n) { true } else { is_unbound_file_op(msg, rest) }
+}
+
+#[doc("A place the root file names a constant spelled against the naming convention: its line, column and name. A declaration and every use the resolver bound to it are sites.")]
+pub(pkg) type ConstSite = ConstSite(Int, Int, String)
+
+#[doc("The declarations and uses, in the root file, of constants not spelled UPPER_SNAKE. A use is a site only when the resolver bound it to such a constant, so a homonym of another kind is never one.")]
+pub(pkg) fn migrate_const_sites(decls: [Decl], tab: SymTab, root_mod: String) : [ConstSite] =
+  flat_map(decls, (d) => if decl_in_root(d, root_mod) { decl_const_sites(d, tab) } else { [] })
+
+fn decl_in_root(d: Decl, root_mod: String) : Bool = match decl_home_module(d) {
+  None -> true
+  Some(m) -> m == root_mod
+}
+
+fn decl_const_sites(d: Decl, tab: SymTab) : [ConstSite] = match decl_transparent_inner(d) {
+  Some(inner) -> decl_const_sites(inner, tab)
+  None -> list_append(const_head_site(d, tab), flat_map(decl_exprs(d), (e) => expr_const_sites(e, tab)))
+}
+
+fn const_head_site(d: Decl, tab: SymTab) : [ConstSite] = match d {
+  DConst(_, s, _, _, _, l, c) -> bad_const_site(s, l, c, tab)
+  _ -> []
+}
+
+fn bad_const_site(s: SymId, line: Int, col: Int, tab: SymTab) : [ConstSite] = {
+  let name = written_text(sym_name(tab, s))
+  if st_valid(tab, s) and name_bad(NkConst, name) { [ConstSite(line, col, name)] } else { [] }
+}
+
+fn expr_const_sites(e: Expr, tab: SymTab) : [ConstSite] = {
+  let here = match e.kind {
+    ESym(s, _) -> if st_valid(tab, s) and ncls_same(sym_class(tab, s), NCConst) { bad_const_site(s, e.line, e.col, tab) } else { [] }
+    _ -> []
+  }
+  list_append(here, flat_map(xp_positions(e), (p) => match p { XP(_, child) -> expr_const_sites(child, tab) }))
+}
+
+#[doc("The source with each site's name respelled in upper case. A use inside an interpolation is found in the text of its hole, since every token of a hole sits at the hole's start; the respelling keeps every length, so positions do not move.")]
+pub(pkg) fn apply_const_sites(src: String, toks: [Token], sites: [ConstSite]) : String =
+  respell_at(src, foldl(flat_map(sites, (s) => site_spans(src, toks, s)), [], insert_span), 0, [])
+
+# A span to respell: its byte offset and length.
+type Span = Span(Int, Int)
+
+fn site_spans(src: String, toks: [Token], s: ConstSite) : [Span] = match s {
+  ConstSite(l, c, n) ->
+    if inside_string(toks, site_offset(src, toks, l, c)) { hole_spans(src, site_offset(src, toks, l, c), n) }
+    else { token_span(src, toks, l, c, n) }
+}
+
+fn token_span(src: String, toks: [Token], l: Int, c: Int, n: String) : [Span] = match toks {
+  [] -> []
+  [t, ...rest] ->
+    if tk_is(t.kind, TkIdent) and (t.line > l or (t.line == l and t.col >= c)) and tok_source(src, t) == n { [Span(t.start, t.length)] }
+    else { token_span(src, rest, l, c, n) }
+}
+
+fn inside_string(toks: [Token], off: Int) : Bool =
+  any(toks, (t) => tk_is(t.kind, TkString) and t.start < off and off < t.start + t.length)
+
+# The offset of a line and column, taking the column base from the first token.
+fn site_offset(src: String, toks: [Token], l: Int, c: Int) : Int = match toks {
+  [] -> 0
+  [t0, ..._] -> line_start(src, l, 1, 0) + c - (t0.col - (t0.start - line_start(src, t0.line, 1, 0)))
+}
+
+fn line_start(src: String, l: Int, cur: Int, i: Int) : Int =
+  if cur >= l { i }
+  else {
+    match char_at(src, i) {
+      None -> i
+      Some('\n') -> line_start(src, l, cur + 1, i + 1)
+      Some(_) -> line_start(src, l, cur, i + 1)
+    }
+  }
+
+# The uses of `n` in the hole starting at `off`, up to its closing brace; a name after a `.` is a field.
+fn hole_spans(src: String, off: Int, n: String) : [Span] = hole_scan(src, off, n, 0, 0)
+
+fn hole_scan(src: String, i: Int, n: String, depth: Int, prev: Int) : [Span] = match char_at(src, i) {
+  None -> []
+  Some('{') -> hole_scan(src, i + 1, n, depth + 1, 123)
+  Some('}') -> if depth == 0 { [] } else { hole_scan(src, i + 1, n, depth - 1, 125) }
+  Some(c) ->
+    if is_word_char(c) {
+      let w = word_at(src, i)
+      let rest = hole_scan(src, i + string_length(w), n, depth, 95)
+      if w == n and prev != 46 { [Span(i, string_length(w)), ...rest] } else { rest }
+    } else { hole_scan(src, i + 1, n, depth, char_to_int(c)) }
+}
+
+fn word_at(src: String, i: Int) : String = string_slice(src, i, word_len(src, i, 0))
+
+fn word_len(src: String, i: Int, k: Int) : Int = match char_at(src, i + k) {
+  Some(c) -> if is_word_char(c) { word_len(src, i, k + 1) } else { k }
+  None -> k
+}
+
+fn is_word_char(c: Char) : Bool = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
+
+fn insert_span(xs: [Span], x: Span) : [Span] = match xs {
+  [] -> [x]
+  [Span(a, la), ...rest] -> match x {
+    Span(b, lb) -> if b == a { xs } else if b < a { [x, ...xs] } else { [Span(a, la), ...insert_span(rest, x)] }
+  }
+}
+
+fn respell_at(src: String, spans: [Span], pos: Int, acc: [String]) : String = match spans {
+  [] -> concat_all(list_reverse([string_slice(src, pos, string_length(src) - pos), ...acc]))
+  [Span(a, n), ...rest] -> respell_at(src, rest, a + n, [to_upper(string_slice(src, a, n)), string_slice(src, pos, a - pos), ...acc])
 }

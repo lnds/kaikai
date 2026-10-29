@@ -433,6 +433,17 @@ fn main() : Int / Stdout = {
 }
 ```
 
+### Naming
+
+Binders are `snake_case`: functions, parameters, fields, `var`/`let` and
+every pattern binder; type parameters are lowercase too (`[t, e]`).
+Types, variants, protocols, effects, units and kinds are `PascalCase`;
+`const` names are `UPPER_SNAKE_CASE`, because a constant can appear in a
+pattern, where a lowercase name would read as a binder. Writing a name
+in the wrong case is a parse error that names the convention; `let Foo =
+1` reads `Foo` as a constructor or constant pattern, and the error says a
+binder must be lowercase when none exists.
+
 ## Lambdas
 
 ```kaikai
