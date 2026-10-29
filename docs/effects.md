@@ -154,6 +154,14 @@ inference stays decidable and principal.
 > into a slot demanding purity). This removes the `[e] / e`
 > boilerplate from named pure callbacks in higher-order combinators.
 
+> **Note — functions named as values.** A declared function read as a
+> value (not called) types like its eta-expansion: its closed row opens with
+> a fresh tail on instantiation, so `shout : (String) -> Unit / Stdout`
+> passes where `(String) -> Unit / Stdout + Stderr` or `... + Stderr + e` is
+> expected, exactly as `(s) => shout(s)` does. This is ordinary row
+> unification: the row gains no label the function does not perform, and an
+> effectful function still cannot flow into a slot demanding fewer effects.
+
 ## Syntax
 
 ### Function types with effects
