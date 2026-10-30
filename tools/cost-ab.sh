@@ -173,6 +173,27 @@ case "$(uname -s)" in
   *) die "unsupported platform" ;;
 esac
 
+# The self-compile input must be a tree both compilers accept: a change that
+# rejects old source (a naming or syntax rule) cannot compile the base tree.
+# The base tree is preferred; the head tree stands in when the branch compiler
+# rejects it; when both compilers reject both, there is nothing to measure.
+accepts() {
+  local tree="$1" bin stdlib
+  for side in base branch; do
+    if [ "$side" = base ]; then bin="$BASE_BIN"; stdlib="$tree/stdlib"; else bin="$BRANCH_BIN"; stdlib="$tree/stdlib"; fi
+    (cd "$tree/stage2" && KAI_THREADS=1 KAIKAI_STDLIB_PATH="$stdlib" "$bin" --edition "$(cat "$tree/EDITION")" --path . --path "$stdlib" main.kai >/dev/null 2>"$WORK/accept-$side.err") \
+      || { REJECTED_BY="$side"; REJECT_ERR="$WORK/accept-$side.err"; return 1; }
+  done
+}
+INPUT_TREE="$BASE_TREE"; INPUT_WHY="the base tree"
+if ! accepts "$BASE_TREE"; then
+  echo "cost-ab: the $REJECTED_BY compiler rejects the base tree; first errors:" >&2
+  head -12 "$REJECT_ERR" >&2
+  BRANCH_HEAD_TREE="${BRANCH_TREE:-$HERE}"
+  accepts "$BRANCH_HEAD_TREE" || { echo "cost-ab: the $REJECTED_BY compiler rejects the head tree too; first errors:" >&2; head -12 "$REJECT_ERR" >&2; die "no tree both compilers accept"; }
+  INPUT_TREE="$BRANCH_HEAD_TREE"; INPUT_WHY="the head tree (the base tree is rejected)"
+fi
+
 # $1=binary $2=probe (selfhost or a .kai path) $3=stdlib $4=side -> cost in $UNIT
 run_probe() {
   local bin="$1" file="$2" stdlib="$3" side="$4" dir n cflags=()
@@ -182,12 +203,12 @@ run_probe() {
     mkdir -p "$cdir"
     cflags=(--user-cache --user-cache-dir "$cdir" --core-cache-dir "$cdir")
   fi
-  if [ "$file" = selfhost ]; then dir="$BASE_TREE/stage2"; file=main.kai
+  if [ "$file" = selfhost ]; then dir="$INPUT_TREE/stage2"; file=main.kai
   else dir="$(dirname "$file")"; file="$(basename "$file")"; fi
   # A kaic2 reads the core from the stdlib path baked at its build; a binary
   # built elsewhere (a CI artifact) must be pointed at this side's tree.
   (cd "$dir" && KAI_THREADS=1 KAIKAI_STDLIB_PATH="$stdlib" measure_cmd "$bin" --edition "$EDITION" --path . --path "$stdlib" ${cflags[@]+"${cflags[@]}"} "$file") \
-    || { tail -20 "$WORK/err" >&2; die "$bin failed on $file"; }
+    || { head -30 "$WORK/err" >&2; die "$bin failed on $file"; }
   n="$(cat "$WORK/count")"
   [ -n "$n" ] || die "no measurement from $bin on $file"
   echo $((n / DIV))
@@ -202,7 +223,7 @@ stats() { # min mean of args
   printf '%s\n' "$@" | awk 'NR==1{m=$1} $1<m{m=$1} {s+=$1} END{printf "%d %d", m, s/NR}'
 }
 
-echo "cost-ab: base=$BASE_BIN branch=$BRANCH_BIN input=$BASE_TREE stdlib base=$BASE_STDLIB branch=$BRANCH_STDLIB rounds=$ROUNDS load=$(uptime | sed 's/.*averages*: //')" >&2
+echo "cost-ab: base=$BASE_BIN branch=$BRANCH_BIN input=$INPUT_TREE ($INPUT_WHY) stdlib base=$BASE_STDLIB branch=$BRANCH_STDLIB rounds=$ROUNDS load=$(uptime | sed 's/.*averages*: //')" >&2
 
 if [ "$MARKDOWN" = 1 ]; then
   echo "| probe | base min / mean ($UNIT) | branch min / mean ($UNIT) | delta ($UNIT) | delta (%) | verdict |"

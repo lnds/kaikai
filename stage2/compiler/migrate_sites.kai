@@ -28,12 +28,42 @@ fn is_unbound_file_op(msg: String, names: [String]) : Bool = match names {
   [n, ...rest] -> if msg == unbound_msg(n) { true } else { is_unbound_file_op(msg, rest) }
 }
 
-#[doc("A place the root file names a constant spelled against the naming convention: its line, column, name and the last segment of its home module. A declaration and every use the resolver bound to it are sites.")]
-pub(pkg) type ConstSite = ConstSite(Int, Int, String, String)
+#[doc("A place the root file names a constant spelled against the naming convention: its line, column and name. A declaration and every use the resolver bound to it are sites.")]
+pub(pkg) type ConstSite = ConstSite(Int, Int, String)
 
 #[doc("The declarations and uses, in the root file, of constants not spelled UPPER_SNAKE. A use is a site only when the resolver bound it to such a constant, so a homonym of another kind is never one.")]
 pub(pkg) fn migrate_const_sites(decls: [Decl], tab: SymTab, root_mod: String) : [ConstSite] =
   flat_map(decls, (d) => if decl_in_root(d, root_mod) { decl_const_sites(d, tab) } else { [] })
+
+#[doc("A selector of an `import m.{...}` that names a constant spelled against the convention: the import's line and column, and the name.")]
+pub(pkg) type ImportSite = ImportSite(Int, Int, String)
+
+#[doc("The selectors of the file's own imports that the resolver binds to a constant not spelled UPPER_SNAKE: the constant is exported by the imported module under that name.")]
+pub(pkg) fn migrate_import_sites(own: [Decl], tab: SymTab) : [ImportSite] = flat_map(own, (d) => import_sites(d, tab))
+
+fn import_sites(d: Decl, tab: SymTab) : [ImportSite] = match decl_transparent_inner(d) {
+  Some(inner) -> import_sites(inner, tab)
+  None -> match d {
+    DImport(IkSelective(path, names), l, c) -> flat_map(names, (n) => selector_site(path, n, l, c, tab))
+    _ -> []
+  }
+}
+
+fn selector_site(path: String, n: String, l: Int, c: Int, tab: SymTab) : [ImportSite] =
+  if name_bad(NkConst, n) and any(st_candidates(tab, NCConst, n), (s) => last_segment(written_text(sym_name(tab, sym_owner(tab, s)))) == last_segment(path)) { [ImportSite(l, c, n)] }
+  else { [] }
+
+fn last_segment(path: String) : String = last_segment_from(path, string_length(path))
+
+fn last_segment_from(path: String, i: Int) : String = match char_at(path, i - 1) {
+  None -> path
+  Some('.') -> string_slice(path, i, string_length(path) - i)
+  Some(_) -> last_segment_from(path, i - 1)
+}
+
+#[doc("The respellings of those selectors in upper case.")]
+pub(pkg) fn import_spans(src: String, sites: [ImportSite]) : [Located] =
+  map(sites, (s) => match s { ImportSite(l, c, n) -> locate_selector(src, l, c, n, to_upper(n)) })
 
 fn decl_in_root(d: Decl, root_mod: String) : Bool = match decl_home_module(d) {
   None -> true
@@ -46,21 +76,13 @@ fn decl_const_sites(d: Decl, tab: SymTab) : [ConstSite] = match decl_transparent
 }
 
 fn const_head_site(d: Decl, tab: SymTab) : [ConstSite] = match d {
-  DConst(_, s, _, _, _, l, c) -> bad_const_site(s, l, c, tab)
+  DConst(_, s, _, _, _, _, _, nl, nc) -> bad_const_site(s, nl, nc, tab)
   _ -> []
 }
 
 fn bad_const_site(s: SymId, line: Int, col: Int, tab: SymTab) : [ConstSite] = {
   let name = written_text(sym_name(tab, s))
-  if st_valid(tab, s) and name_bad(NkConst, name) { [ConstSite(line, col, name, last_segment(written_text(sym_name(tab, sym_owner(tab, s)))))] } else { [] }
-}
-
-fn last_segment(path: String) : String = last_segment_from(path, string_length(path))
-
-fn last_segment_from(path: String, i: Int) : String = match char_at(path, i - 1) {
-  None -> path
-  Some('.') -> string_slice(path, i, string_length(path) - i)
-  Some(_) -> last_segment_from(path, i - 1)
+  if st_valid(tab, s) and name_bad(NkConst, name) { [ConstSite(line, col, name)] } else { [] }
 }
 
 fn expr_const_sites(e: Expr, tab: SymTab) : [ConstSite] = {
@@ -71,21 +93,59 @@ fn expr_const_sites(e: Expr, tab: SymTab) : [ConstSite] = {
   list_append(here, flat_map(xp_positions(e), (p) => match p { XP(_, child) -> expr_const_sites(child, tab) }))
 }
 
-#[doc("The spans that respell each site's name in upper case, at the position the resolver recorded for it.")]
-pub(pkg) fn const_spans(src: String, sites: [ConstSite]) : [Span] =
-  flat_map(sites, (s) => site_spans(src, s))
+#[doc("The respellings of each site's name in upper case, at the position the resolver recorded for it.")]
+pub(pkg) fn const_spans(src: String, sites: [ConstSite]) : [Located] =
+  map(sites, (s) => match s { ConstSite(l, c, n) -> locate_ident(src, l, c, n, to_upper(n)) })
 
-#[doc("The source with `spans` applied, in offset order; two spans at one offset count once.")]
-pub(pkg) fn respell(src: String, spans: [Span]) : String =
-  respell_at(src, foldl(spans, [], insert_span), 0, [])
+#[doc("The source with every respelling applied, in offset order, two at one offset counting once; the reason of the first one that could not be placed otherwise, so a half-migrated source is never written.")]
+pub(pkg) fn respell(src: String, found: [Located]) : Result[String, String] =
+  match find(found, (f) => match f { Missing(_) -> true  Found(_) -> false }) {
+    Some(Missing(why)) -> Err(why)
+    _ -> Ok(respell_at(src, foldl(flat_map(found, spans_of), [], insert_span), 0, []))
+  }
 
-#[doc("The spans that respell the root file's uppercase type parameters: those the binding pass bound, never a spelling that merely matches.")]
-pub(pkg) fn migrate_tparam_spans(decls: [Decl], tab: SymTab, root_mod: String, src: String) : [Span] =
-  tparam_spans(src, flat_map(decls, (d) => if decl_in_root(d, root_mod) { decl_facts(d, tab) } else { [] }))
-
-fn site_spans(src: String, s: ConstSite) : [Span] = match s {
-  ConstSite(l, c, n, q) -> exact_ident_span(src, l, c, n, to_upper(n), q)
+fn spans_of(f: Located) : [Span] = match f {
+  Found(sp) -> [sp]
+  Missing(_) -> []
 }
+
+#[doc("""
+The respellings of an impl header's references to its own uppercase type parameters. The header
+is outside the signatures the binding pass numbers, so the parameters are matched by the impl's
+own binder list, in the file as parsed.
+""")]
+pub(pkg) fn migrate_impl_header_spans(own: [Decl], src: String) : [Located] = flat_map(own, (d) => impl_header_located(d, src))
+
+fn impl_header_located(d: Decl, src: String) : [Located] = match decl_transparent_inner(d) {
+  Some(inner) -> impl_header_located(inner, src)
+  None -> match d {
+    DImpl(_, targs, tgt, _, _, _, tps, _) -> {
+      let names = map(tps, (b) => written_text(b.name))
+      let renames = flat_map(names, (n) => if name_bad(NkTypeParam, n) { [Pair { fst: n, snd: respelled_param(n, names) }] } else { [] })
+      if list_is_empty(renames) { [] } else { flat_map(list_append(targs, [tgt]), (t) => header_located(src, renames, t)) }
+    }
+    _ -> []
+  }
+}
+
+fn header_located(src: String, renames: [Pair[String, String]], t: TypeExpr) : [Located] = match t.tkind {
+  TyName(DrWritten(None, w), args) -> list_append(header_rename(src, renames, written_text(w), t.line, t.col), flat_map(args, (a) => header_located(src, renames, a)))
+  TyName(_, args) -> flat_map(args, (a) => header_located(src, renames, a))
+  TyList(inner) -> header_located(src, renames, inner)
+  TyFn(ps, r, _) -> list_append(flat_map(ps, (a) => header_located(src, renames, a)), header_located(src, renames, r))
+  TyDim(base, _) -> header_located(src, renames, base)
+  TyRefine(base, _, _) -> header_located(src, renames, base)
+  TyRow(_) -> []
+  TySurface(_) -> []
+  TyParam(_, args) -> flat_map(args, (a) => header_located(src, renames, a))
+}
+
+fn header_rename(src: String, renames: [Pair[String, String]], n: String, l: Int, c: Int) : [Located] =
+  flat_map(renames, (r) => if r.fst == n { [locate_ident(src, l, c, n, r.snd)] } else { [] })
+
+#[doc("The respellings of the root file's uppercase type parameters: those the binding pass bound, never a spelling that merely matches.")]
+pub(pkg) fn migrate_tparam_spans(decls: [Decl], tab: SymTab, root_mod: String, src: String) : [Located] =
+  tparam_spans(src, flat_map(decls, (d) => if decl_in_root(d, root_mod) { decl_facts(d, tab) } else { [] }))
 
 fn insert_span(xs: [Span], x: Span) : [Span] = match xs {
   [] -> [x]
