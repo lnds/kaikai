@@ -1,0 +1,158 @@
+#[doc("Typing order for the private fns that omit their row: each is typed once, after every such fn it calls, so a call reads the row its callee settled on.")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.scc
+import compiler.expr_positions
+import compiler.effect_instance
+import compiler.infer_index
+import compiler.infer_env
+import compiler.infer_row_kinds
+import compiler.type_home
+import compiler.infer_env_exhaust
+import compiler.infer_env_schemes
+import compiler.diag_type_text
+
+#[doc("infer: the env with the scheme of every fn typed ahead, and those fns' typed declarations by identity.")]
+pub type RowFirst = { env: TyEnv, done: [(SymId, TypedDecl)] }
+
+#[doc("infer: types the declarations in `cands` callee-first, binding each component's settled scheme before the next is typed. A component of several fns shares one row: the union of its members'.")]
+pub fn type_rowless_first(typeit: (TyEnv, Decl) -> TypedDecl / Console + File + Mutable,
+                          file_of: (Decl) -> String,
+                          rk: [RowKindEntry], homes: TyHomes, env: TyEnv,
+                          cands: [Decl]) : RowFirst / Console + File + Mutable =
+  match cands {
+    [] -> RowFirst { env: env, done: [] }
+    [first, ..._] -> {
+      let n = list_length(cands)
+      let ix = foldl(zip_index(cands, 0), idx_empty(), (a, p) => match p { (i, d) -> idx_prepend_sym(a, decl_fn_sym(d), i) })
+      let es = flat_map(zip_index(cands, 0), (p) => match p {
+        (i, d) -> map(callee_indices(ix, d), (j) => (i, j))
+      })
+      let arr = fill_decls(cands, 0, array_make(n, first))
+      type_components(typeit, file_of, rk, homes, arr, scc_components(n, es), env, [])
+    }
+  }
+
+fn zip_index(ds: [Decl], i: Int) : [(Int, Decl)] = match ds {
+  [] -> []
+  [d, ...rest] -> [(i, d), ...zip_index(rest, i + 1)]
+}
+
+fn fill_decls(ds: [Decl], i: Int, arr: Array[Decl]) : Array[Decl] / Mutable = match ds {
+  [] -> arr
+  [d, ...rest] -> fill_decls(rest, i + 1, array_set(arr, i, d))
+}
+
+fn decl_fn_sym(d: Decl) : SymId = match d {
+  DFn(_, fid, _, _, _, _, _, _, _, _) -> fnid_sym(fid)
+  _ -> sym_none()
+}
+
+fn callee_indices(ix: NameIndex[Int], d: Decl) : [Int] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> body_callees(ix, body, [])
+  _ -> []
+}
+
+fn body_callees(ix: NameIndex[Int], e: Expr, acc: [Int]) : [Int] = {
+  let here = match e.kind {
+    ESym(s, _) -> list_append(idx_chain_sym(ix, s), acc)
+    _ -> acc
+  }
+  foldl(xp_positions(e), here, (a, p) => match p { XP(_, c) -> body_callees(ix, c, a) })
+}
+
+fn type_components(typeit: (TyEnv, Decl) -> TypedDecl / Console + File + Mutable, file_of: (Decl) -> String,
+                   rk: [RowKindEntry], homes: TyHomes, arr: Array[Decl], comps: [[Int]], env: TyEnv,
+                   done: [(SymId, TypedDecl)]) : RowFirst / Console + File + Mutable = match comps {
+  [] -> RowFirst { env: env, done: done }
+  [c, ...rest] -> {
+    let ds = map(c, (i) => array_get(arr, i))
+    let settled = share_row(file_of, ds, map(ds, (d) => typeit(env, d)))
+    let env2 = foldl(zip_decls(ds, settled), env, (e, p) => match p {
+      (d, t) -> match fn_scheme_of_decl(with_row_of(d, t.decl), rk, homes) {
+        Some(sc) -> env_bind_sym(e, decl_fn_sym(d), sc)
+        None -> e
+      }
+    })
+    type_components(typeit, file_of, rk, homes, arr, rest, env2,
+                    list_append(map(zip_decls(ds, settled), (p) => match p { (d, t) -> (decl_fn_sym(d), t) }), done))
+  }
+}
+
+fn zip_decls(ds: [Decl], ts: [TypedDecl]) : [(Decl, TypedDecl)] = match (ds, ts) {
+  ([d, ...dr], [t, ...tr]) -> [(d, t), ...zip_decls(dr, tr)]
+  _ -> []
+}
+
+fn with_row_of(orig: Decl, typed: Decl) : Decl = match (orig, typed) {
+  (DFn(ip, fid, a, b, c, _, g, h, i, j), DFn(_, _, _, _, _, row, _, _, _, _)) -> DFn(ip, fid, a, b, c, row, g, h, i, j)
+  _ -> orig
+}
+
+fn decl_row(d: Decl) : RowExpr = match d {
+  DFn(_, _, _, _, _, row, _, _, _, _) -> row
+  _ -> REmpty
+}
+
+fn decl_with_row(d: Decl, row: RowExpr) : Decl = match d {
+  DFn(ip, fid, a, b, c, _, g, h, i, j) -> DFn(ip, fid, a, b, c, row, g, h, i, j)
+  _ -> d
+}
+
+fn row_labels(r: RowExpr) : [RowLabel] = match r {
+  REmpty -> []
+  RClosed(ls) -> ls
+  ROpen(_, ls) -> ls
+}
+
+fn row_is_open(r: RowExpr) : Bool = match r {
+  ROpen(_, _) -> true
+  _ -> false
+}
+
+fn rl_key(l: RowLabel) : String = match l {
+  RL(r, args) -> concat_all([int_to_string(sym_raw(ref_sym(r))), ...map(args, te_text)])
+}
+
+# The members of a recursive group call one another, so each performs what any
+# of them does. A row open on a variable of one member's signature cannot be
+# the row of another.
+fn share_row(file_of: (Decl) -> String, ds: [Decl], ts: [TypedDecl]) : [TypedDecl] = match ts {
+  [_] -> ts
+  _ -> {
+    if any(ts, (t) => row_is_open(decl_row(t.decl))) {
+      map(zip_decls(ds, ts), (p) => match p {
+        (d, t) -> TypedDecl { ...t, errs: t.errs + 1,
+          diags: list_append(t.diags, [mk_diag(SevError, file_of(d), decl_line(d), decl_col(d),
+            "cannot infer the row of a recursive group whose row is tied to a row variable of its signature",
+            [])]) }
+      })
+    } else {
+      let shared = union_labels(flat_map(ts, (t) => row_labels(decl_row(t.decl))), [], [])
+      let row = if list_is_empty(shared) { REmpty } else { RClosed(shared) }
+      map(ts, (t) => TypedDecl { ...t, decl: decl_with_row(t.decl, row) })
+    }
+  }
+}
+
+fn union_labels(ls: [RowLabel], seen: [String], acc: [RowLabel]) : [RowLabel] = match ls {
+  [] -> list_reverse(acc)
+  [l, ...rest] -> {
+    let k = rl_key(l)
+    if list_has(seen, k) { union_labels(rest, seen, acc) } else { union_labels(rest, [k, ...seen], [l, ...acc]) }
+  }
+}
+
+fn decl_line(d: Decl) : Int = match d {
+  DFn(_, _, _, _, _, _, _, l, _, _) -> l
+  _ -> 0
+}
+
+fn decl_col(d: Decl) : Int = match d {
+  DFn(_, _, _, _, _, _, _, _, c, _) -> c
+  _ -> 0
+}

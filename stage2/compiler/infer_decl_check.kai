@@ -4,6 +4,8 @@ import compiler.util
 import compiler.diag
 import compiler.ast
 import compiler.ast_decl
+import compiler.ast_build
+import compiler.scalar_ty
 import compiler.ast_ids
 import compiler.written
 import compiler.symtab
@@ -173,7 +175,8 @@ type FnBody = { rb: Inferred, st: InferState, declared_ret: Ty, ret_site: Expr }
 
 type FnRows = { st: InferState, picks: [HomPick] }
 
-fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
+#[doc("infer: types one declaration against `env`.")]
+pub fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
               op_eff_arities: [OpEffArity],
               type_aliases: [AliasResult], op_to_eff: [OpToEff],
               sums: [SumInfo], hcar: HandleTab,
@@ -308,13 +311,14 @@ fn check_fn_rows(file: String, env: TyEnv, sums: [SumInfo], hcar: HandleTab, all
   let st1b = check_no_fiber_escape(st1e, file, fnid_sym(site.fid), nm, site.opt_ret, ret_now,
                                    sums, hcar, site.line, site.col)
   let st1c = check_cont_crossings(st_drop_provided_caps(mask_local_mutable_demand(st1b, site.ps, body), site.ps), body, hcar)
-  let st2pre = if site.inferring { check_inferred_row(st1c, nm, site) }
+  let st2pre = if site.inferring { st1c }
                else { check_body_row(st1c, nm, site.entry, site.fid, site.row, site.rbinds, site.tparams,
                                      site.line, site.col, all_decls, mutable_blame(st1c, site.ps, body)) }
   let st2f = drain_deferred_fields(st2pre, list_reverse(st2pre.deferred_fields),
                                    decl_row_concrete_labels(site.row, env_home_view(env, mo)))
   let hd = drain_deferred_homs(st2f, list_reverse(st2f.deferred_homs), [])
-  FnRows { st: report_stranded_ops(hd.st, st2f.deferred_homs, [fb.declared_ret, ...added_tys]), picks: hd.picks }
+  let st_end = report_stranded_ops(hd.st, st2f.deferred_homs, [fb.declared_ret, ...added_tys])
+  FnRows { st: if site.inferring { check_inferred_row(st_end, nm, site) } else { st_end }, picks: hd.picks }
 }
 
 # The final substitution is applied to every `Expr.ty` of the body, then the
@@ -362,7 +366,7 @@ fn main_inferred_row(site: FnSite, final_body: Expr, st2: InferState) : RowExpr 
   match site.row {
     REmpty ->
       if site.entry { inferred_main_row(collect_call_labels(final_body, st2.row)) }
-      else if site.inferring { inferred_main_row(append_labels(apply_labels(st2.sub, st2.row), [])) }
+      else if site.inferring { match spell_inferred_row(st_add_tail_labels(st2, st2.row_tails), site) { Spelled(r) -> r  Unspelled(_) -> REmpty } }
       else { site.row }
     _ -> site.row
   }
@@ -507,18 +511,96 @@ pub fn row_inferable(is_pub: Bool, row: RowExpr, entry: Bool, exported: Bool) : 
 }
 
 
-# A private fn without a row has no declared row to hold its body to: the body's
-# labels become its row. What a row cannot spell yet stays an error: a label
-# carrying type arguments or naming an instance, and a body tied to a row
-# variable of the signature.
-fn check_inferred_row(st: InferState, fname: String, site: FnSite) : InferState / Console + File + Mutable = {
-  let st1 = match site.rbinds {
-    [] -> st
-    _  -> check_body_tails(st, fname, declared_root(st.sub, site.row, site.rbinds), site.rbinds, site.tparams, st.row_tails)
+#[doc("infer: true when the row of the fn `d` is inferred from its body.")]
+pub fn decl_row_inferred(env: TyEnv, d: Decl) : Bool = match d {
+  DFn(ip, fid, _, _, _, row, _, _, _, _) ->
+    row_inferable(ip, row, decl_types_as_entry(env.ty_homes, fid), fn_is_c_export_in(env.tab, fid))
+  _ -> false
+}
+
+type RowSpell = Spelled(RowExpr) | Unspelled(String)
+
+# The row a private fn without one takes from its body: the labels it
+# performs, open on the row variable of its signature the body is tied to.
+fn spell_inferred_row(st: InferState, site: FnSite) : RowSpell = {
+  let labs = list_reverse(append_labels(apply_labels(st.sub, st.row), []))
+  match find(labs, (l) => local_raw(l.cell) != 0) {
+    Some(_) -> Unspelled("it performs an effect on a named instance")
+    None -> match spell_labels(labs, site.tpbinds) {
+      None -> Unspelled("an effect it performs carries a type a row cannot name")
+      Some(rls) -> match sig_row_tails(st, site.rbinds) {
+        []  -> Spelled(if list_is_empty(rls) { REmpty } else { RClosed(rls) })
+        [n] -> Spelled(ROpen(TpId(n), rls))
+        _   -> Unspelled("it is tied to more than one row variable of its signature")
+      }
+    }
   }
-  let unspelled = filter(apply_labels(st.sub, st.row), (l) => not list_is_empty(l.ty_args) or local_raw(l.cell) != 0)
-  foldl(unspelled, st1, (a, l) => report_unhandled_label(a, RowInFn(fname), l, [], ["the row of a private fn is inferred from labels without type arguments or instance names; declare it"],
-                                                          site.line, site.col, None))
+}
+
+fn spell_labels(ls: [Label], binds: [TPBind]) : Option[[RowLabel]] = match ls {
+  [] -> Some([])
+  [l, ...rest] -> match spell_args(l.ty_args, binds) {
+    None -> None
+    Some(args) -> match spell_labels(rest, binds) {
+      None -> None
+      Some(more) -> Some([RL(DrSym(l.sym), args), ...more])
+    }
+  }
+}
+
+fn spell_args(ts: [Ty], binds: [TPBind]) : Option[[TypeExpr]] = match ts {
+  [] -> Some([])
+  [t, ...rest] -> match spell_ty(t, binds) {
+    None -> None
+    Some(te) -> match spell_args(rest, binds) {
+      None -> None
+      Some(more) -> Some([te, ...more])
+    }
+  }
+}
+
+fn spell_ty(t: Ty, binds: [TPBind]) : Option[TypeExpr] = match t {
+  TyVarT(v) -> match find(binds, (b) => match b { TPB(n, i) -> i == v and tb_is_type(n) }) {
+    Some(TPB(n, _)) -> Some(mk_ty(TyParam(n.id, []), 0, 0))
+    None -> None
+  }
+  TyListT(x) -> match spell_ty(x, binds) {
+    Some(e) -> Some(mk_ty(TyList(e), 0, 0))
+    None -> None
+  }
+  TyCon(s, args) -> match spell_args(args, binds) {
+    Some(es) -> Some(mk_ty(TyName(DrSym(s), es), 0, 0))
+    None -> None
+  }
+  TyDimT(b, _) -> spell_ty(b, binds)
+  TyRefineT(b, _, _) -> spell_ty(b, binds)
+  _ -> match scalar_ty_name(t) {
+    Some(n) -> Some(mk_ty(TyName(ref_written(n), []), 0, 0))
+    None -> None
+  }
+}
+
+# The signature row variables the body's row is tied to, each once.
+fn sig_row_tails(st: InferState, rbinds: [RVBind]) : [TLocalId] =
+  foldl(st.row_tails, [], (acc, u) => match u {
+    TU(t, _, _) -> {
+      let root = row_root(st.sub, t)
+      if root < 0 { acc }
+      else { match sig_row_var_at(st.sub, rbinds, root) {
+        Some(n) -> if any(acc, (m) => tlocal_eq(m, n)) { acc } else { [n, ...acc] }
+        None -> acc
+      } }
+    }
+  })
+
+fn check_inferred_row(st: InferState, fname: String, site: FnSite) : InferState / Mutable = {
+  let sta = st_add_tail_labels(st, st.row_tails)
+  match spell_inferred_row(sta, site) {
+    Spelled(_) -> sta
+    Unspelled(why) -> st_bump_err(st_push_diag(sta, mk_diag(SevError, sta.file, site.line, site.col,
+      concat_all(["cannot infer the row of `", fname, "`: ", why]),
+      [ri_help(sta.file, site.line, site.col, "declare the row with `/ ...`")])))
+  }
 }
 
 
@@ -650,7 +732,8 @@ pub fn infer_all_loop(df: DiagFiles, env: TyEnv, core_len: Int, recs: [RecInfo],
                    sums: [SumInfo], hcar: HandleTab,
                    protos: ProtoView,
                    all_decls: [Decl],
-                   kind_theories: [KindTheory]) : TypedProgram / Console + File + Mutable {
+                   kind_theories: [KindTheory],
+                   done: [(SymId, TypedDecl)]) : TypedProgram / Console + File + Mutable {
 
 
   match ds {
@@ -668,7 +751,9 @@ pub fn infer_all_loop(df: DiagFiles, env: TyEnv, core_len: Int, recs: [RecInfo],
       # A decl's diagnostics name the file that declares it, not the
       # root: the flattened stream mixes every imported module's decls
       # and each one's line/column belongs to its own source.
-      let r = infer_decl(decl_diag_file(d, df), env, core_len, recs, op_eff_arities,
+      let r = match typed_ahead(done, d) {
+        Some(t) -> t
+        None -> infer_decl(decl_diag_file(d, df), env, core_len, recs, op_eff_arities,
                           type_aliases, op_to_eff, sums, hcar, protos,
                           # pass program-level decls so
                           # check_body_row / check_main_row_handlable can
@@ -677,6 +762,7 @@ pub fn infer_all_loop(df: DiagFiles, env: TyEnv, core_len: Int, recs: [RecInfo],
                           all_decls,
                           kind_theories,
                           d, verbose)
+      }
       infer_all_loop(df, env, core_len, recs, op_eff_arities, rest, verbose,
                      [r.decl, ...acc_decls],
                      acc_errs + r.errs,
@@ -686,9 +772,18 @@ pub fn infer_all_loop(df: DiagFiles, env: TyEnv, core_len: Int, recs: [RecInfo],
                      prepend_reverse_diags(r.diags, acc_diags),
                      prepend_reverse_op_res(r.op_res, acc_op_res),
                      type_aliases, op_to_eff, sums, hcar, protos,
-                     all_decls, kind_theories)
+                     all_decls, kind_theories, done)
     }
   }
+}
+
+fn typed_ahead(done: [(SymId, TypedDecl)], d: Decl) : Option[TypedDecl] = match d {
+  DFn(_, fid, _, _, _, _, _, _, _, _) ->
+    match find(done, (p) => sym_same(p.fst, fnid_sym(fid))) {
+      Some(p) -> Some(p.snd)
+      None -> None
+    }
+  _ -> None
 }
 
 
