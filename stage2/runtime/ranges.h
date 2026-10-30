@@ -653,7 +653,7 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
     if (kai_is_value(v)) return v;
     switch ((KaiTag) v->tag) {
         /* Iterative down the tail. A list's length is unbounded, so one
-         * recursive frame per cell overflows the 64 KiB fiber stack long
+         * recursive frame per cell overflows a fiber stack long
          * before the heap notices — and the margin is thin enough that
          * frame size alone decides it. Heads still recurse: their depth is
          * the value's nesting, not its length. `kai_cons` steals both refs,
