@@ -122,7 +122,7 @@ static KaiValue *kai_run_main_on_sized_stack(KaiValue *(*user_main)(void)) {
     swapcontext(&host, &ctx);
     root->stack_base = NULL;
     root->stack_size = 0;
-    munmap(region, size + ps);
+    kai_stack_unmap(region, size);
     return kai_user_main_result;
 }
 #endif
