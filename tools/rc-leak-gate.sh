@@ -141,8 +141,8 @@ ledger_run() {
 
 # The verdicts on programs built here: a root actor that never starts, or one
 # parked in `receive`, is cancelled and joined when main returns (settled,
-# growth 0); an actor spawned by an actor sits outside the root's join, and
-# one parked at a clean exit fails; a runtime abort with a fiber parked is
+# growth 0); a plain fiber spawned by an actor sits outside the root's join,
+# and one parked at a clean exit fails; a runtime abort with a fiber parked is
 # measured and noted; and a run that never ends is a TIMEOUT.
 self_test() {
   local dir="$WORK/self-test" once twice parked aborted spun
@@ -175,6 +175,7 @@ fn main() : Unit / Spawn = with_mailbox {
 EOF
   cat > "$dir/nested.kai" <<'EOF'
 import actor
+import spawn
 
 fn grandkid(parent: Pid[String]) : Unit / Actor[String] = {
   Actor.send(parent, "ready")
@@ -183,7 +184,7 @@ fn grandkid(parent: Pid[String]) : Unit / Actor[String] = {
 }
 
 fn kid(parent: Pid[String]) : Unit / Actor[String] + Spawn = {
-  let _g = spawn_actor(() => grandkid(parent))
+  let _g = spawn.spawn(() => with_mailbox { grandkid(parent) })
   let _never = Actor.receive()
   ()
 }
@@ -228,7 +229,7 @@ EOF
   done
   parked="$(ledger_run "$dir/nested" 1)"
   [ "$parked" = FIBERS-STARTED-AT-EXIT=1 ] \
-    || { echo "rc-leak-gate self-test: FAIL — a parked nested actor at exit reads as $parked"; return 1; }
+    || { echo "rc-leak-gate self-test: FAIL — a parked fiber outside the root at exit reads as $parked"; return 1; }
   aborted="$(ledger_run "$dir/aborted" 1)"
   case "$aborted" in
     ''|*[!0-9-]*) echo "rc-leak-gate self-test: FAIL — an abort with a parked fiber reads as $aborted"; return 1 ;;
