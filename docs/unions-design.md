@@ -412,14 +412,12 @@ post-#180). With unions, `!` does not need to invoke `From::from`
 
 ### With protocols (m12.8)
 
-`impl P for U` where `U` is a union is **not allowed** in v1.
-Protocols dispatch by the head type tag; a union does not have a
-single head type. The user implements `P` for each component and
-the call site narrows to the component before dispatch.
-
-If a future use case demands "`impl P for U`" semantics (dispatch
-that walks each variant of each component), it can be revisited as
-a separate proposal. v1 keeps unions and protocols orthogonal.
+`impl P for U` where `U` is a union of types is a compile error.
+The user implements `P` for each component, and a call on a
+`U`-typed value dispatches to the impl of the component it carries:
+the typer rewrites the call to a static match over the components, so
+dispatch stays `O(1)` and a value answers the same through every
+static type it is viewed through.
 
 ### With effects
 

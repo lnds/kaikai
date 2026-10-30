@@ -742,12 +742,17 @@ Clojure protocols + Elixir protocols support: **single dispatch by
 type tag, with explicit declaration, on a closed set of impls per
 compilation unit**.
 
-### Interaction with union types (issue #187)
+### Interaction with union types
 
-`impl P for U` where `U` is a union (`type U = A | B | C`) is **not
-allowed in v1**. Single-dispatch resolves on a head type tag; a
-union has no single head. Implement `P` for each component
-separately, and narrow at the call site:
+`impl P for U` where `U` is a union of types (`type U = A | B | C`)
+is a **compile error**: a union has no single head. Implement `P` for
+each component. A call whose receiver is typed `U` dispatches on the
+component the value carries: the compiler emits a static match over
+the components and calls each component's impl, so lookup stays
+`O(1)` and one value answers the same through every static type it is
+viewed through. Every component must have an impl; the error names
+the component that lacks one. The receiver must be the only
+`Self`-typed parameter of the operation.
 
 ```kaikai
 type IdentityError = AccountNotFound | KycExpired
@@ -768,18 +773,14 @@ impl Show for AuthError {
   }
 }
 
-fn render(err: QueryErr) : String = match err {
-  ie : IdentityError -> show(ie)     # dispatches on IdentityError
-  ae : AuthError     -> show(ae)     # dispatches on AuthError
+fn main() : Unit / Stdout = {
+  let e : QueryErr = KycExpired
+  Stdout.print(show(e))
 }
-
-fn main() : Unit / Stdout = Stdout.print(render(KycExpired))
 ```
 
-A future `impl P for U` semantics that walks each variant of each
-component is conceivable but not proposed; v1 keeps unions and
-protocols orthogonal. See `docs/unions-design.md` *With protocols*
-and `docs/unions.md` *Out of scope (v1)* for the rationale.
+See `docs/unions.md` *Limits* and `docs/unions-design.md` *With
+protocols*.
 
 ## Multi-method dispatch — analysis
 
