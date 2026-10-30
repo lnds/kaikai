@@ -1,0 +1,104 @@
+#[doc("""
+A call that leaves a region before it jumps.
+
+The arguments of such a call outlive the arena they may point into: an
+argument that may hold a value allocated in the arena is copied out first, as
+the region's own result is.
+""")]
+
+import compiler.kir
+import compiler.util
+
+#[doc("The copies out of the arena that a call needs, and its arguments after them.")]
+pub(pkg) type KgCopies = { stmts: [KStmt], args: [KVal] }
+
+#[doc("The registers of `f` that may hold a value allocated in a region's arena; `user` tells a function of the program from a runtime entry.")]
+pub(pkg) fn kg_tainted(f: KFn, user: (String) -> Bool) : [String] = kg_fix(flat_map(f.blocks, kg_block_stmts), user, [])
+
+fn kg_block_stmts(b: KBlock) : [KStmt] = b.stmts
+
+fn kg_fix(stmts: [KStmt], user: (String) -> Bool, seen: [String]) : [String] = {
+  let next = kg_pass(stmts, user, seen)
+  if list_length(next) == list_length(seen) { seen } else { kg_fix(stmts, user, next) }
+}
+
+fn kg_pass(stmts: [KStmt], user: (String) -> Bool, seen: [String]) : [String] = match stmts {
+  []           -> seen
+  [s, ...rest] -> kg_pass(rest, user, kg_add(seen, kg_defs(s, user, seen)))
+}
+
+fn kg_add(seen: [String], regs: [String]) : [String] = match regs {
+  []           -> seen
+  [r, ...rest] -> kg_add(if kg_has(seen, r) { seen } else { [r, ...seen] }, rest)
+}
+
+fn kg_has(xs: [String], x: String) : Bool = any(xs, (y) => y == x)
+
+fn kg_defs(s: KStmt, user: (String) -> Bool, seen: [String]) : [String] = match s {
+  KLet(r, _, op, _)           -> if kg_op(op, user, seen) { [r] } else { [] }
+  KStore(n, v, _)             -> if kg_val(v, seen) { [n] } else { [] }
+  KBindEvState(_, _, regs, _) -> regs
+  KBindSelfState(regs, _)     -> regs
+  _                           -> []
+}
+
+fn kg_val(v: KVal, seen: [String]) : Bool = match v {
+  KVar(n) -> kg_has(seen, n)
+  _       -> false
+}
+
+fn kg_init(i: KSlotInit) : KVal = match i {
+  SIBoxed(v) -> v
+  SIInt64(v) -> v
+  SIReal(v)  -> v
+  SIEnum(v)  -> v
+}
+
+fn kg_field(f: KFieldInit) : KVal = match f {
+  KFI(_, v) -> v
+}
+
+# An operation whose result cannot hold an arena value when its operands do not; any other may.
+fn kg_op(op: KOp, user: (String) -> Bool, seen: [String]) : Bool = match op {
+  KPrim(KpArenaCons, _)         -> true
+  KPrim(_, xs)                  -> any(xs, (x) => kg_val(x, seen))
+  KCon(_, _, _, inits, in_rg)   -> in_rg or any(inits, (i) => kg_val(kg_init(i), seen))
+  KRecord(fs, in_rg, _)         -> in_rg or any(fs, (f) => kg_val(kg_field(f), seen))
+  KProj(v, _)                   -> kg_val(v, seen)
+  KProjBorrow(v, _)             -> kg_val(v, seen)
+  KProjKind(v, _, _)            -> kg_val(v, seen)
+  KTagOf(v)                     -> kg_val(v, seen)
+  KLitOp(v)                     -> kg_val(v, seen)
+  KClosure(_, _, caps)          -> any(caps, (c) => kg_val(c, seen))
+  KCall(sym, xs)                -> user(sym) or any(xs, (x) => kg_val(x, seen))
+  _                             -> true
+}
+
+#[doc("The copies out of the arena that the call result `x` with arguments `args` needs: each boxed argument in `tainted` is copied, the others are passed as they are.")]
+pub(pkg) fn kg_copies(x: String, args: [KVal], boxed: [Bool], tainted: [String], pos: KPos) : KgCopies =
+  kg_copies_from(x, args, boxed, tainted, pos, 0, KgCopies { stmts: [], args: [] })
+
+fn kg_head(bs: [Bool]) : Bool = match bs {
+  []         -> true
+  [b, ...rs] -> b
+}
+
+fn kg_copies_from(x: String, args: [KVal], boxed: [Bool], tainted: [String], pos: KPos, i: Int, acc: KgCopies) : KgCopies = match args {
+  [] -> KgCopies { stmts: list_reverse(acc.stmts), args: list_reverse(acc.args) }
+  [a, ...rest] -> {
+    let b = list_is_empty(boxed) or kg_head(boxed)
+    let more = match boxed {
+      []         -> []
+      [_, ...bs] -> bs
+    }
+    match a {
+      KVar(n) ->
+        if b and kg_has(tainted, n) {
+          let reg = cat2(cat2("__rg.", x), int_to_string(i))
+          kg_copies_from(x, rest, more, tainted, pos, i + 1,
+                         KgCopies { stmts: [KLet(reg, SBoxed, KCall(kir_deep_copy_out_sym(), [a]), pos), ...acc.stmts], args: [KVar(reg), ...acc.args] })
+        } else { kg_copies_from(x, rest, more, tainted, pos, i + 1, KgCopies { stmts: acc.stmts, args: [a, ...acc.args] }) }
+      _ -> kg_copies_from(x, rest, more, tainted, pos, i + 1, KgCopies { stmts: acc.stmts, args: [a, ...acc.args] })
+    }
+  }
+}

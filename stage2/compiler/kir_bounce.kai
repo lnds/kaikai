@@ -13,23 +13,28 @@ to a resolver between two hops of a cycle.
 import compiler.emit_shared_syms
 import compiler.enc_unit
 import compiler.kir
+import compiler.kir_syms
+import compiler.kir_tail_exit
 import compiler.util
 
 #[doc("A function split in two: the stub under its own symbol, the body under another, and the thunks closures over each are made of.")]
 pub(pkg) type KbMember = { stub: String, body: String, stub_thunk: String, body_thunk: String }
 
-#[doc("The functions that have a body, by the symbol of their stub.")]
-pub(pkg) type KbPlan = { members: [KbMember] }
+#[doc("The functions that have a body, by the symbol of their stub, and the names the functions that check a postcondition are emitted under, once known.")]
+pub(pkg) type KbPlan = { members: [KbMember], nm: Option[KNames] }
 
 #[doc("No function has a body.")]
-pub(pkg) fn kb_none() : KbPlan = KbPlan { members: [] }
+pub(pkg) fn kb_none() : KbPlan = KbPlan { members: [], nm: None }
+
+#[doc("`p` with the names its functions are emitted under.")]
+pub(pkg) fn kb_named(p: KbPlan, nm: KNames) : KbPlan = KbPlan { members: p.members, nm: Some(nm) }
 
 #[doc("True when no function has a body.")]
 pub(pkg) fn kb_is_empty(p: KbPlan) : Bool = list_is_empty(p.members)
 
 #[doc("`p` with the function whose stub is `stub` and whose body is `body` split in two.")]
 pub(pkg) fn kb_with(p: KbPlan, stub: String, body: String) : KbPlan =
-  KbPlan { members: [KbMember { stub: stub, body: body, stub_thunk: c_user_thunk_sym(stub), body_thunk: c_user_thunk_sym(body) }, ...p.members] }
+  KbPlan { nm: p.nm, members: [KbMember { stub: stub, body: body, stub_thunk: c_user_thunk_sym(stub), body_thunk: c_user_thunk_sym(body) }, ...p.members] }
 
 #[doc("The symbol of the body of the function whose stub is `sym`.")]
 pub(pkg) fn kb_body_of(p: KbPlan, sym: String) : Option[String] = map(find(p.members, (m) => m.stub == sym), .body)
@@ -46,10 +51,41 @@ pub(pkg) fn kb_returns_token(f: KFn) : Bool = match f.unit {
   }
 }
 
-#[doc("The body of the declared function `f` before its blocks are shaped: its code under a boxed result.")]
-pub(pkg) fn kb_body_shell(f: KFn) : KFn =
-  KFn { unit: EuTail(f.unit), kind: f.kind, params: f.params, ret: SBoxed, blocks: f.blocks, region_id: f.region_id,
-        stateful: f.stateful, mo: f.mo, donor: f.donor, entry: f.entry }
+#[doc("The body of the declared function `f` before its blocks are shaped: its code under a boxed result, owning the parameters `f` borrows and releasing them where it returns.")]
+pub(pkg) fn kb_body_shell(f: KFn) : KFn = {
+  let owned = kb_owned_params(f)
+  KFn { unit: EuTail(f.unit), kind: f.kind, params: map(f.params, (p) => kb_own(p, owned)), ret: SBoxed,
+        blocks: if list_is_empty(owned) { f.blocks } else { map(f.blocks, (b) => kb_release_at_ret(b, owned)) },
+        region_id: f.region_id, stateful: f.stateful, mo: f.mo, donor: f.donor, entry: f.entry }
+}
+
+#[doc("The boxed parameters of `f` that its body owns: those `f` borrows, unless a loop rebinds parameters in place, which leaves their ownership to the loop.")]
+pub(pkg) fn kb_owned_params(f: KFn) : [KParam] =
+  if any(f.blocks, kb_loops) { [] } else { filter(f.params, kb_borrowed_boxed) }
+
+fn kb_borrowed_boxed(p: KParam) : Bool = match p.mode {
+  KBorrow -> kb_boxed_slot(p.slot)
+  KOwn    -> false
+}
+
+fn kb_boxed_slot(s: KSlot) : Bool = match s {
+  SBoxed -> true
+  _      -> false
+}
+
+fn kb_loops(b: KBlock) : Bool = match b.term {
+  KTcrecGoto(_, _, _, _)                       -> true
+  KTrmcStep(_, _, _, _, _, _, _, _, _, _)      -> true
+  _                                            -> false
+}
+
+fn kb_own(p: KParam, owned: [KParam]) : KParam =
+  if any(owned, (o) => o.name == p.name) { KParam { ...p, mode: KOwn } } else { p }
+
+fn kb_release_at_ret(b: KBlock, owned: [KParam]) : KBlock = match b.term {
+  KRet(_, pos) -> KBlock { ...b, stmts: list_append(b.stmts, map(owned, (p) => KRC(KDrop(KVar(p.name)), pos))) }
+  _            -> b
+}
 
 #[doc("True when a result of the slot `s` can be boxed back and forth, so a function returning it can have a body.")]
 pub(pkg) fn kb_boxable(s: KSlot) : Bool = match s {
@@ -87,7 +123,8 @@ fn kb_unbox_prim(s: KSlot) : Option[PrimOp] = match s {
 pub(pkg) fn kb_stub(f: KFn, body: String) : KFn = {
   let called = KLet("__bnc_r", SBoxed, KCall(body, map(f.params, (p) => KVar(p.name))), KNoPos)
   let resolved = KLet("__bnc_v", SBoxed, KPrim(KpBounce, [KVar("__bnc_r")]), KNoPos)
-  let entry = KBlock { label: "entry", stmts: [called, resolved, ...kb_stub_result(f.ret)], term: KRet(kb_stub_value(f.ret), KNoPos), region_id: None }
+  let lend = map(kb_owned_params(f), (p) => KRC(KDup(KVar(p.name)), KNoPos))
+  let entry = KBlock { label: "entry", stmts: list_append(lend, [called, resolved, ...kb_stub_result(f.ret)]), term: KRet(kb_stub_value(f.ret), KNoPos), region_id: None }
   KFn { unit: f.unit, kind: f.kind, params: f.params, ret: f.ret, blocks: [entry], region_id: None,
         stateful: f.stateful, mo: f.mo, donor: f.donor, entry: f.entry }
 }
@@ -152,4 +189,36 @@ fn kb_retarget_stmt(s: KStmt, p: KbPlan) : KStmt = match s {
 fn kb_thunk(p: KbPlan, sym: String) : String = match find(p.members, (m) => m.stub_thunk == sym) {
   Some(m) -> m.body_thunk
   None    -> sym
+}
+
+#[doc("The function that checks a postcondition on the value of the block `label` of `f`: it takes the value, runs the check and returns the value boxed.")]
+pub(pkg) fn kb_post_fn(f: KFn, label: String, p: KtPost) : KFn = {
+  let entry = KBlock { label: "entry", stmts: kb_declare(p.stmts, [p.x], []), term: KRet(KVar(p.value), p.pos), region_id: None }
+  KFn { unit: EuPost(f.unit, label), kind: KFnNormal, params: [KParam { name: p.x, slot: SBoxed, mode: KOwn, origin: PDirect(0) }], ret: SBoxed,
+        blocks: kb_box_rets(kb_value_slot(p.stmts, p.value), [entry]), region_id: None, stateful: false, mo: f.mo, donor: false, entry: false }
+}
+
+#[doc("The symbol of the thunk a closure over the check `post` is made of, when `p` knows the names.")]
+pub(pkg) fn kb_post_thunk(p: KbPlan, post: KFn) : Option[String] = map(p.nm, (nm) => c_user_thunk_sym(kfn_sym(nm, post)))
+
+fn kb_value_slot(stmts: [KStmt], v: String) : KSlot = kb_value_slot_in(list_reverse(stmts), v)
+
+fn kb_value_slot_in(rev: [KStmt], v: String) : KSlot = match rev {
+  []           -> SBoxed
+  [s, ...rest] -> match s {
+    KLet(r, slot, _, _) -> if r == v { slot } else { kb_value_slot_in(rest, v) }
+    _                   -> kb_value_slot_in(rest, v)
+  }
+}
+
+# A store to a register the check has not bound is its binding.
+fn kb_declare(stmts: [KStmt], bound: [String], acc: [KStmt]) : [KStmt] = match stmts {
+  []           -> list_reverse(acc)
+  [s, ...rest] -> match s {
+    KStore(n, v, pos) ->
+      if any(bound, (b) => b == n) { kb_declare(rest, bound, [s, ...acc]) }
+      else { kb_declare(rest, [n, ...bound], [KLet(n, SBoxed, KLitOp(v), pos), ...acc]) }
+    KLet(r, _, _, _) -> kb_declare(rest, [r, ...bound], [s, ...acc])
+    _                -> kb_declare(rest, bound, [s, ...acc])
+  }
 }

@@ -18,7 +18,10 @@ A call through a closure cannot be a jump. A function that makes one in tail
 position, and every function that tail calls such a function, returns a boxed
 value that may be the bounce token (`kir_bounce`): the call is parked in the
 runtime and the nearest resolver runs it, so a cycle through closures runs in
-constant stack.
+constant stack. A body owns the parameters its function borrows and releases
+them where it returns; a call that leaves a region frees the arena first and
+copies out of it the arguments that may live in it; a postcondition that reads
+only the result is checked once by the resolver on the final value.
 """)]
 
 import compiler.enc_unit
@@ -27,6 +30,7 @@ import compiler.kir
 import compiler.kir_bounce
 import compiler.kir_syms
 import compiler.kir_tail_exit
+import compiler.kir_tail_region
 import compiler.kir_tail_report
 import compiler.tail_report
 import compiler.util
@@ -61,22 +65,22 @@ fn kt_pick(chain: [KSymFn], sym: String, found: Option[KFn]) : Option[KFn] = mat
 }
 
 # What became of the block: shaped, shaped around a call that became a bounce, left alone, or left alone with a reason worth reporting.
-type KtRes = KtDone([KStmt], KTerm) | KtBounce([KStmt], KTerm) | KtConv([KStmt], KStmt, KTerm) | KtMissed(KtMiss) | KtNone
+type KtRes = KtDone([KStmt], KTerm) | KtBounce([KStmt], KTerm, [KFn]) | KtConv([KStmt], KStmt, KTerm, [KFn]) | KtJump([KStmt], KStmt, KTerm) | KtMissed(KtMiss) | KtNone
 
-#[doc("A function after shaping, the calls it leaves, and whether a call became a bounce.")]
-pub(pkg) type KtFnRes = { f: KFn, misses: [KtMiss], hit: Bool }
+#[doc("A function after shaping, the calls it leaves, whether a call became a bounce, and the checks of postconditions that a resolver runs.")]
+pub(pkg) type KtFnRes = { f: KFn, misses: [KtMiss], hit: Bool, posts: [KFn] }
 
-type KtBlockRes = { b: KBlock, misses: [KtMiss], hit: Bool }
+type KtBlockRes = { b: KBlock, misses: [KtMiss], hit: Bool, posts: [KFn] }
 
 #[doc("`f` with every call whose result reaches the return shaped as a tail call, parked or jumped to under `plan`.")]
 pub(pkg) fn kt_fn(f: KFn, ix: NameIndex[KSymFn], plan: KbPlan) : KtFnRes =
   if kt_shapeable(f) {
     let rs = map(f.blocks, (b) => kt_block(b, f, ix, plan))
-    KtFnRes { f: kfn_with_blocks(f, map(rs, kt_block_of)), misses: flat_map(rs, kt_block_misses), hit: any(rs, kt_block_hit) }
-  } else { KtFnRes { f: f, misses: [], hit: false } }
+    KtFnRes { f: kfn_with_blocks(f, map(rs, kt_block_of)), misses: flat_map(rs, kt_block_misses), hit: any(rs, kt_block_hit), posts: flat_map(rs, kt_block_posts) }
+  } else { KtFnRes { f: f, misses: [], hit: false, posts: [] } }
 
 fn kt_shapeable(f: KFn) : Bool =
-  not kt_in_region(f.region_id) and ((kir_is_tail_fn(f) and not f.donor) or kt_lambda(f))
+  not kt_in_region(f.region_id) and (kir_is_tail_fn(f) or kt_lambda(f))
 
 fn kt_lambda(f: KFn) : Bool = match f.kind {
   KFnLambda -> f.ret == SBoxed
@@ -89,33 +93,39 @@ fn kt_block_misses(r: KtBlockRes) : [KtMiss] = r.misses
 
 fn kt_block_hit(r: KtBlockRes) : Bool = r.hit
 
+fn kt_block_posts(r: KtBlockRes) : [KFn] = r.posts
+
 # A block ends in a shaped tail call when some call in it reaches the return through the block's remainder.
 fn kt_block(b: KBlock, f: KFn, ix: NameIndex[KSymFn], plan: KbPlan) : KtBlockRes =
-  if kt_in_region(b.region_id) { KtBlockRes { b: b, misses: [], hit: false } } else {
-    match kt_shape(list_reverse(b.stmts), [], b.term, f, ix, plan) {
-      KtDone(stmts, term)     -> KtBlockRes { b: KBlock { ...b, stmts: stmts, term: term }, misses: [], hit: false }
-      KtBounce(stmts, term)   -> KtBlockRes { b: KBlock { ...b, stmts: stmts, term: term }, misses: [], hit: true }
-      KtMissed(m)             -> KtBlockRes { b: b, misses: [m], hit: false }
-      _                       -> KtBlockRes { b: b, misses: [], hit: false }
+  if kt_in_region(b.region_id) { KtBlockRes { b: b, misses: [], hit: false, posts: [] } } else {
+    match kt_shape(list_reverse(b.stmts), [], b.term, KtSite { f: f, ix: ix, plan: plan, label: b.label }) {
+      KtDone(stmts, term)          -> KtBlockRes { b: KBlock { ...b, stmts: stmts, term: term }, misses: [], hit: false, posts: [] }
+      KtBounce(stmts, term, posts) -> KtBlockRes { b: KBlock { ...b, stmts: stmts, term: term }, misses: [], hit: true, posts: posts }
+      KtMissed(m)                  -> KtBlockRes { b: b, misses: [m], hit: false, posts: [] }
+      _                            -> KtBlockRes { b: b, misses: [], hit: false, posts: [] }
     }
   }
 
+# The function being shaped, the callees it can see, the functions that have a body and the block at hand.
+type KtSite = { f: KFn, ix: NameIndex[KSymFn], plan: KbPlan, label: String }
+
 # `rev` holds the statements before the candidate, last first; `after` those following it.
-fn kt_shape(rev: [KStmt], after: [KStmt], term: KTerm, f: KFn, ix: NameIndex[KSymFn], plan: KbPlan) : KtRes = match rev {
+fn kt_shape(rev: [KStmt], after: [KStmt], term: KTerm, w: KtSite) : KtRes = match rev {
   [] -> KtNone
   [s, ...before] -> match s {
-    KLet(x, slot, KCall(sym, args), pos) -> kt_place(kt_try(x, slot, sym, args, pos, after, term, f, ix, plan), s, before)
+    KLet(_, _, KCall(sym, _), _) if sym == kir_deep_copy_out_sym() -> kt_shape(before, [s, ...after], term, w)
+    KLet(x, slot, KCall(sym, args), pos) -> kt_place(kt_try(x, slot, sym, args, pos, after, term, w.f, w.ix, w.plan), before)
     KLet(x, _, op, pos) ->
-      if kt_indirect(op) { kt_place(kt_try_indirect(x, pos, op, after, term, f), s, before) }
-      else { kt_shape(before, [s, ...after], term, f, ix, plan) }
-    _ -> kt_shape(before, [s, ...after], term, f, ix, plan)
+      if kt_indirect(op) { kt_place(kt_try_indirect(x, pos, op, after, term, w), before) }
+      else { kt_shape(before, [s, ...after], term, w) }
+    _ -> kt_shape(before, [s, ...after], term, w)
   }
 }
 
 # The shaped block: what precedes the call, the releases moved before it, the call.
-fn kt_place(r: KtRes, s: KStmt, before: [KStmt]) : KtRes = match r {
-  KtDone(drops, ret)     -> KtDone(list_append(list_reverse(before), list_append(drops, [s])), ret)
-  KtConv(pre, call, ret) -> KtBounce(list_append(list_reverse(before), list_append(pre, [call])), ret)
+fn kt_place(r: KtRes, before: [KStmt]) : KtRes = match r {
+  KtJump(pre, call, ret) -> KtDone(list_append(list_reverse(before), list_append(pre, [call])), ret)
+  KtConv(pre, call, ret, posts) -> KtBounce(list_append(list_reverse(before), list_append(pre, [call])), ret, posts)
   other                  -> other
 }
 
@@ -126,25 +136,71 @@ fn kt_indirect(op: KOp) : Bool = match op {
 }
 
 # A call through a closure has no known callee to take the convention from: it is parked for the nearest resolver, or reported.
-fn kt_try_indirect(x: String, pos: KPos, op: KOp, after: [KStmt], term: KTerm, f: KFn) : KtRes =
-  match kt_exit(after, term, KtSt { alias: [x], drops: [], pads: [], raw: true, checked: false, lenient: false }, f.blocks, 8) {
-    KtNo             -> KtNone
-    KtOk(drops, pads, ret) -> kt_park(x, pos, op, list_append(drops, pads), ret, f)
-    _                -> KtMissed(KtMiss(f, "", pos, TwClosure))
+fn kt_try_indirect(x: String, pos: KPos, op: KOp, after: [KStmt], term: KTerm, w: KtSite) : KtRes =
+  match kt_exit(after, term, kt_start(x, true), w.f.blocks, 8) {
+    KtNo                           -> KtNone
+    KtOk(drops, pads, ret, leaves) -> kt_park(x, pos, op, KtTail { drops: drops, pads: pads, leaves: leaves, ret: ret, post: None }, w)
+    KtChecked(drops, pads, post)   -> match post {
+      Some(p) -> kt_park(x, pos, op, KtTail { drops: drops, pads: pads, leaves: false, ret: p.pos, post: post }, w)
+      None    -> KtMissed(KtMiss(w.f, "", pos, TwClosure))
+    }
   }
 
-fn kt_park(x: String, pos: KPos, op: KOp, drops: [KStmt], ret: KPos, f: KFn) : KtRes = {
-  let missed = KtMissed(KtMiss(f, "", pos, TwClosure))
+# What follows a call: the releases to move before it, the pads to close, whether it leaves a region, where it returns, and the postcondition a resolver checks.
+type KtTail = { drops: [KStmt], pads: [KStmt], leaves: Bool, ret: KPos, post: Option[KtPost] }
+
+fn kt_park(x: String, pos: KPos, op: KOp, t: KtTail, w: KtSite) : KtRes = {
+  let missed = KtMissed(KtMiss(w.f, "", pos, TwClosure))
   match op {
     KCallIndirect(fv, args) ->
-      if kt_parks(f) { KtConv(drops, kt_tail_apply(x, fv, args, pos), KRet(KVar(x), ret)) } else { missed }
+      if kt_parks(w.f) { kt_park_call(x, pos, fv, args, [], t, w) } else { missed }
     KCallIndirectBorrow(fv, args) ->
-      if kt_parks(f) { KtConv([KRC(KDup(fv), pos), ...drops], kt_tail_apply(x, fv, args, pos), KRet(KVar(x), ret)) } else { missed }
+      if kt_parks(w.f) { kt_park_call(x, pos, fv, args, [KRC(KDup(fv), pos)], t, w) } else { missed }
     _ -> KtNone
   }
 }
 
+fn kt_park_call(x: String, pos: KPos, fv: KVal, args: [KVal], lend: [KStmt], t: KtTail, w: KtSite) : KtRes = {
+  let lv = kt_leave(t.leaves, x, [fv, ...args], [], pos, w.f, w.ix)
+  match kt_check_site(x, t, pos, w) {
+    None -> KtMissed(KtMiss(w.f, "", pos, TwClosure))
+    Some(ck) -> match lv.args {
+      [fv2, ...args2] ->
+        KtConv(list_append(lend, list_append(t.drops, list_append(lv.stmts, list_append(t.pads, ck.stmts)))),
+               kt_tail_apply(x, fv2, args2, pos), KRet(KVar(x), t.ret), ck.posts)
+      [] -> KtNone
+    }
+  }
+}
+
+# The statements that hand the postcondition to the resolver, and the function that checks it; none when it cannot be handed.
+type KtCheck = { stmts: [KStmt], posts: [KFn] }
+
+fn kt_check_site(x: String, t: KtTail, pos: KPos, w: KtSite) : Option[KtCheck] = match t.post {
+  None    -> Some(KtCheck { stmts: [], posts: [] })
+  Some(p) -> {
+    let post = kb_post_fn(w.f, w.label, p)
+    match kb_post_thunk(w.plan, post) {
+      None        -> None
+      Some(thunk) -> {
+        let c = cat2("__post.", x)
+        Some(KtCheck { stmts: [KLet(c, SBoxed, KClosure(thunk, 1, []), pos), KDo(KPrim(KpBouncePost, [KVar(c)]), pos)], posts: [post] })
+      }
+    }
+  }
+}
+
 fn kt_tail_apply(x: String, fv: KVal, args: [KVal], pos: KPos) : KStmt = KLet(x, SBoxed, KPrim(KpTailApply, [fv, ...args]), pos)
+
+# The copies out of the arenas a call leaves, and its arguments after them; a call that leaves no region takes its arguments as they are.
+fn kt_leave(leaves: Bool, x: String, vals: [KVal], boxed: [Bool], pos: KPos, f: KFn, ix: NameIndex[KSymFn]) : KgCopies =
+  if leaves { kg_copies(x, vals, boxed, kg_tainted(f, (sym) => is_some(kt_callee(ix, sym))), pos) }
+  else { KgCopies { stmts: [], args: vals } }
+
+fn kt_boxed(p: KParam) : Bool = match p.slot {
+  SBoxed -> true
+  _      -> false
+}
 
 # The caller can return the bounce token.
 fn kt_parks(f: KFn) : Bool = kb_returns_token(f)
@@ -152,12 +208,15 @@ fn kt_parks(f: KFn) : Bool = kb_returns_token(f)
 fn kt_try(x: String, slot: KSlot, sym: String, args: [KVal], pos: KPos, after: [KStmt], term: KTerm, f: KFn, ix: NameIndex[KSymFn], plan: KbPlan) : KtRes =
   match kt_callee(ix, sym) {
     None     -> KtNone
-    Some(cf) -> match kt_exit(after, term, KtSt { alias: [x], drops: [], pads: [], raw: kt_raw(slot), checked: false, lenient: false }, f.blocks, 8) {
+    Some(cf) -> match kt_exit(after, term, kt_start(x, kt_raw(slot)), f.blocks, 8) {
       KtNo      -> KtNone
-      KtChecked -> KtMissed(KtMiss(f, sym, pos, TwCheck))
-      KtOk(drops, pads, ret) -> match kt_body_edge(f, sym, plan) {
-        Some(body) -> kt_to_body(x, body, args, pos, drops, pads, ret, f, ix)
-        None       -> kt_callee_fits(x, slot, sym, pos, drops, ret, f, cf)
+      KtChecked(_, _, _) -> if f.donor { KtNone } else { KtMissed(KtMiss(f, sym, pos, TwCheck)) }
+      KtOk(drops, pads, ret, leaves) -> {
+        let t = KtTail { drops: drops, pads: pads, leaves: leaves, ret: ret, post: None }
+        match kt_body_edge(f, sym, plan) {
+          Some(body) -> kt_to_body(x, cf, body, args, pos, t, f, ix)
+          None       -> if f.donor { KtNone } else { kt_callee_fits(x, slot, sym, args, pos, t, f, cf, ix) }
+        }
       }
     }
   }
@@ -166,21 +225,62 @@ fn kt_try(x: String, slot: KSlot, sym: String, args: [KVal], pos: KPos, after: [
 fn kt_body_edge(f: KFn, sym: String, plan: KbPlan) : Option[String] =
   if kb_returns_token(f) { kb_body_of(plan, sym) } else { None }
 
-fn kt_to_body(x: String, body: String, args: [KVal], pos: KPos, drops: [KStmt], pads: [KStmt], ret: KPos, f: KFn, ix: NameIndex[KSymFn]) : KtRes =
+# The releases of the arguments a body takes over from the function it replaces, and the references it needs lent.
+type KtHand = { lend: [KStmt], drops: [KStmt] }
+
+# A parameter the function borrows and its body owns is handed the caller's reference: the release the caller was to make after the call is dropped, or a reference is lent when the caller owns none.
+fn kt_handoff(stub: [KParam], body: [KParam], args: [KVal], h: KtHand) : Option[KtHand] = match stub {
+  []           -> Some(h)
+  [sp, ...srest] -> match body {
+    []           -> Some(h)
+    [bp, ...brest] -> match args {
+      [] -> Some(h)
+      [a, ...arest] ->
+        if kt_borrowed(sp) and not kt_borrowed(bp) {
+          match a {
+            KVar(r) -> match kt_take_drop(h.drops, r, []) {
+              Some(rest) -> kt_handoff(srest, brest, arest, KtHand { lend: h.lend, drops: rest })
+              None       -> kt_handoff(srest, brest, arest, KtHand { lend: list_append(h.lend, [KRC(KDup(a), KNoPos)]), drops: h.drops })
+            }
+            _ -> None
+          }
+        } else { kt_handoff(srest, brest, arest, h) }
+    }
+  }
+}
+
+fn kt_take_drop(drops: [KStmt], r: String, seen: [KStmt]) : Option[[KStmt]] = match drops {
+  []           -> None
+  [d, ...rest] -> match d {
+    KRC(KDrop(KVar(v)), _) -> if v == r { Some(list_append(list_reverse(seen), rest)) } else { kt_take_drop(rest, r, [d, ...seen]) }
+    _                      -> kt_take_drop(rest, r, [d, ...seen])
+  }
+}
+
+fn kt_to_body(x: String, cf: KFn, body: String, args: [KVal], pos: KPos, t: KtTail, f: KFn, ix: NameIndex[KSymFn]) : KtRes =
   match kt_callee(ix, body) {
     None     -> KtNone
-    Some(cb) ->
-      if not list_is_empty(drops) and any(cb.params, kt_borrowed) { KtMissed(KtMiss(f, body, pos, TwBorrow)) }
-      else { KtConv(list_append(drops, pads), KLet(x, SBoxed, KCall(body, args), pos), KRet(KVar(x), ret)) }
+    Some(cb) -> match kt_handoff(cf.params, cb.params, args, KtHand { lend: [], drops: t.drops }) {
+      None    -> KtMissed(KtMiss(f, body, pos, TwBorrow))
+      Some(h) ->
+        if (t.leaves or not list_is_empty(h.drops)) and any(cb.params, kt_borrowed) { KtMissed(KtMiss(f, body, pos, TwBorrow)) }
+        else {
+          let lv = kt_leave(t.leaves, x, args, map(cb.params, kt_boxed), pos, f, ix)
+          KtConv(list_append(h.lend, list_append(h.drops, list_append(lv.stmts, t.pads))), KLet(x, SBoxed, KCall(body, lv.args), pos), KRet(KVar(x), t.ret), [])
+        }
+    }
   }
 
-fn kt_callee_fits(x: String, slot: KSlot, sym: String, pos: KPos, drops: [KStmt], ret: KPos, f: KFn, cf: KFn) : KtRes =
+fn kt_callee_fits(x: String, slot: KSlot, sym: String, args: [KVal], pos: KPos, t: KtTail, f: KFn, cf: KFn, ix: NameIndex[KSymFn]) : KtRes =
   if not kir_is_tail_fn(cf) or cf.donor { KtMissed(KtMiss(f, sym, pos, TwNotPlain)) }
   else if slot != cf.ret or slot != f.ret { KtMissed(KtMiss(f, sym, pos, TwResult)) }
   else if not kir_same_sig(f, cf) { KtMissed(KtMiss(f, sym, pos, TwParams)) }
-  else if not list_is_empty(drops) and any(cf.params, kt_borrowed) {
-    KtMissed(KtMiss(f, sym, pos, TwBorrow))
-  } else { KtDone(drops, KRet(KVar(x), ret)) }
+  else if (t.leaves or not list_is_empty(t.drops)) and any(cf.params, kt_borrowed) { KtMissed(KtMiss(f, sym, pos, TwBorrow)) }
+  else {
+    let lv = kt_leave(t.leaves, x, args, map(cf.params, kt_boxed), pos, f, ix)
+    let closes = if t.leaves { list_append(lv.stmts, t.pads) } else { [] }
+    KtJump(list_append(t.drops, closes), KLet(x, slot, KCall(sym, lv.args), pos), KRet(KVar(x), t.ret))
+  }
 
 fn kt_borrowed(p: KParam) : Bool = match p.mode {
   KBorrow -> true
