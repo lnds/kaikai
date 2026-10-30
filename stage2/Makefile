@@ -9586,7 +9586,7 @@ test-root-reaps-children-asan: $(TARGET) build
 	      -Wno-unused-function -Wno-unused-variable \
 	      -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c -lm -lpthread; \
 	for n in 1 4; do \
-	  KAI_THREADS=$$n ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=0:symbolize=0" \
+	  KAI_THREADS=$$n ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=$(SEG_RT_LEAKS):symbolize=0" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    $(KAI_BOUNDED) 300 ./build/$$name-asan-c > build/$$name-asan.$$n.out 2> build/$$name-asan.$$n.err \
 	    || { echo "root-reaps-asan FAIL (KAI_THREADS=$$n)"; cat build/$$name-asan.$$n.err; exit 1; }; \
