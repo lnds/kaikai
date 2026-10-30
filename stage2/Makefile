@@ -1703,8 +1703,10 @@ test-native-modular: $(TARGET) build
 	  && echo "native-modular OK: the core is pruned to what the program reaches" \
 	  || { echo "native-modular: the core was not pruned"; exit 1; }; \
 	n1=$$(wc -l < build/nmod-objs1.txt); \
-	printf 'pub fn total(xs: [Int]) : Int = fold_add(xs, 0)\nfn fold_add(xs: [Int], acc: Int) : Int = match xs {\n  [] -> acc\n  [x, ...rest] -> fold_add(rest, x + acc)\n}\npub fn pick[T](a: T, b: T) : T = a\n' > $$work/mathx.kai; \
-	emit | sort > build/nmod-objs2.txt; \
+	printf 'pub fn total(xs: [Int]) : Int = fold_add(xs, 0)\nfn fold_add(xs: [Int], acc: Int) : Int = match xs {\n  [] -> acc\n  [x, ...rest] -> fold_add(rest, x + acc)\n}\npub fn pick[t](a: t, b: t) : t = a\n' > $$work/mathx.kai; \
+	cmp -s $$fx/mathx.kai $$work/mathx.kai && { echo "native-modular: the body edit did not change the source"; exit 1; }; \
+	emit | sort > build/nmod-objs2.txt \
+	  || { echo "native-modular: EMIT FAIL after the body edit"; cat build/nmod.err; exit 1; }; \
 	changed=$$(comm -13 build/nmod-objs1.txt build/nmod-objs2.txt | wc -l | tr -d ' '); \
 	hits=$$(comm -12 build/nmod-objs1.txt build/nmod-objs2.txt | wc -l | tr -d ' '); \
 	[ "$$changed" = "1" ] \
