@@ -11,9 +11,16 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT INT TERM
 fx="$ROOT/examples/runtime"
 
-for name in fiber_stack_sized fiber_stack_sized_overflow fiber_stack_sized_handle_overflow; do
+for name in fiber_stack_many fiber_stack_sized fiber_stack_sized_overflow fiber_stack_sized_handle_overflow; do
   "$ROOT/bin/kai" build --backend="$backend" "$fx/$name.kai" -o "$work/$name" 2> "$work/build.err" \
     || { echo "fiber-stack FAIL ($backend: build of $name failed)"; cat "$work/build.err"; exit 1; }
+done
+
+for n in 1 ""; do
+  out="$(KAI_THREADS=$n "$work/fiber_stack_many" 2>&1)" \
+    || { echo "fiber-stack FAIL ($backend, KAI_THREADS=$n: 20K live fibers failed)"; echo "$out"; exit 1; }
+  [ "$out" = "$(cat "$fx/fiber_stack_many.out.expected")" ] \
+    || { echo "fiber-stack DIFF ($backend, many fibers, KAI_THREADS=$n)"; echo "$out"; exit 1; }
 done
 
 for n in 1 8; do
@@ -28,4 +35,4 @@ for n in 1 8; do
       || { echo "fiber-stack FAIL ($backend, KAI_THREADS=$n: $name not diagnosed, exit=$rc)"; cat "$work/overflow.err"; exit 1; }
   done
 done
-echo "fiber-stack OK ($backend: 20K deep completes on a fiber and in a kept-continuation handle, 50M deep diagnosed, at 1 and 8 threads)"
+echo "fiber-stack OK ($backend: 20K deep completes on a fiber and in a kept-continuation handle, 50M deep diagnosed, at 1 and 8 threads; 20K live fibers at 1 and default)"

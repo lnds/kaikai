@@ -236,12 +236,10 @@ static size_t kai_page_size(void) {
     return ps;
 }
 
-/* Read KAI_FIBER_STACK_SIZE once and cache. The default is an address-space
- * reservation (MAP_NORESERVE), not memory: only the pages a fiber touches are
- * committed. Out-of-range values fall back to the default and log a warning. The result is rounded
- * up to a page-size multiple — mmap + mprotect both require it, and
- * 16 KiB pages on macOS arm64 silently break sub-page values
- * otherwise. */
+/* Read KAI_FIBER_STACK_SIZE once and cache. The default is a MAP_NORESERVE
+ * address reservation: only touched pages are committed. Out-of-range values
+ * fall back to it with a warning. Rounded up to a page multiple: mmap and
+ * mprotect need it, and 16 KiB macOS pages break sub-page values. */
 static size_t kai_fiber_stack_size(void) {
     static _Atomic size_t cached = 0;
     size_t hit = atomic_load_explicit(&cached, memory_order_relaxed);
