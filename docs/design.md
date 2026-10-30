@@ -47,8 +47,8 @@ The design breaks if any of these is compromised.
      runs in constant stack on both backends: the call is parked in the
      runtime and the nearest resolver runs it, so a cycle through a
      closure parameter, a record field or a list never nests. A function
-     that makes such a call returns a boxed value (`kir_bounce`); calls
-     with more than eight arguments are ordinary calls and are reported.
+     that makes such a call returns a boxed value (`kir_bounce`); the
+     arity of the closure does not matter.
    - Compact representations: primitives unboxed inside each fiber,
      heap boxing only for compound immutable values.
    - Effects compiled with one-shot continuations: low cost, not
