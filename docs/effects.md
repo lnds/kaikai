@@ -241,7 +241,10 @@ fn main() : Unit / Stdout = greet("a")
 
 A **private** top-level function may leave the row out: it is inferred
 from the body, and a call to an inferred function carries its row to the
-caller. Recursive and mutually recursive groups are inferred together.
+caller. The inferred row is generalised like the type: it may carry
+effects with type arguments (`Box[Int]`) and stay open on a row variable
+of the signature, so a helper that calls its callback parameter takes the
+callback's row. Recursive and mutually recursive groups share one row.
 
 ```kaikai
 fn greet(name: String) = print(name)            # private: row inferred as Stdout
@@ -249,10 +252,9 @@ fn greet(name: String) = print(name)            # private: row inferred as Stdou
 fn main() : Unit / Stdout = greet("a")
 ```
 
-Two cases still need the row spelled out: a body that performs an effect
-carrying type arguments or named by an instance (`with Eff as a`), and a
-body that calls a function-typed parameter whose row is a variable of the
-signature.
+A row a signature cannot spell still needs to be declared: a body that
+performs an effect on a named instance that escapes it, one tied to two
+row variables of its signature, or a recursive group tied to one.
 
 ```kaikai
 fn greet(name: String) / Stdout = print(name)   # OK
