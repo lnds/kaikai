@@ -48,6 +48,7 @@ static inline KaiValue *kaix_bit_xor(KaiValue *a, KaiValue *b);
 static inline KaiValue *kaix_bool(int b);
 static inline int32_t kaix_bool_field(KaiValue *v);
 static inline KaiValue *kaix_bool_of_i32(int32_t i);
+static inline KaiValue *kaix_bounce_post(KaiValue *post);
 static inline KaiValue *kaix_bounce_resolve(KaiValue *r);
 static inline KaiValue *kaix_byte(uint32_t b);
 KaiValue *kaix_byte_add_thunk(KaiValue *s, KaiValue **a, int n);
@@ -733,6 +734,9 @@ static inline KaiValue *kaix_bit_xor(KaiValue *a, KaiValue *b) {
 static inline KaiValue *kaix_bool(int b) {return kai_bool(b); }
 static inline int32_t kaix_bool_field(KaiValue *v) {return (int32_t) v->as.b; }
 static inline KaiValue *kaix_bool_of_i32(int32_t i) {return kai_bool(i != 0); }
+static inline KaiValue *kaix_bounce_post(KaiValue *post) {
+    return kai_bounce_post(post);
+}
 static inline KaiValue *kaix_bounce_resolve(KaiValue *r) {
     return kai_bounce_resolve(r);
 }

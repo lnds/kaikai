@@ -392,6 +392,10 @@ KaiValue *kaix_bounce_resolve(KaiValue *r) {
     return kai_bounce_resolve(r);
 }
 
+KaiValue *kaix_bounce_post(KaiValue *post) {
+    return kai_bounce_post(post);
+}
+
 /* Core thunks exported as regular symbols so LLVM IR can take
    their address to build closures passed into higher-order core
    calls. One per core entry we may reference as a value. */

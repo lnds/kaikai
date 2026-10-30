@@ -423,7 +423,7 @@ static inline KaiValue *kai_static_closure(KaiValue **slot, KaiFn fn, int arity)
  * fibers. */
 #define KAI_BOUNCE ((KaiValue *) (intptr_t) 16)
 #define KAI_BOUNCE_MAX 8
-typedef struct { KaiValue *clo; int32_t n; KaiValue **big; KaiValue *args[KAI_BOUNCE_MAX]; } KaiBounce;
+typedef struct { KaiValue *clo; KaiValue *post; int32_t n; KaiValue **big; KaiValue *args[KAI_BOUNCE_MAX]; } KaiBounce;
 KAI_RT_COUNTER(KaiBounce kai_bounce_slot, {0});
 
 __attribute__((noinline)) static void kai_bounce_put(KaiValue *clo, int argc, KaiValue **argv) {
@@ -438,8 +438,18 @@ __attribute__((noinline)) static void kai_bounce_put(KaiValue *clo, int argc, Ka
     for (int i = 0; i < argc; ++i) dst[i] = argv[i];
 }
 
-__attribute__((noinline)) static KaiValue *kai_bounce_take(KaiValue **args, int *n, KaiValue ***big) {
+/* A postcondition that reads only the result: the call about to be parked
+ * carries the one-argument closure that checks it. The resolver runs each
+ * distinct closure once, on the final value. */
+__attribute__((noinline)) static KaiValue *kai_bounce_post(KaiValue *post) {
+    kai_bounce_slot.post = post;
+    return kai_unit();
+}
+
+__attribute__((noinline)) static KaiValue *kai_bounce_take(KaiValue **args, int *n, KaiValue ***big, KaiValue **post) {
     KaiBounce *b = &kai_bounce_slot;
+    *post = b->post;
+    b->post = NULL;
     *n = b->n;
     *big = NULL;
     if (b->n > KAI_BOUNCE_MAX) { *big = b->big; b->big = NULL; }
@@ -447,17 +457,40 @@ __attribute__((noinline)) static KaiValue *kai_bounce_take(KaiValue **args, int 
     return b->clo;
 }
 
+static KaiValue *kai_apply(KaiValue *clo, int argc, KaiValue **argv);
+
+static KaiValue **kai_bounce_keep(KaiValue **posts, int *np, int *cap, KaiValue *post) {
+    for (int i = 0; i < *np; ++i) {
+        if (posts[i]->as.clo.fn == post->as.clo.fn) { kai_decref(post); return posts; }
+    }
+    if (*np == *cap) {
+        *cap = *cap ? *cap * 2 : 4;
+        posts = (KaiValue **) realloc(posts, (size_t) *cap * sizeof(KaiValue *));
+    }
+    posts[(*np)++] = post;
+    return posts;
+}
+
 static KaiValue *kai_bounce_run(void) {
     KaiValue *args[KAI_BOUNCE_MAX];
     int n;
     KaiValue *r;
+    KaiValue **posts = NULL;
+    int np = 0, cap = 0;
     do {
         KaiValue **big;
-        KaiValue *clo = kai_bounce_take(args, &n, &big);
+        KaiValue *post;
+        KaiValue *clo = kai_bounce_take(args, &n, &big, &post);
+        if (post) posts = kai_bounce_keep(posts, &np, &cap, post);
         r = clo->as.clo.fn(clo, big ? big : args, n);
         free(big);
         kai_decref(clo);
     } while (r == KAI_BOUNCE);
+    for (int i = np - 1; i >= 0; --i) {
+        KaiValue *a[1] = { r };
+        r = kai_apply(posts[i], 1, a);
+    }
+    free(posts);
     return r;
 }
 
