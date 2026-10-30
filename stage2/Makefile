@@ -1712,7 +1712,7 @@ test-native-modular: $(TARGET) build
 	[ "$$changed" = "1" ] \
 	  && echo "native-modular OK: body edit re-emitted 1 object, $$hits cache hits (of $$n1)" \
 	  || { echo "native-modular: body edit re-emitted $$changed objects (want 1)"; exit 1; }; \
-	printf 'pub fn total(xs: [Int]) : Int = fold_add(xs, 0)\nfn fold_add(xs: [Int], acc: Int) : Int = match xs {\n  [] -> acc\n  [x, ...rest] -> fold_add(rest, acc + x)\n}\npub fn pick[T](a: T, b: T, c: T) : T = a\n' > $$work/mathx.kai; \
+	printf 'pub fn total(xs: [Int]) : Int = fold_add(xs, 0)\nfn fold_add(xs: [Int], acc: Int) : Int = match xs {\n  [] -> acc\n  [x, ...rest] -> fold_add(rest, acc + x)\n}\npub fn pick[t](a: t, b: t, c: t) : t = a\n' > $$work/mathx.kai; \
 	sed 's/mathx.pick(9, 1)/mathx.pick(9, 1, 0)/; s/mathx.pick(2, 8)/mathx.pick(2, 8, 0)/' $$fx/main.kai > $$work/main.kai; \
 	emit | sort > build/nmod-objs3.txt; \
 	sigchg=$$(comm -13 build/nmod-objs2.txt build/nmod-objs3.txt | wc -l | tr -d ' '); \

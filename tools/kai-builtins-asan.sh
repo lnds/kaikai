@@ -17,8 +17,8 @@ LEAKS=0
 [ "$(uname -s)" = Linux ] && LEAKS=1
 CFLAGS_ASAN="-std=c99 -O1 -g -fsanitize=address -fno-omit-frame-pointer -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable"
 
-DECLS='extern "kai"("kai_core_vec_push") pub fn vec_push[T](v: Vec[T], x: T) : Vec[T]
-extern "kai"("kai_core_array_set") pub fn array_set[T](a: Array[T], i: Int, x: T) : Array[T] / Mutable'
+DECLS='extern "kai"("kai_core_vec_push") pub fn vec_push[t](v: Vec[t], x: t) : Vec[t]
+extern "kai"("kai_core_array_set") pub fn array_set[t](a: Array[t], i: Int, x: t) : Array[t] / Mutable'
 
 tmp=$(mktemp -d)
 restore() {

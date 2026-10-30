@@ -15,7 +15,7 @@ decl() {
   case $1 in
     unit|sum_unit) echo "unit m" ;;
     proto) printf 'protocol Named_proto {\n  label(x: Self) : String\n}\nimpl Named_proto for Int {\n  fn label(x: Int) : String = "int"\n}\nimpl Named_proto for String {\n  fn label(x: String) : String = "str"\n}\n' ;;
-    proto_gen) printf 'protocol Named_gen {\n  label(x: Self) : String\n}\nimpl Named_gen for Int {\n  fn label(x: Int) : String = "int"\n}\nfn label_twice[T : Named_gen](x: T) : String = "#{label(x)}#{label(x)}"\n' ;;
+    proto_gen) printf 'protocol Named_gen {\n  label(x: Self) : String\n}\nimpl Named_gen for Int {\n  fn label(x: Int) : String = "int"\n}\nfn label_twice[t : Named_gen](x: t) : String = "#{label(x)}#{label(x)}"\n' ;;
     derive) printf '#[derive(Eq, Show, Ord)]\ntype Pt_derive = { x: Int, y: Int }\n' ;;
   esac
 }
