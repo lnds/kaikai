@@ -18,7 +18,7 @@ import compiler.infer_apply
 pub fn pipe_elem_from_callee(env: TyEnv, sub: Subst, callee_ty: Ty, lhs_ty: Ty) : Option[PipeElem] / Mutable =
   match apply_ty(sub, callee_ty) {
     TyFnT([container, stage], _, _) -> match apply_ty(sub, stage) {
-      TyFnT([elem], _, _) -> match unify_env(env, container, lhs_ty, sub) {
+      TyFnT([elem], _, _) -> match unify_flow(env, container, lhs_ty, sub) {
         Some(s1) -> Some(PE(apply_ty(s1, elem), s1))
         None     -> None
       }
@@ -387,7 +387,7 @@ fn settle_other_args(env: TyEnv, params: [Ty], args: [Ty], s: Subst) : Subst / M
   match (params, args) {
     ([p, ...prest], [a, ...arest]) -> match widen_rows(p, a, s) {
       Some(_) -> settle_other_args(env, prest, arest, s)
-      None -> match unify_env(env, p, a, s) {
+      None -> match unify_flow(env, p, a, s) {
         Some(s1) -> settle_other_args(env, prest, arest, s1)
         None     -> settle_other_args(env, prest, arest, s)
       }
@@ -472,7 +472,7 @@ fn widen_fn_args(env: TyEnv, params: [Ty], args: [Ty], s: Subst) : WidenedArgs /
 
 # variant of `apply_ty` whose only difference from the
 # plain one is that effect-row LABELS are NOT substituted (the row
-# tail still is). Used by `unify_env` so a downstream `unify_row`
+# tail still is). Used by `unify_core` so a downstream `unify_row`
 # partition can see raw TyVar payloads. Everywhere else continues to
 # use `apply_ty`.
 fn apply_ty_keep_row_labels(s: Subst, t: Ty) : Ty {
@@ -567,15 +567,61 @@ pub fn occurs(v: Int, t: Ty, s: Subst) : Bool {
 # Refinements are transparent: both sides are peeled before head unification,
 # and effect-row labels keep their raw TyVar payloads so `unify_row` can tell
 # a bound variable from a literal concrete label when ordering absorption.
-#[doc("Typer-internal helper `unify_env` shared across the infer modules.")]
-pub fn unify_env(env: TyEnv, t1: Ty, t2: Ty, s: Subst) : Option[Subst] / Mutable {
+#[doc("Unify two types that both flow into one slot: `Nothing` on either side is accepted.")]
+pub fn unify_join(env: TyEnv, t1: Ty, t2: Ty, s: Subst) : Option[Subst] / Mutable {
   let ba = unwrap_refines(apply_ty_keep_row_labels(s, t1))
   let bb = unwrap_refines(apply_ty_keep_row_labels(s, t2))
   if ty_is_nothing(ba) or ty_is_nothing(bb) { Some(s) }
   else { unify_core(env, t1, t2, s) }
 }
 
-# `unify_env` without the top-level bottom rule: `Nothing` is an ordinary
+#[doc("How the two sides of a unification relate.")]
+pub type UniDir = UFlow | UJoin | UCallee
+
+#[doc("Unify under `dir`: expected then actual, two actuals, or applied callee then demanded call type.")]
+pub fn unify_dir(env: TyEnv, dir: UniDir, a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable =
+  match dir {
+    UFlow   -> unify_flow(env, a, b, s)
+    UJoin   -> unify_join(env, a, b, s)
+    UCallee -> unify_callee(env, a, b, s)
+  }
+
+# A value of type `actual` flows into a slot of type `expected`: an actual
+# `Nothing` fits anywhere, an expected `Nothing` takes only `Nothing`. Function
+# types are covariant in the return and contravariant in the parameters.
+#[doc("Unify a value of type `actual` flowing into a slot of type `expected`.")]
+pub fn unify_flow(env: TyEnv, expected: Ty, actual: Ty, s: Subst) : Option[Subst] / Mutable {
+  let ba = unwrap_refines(apply_ty_keep_row_labels(s, expected))
+  let bb = unwrap_refines(apply_ty_keep_row_labels(s, actual))
+  if ty_is_nothing(bb) { Some(s) }
+  else {
+    match ba {
+      TyFnT(ep, er, erow) -> match bb {
+        TyFnT(xp, xr, xrow) -> unify_fn_flow(env, ep, er, erow, xp, xr, xrow, false, s)
+        _ -> unify_core(env, expected, actual, s)
+      }
+      _ -> unify_core(env, expected, actual, s)
+    }
+  }
+}
+
+# `callee` is the function being applied, `call_fn` the function type its call
+# site demands (argument types in, result variable out). Same flow as
+# `unify_flow(call_fn, callee)`, with the effect rows paired callee first.
+#[doc("Unify an applied function's type against the function type its call site demands.")]
+pub fn unify_callee(env: TyEnv, callee: Ty, call_fn: Ty, s: Subst) : Option[Subst] / Mutable {
+  let ba = unwrap_refines(apply_ty_keep_row_labels(s, callee))
+  let bb = unwrap_refines(apply_ty_keep_row_labels(s, call_fn))
+  match ba {
+    TyFnT(xp, xr, xrow) -> match bb {
+      TyFnT(ep, er, erow) -> unify_fn_flow(env, ep, er, erow, xp, xr, xrow, true, s)
+      _ -> unify_flow(env, call_fn, callee, s)
+    }
+    _ -> unify_flow(env, call_fn, callee, s)
+  }
+}
+
+# Unification without a direction: `Nothing` is an ordinary
 # nominal type here, so it equals only itself and a variable may bind to it.
 # Positions below the top of a type are invariant.
 #[doc("Unify with `Nothing` equal only to itself and to a variable it binds.")]
@@ -696,16 +742,14 @@ fn unify_scalar(a: Ty, b: Ty, s: Subst) : Option[Subst] / Mutable {
   }
 }
 
-# A parameter list, callee side first: an argument of type `Nothing` fits any
-# parameter, but a `Nothing` parameter takes only `Nothing`.
+# A parameter list, callee side first: each argument flows into its parameter.
 fn unify_params(env: TyEnv, ps: [Ty], args: [Ty], s: Subst) : Option[Subst] / Mutable =
   match ps {
     [] -> match args { [] -> Some(s) _ -> None }
     [p, ...pr] -> match args {
       [] -> None
       [a, ...ar] -> {
-        let step = if ty_is_nothing(unwrap_refines(apply_ty(s, a))) { Some(s) } else { unify_core(env, p, a, s) }
-        match step {
+        match unify_flow(env, p, a, s) {
           None -> None
           Some(s1) -> unify_params(env, pr, ar, s1)
         }
@@ -713,13 +757,22 @@ fn unify_params(env: TyEnv, ps: [Ty], args: [Ty], s: Subst) : Option[Subst] / Mu
     }
   }
 
+# Below the top of a type a function type is invariant.
 fn unify_fn_heads(env: TyEnv, ap: [Ty], ar: Ty, arow: Row, b: Ty, s: Subst) : Option[Subst] / Mutable =
   match b {
-    TyFnT(bp, br, brow) -> unify_params(env, ap, bp, s)
-      |> and_then((s1) => unify_env(env, ar, br, s1))
+    TyFnT(bp, br, brow) -> unify_list(env, ap, bp, s)
+      |> and_then((s1) => unify_core(env, ar, br, s1))
       |> and_then((s2) => unify_row(arow, brow, s2))
     _ -> None
   }
+
+# `x` is the function that is used, `e` the one the context demands: the
+# return flows from `x` to `e`, each parameter from `e` to `x`. The rows keep
+# the pairing of the caller's convention.
+fn unify_fn_flow(env: TyEnv, ep: [Ty], er: Ty, erow: Row, xp: [Ty], xr: Ty, xrow: Row, callee_rows: Bool, s: Subst) : Option[Subst] / Mutable =
+  unify_params(env, xp, ep, s)
+    |> and_then((s1) => unify_flow(env, er, xr, s1))
+    |> and_then((s2) => if callee_rows { unify_row(xrow, erow, s2) } else { unify_row(erow, xrow, s2) })
 
 # Same-name types from different modules are distinct, so nominal types unify
 # only when they name one declaration. A union's home and its component's are
