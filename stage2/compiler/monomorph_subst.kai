@@ -13,6 +13,7 @@ import compiler.infer_state
 import compiler.infer_arms_vec
 import compiler.infer_env_exhaust
 import compiler.diag_type_text
+import compiler.desugar_mangle
 import compiler.infer_apply
 import compiler.infer_clause_holes
 
@@ -657,13 +658,35 @@ fn collect_ty_tvar_ids(t: Ty, acc: [Int]) : [Int] {
   match t {
     TyVarT(id)       -> if list_has_int(acc, id) { acc } else { [id, ...acc] }
     TyListT(inner)   -> collect_ty_tvar_ids(inner, acc)
-    TyFnT(ps, r, _)  -> collect_ty_tvar_ids(r, collect_ty_tvar_ids_list(ps, acc))
+    TyFnT(ps, r, row) -> collect_row_tvar_ids(row, collect_ty_tvar_ids(r, collect_ty_tvar_ids_list(ps, acc)))
     TyCon(_, as_)    -> collect_ty_tvar_ids_list(as_, acc)
     TyDimT(base, _)  -> collect_ty_tvar_ids(base, acc)
     TyRefineT(base, _, _) -> collect_ty_tvar_ids(base, acc)
-    _ -> acc
+    TyUnion(parts)   -> collect_ty_tvar_ids_list(parts, acc)
+    TyShapeApp(sv, arg) -> collect_ty_tvar_ids(arg, if list_has_int(acc, sv) { acc } else { [sv, ...acc] })
+    TyInt    -> acc
+    TyReal   -> acc
+    TyBool   -> acc
+    TyString -> acc
+    TyChar   -> acc
+    TyUnit   -> acc
+    TyByte   -> acc
+    TyInt32  -> acc
+    TyUInt32 -> acc
+    TyUInt64 -> acc
+    TyInt128 -> acc
+    TyHandle -> acc
+    TyAny    -> acc
   }
 }
+
+fn collect_row_tvar_ids(row: Row, acc: [Int]) : [Int] = match row.labels {
+  [] -> acc
+  [l, ...rest] -> collect_row_tvar_ids(Row { ...row, labels: rest }, collect_ty_tvar_ids_list(l.ty_args, acc))
+}
+
+fn bind_mismatch(formal: Ty, actual: Ty) : SubstBindings =
+  panic("monomorph: cannot bind `#{mangle_ty(formal)}` against `#{mangle_ty(actual)}`")
 
 fn extract_bindings_ty(formal: Ty, actual: Ty, b: SubstBindings) : SubstBindings {
   # A refinement on the actual side hides the shape a formal reads.
@@ -675,16 +698,22 @@ fn extract_bindings_ty(formal: Ty, actual: Ty, b: SubstBindings) : SubstBindings
     TyVarT(id) -> SubstBindings { tvars: [STP(id, actual), ...b.tvars], uvars: b.uvars }
     TyListT(fi) -> match a {
       TyListT(ai) -> extract_bindings_ty(fi, ai, b)
-      _ -> b
+      TyVarT(_)   -> b
+      TyAny       -> b
+      _ -> bind_mismatch(formal, a)
     }
-    TyFnT(fps, fret, _) -> match a {
-      TyFnT(aps, aret, _) -> extract_bindings_ty(fret, aret,
-                              extract_bindings_tys(fps, aps, b))
-      _ -> b
+    TyFnT(fps, fret, frow) -> match a {
+      TyFnT(aps, aret, arow) -> extract_bindings_row(frow, arow, extract_bindings_ty(fret, aret,
+                                  extract_bindings_tys(fps, aps, b)))
+      TyVarT(_) -> b
+      TyAny     -> b
+      _ -> bind_mismatch(formal, a)
     }
     TyCon(_, fas) -> match a {
       TyCon(_, aas) -> extract_bindings_tys(fas, aas, b)
-      _ -> b
+      TyVarT(_)     -> b
+      TyAny         -> b
+      _ -> bind_mismatch(formal, a)
     }
     # `s[A]` against a concrete arity-1 type binds the shape var to the
     # constructor witness and recurses into the argument — the mono
@@ -692,29 +721,79 @@ fn extract_bindings_ty(formal: Ty, actual: Ty, b: SubstBindings) : SubstBindings
     TyShapeApp(sv, fa) -> match shape_witness_of(a) {
       Some(wit) -> extract_bindings_ty(fa, shape_arg_of(a),
                      SubstBindings { tvars: [STP(sv, wit), ...b.tvars], uvars: b.uvars })
-      None -> b
+      None -> match a {
+        TyShapeApp(_, aa) -> extract_bindings_ty(fa, aa, b)
+        TyVarT(_)         -> b
+        TyAny             -> b
+        _ -> bind_mismatch(formal, a)
+      }
     }
     TyDimT(fb, fu) -> match a {
       TyDimT(ab, au) -> extract_bindings_unit(fu, au,
                           extract_bindings_ty(fb, ab, b))
-      _ -> b
+      _ -> extract_bindings_ty(fb, a, b)
     }
     TyRefineT(fb, _, _) -> match a {
       TyRefineT(ab, _, _) -> extract_bindings_ty(fb, ab, b)
       _ -> extract_bindings_ty(fb, a, b)
     }
-    _ -> b
+    TyUnion(fparts) -> extract_bindings_union(fparts, match a { TyUnion(aparts) -> aparts  _ -> [a] }, formal, a, b)
+    TyInt    -> b
+    TyReal   -> b
+    TyBool   -> b
+    TyString -> b
+    TyChar   -> b
+    TyUnit   -> b
+    TyByte   -> b
+    TyInt32  -> b
+    TyUInt32 -> b
+    TyUInt64 -> b
+    TyInt128 -> b
+    TyHandle -> b
+    TyAny    -> b
   }
+}
+
+# Union components are sorted by their mangled form, so a component holding
+# a type variable has no fixed position: the closed components are matched
+# off by identity and the open ones pair up in order.
+fn extract_bindings_union(fparts: [Ty], aparts: [Ty], formal: Ty, actual: Ty, b: SubstBindings) : SubstBindings {
+  let fopen = filter(fparts, (p) => list_length(collect_ty_tvar_ids(p, [])) > 0)
+  let fclosed = map(filter(fparts, (p) => list_length(collect_ty_tvar_ids(p, [])) == 0), mangle_ty)
+  let aopen = filter(aparts, (p) => not contains(fclosed, mangle_ty(p)))
+  if list_length(fopen) == list_length(aopen) { extract_bindings_tys(fopen, aopen, b) }
+  else { bind_mismatch(formal, actual) }
 }
 
 fn extract_bindings_tys(fs: [Ty], a_s: [Ty], b: SubstBindings) : SubstBindings {
   match fs {
-    [] -> b
-    [f, ...frest] -> match a_s {
+    [] -> match a_s {
       [] -> b
+      _  -> panic("monomorph: type argument lists of different length: `#{string_join(map(a_s, mangle_ty), ", ")}` has more than the formal side")
+    }
+    [f, ...frest] -> match a_s {
+      [] -> panic("monomorph: type argument lists of different length: formal `#{mangle_ty(f)}` has no actual")
       [a, ...arest] -> extract_bindings_tys(frest, arest, extract_bindings_ty(f, a, b))
     }
   }
+}
+
+# A formal label the actual row lacks is legitimate: the actual function may
+# perform fewer effects than the formal admits.
+fn extract_bindings_row(frow: Row, arow: Row, b: SubstBindings) : SubstBindings = match frow.labels {
+  [] -> b
+  [fl, ...rest] -> {
+    let b2 = match find_label(arow.labels, fl) {
+      Some(al) -> extract_bindings_tys(fl.ty_args, al.ty_args, b)
+      None     -> b
+    }
+    extract_bindings_row(Row { ...frow, labels: rest }, arow, b2)
+  }
+}
+
+fn find_label(ls: [Label], want: Label) : Option[Label] = match ls {
+  [] -> None
+  [l, ...rest] -> if l.sym == want.sym and l.cell == want.cell { Some(l) } else { find_label(rest, want) }
 }
 
 fn extract_bindings_unit(formal: UnitExprT, actual: UnitExprT,
