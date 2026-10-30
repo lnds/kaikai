@@ -81,25 +81,6 @@ the interaction proves complex.
 **Origin**: design doc `docs/unions-design.md` §"Phases NOT in
 v1".
 
-### `impl P for U` where U is a union
-
-**What**: protocol implementations that target union types
-directly (instead of requiring per-component impls).
-
-**Blocker**:
-1. #180 (`protocol P[A]`) — needed for the dispatch model.
-2. #174 (polymorphic-impl runtime panic) — affects any feature
-   that dispatches at runtime.
-
-**Why forbidden in v1**: protocols dispatch by the head type
-tag; a union has no single head type. Today users implement `P`
-for each component; the call site narrows before dispatch.
-
-**When unblocks**: after both #180 and #174 resolve.
-
-**Origin**: design doc `docs/unions-design.md` §"Interaction with
-protocols (m12.8)".
-
 ## Cross-references
 
 - Milestone #187 — closed 2026-05-03. Phases 0–5 in PRs

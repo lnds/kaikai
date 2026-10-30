@@ -305,12 +305,14 @@ footgun the unified model set out to remove.
   T2)`, or a qualified `pkg.Name`; an applied type such as
   `Option[T]` or `Box[Int]` is not a component, so
   `type F[T] = Option[T] | Result[String, T]` does not parse.
-- **Protocols dispatch on the static type.** An `impl P for U` on a
-  union serves values typed `U`; a component-typed argument is not
-  upcast for dispatch, so `describe(AccountNotFound)` needs an impl
-  for `IdentityError` (or a `let e : U = ...` first). Implementing
-  `P` per component and narrowing at the call site keeps both paths
-  working.
+- **Protocols dispatch on the component.** `impl P for U` on a union
+  is a compile error: implement `P` for each component. A call on a
+  `U`-typed value runs the impl of the component the value carries,
+  through a match over the components the compiler emits, so a value
+  answers the same through `U` and through its own type. Every
+  component needs an impl; the error names the one that lacks it.
+  The receiver must be the only `Self`-typed parameter of the
+  operation.
 
 ## Cross-references
 

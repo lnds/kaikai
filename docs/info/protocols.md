@@ -64,6 +64,13 @@ fn main() : Unit / Stdout = {
 }
 ```
 
+## Unions
+
+`impl P for U` on a union of types (`type U = A | B`) is a compile
+error: implement `P` for each component. A call on a `U`-typed value
+runs the impl of the component it carries, so every component needs
+an impl and the receiver must be the only `Self`-typed parameter.
+
 ## Equality and order without an impl
 
 A record or sum type is `Eq` when every field is, with no `impl` or

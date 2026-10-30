@@ -1,0 +1,96 @@
+#[doc("The impls a union of types cannot carry: a protocol is implemented for each component, and a call on the union dispatches to the component it holds.")]
+
+import compiler.ast
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.symtab
+import compiler.diag
+import compiler.diag_file
+import compiler.util
+import compiler.written
+import compiler.modules_homes
+import compiler.modules_paths
+import compiler.proto_resolve
+import compiler.protos_registry
+import compiler.protos_impls
+
+#[doc("A union of types the program declares, and the types it is made of.")]
+pub(pkg) type UnionDecl = UnionDecl(SymId, [SymId])
+
+#[doc("Every union of types the declarations make: a sum whose members are all sums declared in the program.")]
+pub(pkg) fn union_decls(tab: SymTab, ds: [Decl]) : [UnionDecl] = {
+  let sums = sum_decls(ds, [])
+  flat_map(sums, (s) => match union_of(tab, sums, s) {
+    Some(u) -> [u]
+    None    -> []
+  })
+}
+
+type SumDecl = SumDecl(SymId, [Variant])
+
+fn sum_decls(ds: [Decl], acc: [SumDecl]) : [SumDecl] = match ds {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match decl_transparent_inner(d) {
+    Some(inner) -> sum_decls([inner, ...rest], acc)
+    None -> match d {
+      DType(_, tsym, _, TBSum(vs), _, _, _, _) -> sum_decls(rest, [SumDecl(tsym, vs), ...acc])
+      _ -> sum_decls(rest, acc)
+    }
+  }
+}
+
+fn union_of(tab: SymTab, sums: [SumDecl], s: SumDecl) : Option[UnionDecl] = match s {
+  SumDecl(tsym, vs) -> {
+    let comps = map(vs, (v) => match v {
+      Var(c, []) -> component_type(tab, sums, c)
+      Var(_, _)  -> sym_none()
+    })
+    if all(comps, (c) => sym_raw(c) >= 0) { Some(UnionDecl(tsym, comps)) } else { None }
+  }
+}
+
+# The sum type a variant stands for: the one of its spelling that the
+# variant's own module declares.
+fn component_type(tab: SymTab, sums: [SumDecl], c: SymId) : SymId =
+  match st_type_lookup(tab, written_text(sym_name(tab, c)), sym_owner(tab, c)) {
+    Some(t) -> if any(sums, (s) => match s { SumDecl(x, _) -> sym_same(x, t) }) { t } else { sym_none() }
+    None    -> sym_none()
+  }
+
+#[doc("The errors for each impl whose target is a union of types.")]
+pub(pkg) fn union_impl_diags(ds: [Decl], homes: [HomeAnchor], df: DiagFiles, target_mod: String,
+                             ps: PScope, unions: [UnionDecl]) : [Diagnostic] =
+  if unions == [] { [] } else { list_reverse(union_impl_loop(ds, homes, df, target_mod, ps, unions, [])) }
+
+fn union_impl_loop(ds: [Decl], homes: [HomeAnchor], df: DiagFiles, target_mod: String, ps: PScope,
+                   unions: [UnionDecl], acc: [Diagnostic]) : [Diagnostic] = match ds {
+  [] -> acc
+  [d, ...rest] -> match homes {
+    [] -> acc
+    [h, ...hrest] -> match decl_transparent_inner(d) {
+      Some(inner) -> union_impl_loop([inner, ...rest], homes, df, target_mod, ps, unions, acc)
+      None -> union_impl_loop(rest, hrest, df, target_mod, ps, unions,
+                              union_impl_diag(d, h, df, target_mod, ps, unions, acc))
+    }
+  }
+}
+
+fn union_impl_diag(d: Decl, h: HomeAnchor, df: DiagFiles, target_mod: String, ps: PScope,
+                   unions: [UnionDecl], acc: [Diagnostic]) : [Diagnostic] = match d {
+  DImpl(pref, _, target, _, line, col, _, _) -> {
+    let tab = ps_tab(ps)
+    let head = ref_sym(vdv_head(ps, target, proto_mo_of(ha_home(h), target_mod)))
+    match find(unions, (u) => match u { UnionDecl(s, _) -> sym_raw(head) >= 0 and sym_same(s, head) }) {
+      None -> acc
+      Some(UnionDecl(_, comps)) -> {
+        let uname = written_text(sym_name(tab, head))
+        let msg = concat_all(["`impl ", dotted_bare(proto_ref_spell(tab, pref)), " for ", uname,
+                              "`: `", uname, "` is a union of types, which dispatches to the impl of the component it holds; implement `",
+                              dotted_bare(proto_ref_spell(tab, pref)), "` for each of ",
+                              join_with(map(comps, (c) => concat_all(["`", written_text(sym_name(tab, c)), "`"])), ", ")])
+        [proto_err(decl_diag_file(d, df), line, col, msg), ...acc]
+      }
+    }
+  }
+  _ -> acc
+}
