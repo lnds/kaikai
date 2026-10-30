@@ -423,20 +423,27 @@ static inline KaiValue *kai_static_closure(KaiValue **slot, KaiFn fn, int arity)
  * fibers. */
 #define KAI_BOUNCE ((KaiValue *) (intptr_t) 16)
 #define KAI_BOUNCE_MAX 8
-typedef struct { KaiValue *clo; int32_t n; KaiValue *args[KAI_BOUNCE_MAX]; } KaiBounce;
+typedef struct { KaiValue *clo; int32_t n; KaiValue **big; KaiValue *args[KAI_BOUNCE_MAX]; } KaiBounce;
 KAI_RT_COUNTER(KaiBounce kai_bounce_slot, {0});
 
 __attribute__((noinline)) static void kai_bounce_put(KaiValue *clo, int argc, KaiValue **argv) {
     KaiBounce *b = &kai_bounce_slot;
     b->clo = clo;
     b->n = argc;
-    for (int i = 0; i < argc; ++i) b->args[i] = argv[i];
+    KaiValue **dst = b->args;
+    if (argc > KAI_BOUNCE_MAX) {
+        b->big = (KaiValue **) malloc((size_t) argc * sizeof(KaiValue *));
+        dst = b->big;
+    }
+    for (int i = 0; i < argc; ++i) dst[i] = argv[i];
 }
 
-__attribute__((noinline)) static KaiValue *kai_bounce_take(KaiValue **args, int *n) {
+__attribute__((noinline)) static KaiValue *kai_bounce_take(KaiValue **args, int *n, KaiValue ***big) {
     KaiBounce *b = &kai_bounce_slot;
     *n = b->n;
-    for (int i = 0; i < b->n; ++i) args[i] = b->args[i];
+    *big = NULL;
+    if (b->n > KAI_BOUNCE_MAX) { *big = b->big; b->big = NULL; }
+    else for (int i = 0; i < b->n; ++i) args[i] = b->args[i];
     return b->clo;
 }
 
@@ -445,8 +452,10 @@ static KaiValue *kai_bounce_run(void) {
     int n;
     KaiValue *r;
     do {
-        KaiValue *clo = kai_bounce_take(args, &n);
-        r = clo->as.clo.fn(clo, args, n);
+        KaiValue **big;
+        KaiValue *clo = kai_bounce_take(args, &n, &big);
+        r = clo->as.clo.fn(clo, big ? big : args, n);
+        free(big);
         kai_decref(clo);
     } while (r == KAI_BOUNCE);
     return r;
@@ -497,14 +506,12 @@ static KaiValue *kai_apply_borrow(KaiValue *clo, int argc, KaiValue **argv) {
 }
 
 /* Tail call through a closure: consumes `clo` and the arguments, and returns
- * the token the nearest resolver turns into the call's value. More arguments
- * than the slot holds run as an ordinary call. */
+ * the token the nearest resolver turns into the call's value. */
 static KAI_RC_NOINLINE KaiValue *kai_tail_apply(KaiValue *clo, int argc, KaiValue **argv) {
     if (!clo || clo->tag != KAI_CLOSURE) {
         kai_eprintf("kai: attempted to call a non-callable value\n");
         kai_exit(1);
     }
-    if (argc > KAI_BOUNCE_MAX) return kai_apply(clo, argc, argv);
     kai_bounce_put(clo, argc, argv);
     return KAI_BOUNCE;
 }
