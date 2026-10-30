@@ -580,6 +580,8 @@ joins it: the actor unwinds through its handlers (`finally` clauses and
 `with Cancel` cleanups run) and the program exits only after all of them
 have terminated. A server parked in `receive` therefore never keeps the
 program alive. A trap in an actor is contained and does not fail `main`.
+An actor spawned by another fiber outside any `nursery` belongs to no scope
+and is not joined.
 Same at every `KAI_THREADS` and on both backends. Coverage:
 `examples/effects/actor_cancelled_at_main_return.kai` and
 `actor_server_parked_at_main_return.kai` (each also pinned to one thread

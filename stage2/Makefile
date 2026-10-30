@@ -10278,8 +10278,9 @@ test-issue-779: $(TARGET) build
 	    || { echo "issue-779 DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.out; exit 1; }; \
 	done
 
-# The exit report settles an unstarted fiber's captures after main returns;
-# the slab teardown must run after it, or the settle reads freed slabs.
+# An actor that never starts is cancelled and joined when main returns: its
+# captures are released before the slab teardown and no fiber is left for the
+# exit report to settle.
 test-exit-report-asan: $(TARGET) build
 	@set -e; \
 	name=exit_report_unstarted; \
@@ -10294,9 +10295,12 @@ test-exit-report-asan: $(TARGET) build
 	if grep -qE 'AddressSanitizer|UndefinedBehaviorSanitizer|runtime error:' build/$$name-asan.err; then \
 	  echo "exit-report-asan FAIL — sanitizer diagnostic:"; cat build/$$name-asan.err; exit 1; \
 	fi; \
-	grep -q 'fibers_unstarted_at_exit=1$$' build/$$name-asan.err \
-	  || { echo "exit-report-asan FAIL — the actor was not settled at exit"; cat build/$$name-asan.err; exit 1; }; \
-	echo "exit-report-asan OK (unstarted actor settled before the slabs are freed)"
+	grep -q 'exit_code=0$$' build/$$name-asan.err \
+	  || { echo "exit-report-asan FAIL — the program did not exit cleanly"; cat build/$$name-asan.err; exit 1; }; \
+	if grep -q 'fibers_.*_at_exit' build/$$name-asan.err; then \
+	  echo "exit-report-asan FAIL — a fiber outlived main"; cat build/$$name-asan.err; exit 1; \
+	fi; \
+	echo "exit-report-asan OK (unstarted actor cancelled and joined before the slabs are freed)"
 
 # Enum-as-int slot representation (#210 follow-up). A nullary-only sum
 # type used as a constructor slot is packed as its immediate variant_tag
