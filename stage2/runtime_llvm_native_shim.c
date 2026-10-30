@@ -13,6 +13,9 @@
 #define KAI_SEPARATE_COMPILATION 1
 #endif
 #define KAI_LLVM_STATE_OWNER 1
+#ifndef KAI_LLVM_BRIDGE
+#define KAI_LLVM_BRIDGE 1
+#endif
 #include <runtime.h>
 
 KaiValue * kaix_core_llvm_add_byval_call(void *m, void *call, int64_t param_ix, void *sty) { return kai_llvm_add_byval_call(m, call, param_ix, sty); }
