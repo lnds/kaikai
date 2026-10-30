@@ -41,7 +41,7 @@ verdict() {
 # runtime_text <dir>: the umbrella and its parts as one file, so a thunk is found wherever it sits.
 runtime_text() {
   mkdir -p "$1"
-  cat stage2/runtime.h stage2/runtime/*.h > "$1/runtime.h"
+  cat stage2/runtime.h stage2/runtime/*.h stage2/llvm/*.h > "$1/runtime.h"
   printf '%s' "$1/runtime.h"
 }
 

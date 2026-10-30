@@ -83,7 +83,7 @@ prototypes() {
 # a manifest line carrying `raw=`, so a raw entry cannot exist without the compiler knowing it.
 raw_symmetry() {
   local rc=0 sym
-  for sym in $(grep -ho 'kai_core_[a-z0-9_]*_raw(' stage2/runtime.h stage2/runtime/*.h | tr -d '(' | sort -u); do
+  for sym in $(grep -ho 'kai_core_[a-z0-9_]*_raw(' stage2/runtime.h stage2/runtime/*.h stage2/llvm/*.h | tr -d '(' | sort -u); do
     grep -q " ${sym%_raw} .* raw=" "$1" || { echo "raw entry $sym has no manifest line with raw="; rc=1; }
   done
   for sym in $(grep -ho 'kaix_core_[a-z0-9_]*_raw(' stage0/runtime_llvm.c | tr -d '(' | sort -u); do

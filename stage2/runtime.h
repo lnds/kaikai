@@ -89,8 +89,8 @@
 #include "runtime/evidence.h"
 #include "runtime/segments.h"
 
-#if defined(KAI_LLVM) || !defined(KAI_NO_LLVM_BRIDGE)
-#include "runtime/llvm_bridge.h"
+#if defined(KAI_LLVM) || (defined(__has_include) && __has_include("llvm/llvm_bridge.h"))
+#include "llvm/llvm_bridge.h"
 #endif
 
 #endif /* KAI_RUNTIME_H */

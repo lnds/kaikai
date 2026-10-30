@@ -98,7 +98,7 @@ nm --defined-only "$obj" | awk '{print $NF}' \
   | sed 's/\$tlv\$init$//; s/\.[A-Za-z0-9_]*$//' \
   | grep -E '^_?kai' | grep -vE '^kai[uv]_' | sed 's/^_//' | sort -u > "$work/emitted.txt"
 
-{ cat "$ROOT/stage2/runtime.h" "$ROOT"/stage2/runtime/*.h | tr -c 'A-Za-z0-9_' '\n'
+{ cat "$ROOT/stage2/runtime.h" "$ROOT"/stage2/runtime/*.h "$ROOT"/stage2/llvm/*.h | tr -c 'A-Za-z0-9_' '\n'
   tr -c 'A-Za-z0-9_' '\n' < "$ROOT/stage0/runtime_llvm.c"
 } | grep -E '^_?kai' | grep -vE '^_?kai[uv]_' | sed 's/^_//' | sort -u > "$work/runtime.txt"
 

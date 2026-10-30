@@ -88,7 +88,7 @@ fi
 # linking a bitcode written for a different LLVM. This script is too, so a
 # change to its flags re-emits.
 input_hash() {
-  { $SHA256 "$RUNTIME_C" "$RUNTIME_H" "$ROOT"/stage2/runtime/*.h "$ROOT/tools/gen-runtime-bc.sh"
+  { $SHA256 "$RUNTIME_C" "$RUNTIME_H" "$ROOT"/stage2/runtime/*.h "$ROOT"/stage2/llvm/*.h "$ROOT/tools/gen-runtime-bc.sh"
     printf '%s\n' "$(resolve_clang 2>/dev/null || echo none)"
     printf '%s\n' "$(clang_major "$(resolve_clang 2>/dev/null || echo false)" 2>/dev/null || echo 0)"
   } | $SHA256 | awk '{print $1}'
