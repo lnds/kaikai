@@ -286,6 +286,9 @@ struct KaiFiber {
      * enqueue (route to thread 0 instead of the caller's slot); never
      * written after spawn. */
     int pinned_main;
+    /* Registered on the root scope as an actor: cancelled, then joined, when
+     * main returns. Never written after spawn. */
+    int root_actor;
     /* M:N — a cross-thread wake that arrives while this fiber is still
      * RUNNING (it enqueued its recv-waiter but has not yet reached the
      * park swap) is recorded here instead of lost. The park path checks
