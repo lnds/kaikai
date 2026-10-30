@@ -662,6 +662,10 @@ static void kai_stack_pool_init(KaiStackPool *pl) {
     if (!pl->inited) {
         pl->madv_guard = kai_stack_probe_madv_guard();
         pl->vma_budget = pl->madv_guard ? (size_t) -1 : kai_stack_vma_budget();
+        const char *report = getenv("KAI_FIBER_STACK_REPORT");
+        if (report != NULL && *report == '1') {
+            kai_eprintf("kai: fiber stack guards: %s\n", pl->vma_budget == (size_t) -1 ? "vma-free" : "prot-none");
+        }
         pl->inited = 1;
     }
 }
