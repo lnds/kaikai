@@ -27,16 +27,30 @@ static int kai_read_rc_runs(void) {
     return n < 1 ? 1 : (int) n;
 }
 
+static void kai_root_nursery_join(KaiNursery *root);
+
+/* One run of main inside the implicit root nursery: fibers it spawns outside
+ * any scope are joined before the run ends, at every thread count. */
+static KaiValue *kai_main_once(KaiValue *(*user_main)(void)) {
+    KaiFiber *self = kai_current_fiber();
+    KaiNursery root = { .root = 1, .parent = self->nursery_top, .ev_top = self->evidence_top };
+    self->nursery_top = &root;
+    KaiValue *r = user_main();
+    self->nursery_top = root.parent;
+    kai_root_nursery_join(&root);
+    return r;
+}
+
 /* main, as many times as the ledger asks, on the fiber that is current;
  * what that fiber kept for its constants goes with the last run. */
 static KaiValue *kai_main_runs(KaiValue *(*user_main)(void)) {
     KaiFiber *self = kai_current_fiber();
     for (int run = kai_read_rc_runs(); run > 1; run--) {
-        kai_decref(user_main());
+        kai_decref(kai_main_once(user_main));
         atomic_store(&self->cancel_requested, 0);
         self->cancel_delivered = 0;
     }
-    KaiValue *r = user_main();
+    KaiValue *r = kai_main_once(user_main);
     kai_fiber_consts_drop(kai_current_fiber());
     return r;
 }
@@ -157,6 +171,63 @@ static void *kai_reactor_thread_main(void *arg) {
     return NULL;
 }
 #endif
+
+/* Threads start on first demand, so a program that never spawns and never
+ * waits on the reactor runs on thread 0 alone. */
+#if defined(KAI_SEPARATE_COMPILATION)
+extern pthread_mutex_t kai_pool_mu;
+extern _Atomic int     kai_workers_up;
+extern _Atomic int     kai_reactor_up;
+#  if defined(KAI_RUNTIME_OWNER)
+pthread_mutex_t kai_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+_Atomic int     kai_workers_up = 0;
+_Atomic int     kai_reactor_up = 0;
+#  endif
+#else
+static pthread_mutex_t kai_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int     kai_workers_up = 0;
+static _Atomic int     kai_reactor_up = 0;
+#endif
+
+/* Workers 1..N-1 are counted idle until they exist, so the all-idle tests
+ * keep comparing against kai_nthreads. */
+static void kai_workers_ensure(void) {
+#if KAI_HOST_FIBERS && !defined(__wasm__)
+    if (kai_nthreads <= 1 || atomic_load_explicit(&kai_workers_up, memory_order_acquire)) return;
+    pthread_mutex_lock(&kai_pool_mu);
+    if (!atomic_load_explicit(&kai_workers_up, memory_order_relaxed)) {
+        atomic_fetch_sub(&kai_sched_idle_count, kai_nthreads - 1);
+        atomic_fetch_add(&kai_sched_idle_epoch, 1);
+        for (int i = 1; i < kai_nthreads; i++) {
+            kai_rc_go_mt();
+            if (pthread_create(&kai_worker_threads[i], NULL,
+                               kai_worker_thread_main, (void *) (intptr_t) i) != 0) {
+                kai_eprintf("kai: scheduler pthread_create failed: %s\n", strerror(errno));
+                kai_exit(1);
+            }
+        }
+        atomic_store_explicit(&kai_workers_up, 1, memory_order_release);
+    }
+    pthread_mutex_unlock(&kai_pool_mu);
+#endif
+}
+
+static void kai_reactor_thread_ensure(void) {
+#if KAI_HOST_FIBERS && !defined(__wasm__)
+    if (kai_nthreads <= 1 || atomic_load_explicit(&kai_reactor_up, memory_order_acquire)) return;
+    pthread_mutex_lock(&kai_pool_mu);
+    if (!atomic_load_explicit(&kai_reactor_up, memory_order_relaxed)) {
+        atomic_store(&kai_reactor_idle, 0);
+        kai_rc_go_mt();
+        if (pthread_create(&kai_reactor_thread, NULL, kai_reactor_thread_main, NULL) != 0) {
+            kai_eprintf("kai: reactor pthread_create failed: %s\n", strerror(errno));
+            kai_exit(1);
+        }
+        atomic_store_explicit(&kai_reactor_up, 1, memory_order_release);
+    }
+    pthread_mutex_unlock(&kai_pool_mu);
+#endif
+}
 
 /* CPUs this process may actually run on. sysconf reports the whole
  * machine, which over-subscribes a process pinned by an affinity mask
@@ -279,24 +350,8 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     root->state = KAI_FIBER_READY;
     kai_sched_enqueue(root);
 
-    /* Start workers 1..N-1. */
-    for (int i = 1; i < kai_nthreads; i++) {
-        kai_rc_go_mt();
-        if (pthread_create(&kai_worker_threads[i], NULL,
-                           kai_worker_thread_main, (void *) (intptr_t) i) != 0) {
-            kai_eprintf("kai: scheduler pthread_create failed: %s\n",
-                    strerror(errno));
-            kai_exit(1);
-        }
-    }
-
-    /* F2 — start the dedicated reactor thread. */
-    kai_rc_go_mt();
-    if (pthread_create(&kai_reactor_thread, NULL, kai_reactor_thread_main, NULL) != 0) {
-        kai_eprintf("kai: reactor pthread_create failed: %s\n", strerror(errno));
-        kai_exit(1);
-    }
-
+    atomic_store(&kai_sched_idle_count, kai_nthreads - 1);
+    atomic_store(&kai_reactor_idle, 1);
 
     /* Thread 0 runs the scheduler loop (its root fiber is the loop
      * context) until the bootstrap trampoline flips the shutdown flag. */
@@ -307,8 +362,9 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
      * observes the flag and exits. */
     kai_sched_wake_all();
     kai_reactor_wake();
-    for (int i = 1; i < kai_nthreads; i++) pthread_join(kai_worker_threads[i], NULL);
-    pthread_join(kai_reactor_thread, NULL);
+    if (atomic_load(&kai_workers_up))
+        for (int i = 1; i < kai_nthreads; i++) pthread_join(kai_worker_threads[i], NULL);
+    if (atomic_load(&kai_reactor_up)) pthread_join(kai_reactor_thread, NULL);
     free(root);
     return kai_user_main_result;
 #else
@@ -354,6 +410,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_yield(void *self, KaiCont *k)
  * and returns the RC=2 Fiber[T] wrapper. */
 static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiValue *stamp_pid) {
     KaiMailbox *stamp_mb = stamp_pid ? stamp_pid->as.mb : NULL;
+    kai_workers_ensure();
     if (!thunk || thunk->tag != KAI_CLOSURE) {
         kai_eprintf("kai: Spawn.spawn called with non-closure value\n");
         kai_exit(1);
@@ -798,7 +855,7 @@ static void kai_nursery_cancel_siblings(KaiFiber *head, KaiFiber *skip) {
  * recorded, so its skipped walk changes nothing. */
 static void kai_nursery_propagate_failure(KaiFiber *self) {
     KaiNursery *scope = self->scope_nursery;
-    if (!scope || self->cancel_requested) return;
+    if (!scope || scope->root || self->cancel_requested) return;
     KaiFiber *expected = NULL;
     if (!atomic_compare_exchange_strong(&scope->failed_child, &expected, self)) {
         return;
@@ -818,7 +875,13 @@ static void kai_nursery_release(KaiFiber *head, KaiNursery *scope) {
         if (c->value) kai_decref(c->value);
         c = nx;
     }
-    free(scope);
+    if (!scope->root) free(scope);
+}
+
+static void kai_root_nursery_join(KaiNursery *root) {
+    KaiFiber *head = root->children_head;
+    for (KaiFiber *c = head; c; c = c->scope_sibling_next) kai_nursery_join_child(c, head, 0);
+    kai_nursery_release(head, root);
 }
 
 /* A fiber unwinding by cancel never reaches its `scope_exit`: cancel and

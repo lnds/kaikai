@@ -263,6 +263,8 @@ static void kai_reactor_wait(void) {
  * self-pipe poke re-arms a reactor already asleep in poll() with a stale
  * timeout (the residual-deadlock fix: a timer linked while poll slept was
  * never drained). Only reached at N>1 (the N=1 park sites link inline). */
+static void kai_reactor_thread_ensure(void);
+
 static void kai_sched_commit_park(KaiFiber *f) {
     /* Non-reactor park: commit under f's slot lock, not reactor_mu. Its ctx
      * is now saved (the exit swap completed), so publishing it PARKED is
@@ -292,6 +294,7 @@ static void kai_sched_commit_park(KaiFiber *f) {
         kai_fiber_slot_unlock_at(home);
         return;
     }
+    kai_reactor_thread_ensure();
     kai_reactor_lock();
     int reason = f->pending_park;
     int home = kai_fiber_slot_lock(f);
