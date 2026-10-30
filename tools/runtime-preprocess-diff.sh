@@ -44,7 +44,7 @@ fi
 work="$(mktemp -d "${TMPDIR:-/tmp}/kai-rt-pp.XXXXXX")"
 trap 'rm -rf "$work"' EXIT INT TERM
 mkdir -p "$work/base/stage0" "$work/base/stage2"
-for f in stage2/runtime.h stage0/runtime_llvm.c $(git ls-tree -r --name-only "$base" stage2/runtime/); do
+for f in stage2/runtime.h stage0/runtime_llvm.c $(git ls-tree -r --name-only "$base" stage2/runtime/ stage2/llvm/); do
   mkdir -p "$work/base/$(dirname "$f")"
   git show "$base:$f" > "$work/base/$f"
 done

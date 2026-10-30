@@ -137,6 +137,8 @@ mkdir -p "$SEED/bootstrap"
 cp stage2/build/kaic2b.c "$SEED/bootstrap/stage2.c"
 cp stage2/runtime.h      "$SEED/bootstrap/runtime.h"
 cp -R stage2/runtime     "$SEED/bootstrap/runtime"
+mkdir "$SEED/bootstrap/llvm"
+cp stage2/llvm/*.h       "$SEED/bootstrap/llvm/"
 cp stage0/runtime_llvm.c "$SEED/bootstrap/runtime_llvm.c"
 make -s -C stage2 boot-hop HOP_C="$SEED/bootstrap/stage2.c" HOP_BIN="$SEED/kaic2" HOP_INC="$SEED/bootstrap" >&2
 (cd stage2 && KAIKAI_STDLIB_PATH="$ROOT/stdlib" "$SEED/kaic2" --edition "$(cat ../EDITION)" main.kai) > "$SEED/self.c"

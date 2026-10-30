@@ -1076,7 +1076,7 @@ gaps of entry 16 closed as follows:
   `kaix_evidence_fits_node` check.
 - *Cleanup and non-local exit.* `invoke` and `landingpad` survive only under
   the wasm exception model, which the LLVM C API cannot select; a 10-line C++
-  shim (`stage2/runtime/llvm_wasm_eh.cpp`) sets it. `_setjmp` is renamed
+  shim (`stage2/llvm/llvm_wasm_eh.cpp`) sets it. `_setjmp` is renamed
   `setjmp` for the wasm sjlj lowering and cleanup pads take
   `__gxx_wasm_personality_v0`.
 - *Runtime bitcode per target* (`runtime_{llvm,inline}.<target>.bc`), written by

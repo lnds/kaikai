@@ -431,10 +431,10 @@ test-kai-namespace: kaic2
 	( cd stage2 && ./kaic2 $(EDITION_FLAG) main.kai ) > $$tmp/self.c; \
 	perl -pe 's/"(?:[^"\\]|\\.)*"//g' $$tmp/self.c \
 	  | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/emitted.txt; \
-	cat stage2/runtime.h stage2/runtime/*.h stage0/runtime_llvm.c | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/runtime.txt; \
+	cat stage2/runtime.h stage2/runtime/*.h stage2/llvm/*.h stage0/runtime_llvm.c | tr -c 'A-Za-z0-9_' '\n' | grep -E '^kai_' | sort -u > $$tmp/runtime.txt; \
 	leaks=$$(comm -23 $$tmp/emitted.txt $$tmp/runtime.txt); \
 	[ -z "$$leaks" ] || { echo "test-kai-namespace FAIL: user-derived identifiers emitted into the runtime kai_ namespace:"; echo "$$leaks"; exit 1; }; \
-	rev=$$(cat stage2/runtime.h stage2/runtime/*.h | tr -c 'A-Za-z0-9_' '\n' | grep -E '^(kaiu_|kaiv_)' | sort -u); \
+	rev=$$(cat stage2/runtime.h stage2/runtime/*.h stage2/llvm/*.h | tr -c 'A-Za-z0-9_' '\n' | grep -E '^(kaiu_|kaiv_)' | sort -u); \
 	[ -z "$$rev" ] || { echo "test-kai-namespace FAIL: runtime.h names symbols inside the user namespaces:"; echo "$$rev"; exit 1; }; \
 	fx=examples/namespace-collisions/adv_name_internal_prefix; \
 	( cd stage2 && ./kaic2 $(EDITION_FLAG) ../$$fx/main.kai ) > $$tmp/adv.c; \

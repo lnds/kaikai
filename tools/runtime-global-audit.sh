@@ -37,6 +37,7 @@ ALLOW="$ROOT/tools/baselines/runtime-globals"
 FILES=(
   "stage2/runtime.h"
   stage2/runtime/*.h
+  stage2/llvm/*.h
   "stage0/runtime_llvm.c"
   "stage0/runtime.h"
 )
