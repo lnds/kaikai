@@ -548,24 +548,167 @@ static void kai_nursery_propagate_failure(KaiFiber *self);
 #  pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
 #if KAI_HOST_STACK_GUARD
-/* [guard page | stack_size bytes], low to high; the caller munmaps
- * stack_size + one page. MAP_NORESERVE keeps a large stack a pure address
- * reservation: pages are committed only as the stack reaches them. */
+/* A slot is [guard page | stack_size bytes], low to high. MAP_NORESERVE keeps
+ * a large stack a pure address reservation: pages are committed only as the
+ * stack reaches them.
+ *
+ * Default-size slots come from chunks of KAI_STACK_CHUNK_SLOTS, so many
+ * stacks share a VMA. A guard page splits its VMA, so guarded chunks are
+ * capped at a fraction of vm.max_map_count; past it a chunk is plain: its
+ * guard page is ordinary memory, and an overflow is caught when the slot is
+ * released by finding it written. Other sizes get a guarded mapping each. */
+#define KAI_STACK_CHUNK_SLOTS 64
+
+typedef struct KaiStackPool {
+    pthread_mutex_t mu;
+    void  **guarded;
+    void  **plain;
+    size_t  n_guarded, cap_guarded, n_plain, cap_plain;
+    char  **guarded_chunks;
+    size_t  n_guarded_chunks, cap_guarded_chunks;
+    size_t  chunk_budget;
+    int     inited;
+} KaiStackPool;
+
+#if defined(KAI_SEPARATE_COMPILATION)
+extern KaiStackPool kai_stack_pool;
+#  if defined(KAI_RUNTIME_OWNER)
+KaiStackPool kai_stack_pool = { .mu = PTHREAD_MUTEX_INITIALIZER };
+#  endif
+#else
+static KaiStackPool kai_stack_pool = { .mu = PTHREAD_MUTEX_INITIALIZER };
+#endif
+
+static void kai_stack_oom(size_t bytes) {
+    kai_eprintf("kai: mmap failed allocating fiber stack (%zu bytes)\n", bytes);
+    kai_exit(1);
+}
+
+static void kai_stack_push(void ***arr, size_t *n, size_t *cap, void *p) {
+    if (*n == *cap) {
+        size_t ncap = *cap ? *cap * 2 : 1024;
+        void **grown = (void **) realloc(*arr, ncap * sizeof(void *));
+        if (grown == NULL) kai_stack_oom(ncap * sizeof(void *));
+        *arr = grown;
+        *cap = ncap;
+    }
+    (*arr)[(*n)++] = p;
+}
+
+static size_t kai_stack_chunk_budget(void) {
+#if defined(__linux__)
+    size_t maps = 65530;
+    FILE *fp = fopen("/proc/sys/vm/max_map_count", "r");
+    if (fp != NULL) {
+        unsigned long v = 0;
+        if (fscanf(fp, "%lu", &v) == 1 && v > 0) maps = (size_t) v;
+        fclose(fp);
+    }
+    return maps / 8 / KAI_STACK_CHUNK_SLOTS;
+#else
+    return (size_t) -1;
+#endif
+}
+
+static int kai_stack_in_guarded_chunk(const void *slot, size_t slot_bytes) {
+    size_t span = slot_bytes * KAI_STACK_CHUNK_SLOTS;
+    for (size_t i = 0; i < kai_stack_pool.n_guarded_chunks; i++) {
+        const char *c = kai_stack_pool.guarded_chunks[i];
+        if ((const char *) slot >= c && (const char *) slot < c + span) return 1;
+    }
+    return 0;
+}
+
+/* Called with the pool lock held and both free lists empty. */
+static void kai_stack_new_chunk(size_t slot_bytes) {
+    KaiStackPool *pl = &kai_stack_pool;
+    size_t total = slot_bytes * KAI_STACK_CHUNK_SLOTS;
+    char *chunk = (char *) mmap(NULL, total, PROT_READ | PROT_WRITE, kai_stack_map_flags(), -1, 0);
+    if (chunk == (char *) MAP_FAILED) kai_stack_oom(total);
+    size_t page = kai_page_size();
+    int guarded = pl->n_guarded_chunks < pl->chunk_budget;
+    if (guarded) {
+        for (size_t i = 0; i < KAI_STACK_CHUNK_SLOTS; i++) {
+            if (mprotect(chunk + i * slot_bytes, page, PROT_NONE) != 0) {
+                kai_eprintf("kai: mprotect guard page failed for fiber stack\n");
+                kai_exit(1);
+            }
+        }
+        if (pl->n_guarded_chunks == pl->cap_guarded_chunks) {
+            size_t ncap = pl->cap_guarded_chunks ? pl->cap_guarded_chunks * 2 : 16;
+            char **grown = (char **) realloc(pl->guarded_chunks, ncap * sizeof(char *));
+            if (grown == NULL) kai_stack_oom(ncap * sizeof(char *));
+            pl->guarded_chunks = grown;
+            pl->cap_guarded_chunks = ncap;
+        }
+        pl->guarded_chunks[pl->n_guarded_chunks++] = chunk;
+    }
+    for (size_t i = KAI_STACK_CHUNK_SLOTS; i-- > 0;) {
+        void *slot = chunk + i * slot_bytes;
+        if (guarded) kai_stack_push(&pl->guarded, &pl->n_guarded, &pl->cap_guarded, slot);
+        else         kai_stack_push(&pl->plain, &pl->n_plain, &pl->cap_plain, slot);
+    }
+}
+
 static void *kai_stack_map(size_t stack_size) {
     size_t page = kai_page_size();
     size_t total = stack_size + page;
-    void *region = mmap(NULL, total, PROT_READ | PROT_WRITE, kai_stack_map_flags(), -1, 0);
-    if (region == MAP_FAILED) {
-        kai_eprintf("kai: mmap failed allocating fiber stack (%zu bytes)\n",
-                total);
+    if (stack_size != kai_fiber_stack_size()) {
+        void *region = mmap(NULL, total, PROT_READ | PROT_WRITE, kai_stack_map_flags(), -1, 0);
+        if (region == MAP_FAILED) kai_stack_oom(total);
+        if (mprotect(region, page, PROT_NONE) != 0) {
+            kai_eprintf("kai: mprotect guard page failed for fiber stack\n");
+            munmap(region, total);
+            kai_exit(1);
+        }
+        return region;
+    }
+    KaiStackPool *pl = &kai_stack_pool;
+    pthread_mutex_lock(&pl->mu);
+    if (!pl->inited) {
+        pl->chunk_budget = kai_stack_chunk_budget();
+        pl->inited = 1;
+    }
+    if (pl->n_guarded == 0 && pl->n_plain == 0) kai_stack_new_chunk(total);
+    void *slot = pl->n_guarded > 0 ? pl->guarded[--pl->n_guarded] : pl->plain[--pl->n_plain];
+    pthread_mutex_unlock(&pl->mu);
+    return slot;
+}
+
+/* Words below the usable stack of a plain slot; zero until an overflow
+ * writes there. */
+static int kai_stack_plain_overflowed(const char *slot, size_t page) {
+    const volatile uint64_t *w = (const volatile uint64_t *) (slot + page);
+    for (size_t i = 1; i <= 16; i++) {
+        if (w[-(ptrdiff_t) i] != 0) return 1;
+    }
+    return 0;
+}
+
+static void kai_stack_unmap(void *base, size_t stack_size) {
+    size_t page = kai_page_size();
+    if (stack_size != kai_fiber_stack_size()) {
+        munmap(base, stack_size + page);
+        return;
+    }
+    KaiStackPool *pl = &kai_stack_pool;
+    size_t total = stack_size + page;
+    pthread_mutex_lock(&pl->mu);
+    int guarded = kai_stack_in_guarded_chunk(base, total);
+    pthread_mutex_unlock(&pl->mu);
+    if (!guarded && kai_stack_plain_overflowed((const char *) base, page)) {
+        kai_write_stack_overflow(base);
         kai_exit(1);
     }
-    if (mprotect(region, page, PROT_NONE) != 0) {
-        kai_eprintf("kai: mprotect guard page failed for fiber stack\n");
-        munmap(region, total);
-        kai_exit(1);
-    }
-    return region;
+#if defined(__APPLE__)
+    madvise((char *) base + page, stack_size, MADV_FREE);
+#else
+    madvise((char *) base + page, stack_size, MADV_DONTNEED);
+#endif
+    pthread_mutex_lock(&pl->mu);
+    if (guarded) kai_stack_push(&pl->guarded, &pl->n_guarded, &pl->cap_guarded, base);
+    else         kai_stack_push(&pl->plain, &pl->n_plain, &pl->cap_plain, base);
+    pthread_mutex_unlock(&pl->mu);
 }
 #elif defined(__wasm__)
 /* The "guard" is the page-size prefix, which nothing protects here. */
@@ -576,6 +719,10 @@ static void *kai_stack_map(size_t stack_size) {
         kai_exit(1);
     }
     return region;
+}
+static void kai_stack_unmap(void *base, size_t stack_size) {
+    (void) stack_size;
+    free(base);
 }
 #endif
 

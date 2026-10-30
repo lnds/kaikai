@@ -246,8 +246,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
                      * and must release it via munmap. */
 #if KAI_HOST_STACK_GUARD
                     if (v->as.fib->stack_base) {
-                        munmap(v->as.fib->stack_base,
-                               v->as.fib->stack_size + kai_page_size());
+                        kai_stack_unmap(v->as.fib->stack_base, v->as.fib->stack_size);
                     }
 #elif defined(__wasm__)
                     free(v->as.fib->stack_base);

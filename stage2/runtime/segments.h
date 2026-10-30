@@ -120,7 +120,7 @@ static void kai_seg_unmap(KaiSegment *seg) {
 #if defined(__wasm__)
     free(seg->own.stack_base);
 #else
-    munmap(seg->own.stack_base, seg->own.stack_size + kai_page_size());
+    kai_stack_unmap(seg->own.stack_base, seg->own.stack_size);
 #endif
     free(seg->own.unw_buf);
     free(seg->own.rframe_buf);

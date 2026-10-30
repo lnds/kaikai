@@ -188,6 +188,7 @@ static void kai_pending_free_set(KaiFiber *f) { kai_worker_here()->pending_free 
  * later in the file, but used here by the free path (munmap needs the
  * stack_size + page_size total). */
 static size_t kai_page_size(void);
+static void kai_stack_unmap(void *base, size_t stack_size);
 
 /* Linux's <sys/mman.h> exposes MAP_ANONYMOUS; older BSD-style headers
  * (and the legacy macOS spelling) use MAP_ANON. Define whichever the
@@ -214,7 +215,7 @@ static void kai_drain_pending_free(KaiWorker *w) {
      * (free would corrupt the heap). */
 #if KAI_HOST_STACK_GUARD
     if (f->stack_base) {
-        munmap(f->stack_base, f->stack_size + kai_page_size());
+        kai_stack_unmap(f->stack_base, f->stack_size);
     }
 #elif defined(__wasm__)
     free(f->stack_base);
