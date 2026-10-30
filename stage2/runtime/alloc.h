@@ -453,6 +453,12 @@ struct KaiNursery {
     _Atomic(KaiFiber *) failed_child;
     KaiEvidence        *ev_top;
     int                 root;   /* implicit scope of `main`: joins, never cancels siblings */
+    /* Root only: terminated children are dropped from the list as it grows,
+     * so a program that spawns actors for as long as it runs holds only the
+     * live ones. `reap_lock` serialises the dropping with the final join. */
+    _Atomic int         reap_lock;
+    _Atomic long        registered;
+    _Atomic long        reap_at;
 };
 
 /* A worker's root fiber starts as the OS-thread context, representing the
