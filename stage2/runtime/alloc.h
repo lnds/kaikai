@@ -449,6 +449,11 @@ KAI_SCHED_FN __attribute__((noinline)) void kai_seg_pool_drain(void);
  * failure. */
 #define KAI_ROOT_REAP_MIN 256
 
+/* How an implicit scope joins its children. */
+#define KAI_JOIN_PLAIN         0
+#define KAI_JOIN_INTERRUPTIBLE 1
+#define KAI_JOIN_CANCEL        2
+
 struct KaiNursery {
     _Atomic(KaiFiber *) children_head;
     KaiNursery         *parent;

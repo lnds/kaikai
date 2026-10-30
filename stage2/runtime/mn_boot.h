@@ -27,7 +27,7 @@ static int kai_read_rc_runs(void) {
     return n < 1 ? 1 : (int) n;
 }
 
-static void kai_root_nursery_join(KaiNursery *scope, int interruptible);
+static void kai_root_nursery_join(KaiNursery *scope, int mode);
 static void kai_root_reap(KaiNursery *root);
 
 /* One run of main inside the implicit root nursery: fibers it spawns outside
@@ -39,7 +39,7 @@ static KaiValue *kai_main_once(KaiValue *(*user_main)(void)) {
     self->nursery_top = &root;
     KaiValue *r = user_main();
     self->nursery_top = root.parent;
-    kai_root_nursery_join(&root, 0);
+    kai_root_nursery_join(&root, KAI_JOIN_PLAIN);
     return r;
 }
 
@@ -940,11 +940,11 @@ static void kai_root_reap(KaiNursery *root) {
  * owner. Plain children are joined first; the actors still alive then get a
  * cancel (a server parked in `receive` never ends on its own) and are joined
  * too. Children registered while a batch is joined (an actor spawning from
- * its cleanup, from any thread) form the next batch. An `interruptible` join
+ * its cleanup, from any thread) form the next batch. An interruptible join
  * (a fiber body) turns a cancel aimed at the owner into a cancel of every
- * child, still waiting for them to end. */
-static void kai_root_nursery_join(KaiNursery *scope, int interruptible) {
-    int cancelled = 0;
+ * child, still waiting for them to end; a cancelling join starts from there. */
+static void kai_root_nursery_join(KaiNursery *scope, int mode) {
+    int cancelled = mode == KAI_JOIN_CANCEL;
     for (;;) {
         while (atomic_exchange(&scope->reap_lock, 1)) { }
         KaiFiber *head = atomic_exchange(&scope->children_head, NULL);
@@ -953,7 +953,7 @@ static void kai_root_nursery_join(KaiNursery *scope, int interruptible) {
         if (cancelled) kai_nursery_cancel_siblings(head, NULL);
         for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
             if (c->root_actor) continue;
-            if (kai_nursery_join_child(c, head, interruptible && !cancelled)) cancelled = 1;
+            if (kai_nursery_join_child(c, head, mode == KAI_JOIN_INTERRUPTIBLE && !cancelled)) cancelled = 1;
         }
         for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
             if (!c->root_actor) continue;
@@ -979,6 +979,14 @@ static void kai_nursery_abandon_top(KaiFiber *f) {
 
 static void kai_nursery_abandon(KaiFiber *f) {
     while (f->nursery_top) kai_nursery_abandon_top(f);
+}
+
+/* A fiber about to unwind to its pad ends its children first, so they are
+ * gone before any handler's cleanup runs. The body scope stays open: cleanup
+ * may still spawn into it. */
+static void kai_nursery_end_children(KaiFiber *f) {
+    while (f->nursery_top && f->nursery_top->parent) kai_nursery_abandon_top(f);
+    if (f->nursery_top) kai_root_nursery_join(f->nursery_top, KAI_JOIN_CANCEL);
 }
 
 /* Issue #959 — close the innermost scope: join every child, then on
