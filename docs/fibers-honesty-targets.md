@@ -339,13 +339,13 @@ unwinds (`examples/effects/cancel_in_receive_timeout.kai`).
 
 When `main` returns, the root scope joins its `Spawn.spawn` children, then
 cancels the actors still alive (a server parked in `receive` included) and
-joins them, so no fiber outlives `main` and actor cleanup runs. The same holds
-for every spawned fiber: its body is an implicit scope that joins its plain
-children, cancels and joins its actors, and forwards a cancel aimed at the
-fiber to them, so no fiber is orphaned. A fiber unwinding by cancel ends its
+joins them, so no fiber outlives `main` and actor cleanup runs. Every spawned
+fiber's body is an implicit scope for its plain children: they are joined when
+the body ends, and a cancel aimed at the fiber reaches them, so no plain fiber
+is orphaned. Actors spawned outside a `nursery` stay with the root scope. A fiber unwinding by cancel ends its
 children before any of its handlers' `finally` clauses run. Coverage:
 `examples/effects/fiber_body_joins_plain_child.kai`,
-`fiber_body_cancels_blocked_child.kai`,
+`fiber_body_cancels_blocked_child.kai`, `fiber_spawns_server_actor.kai`,
 `examples/effects/actor_cancelled_at_main_return.kai`,
 `actor_server_parked_at_main_return.kai` and their `_n1` variants.
 

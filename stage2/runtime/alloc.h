@@ -459,7 +459,8 @@ struct KaiNursery {
     KaiNursery         *parent;
     _Atomic(KaiFiber *) failed_child;
     KaiEvidence        *ev_top;
-    int                 root;   /* implicit scope of `main`: joins, never cancels siblings */
+    int                 root;   /* implicit scope of `main` or a fiber body: joins, never cancels siblings */
+    int                 body;   /* a fiber body's scope: owns plain children only */
     /* Root only: terminated children are dropped from the list as it grows,
      * so a program that spawns actors for as long as it runs holds only the
      * live ones. `reap_lock` serialises the dropping with the final join. */
