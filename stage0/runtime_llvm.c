@@ -382,6 +382,16 @@ KaiValue *kaix_apply_borrow(KaiValue *clo, int32_t n, KaiValue **args) {
     return kai_apply_borrow(clo, n, args);
 }
 
+/* Tail call through a closure: parks the call and returns the bounce token
+   (kai_tail_apply); kaix_bounce_resolve runs a parked call to its value. */
+KaiValue *kaix_tail_apply(KaiValue *clo, int32_t n, KaiValue **args) {
+    return kai_tail_apply(clo, n, args);
+}
+
+KaiValue *kaix_bounce_resolve(KaiValue *r) {
+    return kai_bounce_resolve(r);
+}
+
 /* Core thunks exported as regular symbols so LLVM IR can take
    their address to build closures passed into higher-order core
    calls. One per core entry we may reference as a value. */

@@ -48,6 +48,7 @@ static inline KaiValue *kaix_bit_xor(KaiValue *a, KaiValue *b);
 static inline KaiValue *kaix_bool(int b);
 static inline int32_t kaix_bool_field(KaiValue *v);
 static inline KaiValue *kaix_bool_of_i32(int32_t i);
+static inline KaiValue *kaix_bounce_resolve(KaiValue *r);
 static inline KaiValue *kaix_byte(uint32_t b);
 KaiValue *kaix_byte_add_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_byte_eq_thunk(KaiValue *s, KaiValue **a, int n);
@@ -548,6 +549,7 @@ KaiValue *kaix_string_to_real_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_string_to_upper_ascii_thunk(KaiValue *s, KaiValue **a, int n);
 static inline KaiValue *kaix_sub(KaiValue *a, KaiValue *b);
 static inline KaiValue *kaix_tag_eq(KaiValue *v, int32_t tag);
+static inline KaiValue *kaix_tail_apply(KaiValue *clo, int32_t n, KaiValue **args);
 static inline int64_t kaix_take_enum(KaiValue *v);
 static inline double kaix_take_real(KaiValue *v);
 static inline KaiValue *kaix_take_slot(KaiValue *cell, KaiValue *child);
@@ -731,6 +733,9 @@ static inline KaiValue *kaix_bit_xor(KaiValue *a, KaiValue *b) {
 static inline KaiValue *kaix_bool(int b) {return kai_bool(b); }
 static inline int32_t kaix_bool_field(KaiValue *v) {return (int32_t) v->as.b; }
 static inline KaiValue *kaix_bool_of_i32(int32_t i) {return kai_bool(i != 0); }
+static inline KaiValue *kaix_bounce_resolve(KaiValue *r) {
+    return kai_bounce_resolve(r);
+}
 static inline KaiValue *kaix_byte(uint32_t b) {return kai_byte((uint8_t) b); }
 static inline int32_t kaix_byte_field(KaiValue *v) {return (int32_t) v->as.byte_val; }
 static inline void kaix_cancel_poll(KaiFiber *f) {
@@ -938,6 +943,9 @@ static inline KaiValue *kaix_string_concat(KaiValue *a, KaiValue *b) {return kai
 static inline KaiValue *kaix_sub(KaiValue *a, KaiValue *b) {return kai_op_sub(a, b); }
 static inline KaiValue *kaix_tag_eq(KaiValue *v, int32_t tag) {
     return kai_bool(v && v->variant_tag == tag);
+}
+static inline KaiValue *kaix_tail_apply(KaiValue *clo, int32_t n, KaiValue **args) {
+    return kai_tail_apply(clo, n, args);
 }
 static inline int64_t kaix_take_enum(KaiValue *v) {return kai_take_enum(v); }
 static inline double kaix_take_real(KaiValue *v) {return kai_take_real(v); }

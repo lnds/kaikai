@@ -43,6 +43,12 @@ The design breaks if any of these is compromised.
    - Monomorphisation of generics; no dictionary passing.
    - Mandatory tail-call optimisation for self-recursion and mutual
      recursion within a module.
+   - A call through a closure or any function value in tail position
+     runs in constant stack on both backends: the call is parked in the
+     runtime and the nearest resolver runs it, so a cycle through a
+     closure parameter, a record field or a list never nests. A function
+     that makes such a call returns a boxed value (`kir_bounce`); calls
+     with more than eight arguments are ordinary calls and are reported.
    - Compact representations: primitives unboxed inside each fiber,
      heap boxing only for compound immutable values.
    - Effects compiled with one-shot continuations: low cost, not

@@ -413,6 +413,49 @@ static inline KaiValue *kai_static_closure(KaiValue **slot, KaiFn fn, int arity)
     return c != NULL ? c : kai_static_closure_build(slot, fn, arity);
 }
 
+/* A tail call through a closure does not nest: `kai_tail_apply` parks the
+ * call (closure and arguments, both owned) in the thread's slot and returns
+ * KAI_BOUNCE; the frame that is waiting for the value, `kai_apply` or a
+ * resolving stub, runs the parked call in `kai_bounce_run`. The token is
+ * neither a heap cell nor an immediate Int: only a function that returns it
+ * to a resolver may produce it. The slot is touched only by the two noinline
+ * accessors, so no thread-local address outlives a call that can switch
+ * fibers. */
+#define KAI_BOUNCE ((KaiValue *) (intptr_t) 16)
+#define KAI_BOUNCE_MAX 8
+typedef struct { KaiValue *clo; int32_t n; KaiValue *args[KAI_BOUNCE_MAX]; } KaiBounce;
+KAI_RT_COUNTER(KaiBounce kai_bounce_slot, {0});
+
+__attribute__((noinline)) static void kai_bounce_put(KaiValue *clo, int argc, KaiValue **argv) {
+    KaiBounce *b = &kai_bounce_slot;
+    b->clo = clo;
+    b->n = argc;
+    for (int i = 0; i < argc; ++i) b->args[i] = argv[i];
+}
+
+__attribute__((noinline)) static KaiValue *kai_bounce_take(KaiValue **args, int *n) {
+    KaiBounce *b = &kai_bounce_slot;
+    *n = b->n;
+    for (int i = 0; i < b->n; ++i) args[i] = b->args[i];
+    return b->clo;
+}
+
+static KaiValue *kai_bounce_run(void) {
+    KaiValue *args[KAI_BOUNCE_MAX];
+    int n;
+    KaiValue *r;
+    do {
+        KaiValue *clo = kai_bounce_take(args, &n);
+        r = clo->as.clo.fn(clo, args, n);
+        kai_decref(clo);
+    } while (r == KAI_BOUNCE);
+    return r;
+}
+
+static inline KaiValue *kai_bounce_resolve(KaiValue *r) {
+    return __builtin_expect(r == KAI_BOUNCE, 0) ? kai_bounce_run() : r;
+}
+
 /* Invoke a closure dynamically.
  *
  * Issue #298 — kai_apply consumes its closure argument. Pre-fix the
@@ -435,7 +478,7 @@ static KaiValue *kai_apply(KaiValue *clo, int argc, KaiValue **argv) {
     }
     KaiValue *r = clo->as.clo.fn(clo, argv, argc);
     kai_decref(clo);
-    return r;
+    return kai_bounce_resolve(r);
 }
 
 /* Borrowing indirect call (issue #1130). Invokes the closure WITHOUT
@@ -450,7 +493,20 @@ static KaiValue *kai_apply_borrow(KaiValue *clo, int argc, KaiValue **argv) {
         kai_eprintf("kai: attempted to call a non-callable value\n");
         kai_exit(1);
     }
-    return clo->as.clo.fn(clo, argv, argc);
+    return kai_bounce_resolve(clo->as.clo.fn(clo, argv, argc));
+}
+
+/* Tail call through a closure: consumes `clo` and the arguments, and returns
+ * the token the nearest resolver turns into the call's value. More arguments
+ * than the slot holds run as an ordinary call. */
+static KAI_RC_NOINLINE KaiValue *kai_tail_apply(KaiValue *clo, int argc, KaiValue **argv) {
+    if (!clo || clo->tag != KAI_CLOSURE) {
+        kai_eprintf("kai: attempted to call a non-callable value\n");
+        kai_exit(1);
+    }
+    if (argc > KAI_BOUNCE_MAX) return kai_apply(clo, argc, argv);
+    kai_bounce_put(clo, argc, argv);
+    return KAI_BOUNCE;
 }
 
 /* ---------- field access helpers ---------- */
