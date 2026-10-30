@@ -586,6 +586,7 @@ static ucontext_t *kai_uc_link_target(void) {
 }
 
 static void kai_nursery_abandon(KaiFiber *f);
+static void kai_root_nursery_join(KaiNursery *scope, int interruptible);
 
 static void kai_fiber_trampoline(void) {
     KaiWorker *w = kai_worker_here();
@@ -596,10 +597,16 @@ static void kai_fiber_trampoline(void) {
      * `kai_decref(self->value)` before we touch our own state. */
     kai_drain_pending_free(w);
     self->unwind_frame = (uintptr_t) __builtin_frame_address(0);
+    /* Lives in this frame: the cancel landing below reads it after the body's
+     * own frames are gone. */
+    KaiNursery body = { .root = 1, .reap_at = KAI_ROOT_REAP_MIN };
     if (setjmp(self->cancel_pad) == 0) {
         self->cancel_pad_set = 1;
+        self->nursery_top = &body;
         /* Borrowed: a cancel longjmps past any release after the call. */
         self->result = kai_apply_borrow(self->thunk, 0, NULL);
+        self->nursery_top = NULL;
+        kai_root_nursery_join(&body, 1);
         self->cancel_pad_set = 0;
         /* Before the terminal state: once it is stored another thread
          * may read the result, which can share cells with a constant. */
