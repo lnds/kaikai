@@ -586,7 +586,7 @@ static ucontext_t *kai_uc_link_target(void) {
 }
 
 static void kai_nursery_abandon(KaiFiber *f);
-static void kai_root_nursery_join(KaiNursery *scope, int interruptible);
+static void kai_root_nursery_join(KaiNursery *scope, int mode);
 
 static void kai_fiber_trampoline(void) {
     KaiWorker *w = kai_worker_here();
@@ -606,7 +606,7 @@ static void kai_fiber_trampoline(void) {
         /* Borrowed: a cancel longjmps past any release after the call. */
         self->result = kai_apply_borrow(self->thunk, 0, NULL);
         self->nursery_top = NULL;
-        kai_root_nursery_join(&body, 1);
+        kai_root_nursery_join(&body, KAI_JOIN_INTERRUPTIBLE);
         self->cancel_pad_set = 0;
         /* Before the terminal state: once it is stored another thread
          * may read the result, which can share cells with a constant. */

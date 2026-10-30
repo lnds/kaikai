@@ -642,6 +642,7 @@ static __attribute__((noinline)) void kai_cancel_deliver(KaiFiber *f) {
         kai_eputs("kai: Cancel.raise: unhandled (fiber cancelled)\n");
         kai_exit(0);
     }
+    kai_nursery_end_children(f);
     kai_evidence_unwind_all();
     kai_fiber_pad_jump(f, 0);
     /* Unreachable. */
