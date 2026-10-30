@@ -23,17 +23,13 @@ for n in 1 ""; do
     || { echo "fiber-stack DIFF ($backend, many fibers, KAI_THREADS=$n)"; echo "$out"; exit 1; }
 done
 
-# Guards that do not split the VMA (macOS, Linux >= 6.13) leave the live-fiber
+# Guards that do not split the VMA (the runtime reports it with
+# KAI_FIBER_STACK_REPORT=1) leave the live-fiber
 # count to address space: 100K must run. Elsewhere each stack is two VMAs and
 # allocation past vm.max_map_count must fail with the diagnostic, not hand out
 # an unguarded stack.
 vma_free=0
-if [ "$(uname -s)" = Darwin ]; then
-  vma_free=1
-else
-  kver="$(uname -r | sed 's/[^0-9.].*//')"
-  [ "$(printf '%s\n6.13\n' "$kver" | sort -V | head -n 1)" = "6.13" ] && vma_free=1
-fi
+KAI_FIBER_STACK_REPORT=1 "$work/fiber_stack_many" 2>&1 > /dev/null | grep -q "fiber stack guards: vma-free" && vma_free=1
 rss_limit_kb=5000000
 max_maps=0
 [ -r /proc/sys/vm/max_map_count ] && max_maps="$(cat /proc/sys/vm/max_map_count)"
