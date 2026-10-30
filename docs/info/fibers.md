@@ -5,7 +5,7 @@ fibers coordinated by the `Spawn` effect.
 
 ## Description
 
-kaikai concurrency is fibers (private heap, cheap, ~64 KiB default
+kaikai concurrency is fibers (private heap, cheap, 8 MiB reserved
 stack) coordinated by structured-concurrency primitives. The `Spawn`
 effect provides spawn/await/select/cancel as ops; `nursery` is the
 stdlib helper that installs Spawn for a scope and joins all children
@@ -182,7 +182,7 @@ overflow` and exits non-zero at any thread count. Set
 KAI_MAIN_STACK_SIZE=8388608 ./my_program
 ```
 
-Spawned fibers have their own, much smaller stacks (`KAI_FIBER_STACK_SIZE`).
+Spawned fibers and the stack segments of handlers that keep their continuation reserve 8 MiB each (`KAI_FIBER_STACK_SIZE`, in bytes); only the pages a fiber touches are committed.
 
 ## Mutable state and fibers
 

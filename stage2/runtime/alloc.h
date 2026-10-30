@@ -466,7 +466,7 @@ struct KaiNursery {
  * the rest through this stack of pending cells instead of recursing: a
  * structure of any depth takes bounded C stack. Never a local array: a free
  * runs at the deepest point of whatever dropped the last reference, often on
- * a 64 KiB fiber stack, and must not add to it. Past the inline buffer the
+ * a fiber stack, and must not add to it. Past the inline buffer the
  * pending cells spill to the heap until the drain finishes.
  *
  * The stack belongs to the draining fiber, not the thread: dropping a

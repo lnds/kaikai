@@ -236,8 +236,9 @@ static size_t kai_page_size(void) {
     return ps;
 }
 
-/* Read KAI_FIBER_STACK_SIZE once and cache. Out-of-range values
- * fall back to the default and log a warning. The result is rounded
+/* Read KAI_FIBER_STACK_SIZE once and cache. The default is an address-space
+ * reservation (MAP_NORESERVE), not memory: only the pages a fiber touches are
+ * committed. Out-of-range values fall back to the default and log a warning. The result is rounded
  * up to a page-size multiple — mmap + mprotect both require it, and
  * 16 KiB pages on macOS arm64 silently break sub-page values
  * otherwise. */
@@ -246,7 +247,7 @@ static size_t kai_fiber_stack_size(void) {
     size_t hit = atomic_load_explicit(&cached, memory_order_relaxed);
     if (hit != 0) return hit;
     const char *env = getenv("KAI_FIBER_STACK_SIZE");
-    size_t sz = 64 * 1024;  /* default 64 KiB */
+    size_t sz = 8 * 1024 * 1024;
     if (env && *env) {
         char *end = NULL;
         long long parsed = strtoll(env, &end, 10);
@@ -254,7 +255,7 @@ static size_t kai_fiber_stack_size(void) {
             sz = (size_t) parsed;
         } else {
             kai_eprintf(
-                "kai: KAI_FIBER_STACK_SIZE=%s out of range [4096, 64M]; using default 64K\n",
+                "kai: KAI_FIBER_STACK_SIZE=%s out of range [4096, 64M]; using default 8M\n",
                 env);
         }
     }

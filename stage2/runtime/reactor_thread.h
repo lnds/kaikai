@@ -578,12 +578,13 @@ static void *kai_stack_map(size_t stack_size) {
 
 #if KAI_HOST_FIBERS
 /* Point `c` at the usable stack [lo, lo + size). TRAP (macOS): makecontext
- * bzeroes the whole uc_stack, which commits every page of a large reserved
- * stack up front. Hand it only the top window instead; the frames below grow
- * on into the rest of the mapping, down to the guard page. */
+ * bzeroes the whole uc_stack, which commits every page of a reserved stack up
+ * front. Hand it only the top window (the smallest the host accepts) instead;
+ * the frames below grow on into the rest of the mapping, down to the guard
+ * page. */
 static void kai_ctx_set_stack(ucontext_t *c, void *lo, size_t size) {
 #if defined(__APPLE__)
-    size_t window = 256 * 1024;
+    size_t window = 32 * 1024;
     if (size > window) {
         lo = (char *) lo + (size - window);
         size = window;
