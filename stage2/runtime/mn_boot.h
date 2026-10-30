@@ -855,7 +855,7 @@ static void kai_nursery_cancel_siblings(KaiFiber *head, KaiFiber *skip) {
  * recorded, so its skipped walk changes nothing. */
 static void kai_nursery_propagate_failure(KaiFiber *self) {
     KaiNursery *scope = self->scope_nursery;
-    if (!scope || scope->root || self->cancel_requested) return;
+    if (!scope || self->cancel_requested) return;
     KaiFiber *expected = NULL;
     if (!atomic_compare_exchange_strong(&scope->failed_child, &expected, self)) {
         return;
@@ -878,10 +878,30 @@ static void kai_nursery_release(KaiFiber *head, KaiNursery *scope) {
     if (!scope->root) free(scope);
 }
 
+/* Join every child of `scope`, cancelling the rest on the first failure
+ * (a child cancelled without a request: it raised Cancel or trapped), then
+ * release the scope's refs. Returns 1 if a child failed. */
+static int kai_nursery_join_all(KaiFiber *head, KaiNursery *scope) {
+    int failed = 0;
+    for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
+        if (kai_nursery_join_child(c, head, !failed)) failed = 1;
+        if (!failed && c->state == KAI_FIBER_CANCELLED && !c->cancel_requested) {
+            failed = 1;
+            kai_nursery_cancel_siblings(head, NULL);
+        }
+    }
+    /* A child that failed concurrently with a peer's cancel walk terminates
+     * flagged; only the latch records it. */
+    if (!failed && scope->failed_child != NULL) failed = 1;
+    kai_nursery_release(head, scope);
+    return failed;
+}
+
 static void kai_root_nursery_join(KaiNursery *root) {
-    KaiFiber *head = root->children_head;
-    for (KaiFiber *c = head; c; c = c->scope_sibling_next) kai_nursery_join_child(c, head, 0);
-    kai_nursery_release(head, root);
+    if (!kai_nursery_join_all(root->children_head, root)) return;
+    kai_test_cancel_escape();
+    kai_eputs("kai: nursery child cancelled; no survivors\n");
+    kai_exit(1);
 }
 
 /* A fiber unwinding by cancel never reaches its `scope_exit`: cancel and
@@ -926,30 +946,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_scope_exit(void *self, KaiCont *k)
     f->nursery_top = scope->parent;
 
     KaiFiber *head   = scope->children_head;
-    int       failed = 0;
-    for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
-        if (kai_nursery_join_child(c, head, !failed)) failed = 1;
-        /* A child counts as a *failure* only if it terminated
-         * CANCELLED without anyone requesting its cancellation — i.e.
-         * it raised `Cancel` on its own or hit a runtime trap. A child
-         * cancelled on request (`Spawn.cancel` from a sibling, or the
-         * cancel_siblings walk below) terminates CANCELLED with
-         * `cancel_requested` set and is an expected, non-propagating
-         * outcome. */
-        if (!failed && c->state == KAI_FIBER_CANCELLED && !c->cancel_requested) {
-            failed = 1;
-            kai_nursery_cancel_siblings(head, NULL);
-        }
-    }
-    /* A failure the loop's flag test cannot see: a child that failed
-     * concurrently with a peer's cancel walk terminates flagged, and
-     * only the latch records it. All children are joined by now, so
-     * no further cancel walk is needed. */
-    if (!failed && scope->failed_child != NULL) failed = 1;
-    /* Release the scope's refs and clear the intrusive links. The
-     * children are all terminated now; their wrappers may still be
-     * held by the user's `Fiber[T]` handles, so decref (not free). */
-    kai_nursery_release(head, scope);
+    int       failed = kai_nursery_join_all(head, scope);
 
     if (failed) {
         /* The re-raise is a `Cancel.raise()` like any other: it walks
