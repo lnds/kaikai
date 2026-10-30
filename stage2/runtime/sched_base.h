@@ -245,7 +245,13 @@ static size_t kai_fiber_stack_size(void) {
     size_t hit = atomic_load_explicit(&cached, memory_order_relaxed);
     if (hit != 0) return hit;
     const char *env = getenv("KAI_FIBER_STACK_SIZE");
+#if defined(__wasm__)
+    /* The stack is carved from linear memory and the host's own call stack
+     * bounds recursion before a larger one is reached. */
+    size_t sz = 64 * 1024;
+#else
     size_t sz = 8 * 1024 * 1024;
+#endif
     if (env && *env) {
         char *end = NULL;
         long long parsed = strtoll(env, &end, 10);
@@ -253,8 +259,8 @@ static size_t kai_fiber_stack_size(void) {
             sz = (size_t) parsed;
         } else {
             kai_eprintf(
-                "kai: KAI_FIBER_STACK_SIZE=%s out of range [4096, 64M]; using default 8M\n",
-                env);
+                "kai: KAI_FIBER_STACK_SIZE=%s out of range [4096, 64M]; using default %zuK\n",
+                env, sz / 1024);
         }
     }
     size_t ps = kai_page_size();
