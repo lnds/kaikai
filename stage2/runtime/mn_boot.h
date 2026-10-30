@@ -29,15 +29,21 @@ static int kai_read_rc_runs(void) {
 
 static void kai_root_nursery_join(KaiNursery *root);
 
+/* The scope of the main run in flight: the nearest scope of an actor spawned
+ * by a fiber that has none open. */
+static _Atomic(KaiNursery *) kai_root_scope;
+
 /* One run of main inside the implicit root nursery: fibers it spawns outside
  * any scope are joined before the run ends, at every thread count. */
 static KaiValue *kai_main_once(KaiValue *(*user_main)(void)) {
     KaiFiber *self = kai_current_fiber();
     KaiNursery root = { .root = 1, .parent = self->nursery_top, .ev_top = self->evidence_top };
     self->nursery_top = &root;
+    atomic_store(&kai_root_scope, &root);
     KaiValue *r = user_main();
     self->nursery_top = root.parent;
     kai_root_nursery_join(&root);
+    atomic_store(&kai_root_scope, NULL);
     return r;
 }
 
@@ -465,12 +471,15 @@ static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiVal
      * `Fiber[T]` handle cannot free the wrapper before `nursery_exit`
      * joins this child; the scope releases it during the join walk. */
     KaiNursery *scope = kai_current_fiber()->nursery_top;
+    if (!scope && stamp_mb) scope = atomic_load(&kai_root_scope);
     if (scope) {
-        f->root_actor         = scope->root && stamp_mb;
+        f->root_actor    = scope->root && stamp_mb;
         kai_incref(v);
-        f->scope_nursery      = scope;
-        f->scope_sibling_next = scope->children_head;
-        scope->children_head  = f;
+        f->scope_nursery = scope;
+        KaiFiber *head   = atomic_load(&scope->children_head);
+        do {
+            f->scope_sibling_next = head;
+        } while (!atomic_compare_exchange_weak(&scope->children_head, &head, f));
     }
     f->state = KAI_FIBER_READY;
     kai_sched_enqueue(f);
@@ -901,18 +910,23 @@ static int kai_nursery_join_all(KaiFiber *head, KaiNursery *scope) {
 /* A fiber's trap or unrequested cancel is contained at the root: the join
  * waits for every child but neither cancels its siblings nor fails `main`.
  * Plain children are joined first; the actors still alive then get a cancel
- * (a server parked in `receive` never ends on its own) and are joined too. */
+ * (a server parked in `receive` never ends on its own) and are joined too.
+ * Children registered while a batch is joined (an actor spawning from its
+ * cleanup, from any thread) form the next batch. */
 static void kai_root_nursery_join(KaiNursery *root) {
-    KaiFiber *head = root->children_head;
-    for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
-        if (!c->root_actor) kai_nursery_join_child(c, head, 0);
+    for (;;) {
+        KaiFiber *head = atomic_exchange(&root->children_head, NULL);
+        if (!head) break;
+        for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
+            if (!c->root_actor) kai_nursery_join_child(c, head, 0);
+        }
+        for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
+            if (!c->root_actor) continue;
+            kai_fiber_request_cancel(c);
+            kai_nursery_join_child(c, head, 0);
+        }
+        kai_nursery_release(head, root);
     }
-    for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
-        if (!c->root_actor) continue;
-        kai_fiber_request_cancel(c);
-        kai_nursery_join_child(c, head, 0);
-    }
-    kai_nursery_release(head, root);
 }
 
 /* A fiber unwinding by cancel never reaches its `scope_exit`: cancel and
