@@ -84,6 +84,52 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.187.0 (2026-10-29)
+
+### BREAKING CHANGE
+
+- lowercase `const` names and uppercase type parameters are parse errors; `kai migrate` respells both (`const max_n` -> `MAX_N`, `[T]` -> `[t]`).
+- Random.int_range(lo, hi) includes hi; callers that relied on the half-open bound must pass hi - 1.
+
+### Added
+
+- **migrate**: respell type parameters, parse legacy modules for the whole run, audit binder sites
+- **parse**: one binder-case table for the naming conventions
+- **typer**: an impl for a refinement alias keys on the alias itself
+- **mutate**: add the return operator
+- **stdlib**: Random.int_range is inclusive; read_lines leaves its row open
+
+### Fixed
+
+- **migrate**: respell selectors of dotted module paths; correct kaikai sources embedded in scripts and Makefiles; respell constants imported by selector in three examples
+- **migrate**: lint-ratchet unwrap_or on the const home reads; native-modular body edit spells its type parameter lowercase and fails loudly
+- **migrate**: a recorded position names the exact identifier, with no segment search or fixed-size slice; claim the imported tparam fixture in the matrix
+- **migrate**: locate every site by the recorded position and abort on one it cannot; keep DConst's position and add the name's; respell import selectors, units and impl headers
+- **parse**: region and check-with binders go through the case table
+- **typer**: decide a spawn crossing from the row instantiation the typer records at every read of a function
+- **typer**: a unitless scalar unifies with a dimension over an open base
+- **typer**: keep unit-name type arguments out of the written-name readers
+- **typer**: Shape-generic ops, dimensioned refinements, Measure-parameterised records
+- **typer**: Any equals Any in label-argument shape comparison
+- **typer**: fn named as a value opens its row; Pid[Nothing] in rows; union-component diagnostics; full pattern-hole remainder
+- **mutate**: satisfy the symid and lint gates for the return operator
+- **migrate**: flip Result only for a tongariki source, leave Ok-first hanga-roa alone
+- **build**: KAIC_BOOT=seed fetches the bootstrap-seed tags before picking one
+- **tooling**: init writes main.kai, user-facing help and --version, kai doc core effects, LSP prefix filter, clearer parse diagnostics
+- **ci**: check out the cost-ab base before the PR tree so the root checkout does not wipe it
+- **typer**: a payload variant is its own union component, not the type spelled like it
+
+### Changed
+
+- **migrate**: an import selector is bound to the module its path resolved to, by SymId, not by the module's spelling
+- **migrate**: respell consts and type parameters at the positions the resolver recorded
+- **parse**: re-reads of an already checked file skip the binder pass
+- **parse**: the shipped core skips the binder pass; a gate holds the stdlib to the table
+- **parse**: scan binder positions without building facts unless one is wrong
+- **ast**: a type parameter keeps the position of its name
+- **parse**: one post-parse pass applies the naming table; migrate respells type parameters by binding
+- respell constants UPPER_SNAKE and type parameters lowercase
+
 ## v0.186.0 (2026-10-29)
 
 ### Added
