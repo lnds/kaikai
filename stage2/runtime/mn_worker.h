@@ -599,7 +599,7 @@ static void kai_fiber_trampoline(void) {
     self->unwind_frame = (uintptr_t) __builtin_frame_address(0);
     /* Lives in this frame: the cancel landing below reads it after the body's
      * own frames are gone. */
-    KaiNursery body = { .root = 1, .reap_at = KAI_ROOT_REAP_MIN };
+    KaiNursery body = { .root = 1, .body = 1, .reap_at = KAI_ROOT_REAP_MIN };
     if (setjmp(self->cancel_pad) == 0) {
         self->cancel_pad_set = 1;
         self->nursery_top = &body;

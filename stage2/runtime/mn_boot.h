@@ -30,6 +30,10 @@ static int kai_read_rc_runs(void) {
 static void kai_root_nursery_join(KaiNursery *scope, int mode);
 static void kai_root_reap(KaiNursery *root);
 
+/* The scope of the main run in flight: where an actor spawned by a fiber with
+ * no explicit scope lives, until main returns. */
+static _Atomic(KaiNursery *) kai_root_scope;
+
 /* One run of main inside the implicit root nursery: fibers it spawns outside
  * any scope are joined before the run ends, at every thread count. */
 static KaiValue *kai_main_once(KaiValue *(*user_main)(void)) {
@@ -37,9 +41,11 @@ static KaiValue *kai_main_once(KaiValue *(*user_main)(void)) {
     KaiNursery root = { .root = 1, .parent = self->nursery_top, .ev_top = self->evidence_top,
                         .reap_at = KAI_ROOT_REAP_MIN };
     self->nursery_top = &root;
+    atomic_store(&kai_root_scope, &root);
     KaiValue *r = user_main();
     self->nursery_top = root.parent;
     kai_root_nursery_join(&root, KAI_JOIN_PLAIN);
+    atomic_store(&kai_root_scope, NULL);
     return r;
 }
 
@@ -467,6 +473,7 @@ static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiVal
      * `Fiber[T]` handle cannot free the wrapper before `nursery_exit`
      * joins this child; the scope releases it during the join walk. */
     KaiNursery *scope = kai_current_fiber()->nursery_top;
+    if (stamp_mb && (!scope || scope->body)) scope = atomic_load(&kai_root_scope);
     if (scope) {
         f->root_actor    = scope->root && stamp_mb;
         kai_incref(v);
