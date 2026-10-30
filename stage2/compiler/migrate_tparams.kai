@@ -3,28 +3,35 @@
 import compiler.ast_binders
 import compiler.ast_ids
 import compiler.parse_naming
+import compiler.lex
+import compiler.parse_state
 import compiler.util
 
 #[doc("A span of source to respell: byte offset, length and replacement.")]
 pub(pkg) type Span = Span(Int, Int, String)
 
-#[doc("The spans that respell every uppercase type parameter among `facts`: its declaration and each use bound to its id.")]
-pub(pkg) fn tparam_spans(src: String, facts: [AstFact]) : [Span] =
+#[doc("The lowercase spelling an uppercase type parameter takes, avoiding its siblings'.")]
+pub(pkg) fn respelled_param(name: String, siblings: [String]) : String = fresh_name(snake_of(name), siblings)
+
+#[doc("The respellings of every uppercase type parameter among `facts`: its declaration and each use bound to its id.")]
+pub(pkg) fn tparam_spans(src: String, facts: [AstFact]) : [Located] =
   flat_map(facts, (f) => binder_spans(src, facts, f))
 
-fn binder_spans(src: String, facts: [AstFact], f: AstFact) : [Span] = match f {
+fn binder_spans(src: String, facts: [AstFact], f: AstFact) : [Located] = match f {
   FTParam(id, name, implicit, l, c, siblings) ->
-    if name_bad(NkTypeParam, name) {
+    if name_bad(NkTypeParam, name) and not implicit {
       let new = fresh_name(snake_of(name), siblings)
-      list_append(if implicit { [] } else { exact_ident_span(src, l, c, name, new, "") },
+      list_append([locate_ident(src, l, c, name, new)],
                   flat_map(facts, (u) => use_span(src, u, id, name, new)))
     } else { [] }
   FBind(_, _, _, _) -> []
   FTyUse(_, _, _) -> []
+  FUnitUse(_, _, _) -> []
 }
 
-fn use_span(src: String, u: AstFact, id: TLocalId, name: String, new: String) : [Span] = match u {
-  FTyUse(uid, l, c) -> if tlocal_eq(uid, id) { exact_ident_span(src, l, c, name, new, "") } else { [] }
+fn use_span(src: String, u: AstFact, id: TLocalId, name: String, new: String) : [Located] = match u {
+  FTyUse(uid, l, c) -> if tlocal_eq(uid, id) { [locate_ident(src, l, c, name, new)] } else { [] }
+  FUnitUse(uid, l, c) -> if tlocal_eq(uid, id) { locate_unit(src, l, c, name, new) } else { [] }
   FBind(_, _, _, _) -> []
   FTParam(_, _, _, _, _, _) -> []
 }
@@ -44,17 +51,92 @@ fn snake_chars(name: String, i: Int, acc: [String]) : String = match char_at(nam
     } else { snake_chars(name, i + 1, [string_slice(name, i, 1), ...acc]) }
 }
 
+#[doc("A respelling the walk could place, or the reason it could not.")]
+pub(pkg) type Located = Found(Span) | Missing(String)
+
 #[doc("""
-The span of the name a resolved reference stands on. `line`/`col` is where the
-reference starts: the name itself, or a qualifier `qualifier.name` in front of it.
+Places the respelling of `name` for the reference the resolver recorded at
+`line`/`col`. The reference starts a dotted path `seg(.seg)*`, which is lexed
+from there; the first segment spelled `name` is the one respelled, so an
+import alias or a multi-segment qualifier is walked, never guessed.
 """)]
-pub(pkg) fn exact_ident_span(src: String, l: Int, c: Int, name: String, new: String, qualifier: String) : [Span] = {
+pub(pkg) fn locate_ident(src: String, l: Int, c: Int, name: String, new: String) : Located = {
   let off = line_start(src, l, 1, 0) + c - 1
-  let n = string_length(name)
-  let q = string_length(qualifier)
-  if string_slice(src, off, n) == name { [Span(off, n, new)] }
-  else if q > 0 and string_slice(src, off, q + 1) == "#{qualifier}." and string_slice(src, off + q + 1, n) == name { [Span(off + q + 1, n, new)] }
-  else { [] }
+  let slice = string_slice(src, off, 512)
+  match path_segment(slice, tokenize(slice), name) {
+    Some(t) -> Found(Span(off + t.start, t.length, new))
+    None -> Missing("no `#{name}` at line #{int_to_string(l)}, column #{int_to_string(c)}")
+  }
+}
+
+# The segments of the dotted path that opens `ts`, no whitespace between them.
+fn path_segment(slice: String, ts: [Token], name: String) : Option[Token] = match ts {
+  [t, ...rest] ->
+    if tk_is(t.kind, TkIdent) and t.start == 0 { first_named(slice, t, rest, name) }
+    else if tk_is(t.kind, TkDot) and t.start == 0 { after_dot(slice, rest, name) }
+    else { None }
+  [] -> None
+}
+
+# A qualified reference is recorded at its last dot.
+fn after_dot(slice: String, ts: [Token], name: String) : Option[Token] = match ts {
+  [i, ...more] -> if tk_is(i.kind, TkIdent) and i.start == 1 { first_named(slice, i, more, name) } else { None }
+  [] -> None
+}
+
+fn first_named(slice: String, seg: Token, rest: [Token], name: String) : Option[Token] =
+  if tok_source(slice, seg) == name { Some(seg) }
+  else {
+    match rest {
+      [d, nx, ...more] ->
+        if tk_is(d.kind, TkDot) and tk_is(nx.kind, TkIdent) and d.start == seg.start + seg.length and nx.start == d.start + 1 { first_named(slice, nx, more, name) }
+        else { None }
+      _ -> None
+    }
+  }
+
+#[doc("""
+Places the respelling of `name` in the selector list of the `import` that starts at `line`/`col`:
+the first identifier between its braces spelled `name`.
+""")]
+pub(pkg) fn locate_selector(src: String, l: Int, c: Int, name: String, new: String) : Located = {
+  let off = line_start(src, l, 1, 0) + c - 1
+  let slice = string_slice(src, off, 1024)
+  match selector_token(slice, tokenize(slice), name, false) {
+    Some(t) -> Found(Span(off + t.start, t.length, new))
+    None -> Missing("no selector `#{name}` in the import at line #{int_to_string(l)}")
+  }
+}
+
+fn selector_token(slice: String, ts: [Token], name: String, inside: Bool) : Option[Token] = match ts {
+  [] -> None
+  [t, ...rest] ->
+    if tk_is(t.kind, TkRbrace) { None }
+    else if tk_is(t.kind, TkLbrace) { selector_token(slice, rest, name, true) }
+    else if inside and tk_is(t.kind, TkIdent) and tok_source(slice, t) == name { Some(t) }
+    else { selector_token(slice, rest, name, inside) }
+}
+
+#[doc("""
+Places the respellings of `name` in the unit written after the base type that starts at
+`line`/`col`: every identifier spelled `name` between its `<` and the matching `>`.
+""")]
+pub(pkg) fn locate_unit(src: String, l: Int, c: Int, name: String, new: String) : [Located] = {
+  let off = line_start(src, l, 1, 0) + c - 1
+  let slice = string_slice(src, off, 512)
+  match unit_tokens(slice, tokenize(slice), name, 0, []) {
+    [] -> [Missing("no unit `#{name}` after the type at line #{int_to_string(l)}, column #{int_to_string(c)}")]
+    hits -> map(hits, (t) => Found(Span(off + t.start, t.length, new)))
+  }
+}
+
+fn unit_tokens(slice: String, ts: [Token], name: String, depth: Int, acc: [Token]) : [Token] = match ts {
+  [] -> acc
+  [t, ...rest] ->
+    if tk_is(t.kind, TkLt) { unit_tokens(slice, rest, name, depth + 1, acc) }
+    else if tk_is(t.kind, TkGt) { if depth <= 1 { acc } else { unit_tokens(slice, rest, name, depth - 1, acc) } }
+    else if depth > 0 and tk_is(t.kind, TkIdent) and tok_source(slice, t) == name { unit_tokens(slice, rest, name, depth, [t, ...acc]) }
+    else { unit_tokens(slice, rest, name, depth, acc) }
 }
 
 fn line_start(src: String, l: Int, cur: Int, i: Int) : Int =
