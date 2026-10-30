@@ -1,0 +1,91 @@
+#[doc("""
+The exit of a call, for tail-call shaping.
+
+What follows a call before the function returns: copies of the result, the
+releases of other values, the pads it closes. An exit that does anything else
+with the result is no tail.
+""")]
+
+import compiler.kir
+
+#[doc("The exit of a call: the releases to move, the pads it closes and where it returns, a postcondition between them, or no tail.")]
+pub(pkg) type KtExit = KtOk([KStmt], [KStmt], KPos) | KtChecked | KtNo
+
+#[doc("What the scan of an exit has seen: the registers holding the call's result, the releases to move, the pads to close, and whether the result is read by work other than a copy or by a postcondition.")]
+pub(pkg) type KtSt = { alias: [String], drops: [KStmt], pads: [KStmt], raw: Bool, checked: Bool, lenient: Bool }
+
+#[doc("True when a block belongs to a region, whose returns no call may be moved across.")]
+pub(pkg) fn kt_in_region(r: Option[Int]) : Bool = is_some(r)
+
+#[doc("True when a result in `slot` is a raw scalar, which carries no reference count.")]
+pub(pkg) fn kt_raw(slot: KSlot) : Bool = match slot {
+  SBoxed -> false
+  _      -> true
+}
+
+#[doc("The releases an exit performs before returning a copy of the call's result, and where it returns; an exit that does anything else, or releases the result, is no tail.")]
+pub(pkg) fn kt_exit(stmts: [KStmt], term: KTerm, st: KtSt, blocks: [KBlock], fuel: Int) : KtExit = match stmts {
+  [] -> kt_exit_end(term, st, blocks, fuel)
+  [s, ...rest] -> match kt_step(s, st) {
+    Some(st1) -> kt_exit(rest, term, st1, blocks, fuel)
+    None      -> KtNo
+  }
+}
+
+fn kt_exit_end(term: KTerm, st: KtSt, blocks: [KBlock], fuel: Int) : KtExit = match term {
+  KRet(KVar(v), pos) ->
+    if not kt_has(st.alias, v) { KtNo }
+    else if st.lenient { if st.checked { KtChecked } else { KtNo } }
+    else if st.checked { KtChecked }
+    else { KtOk(list_reverse(st.drops), list_reverse(st.pads), pos) }
+  KBr(l, _) -> match kt_find(blocks, l) {
+    Some(nb) -> if fuel <= 0 or kt_in_region(nb.region_id) { KtNo } else { kt_exit(nb.stmts, nb.term, st, blocks, fuel - 1) }
+    None     -> KtNo
+  }
+  _ -> KtNo
+}
+
+# One statement of an exit, or none when the exit does something a tail call cannot move before the call.
+fn kt_step(s: KStmt, st: KtSt) : Option[KtSt] = match s {
+  KStore(n, KVar(v), _) -> kt_copy(n, v, st)
+  KLet(r, _, KLitOp(KVar(v)), _) -> kt_copy(r, v, st)
+  KLet(r, _, KPrim(KpUnbox(_), [KVar(v)]), _) -> if st.raw { kt_copy(r, v, st) } else { None }
+  KDo(KPrim(KpPadClose, _), _) -> Some(KtSt { ...st, pads: [s, ...st.pads] })
+  KDo(KPrim(KpAssertCheck, _), _) -> Some(KtSt { ...st, checked: true })
+  KDo(KPrim(KpAssertCheckWithValue, _), _) -> Some(KtSt { ...st, checked: true })
+  KRC(KDrop(KVar(v)), _) -> kt_release(s, v, st)
+  KLet(_, _, op, _) -> kt_work(op, st)
+  KDo(op, _) -> kt_work(op, st)
+  _ -> if st.lenient { Some(st) } else { None }
+}
+
+fn kt_copy(to: String, from: String, st: KtSt) : Option[KtSt] =
+  if kt_has(st.alias, from) { Some(KtSt { ...st, alias: [to, ...st.alias] }) } else { None }
+
+# Releasing another register moves before the call; releasing the result is nothing for a raw scalar.
+fn kt_release(s: KStmt, v: String, st: KtSt) : Option[KtSt] =
+  if not kt_has(st.alias, v) { Some(KtSt { ...st, drops: [s, ...st.drops] }) }
+  else if st.raw { Some(st) }
+  else { None }
+
+# Work that reads the result is no tail; it is looked past only to find a postcondition.
+fn kt_work(op: KOp, st: KtSt) : Option[KtSt] =
+  if st.lenient or kt_reads(op, st.alias) { Some(KtSt { ...st, lenient: true }) } else { None }
+
+fn kt_reads(op: KOp, alias: [String]) : Bool = match op {
+  KPrim(_, xs) -> any(xs, (x) => kt_uses(x, alias))
+  KCall(_, xs) -> any(xs, (x) => kt_uses(x, alias))
+  _            -> false
+}
+
+fn kt_uses(v: KVal, alias: [String]) : Bool = match v {
+  KVar(n) -> kt_has(alias, n)
+  _       -> false
+}
+
+fn kt_has(xs: [String], x: String) : Bool = any(xs, (y) => y == x)
+
+fn kt_find(blocks: [KBlock], l: String) : Option[KBlock] = match blocks {
+  []           -> None
+  [b, ...rest] -> if b.label == l { Some(b) } else { kt_find(rest, l) }
+}
