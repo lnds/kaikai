@@ -37,6 +37,7 @@ import compiler.infer_instantiate
 import compiler.infer_env_schemes
 import compiler.infer_decl_check
 import compiler.infer_union_dispatch
+import compiler.infer_export
 
 fn check_default_coverage(df: DiagFiles, tab: SymTab, mod_decls: [Decl], all_decls: [Decl],
                           effs: [EffDefaultOps], homes: TyHomes) : [Diagnostic] / Console + File {
@@ -412,6 +413,42 @@ pub fn spawn_check_program(df: DiagFiles, tab: SymTab, sh: TcShared, all_program
   TypedProgram { ...tp, errs: tp.errs + list_length(ds), diags: list_append(tp.diags, ds) }
 }
 
+# The private fns without a row take the labels their bodies perform. A call
+# reads its callee's scheme, so each round binds the rows found so far and
+# types the module again until no row grows; only the last round's diagnostics
+# are real.
+fn settle_inferred_rows(run: (TyEnv) -> TypedProgram / Console + File + Mutable, sh: TcShared, decls: [Decl],
+                        env: TyEnv, tp: TypedProgram, prev: Int,
+                        fuel: Int) : TypedProgram / Console + File + Mutable = {
+  let found = inferred_rows(env, decls, tp.decls, [])
+  let total = foldl(found, 0, (n, d) => n + list_length(decl_row_labels(d)))
+  if total == prev or fuel == 0 { tp }
+  else {
+    let env2 = foldl(found, env, (e, d) => match fn_scheme_of_decl(d, sh.rk_table, sh.homes) {
+      Some(sc) -> match d { DFn(_, fid, _, _, _, _, _, _, _, _) -> env_bind_sym(e, fnid_sym(fid), sc)  _ -> e }
+      None     -> e
+    })
+    settle_inferred_rows(run, sh, decls, env2, run(env2), total, fuel - 1)
+  }
+}
+
+# Each declaration whose row is inferred, carrying the row its typed twin settled on.
+fn inferred_rows(env: TyEnv, orig: [Decl], typed: [Decl], acc: [Decl]) : [Decl] = match (orig, typed) {
+  ([o, ...os], [t, ...ts]) -> match (o, t) {
+    (DFn(ip, fid, a, b, c, REmpty, g, h, i, j), DFn(_, _, _, _, _, RClosed(ls), _, _, _, _)) ->
+      if row_inferable(ip, REmpty, decl_types_as_entry(env.ty_homes, fid), fn_is_c_export_in(env.tab, fid)) {
+        inferred_rows(env, os, ts, [DFn(ip, fid, a, b, c, RClosed(ls), g, h, i, j), ...acc])
+      } else { inferred_rows(env, os, ts, acc) }
+    _ -> inferred_rows(env, os, ts, acc)
+  }
+  _ -> acc
+}
+
+fn decl_row_labels(d: Decl) : [RowLabel] = match d {
+  DFn(_, _, _, _, _, RClosed(ls), _, _, _, _) -> ls
+  _ -> []
+}
+
 #[doc("infer: the body half of `typecheck_module`, over the front the module's declarations gave.")]
 pub fn module_bodies(file: String, df: DiagFiles, mod: ModuleDecls, fr: ModuleFront,
                      all_program_decls: [Decl],
@@ -428,11 +465,13 @@ pub fn module_bodies(file: String, df: DiagFiles, mod: ModuleDecls, fr: ModuleFr
   let all_decls_for_typer = if not list_is_empty(all_program_decls) {
     all_program_decls
   } else { data.decls_a }
-  let tp = infer_all_loop(df, data.built.env, data.built.core_len, data.recs,
+  let run = (env: TyEnv) => infer_all_loop(df, env, data.built.core_len, data.recs,
                  data.built.op_eff_arities, data.decls_a, verbose, [], 0, [], [], [], [], [],
                  data.alias_res.aliases, data.op_to_eff, data.sums,
                  handle_tab_of(fr.holds), protos,
                  all_decls_for_typer, kind_theories)
+  let tp = settle_inferred_rows(run, sh, data.decls_a, data.built.env, run(data.built.env), 0,
+                                list_length(data.decls_a))
   let cov_diags = check_default_coverage(df, tab, tp.decls, all_decls_for_typer,
     if not list_is_empty(all_program_decls) { sh.effs } else { build_effect_default_op_map(all_decls_for_typer) }, sh.homes)
   let priv_diags = check_field_privacy(df, tab, tsh_view(sh.homes, mod.name), tp.decls,

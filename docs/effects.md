@@ -231,13 +231,28 @@ it removes the noise from one-line procedures. The typer infers
 disagrees with the row.
 
 The **effect row is NOT inferred** at the public-signature level.
-A function that uses any effect must declare the row explicitly:
+A `pub` function that uses any effect must declare the row explicitly:
 
 ```kaikai-neg
-fn greet(name: String) = print(name)            # ERROR: missing / Stdout
+pub fn greet(name: String) = print(name)        # ERROR: missing / Stdout
 
 fn main() : Unit / Stdout = greet("a")
 ```
+
+A **private** top-level function may leave the row out: it is inferred
+from the body, and a call to an inferred function carries its row to the
+caller. Recursive and mutually recursive groups are inferred together.
+
+```kaikai
+fn greet(name: String) = print(name)            # private: row inferred as Stdout
+
+fn main() : Unit / Stdout = greet("a")
+```
+
+Two cases still need the row spelled out: a body that performs an effect
+carrying type arguments or named by an instance (`with Eff as a`), and a
+body that calls a function-typed parameter whose row is a variable of the
+signature.
 
 ```kaikai
 fn greet(name: String) / Stdout = print(name)   # OK
@@ -246,7 +261,8 @@ fn main() : Unit / Stdout = greet("a")
 ```
 
 Tier 1 #1 (effects visible in row types) requires every public
-function to expose its effects in the signature. Letting the row
+function to expose its effects in the signature; a private function's
+row never leaves its module, so it is inferred. Letting the row
 disappear by inference would defeat the principle. The return
 type, on the other hand, is a transparent local inference — the
 body determines it, the row stays explicit.
@@ -255,8 +271,8 @@ This applies uniformly:
 
 | Form                                         | Inference                |
 |----------------------------------------------|--------------------------|
-| `fn f(x: Int) = body`                        | return inferred, no row  |
-| `fn f(x: Int) : T = body`                    | return explicit, no row  |
+| `fn f(x: Int) = body`                        | return inferred, no row (private: row inferred) |
+| `fn f(x: Int) : T = body`                    | return explicit, no row (private: row inferred) |
 | `fn f(x: Int) / E = body`                    | return inferred, row explicit |
 | `fn f(x: Int) : T / E = body`                | both explicit            |
 
