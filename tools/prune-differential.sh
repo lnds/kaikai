@@ -28,6 +28,11 @@ norm() { sed -e "s#$ROOT#<root>#g" -e "s#${WORK:-/nonexistent}#<work>#g" -e 's#/
   -e 's#[0-9]\{4\}-[0-9][0-9]-[0-9][0-9]T[0-9:]*Z#<time>#g' -e 's#elapsed: [0-9.]*s#elapsed: <t>#g' \
   -e 's#"duration_ms":[0-9]*#"duration_ms":0#g' -e '/__root__\.c:[0-9]*:[0-9]*: warning/,/^[0-9]* warnings\{0,1\} generated/d'; }
 
+# A linker error is compared by its missing symbols: code offsets and the number of references
+# to each one follow code size, which pruning changes.
+norm_link() { sed -e "s#.*undefined reference to \(\`[^']*'\).*#undefined reference to \1#" -e "/: in function \`/d" -e '/more undefined references to/d' \
+  | awk '!/^undefined reference to / || !seen[$0]++'; }
+
 # run_variant <tag> <backend> <mode> <file>: leaves $OUT/<tag>.{out,err,rc}.
 run_variant() {
   tag=$1; be=$2; mode=$3; file=$4
@@ -53,7 +58,7 @@ compare() {
   grep -q 'pruning dropped\|internal error' "$OUT/pruned.err" && why="$why internal-pruning-error"
   [ "$(cat "$OUT/pruned.rc")" = "$(cat "$OUT/whole.rc")" ] || why="$why exit($(cat "$OUT/pruned.rc")/$(cat "$OUT/whole.rc"))"
   norm < "$OUT/pruned.out" > "$OUT/p.out"; norm < "$OUT/whole.out" > "$OUT/w.out"
-  norm < "$OUT/pruned.err" | grep -v '^kai: ' > "$OUT/p.err"; norm < "$OUT/whole.err" | grep -v '^kai: ' > "$OUT/w.err"
+  norm < "$OUT/pruned.err" | norm_link | grep -v '^kai: ' > "$OUT/p.err"; norm < "$OUT/whole.err" | norm_link | grep -v '^kai: ' > "$OUT/w.err"
   cmp -s "$OUT/p.out" "$OUT/w.out" || why="$why stdout"
   [ -z "${PRUNE_DIFF_EXPECT_OK:-}" ] || [ "$(cat "$OUT/whole.rc")" = 0 ] || why="$why whole-core-failed"
   cmp -s "$OUT/p.err" "$OUT/w.err" || why="$why stderr"
