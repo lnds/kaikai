@@ -141,11 +141,10 @@ ledger_run() {
 
 # The verdicts on programs built here: a root actor that never starts, or one
 # parked in `receive`, is cancelled and joined when main returns (settled,
-# growth 0); a plain fiber spawned by an actor sits outside the root's join,
-# and one parked at a clean exit fails; a runtime abort with a fiber parked is
-# measured and noted; and a run that never ends is a TIMEOUT.
+# growth 0), and so is a plain fiber it spawned that is parked too; a runtime
+# abort with a fiber parked is measured and noted; and a run that never ends is a TIMEOUT.
 self_test() {
-  local dir="$WORK/self-test" once twice parked aborted spun
+  local dir="$WORK/self-test" once twice aborted spun
   mkdir -p "$dir"
   cat > "$dir/unstarted.kai" <<'EOF'
 import actor
@@ -218,7 +217,7 @@ EOF
     "$KAI" build --backend="$BACKEND" "$dir/$p.kai" -o "$dir/$p" >"$dir/$p.build" 2>&1 \
       || { echo "rc-leak-gate self-test: FAIL — $p does not build"; sed 's/^/  /' "$dir/$p.build"; return 1; }
   done
-  for p in unstarted started; do
+  for p in unstarted started nested; do
     once="$(ledger_run "$dir/$p" 1)"
     case "$once" in
       ''|*[!0-9-]*) echo "rc-leak-gate self-test: FAIL — a $p root actor at main's return reads as $once"; return 1 ;;
@@ -227,9 +226,6 @@ EOF
     [ "$((twice - once))" -eq 0 ] \
       || { echo "rc-leak-gate self-test: FAIL — a $p root actor grows by $((twice - once))"; return 1; }
   done
-  parked="$(ledger_run "$dir/nested" 1)"
-  [ "$parked" = FIBERS-STARTED-AT-EXIT=1 ] \
-    || { echo "rc-leak-gate self-test: FAIL — a parked fiber outside the root at exit reads as $parked"; return 1; }
   aborted="$(ledger_run "$dir/aborted" 1)"
   case "$aborted" in
     ''|*[!0-9-]*) echo "rc-leak-gate self-test: FAIL — an abort with a parked fiber reads as $aborted"; return 1 ;;

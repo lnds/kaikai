@@ -580,13 +580,15 @@ joins it: the actor unwinds through its handlers (`finally` clauses and
 `with Cancel` cleanups run) and the program exits only after all of them
 have terminated. A server parked in `receive` therefore never keeps the
 program alive. A trap in an actor is contained and does not fail `main`.
-An actor spawned by a fiber with no scope open (another actor, a plain
-child) belongs to the root scope too, and so does one spawned during the
-cleanup of a cancelled actor.
+Every fiber body is such a scope: an actor or plain fiber spawned by another
+fiber with no `nursery` open belongs to the spawner's body scope, which joins
+its plain children when the body ends, cancels and joins its actors, and
+forwards a cancel aimed at the fiber to them. Nothing is orphaned.
 Same at every `KAI_THREADS` and on both backends. Coverage:
 `examples/effects/actor_cancelled_at_main_return.kai` and
-`actor_server_parked_at_main_return.kai` (each also pinned to one thread
-by the `_n1` variant).
+`actor_server_parked_at_main_return.kai`,
+`fiber_body_joins_plain_child.kai` and `fiber_body_cancels_blocked_child.kai`
+(each also pinned to one thread by the `_n1` variant).
 
 ## Patterns
 

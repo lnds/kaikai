@@ -447,6 +447,8 @@ KAI_SCHED_FN __attribute__((noinline)) void kai_seg_pool_drain(void);
  * peers, so a concurrently-failing peer can terminate flagged and
  * would otherwise read as an expected cancellation, swallowing the
  * failure. */
+#define KAI_ROOT_REAP_MIN 256
+
 struct KaiNursery {
     _Atomic(KaiFiber *) children_head;
     KaiNursery         *parent;
