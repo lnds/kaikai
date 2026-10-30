@@ -418,7 +418,7 @@ static inline KaiValue *kai_static_closure(KaiValue **slot, KaiFn fn, int arity)
  * KAI_BOUNCE; the frame that is waiting for the value, `kai_apply` or a
  * resolving stub, runs the parked call in `kai_bounce_run`. The token is
  * neither a heap cell nor an immediate Int: only a function that returns it
- * to a resolver may produce it. The slot is touched only by the two noinline
+ * to a resolver may produce it. The slot is touched only by noinline
  * accessors, so no thread-local address outlives a call that can switch
  * fibers. */
 #define KAI_BOUNCE ((KaiValue *) (intptr_t) 16)
