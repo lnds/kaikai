@@ -7,11 +7,9 @@ import compiler.ast_ids
 import compiler.diag
 import compiler.diag_file
 import compiler.expr_positions
-import compiler.lex
 import compiler.migrate
 import compiler.migrate_tparams
 import compiler.parse_naming
-import compiler.parse_state
 import compiler.resolve_names
 import compiler.symtab
 import compiler.util
@@ -73,81 +71,21 @@ fn expr_const_sites(e: Expr, tab: SymTab) : [ConstSite] = {
   list_append(here, flat_map(xp_positions(e), (p) => match p { XP(_, child) -> expr_const_sites(child, tab) }))
 }
 
-#[doc("The spans that respell each site's name in upper case. A use inside an interpolation is found in the text of its hole, since every token of a hole sits at the hole's start; the respelling keeps every length, so positions do not move.")]
-pub(pkg) fn const_spans(src: String, toks: [Token], sites: [ConstSite]) : [Span] =
-  flat_map(sites, (s) => site_spans(src, toks, s))
+#[doc("The spans that respell each site's name in upper case, at the position the resolver recorded for it.")]
+pub(pkg) fn const_spans(src: String, sites: [ConstSite]) : [Span] =
+  flat_map(sites, (s) => site_spans(src, s))
 
 #[doc("The source with `spans` applied, in offset order; two spans at one offset count once.")]
 pub(pkg) fn respell(src: String, spans: [Span]) : String =
   respell_at(src, foldl(spans, [], insert_span), 0, [])
 
 #[doc("The spans that respell the root file's uppercase type parameters: those the binding pass bound, never a spelling that merely matches.")]
-pub(pkg) fn migrate_tparam_spans(decls: [Decl], tab: SymTab, root_mod: String, src: String, toks: [Token]) : [Span] =
-  tparam_spans(src, toks, flat_map(decls, (d) => if decl_in_root(d, root_mod) { decl_facts(d, tab) } else { [] }))
+pub(pkg) fn migrate_tparam_spans(decls: [Decl], tab: SymTab, root_mod: String, src: String) : [Span] =
+  tparam_spans(src, flat_map(decls, (d) => if decl_in_root(d, root_mod) { decl_facts(d, tab) } else { [] }))
 
-fn site_spans(src: String, toks: [Token], s: ConstSite) : [Span] = match s {
-  ConstSite(l, c, n, q) ->
-    if inside_string(toks, site_offset(src, toks, l, c)) { hole_spans(src, site_offset(src, toks, l, c), n, q) }
-    else { token_span(src, toks, l, c, n) }
+fn site_spans(src: String, s: ConstSite) : [Span] = match s {
+  ConstSite(l, c, n, q) -> exact_ident_span(src, l, c, n, to_upper(n), q)
 }
-
-fn token_span(src: String, toks: [Token], l: Int, c: Int, n: String) : [Span] = match toks {
-  [] -> []
-  [t, ...rest] ->
-    if tk_is(t.kind, TkIdent) and (t.line > l or (t.line == l and t.col >= c)) and tok_source(src, t) == n { [Span(t.start, t.length, to_upper(tok_source(src, t)))] }
-    else { token_span(src, rest, l, c, n) }
-}
-
-fn inside_string(toks: [Token], off: Int) : Bool =
-  any(toks, (t) => tk_is(t.kind, TkString) and t.start < off and off < t.start + t.length)
-
-# The offset of a line and column, taking the column base from the first token.
-fn site_offset(src: String, toks: [Token], l: Int, c: Int) : Int = match toks {
-  [] -> 0
-  [t0, ..._] -> line_start(src, l, 1, 0) + c - (t0.col - (t0.start - line_start(src, t0.line, 1, 0)))
-}
-
-fn line_start(src: String, l: Int, cur: Int, i: Int) : Int =
-  if cur >= l { i }
-  else {
-    match char_at(src, i) {
-      None -> i
-      Some('\n') -> line_start(src, l, cur + 1, i + 1)
-      Some(_) -> line_start(src, l, cur, i + 1)
-    }
-  }
-
-# The uses of `n` in the hole starting at `off`, up to its closing brace; a name after a `.` is a field.
-fn hole_spans(src: String, off: Int, n: String, q: String) : [Span] = hole_scan(src, off, n, q, 0, 0)
-
-fn hole_scan(src: String, i: Int, n: String, q: String, depth: Int, prev: Int) : [Span] = match char_at(src, i) {
-  None -> []
-  Some('{') -> hole_scan(src, i + 1, n, q, depth + 1, 123)
-  Some('}') -> if depth == 0 { [] } else { hole_scan(src, i + 1, n, q, depth - 1, 125) }
-  Some(c) ->
-    if is_word_char(c) {
-      let w = word_at(src, i)
-      let rest = hole_scan(src, i + string_length(w), n, q, depth, 95)
-      if w == n and (prev != 46 or word_before(src, i - 1) == q) { [Span(i, string_length(w), to_upper(w)), ...rest] } else { rest }
-    } else { hole_scan(src, i + 1, n, q, depth, char_to_int(c)) }
-}
-
-# The identifier ending just before the `.` at offset `dot`.
-fn word_before(src: String, dot: Int) : String = word_back(src, dot, dot)
-
-fn word_back(src: String, start: Int, dot: Int) : String = match char_at(src, start - 1) {
-  Some(c) -> if is_word_char(c) { word_back(src, start - 1, dot) } else { string_slice(src, start, dot - start) }
-  None -> string_slice(src, start, dot - start)
-}
-
-fn word_at(src: String, i: Int) : String = string_slice(src, i, word_len(src, i, 0))
-
-fn word_len(src: String, i: Int, k: Int) : Int = match char_at(src, i + k) {
-  Some(c) -> if is_word_char(c) { word_len(src, i, k + 1) } else { k }
-  None -> k
-}
-
-fn is_word_char(c: Char) : Bool = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
 
 fn insert_span(xs: [Span], x: Span) : [Span] = match xs {
   [] -> [x]
