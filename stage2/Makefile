@@ -5656,7 +5656,7 @@ selfhost: $(TARGET) build
 	if grep -q '^warning:' build/kaic2b.err; then \
 	  echo "selfhost warnings: the compiler's own sources must compile without a warning"; exit 1; \
 	fi; \
-	$(CC) $(SELFHOST_CFLAGS) $(CPPFLAGS_CORE) $(KAI_MAIN_STACK) -I ../stage0 build/kaic2b.c -o build/kaic2b $(LDLIBS_M) ; \
+	$(CC) $(SELFHOST_CFLAGS) $(CPPFLAGS_CORE) $(COMPILER_DEFS) $(KAI_MAIN_STACK) -I ../stage0 build/kaic2b.c -o build/kaic2b $(LDLIBS_M) ; \
 	./build/kaic2b $(EDITION_FLAG) $(SRC) > build/kaic2c.c; \
 	diff -q build/kaic2b.c build/kaic2c.c > /dev/null \
 	  && echo "selfhost determinism: OK (kaic2b.c == kaic2c.c)" \
