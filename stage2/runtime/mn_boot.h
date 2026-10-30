@@ -466,6 +466,7 @@ static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiVal
      * joins this child; the scope releases it during the join walk. */
     KaiNursery *scope = kai_current_fiber()->nursery_top;
     if (scope) {
+        f->root_actor         = scope->root && stamp_mb;
         kai_incref(v);
         f->scope_nursery      = scope;
         f->scope_sibling_next = scope->children_head;
@@ -904,11 +905,11 @@ static int kai_nursery_join_all(KaiFiber *head, KaiNursery *scope) {
 static void kai_root_nursery_join(KaiNursery *root) {
     KaiFiber *head = root->children_head;
     for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
-        if (!c->mailbox) kai_nursery_join_child(c, head, 0);
+        if (!c->root_actor) kai_nursery_join_child(c, head, 0);
     }
     for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
-        if (!c->mailbox) continue;
-        if (c->state != KAI_FIBER_DONE && c->state != KAI_FIBER_CANCELLED) kai_fiber_request_cancel(c);
+        if (!c->root_actor) continue;
+        kai_fiber_request_cancel(c);
         kai_nursery_join_child(c, head, 0);
     }
     kai_nursery_release(head, root);
