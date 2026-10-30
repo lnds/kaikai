@@ -9,6 +9,7 @@ import compiler.scc
 import compiler.expr_positions
 import compiler.effect_instance
 import compiler.infer_index
+import compiler.infer_unify_rows
 import compiler.infer_env
 import compiler.infer_row_kinds
 import compiler.type_home
@@ -114,13 +115,22 @@ fn row_is_open(r: RowExpr) : Bool = match r {
   _ -> false
 }
 
-fn rl_key(l: RowLabel) : String = match l {
-  RL(r, args) -> concat_all([int_to_string(sym_raw(ref_sym(r))), ...map(args, te_text)])
+# Two labels are one when they name one effect at structurally equal types.
+fn rl_same(a: RowLabel, b: RowLabel) : Bool = match (a, b) {
+  (RL(ra, xs), RL(rb, ys)) ->
+    sym_same(ref_sym(ra), ref_sym(rb)) and list_length(xs) == list_length(ys)
+      and all(zip_tes(xs, ys), (p) => ty_eq_shape(te_as_ty(p.fst), te_as_ty(p.snd)))
 }
 
-# The members of a recursive group call one another, so each performs what any
-# of them does. A row open on a variable of one member's signature cannot be
-# the row of another.
+fn zip_tes(xs: [TypeExpr], ys: [TypeExpr]) : [(TypeExpr, TypeExpr)] = match (xs, ys) {
+  ([x, ...xr], [y, ...yr]) -> [(x, y), ...zip_tes(xr, yr)]
+  _ -> []
+}
+
+# The members of a recursive group call one another, so a member performs
+# what its own body does and what its callees do, less what the handlers
+# around each call discharge. Each member's own labels come from its typing;
+# the call sites are read off the typed bodies by identity.
 fn share_row(file_of: (Decl) -> String, ds: [Decl], ts: [TypedDecl]) : [TypedDecl] = match ts {
   [_] -> ts
   _ -> {
@@ -132,19 +142,78 @@ fn share_row(file_of: (Decl) -> String, ds: [Decl], ts: [TypedDecl]) : [TypedDec
             [])]) }
       })
     } else {
-      let shared = union_labels(flat_map(ts, (t) => row_labels(decl_row(t.decl))), [], [])
-      let row = if list_is_empty(shared) { REmpty } else { RClosed(shared) }
-      map(ts, (t) => TypedDecl { ...t, decl: decl_with_row(t.decl, row) })
+      let syms = map(ds, decl_fn_sym)
+      let own = map(ts, (t) => row_labels(decl_row(t.decl)))
+      let calls = map(ts, (t) => decl_group_calls(syms, t.decl))
+      let rows = solve_group(own, calls, own)
+      map(zip_rows(ts, rows), (p) => match p {
+        (t, ls) -> TypedDecl { ...t, decl: decl_with_row(t.decl, if list_is_empty(ls) { REmpty } else { RClosed(ls) }) }
+      })
     }
   }
 }
 
-fn union_labels(ls: [RowLabel], seen: [String], acc: [RowLabel]) : [RowLabel] = match ls {
+fn zip_rows(ts: [TypedDecl], rs: [[RowLabel]]) : [(TypedDecl, [RowLabel])] = match (ts, rs) {
+  ([t, ...tr], [r, ...rr]) -> [(t, r), ...zip_rows(tr, rr)]
+  _ -> []
+}
+
+# Rows only grow and the labels are finite, so the rows settle.
+fn solve_group(own: [[RowLabel]], calls: [[(Int, [RowLabel])]], rows: [[RowLabel]]) : [[RowLabel]] = {
+  let next = map(zip_rows_calls(own, calls), (p) => match p {
+    (o, cs) -> union_labels(list_append(o, flat_map(cs, (c) => match c {
+      (j, handled) -> filter(nth_row(rows, j), (l) => not any(handled, (h) => rl_same(h, l)))
+    })), [])
+  })
+  if total_labels(next) == total_labels(rows) { rows } else { solve_group(own, calls, next) }
+}
+
+fn total_labels(rows: [[RowLabel]]) : Int = foldl(rows, 0, (n, r) => n + list_length(r))
+
+fn zip_rows_calls(own: [[RowLabel]], calls: [[(Int, [RowLabel])]]) : [([RowLabel], [(Int, [RowLabel])])] = match (own, calls) {
+  ([o, ...os], [c, ...cr]) -> [(o, c), ...zip_rows_calls(os, cr)]
+  _ -> []
+}
+
+fn nth_row(rows: [[RowLabel]], j: Int) : [RowLabel] = match rows {
+  [] -> []
+  [r, ...rest] -> if j == 0 { r } else { nth_row(rest, j - 1) }
+}
+
+fn union_labels(ls: [RowLabel], acc: [RowLabel]) : [RowLabel] = match ls {
   [] -> list_reverse(acc)
-  [l, ...rest] -> {
-    let k = rl_key(l)
-    if list_has(seen, k) { union_labels(rest, seen, acc) } else { union_labels(rest, [k, ...seen], [l, ...acc]) }
+  [l, ...rest] -> if any(acc, (a) => rl_same(a, l)) { union_labels(rest, acc) } else { union_labels(rest, [l, ...acc]) }
+}
+
+# Each call a body makes to a member of the group, with the labels the
+# handles around it discharge.
+fn decl_group_calls(syms: [SymId], d: Decl) : [(Int, [RowLabel])] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _) -> group_calls(syms, body, [], [])
+  _ -> []
+}
+
+fn group_calls(syms: [SymId], e: Expr, handled: [RowLabel], acc: [(Int, [RowLabel])]) : [(Int, [RowLabel])] = {
+  let here = match e.kind {
+    ESym(s, _) -> match index_of_sym(syms, s, 0) {
+      Some(j) -> [(j, handled), ...acc]
+      None -> acc
+    }
+    _ -> acc
   }
+  match e.kind {
+    EHandle(body, ref, targs, init, _, cls, oret) -> {
+      let inside = group_calls(syms, body, [RL(ref, targs), ...handled], here)
+      let a1 = match init { Some(i) -> group_calls(syms, i, handled, inside)  None -> inside }
+      let a2 = foldl(cls, a1, (a, c) => match c { HC(_, _, b, _, _) -> group_calls(syms, b, handled, a) })
+      match oret { Some(HR(_, b, _, _)) -> group_calls(syms, b, handled, a2)  None -> a2 }
+    }
+    _ -> foldl(xp_positions(e), here, (a, p) => match p { XP(_, c) -> group_calls(syms, c, handled, a) })
+  }
+}
+
+fn index_of_sym(syms: [SymId], s: SymId, i: Int) : Option[Int] = match syms {
+  [] -> None
+  [m, ...rest] -> if sym_same(m, s) { Some(i) } else { index_of_sym(rest, s, i + 1) }
 }
 
 fn decl_line(d: Decl) : Int = match d {
