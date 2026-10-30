@@ -292,7 +292,7 @@ fn st_unify_ty_args(st: InferState, a: [Ty], b: [Ty], line: Int, col: Int) : Inf
     [ah, ...arest] -> match b {
       [] -> st
       [bh, ...brest] ->
-        st_unify_ty_args(st_unify(st, ah, bh, "shared effect label", line, col), arest, brest, line, col)
+        st_unify_ty_args(st_unify_join(st, ah, bh, "shared effect label", line, col), arest, brest, line, col)
     }
   }
 
@@ -317,18 +317,23 @@ pub fn st_propagate_capability_labels(st: InferState, callee_ty: Ty,
 }
 
 
-#[doc("Typer-internal helper `st_unify` shared across the infer modules.")]
-pub fn st_unify(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : InferState / Console + File + Mutable =
-  st_unify_by(st, a, b, false, what, line, col)
+#[doc("Unify two types that both flow into one slot; `Nothing` on either side is accepted.")]
+pub fn st_unify_join(st: InferState, a: Ty, b: Ty, what: String, line: Int, col: Int) : InferState / Console + File + Mutable =
+  st_unify_by(st, UJoin, a, b, what, line, col)
 
 
-#[doc("`st_unify` for a value of type `actual` flowing into a slot of type `expected`: an expected `Nothing` takes only `Nothing`.")]
+#[doc("Unify a value of type `actual` flowing into a slot of type `expected`: an expected `Nothing` takes only `Nothing`.")]
 pub fn st_unify_flow(st: InferState, expected: Ty, actual: Ty, what: String, line: Int, col: Int) : InferState / Console + File + Mutable =
-  st_unify_by(st, expected, actual, ty_is_nothing(unwrap_refines(apply_ty(st.sub, expected))), what, line, col)
+  st_unify_by(st, UFlow, expected, actual, what, line, col)
 
 
-fn st_unify_by(st: InferState, a: Ty, b: Ty, strict: Bool, what: String, line: Int, col: Int) : InferState / Console + File + Mutable {
-  match (if strict { unify_core(st.env, a, b, st.sub) } else { unify_env(st.env, a, b, st.sub) }) {
+#[doc("Unify an applied function's type against the function type its call site demands.")]
+pub fn st_unify_callee(st: InferState, callee_ty: Ty, call_fn: Ty, what: String, line: Int, col: Int) : InferState / Console + File + Mutable =
+  st_unify_by(st, UCallee, callee_ty, call_fn, what, line, col)
+
+
+fn st_unify_by(st: InferState, dir: UniDir, a: Ty, b: Ty, what: String, line: Int, col: Int) : InferState / Console + File + Mutable {
+  match unify_dir(st.env, dir, a, b, st.sub) {
     Some(s2) -> st_set_sub(st, s2)
     None -> {
       let a1 = apply_ty(st.sub, a)
@@ -341,7 +346,7 @@ fn st_unify_by(st: InferState, a: Ty, b: Ty, strict: Bool, what: String, line: I
       # accept it after the symmetric `unify` failed, with no
       # substitution side-effects: the runtime layout is identical.
       if union_upcast_ok(st.env, a1, b1) { st }
-      else { match rigid_either(st, a, b) {
+      else { match rigid_either(st, dir, a, b) {
         Some(RigidWhy(msg, help)) -> st_bump_err(st_help(st_push_diag(st, mk_diag(SevError, st.file, line, col, msg, [])), help))
         None -> {
         let d = mk_diag(SevError, st.file, line, col, "type mismatch in #{what}", [])
@@ -353,18 +358,18 @@ fn st_unify_by(st: InferState, a: Ty, b: Ty, strict: Bool, what: String, line: I
 }
 
 
-fn rigid_either(st: InferState, a: Ty, b: Ty) : Option[RigidWhy] / Mutable = match rigid_forced(st, a, b) {
+fn rigid_either(st: InferState, dir: UniDir, a: Ty, b: Ty) : Option[RigidWhy] / Mutable = match rigid_forced(st, dir, a, b) {
   Some(w) -> Some(w)
-  None    -> rigid_row_forced(st, a, b, is_pure_fn_ty(apply_ty(st.sub, a)) or is_pure_fn_ty(apply_ty(st.sub, b)))
+  None    -> rigid_row_forced(st, dir, a, b, is_pure_fn_ty(apply_ty(st.sub, a)) or is_pure_fn_ty(apply_ty(st.sub, b)))
 }
 
 
 # A declared row variable stands for whatever effects the callers choose, so
 # a pure function type cannot take its place: the unification that fails
 # here succeeds once the declared rows are let go.
-fn rigid_row_forced(st: InferState, a: Ty, b: Ty, pure: Bool) : Option[RigidWhy] / Mutable = match st.sub.rigid_rows {
+fn rigid_row_forced(st: InferState, dir: UniDir, a: Ty, b: Ty, pure: Bool) : Option[RigidWhy] / Mutable = match st.sub.rigid_rows {
   [] -> None
-  _  -> match unify_env(st.env, a, b, subst_with_rigid_rows(st.sub, [])) {
+  _  -> match unify_dir(st.env, dir, a, b, subst_with_rigid_rows(st.sub, [])) {
     None    -> None
     Some(_) -> Some(rigid_row_why(sig_row_name(st), pure))
   }
@@ -408,9 +413,9 @@ fn sig_row_name(st: InferState) : Option[String] = match st.sig_rows {
 }
 
 
-fn rigid_forced(st: InferState, a: Ty, b: Ty) : Option[RigidWhy] / Mutable = match st.sub.rigid {
+fn rigid_forced(st: InferState, dir: UniDir, a: Ty, b: Ty) : Option[RigidWhy] / Mutable = match st.sub.rigid {
   [] -> None
-  rs -> match unify_env(st.env, a, b, subst_with_rigid(st.sub, [])) {
+  rs -> match unify_dir(st.env, dir, a, b, subst_with_rigid(st.sub, [])) {
     None     -> None
     Some(s2) -> rigid_first_bound(st, rs, rs, s2)
   }
@@ -456,7 +461,7 @@ fn first_failing_arg_loop(env: TyEnv, sub: Subst, params: [Ty],
       [a, ...arest] -> {
         let p1 = apply_ty(sub, p)
         let a1 = apply_ty(sub, a)
-        match unify_env(env, p1, a1, sub) {
+        match unify_flow(env, p1, a1, sub) {
           Some(_) -> first_failing_arg_loop(env, sub, prest, arest, idx + 1)
           None    -> if union_upcast_ok(env, p1, a1) {
             first_failing_arg_loop(env, sub, prest, arest, idx + 1)
@@ -512,7 +517,7 @@ pub fn dot_identity_help(before: InferState, st: InferState, callee_ty: Ty,
 # a different parameter count than the call site supplied, emit a
 # canonical "wrong number of arguments" diagnostic in place of the
 # generic "type mismatch in function call". The arity check runs as
-# a preflight before `st_unify` so we never produce both diagnostics
+# a preflight before `st_unify_callee` so we never produce both diagnostics
 # for the same site.
 #
 # `arg_tys` is the list of inferred argument types at the call site.
@@ -532,9 +537,9 @@ fn arity_mismatch_of(sub: Subst, callee_ty: Ty, arg_tys: [Ty]) : Option[Int] {
 }
 
 
-# Template 1 — wrapper around `st_unify` for call sites that
+# Template 1 — wrapper around `st_unify_callee` for call sites that
 # want richer diagnostics. Preflights arity (Template 4) before
-# delegating to `st_unify`; on failure, appends the argument-position
+# delegating to `st_unify_callee`; on failure, appends the argument-position
 # + callee signature notes (Template 1) and the missing-effect notes
 # (Template 5) when applicable.
 #[doc("Typer-internal helper `st_unify_call` shared across the infer modules.")]
@@ -542,7 +547,7 @@ pub fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
                    arg_tys: [Ty], arg_exprs: [Expr], expected_fn_ty: Ty,
                    line: Int, col: Int) : InferState / Console + File + Mutable =
   match var_write_mismatch(st, callee, arg_tys, arg_exprs) {
-    Some((slot_elem, value)) -> st_unify(st, slot_elem, value, "`var` assignment", line, col)
+    Some((slot_elem, value)) -> st_unify_flow(st, slot_elem, value, "`var` assignment", line, col)
     None -> st_unify_named(st, callee_display_name(st, callee), callee_ty, arg_tys, arg_exprs, expected_fn_ty, line, col)
   }
 
@@ -552,7 +557,7 @@ pub fn st_unify_call(st: InferState, callee: Expr, callee_ty: Ty,
 fn var_write_mismatch(st: InferState, callee: Expr, arg_tys: [Ty], arg_exprs: [Expr]) : Option[(Ty, Ty)] / Mutable =
   match (arg_tys, arg_exprs) {
     ([slot, _, value], [_, idx, _]) -> match (is_builtin_ref(callee, CbArraySet), idx.kind, apply_ty(st.sub, slot)) {
-      (true, EInt(0, ""), TyCon(_, [elem])) -> match unify_env(st.env, elem, value, st.sub) {
+      (true, EInt(0, ""), TyCon(_, [elem])) -> match unify_flow(st.env, elem, value, st.sub) {
         None    -> Some((elem, value))
         Some(_) -> None
       }
@@ -592,9 +597,9 @@ fn unify_widened_call(st: InferState, who: Option[String], callee_ty: Ty,
       Some(st_row) -> st_row
       None -> {
       let pre_errs = st.errs
-      let st1 = st_unify(st, callee_ty, expected_fn_ty, "function call", line, col)
+      let st1 = st_unify_callee(st, callee_ty, expected_fn_ty, "function call", line, col)
       if st1.errs > pre_errs {
-        # Mirrors the `expected:` note `st_unify` just attached, so the
+        # Mirrors the `expected:` note `st_unify_callee` just attached, so the
         # trailing signature note can drop itself when it would repeat it.
         let expected_shown = inf_ty_to_string_ow(st1.env.tab, st1.env.head_owners, apply_ty(st1.sub, callee_ty))
         st_relate_all(st1, call_mismatch_notes(st1.env, st1.sub, who, callee_ty,
@@ -613,7 +618,7 @@ fn unify_widened_call(st: InferState, who: Option[String], callee_ty: Ty,
 fn rigid_row_call(st: InferState, who: Option[String], callee_ty: Ty, arg_tys: [Ty], arg_exprs: [Expr], expected_fn_ty: Ty,
                   line: Int, col: Int) : Option[InferState] / Console + File + Mutable =
   if st.sub.rigid_rows == [] { None }
-  else { match unify_env(st.env, callee_ty, expected_fn_ty, st.sub) {
+  else { match unify_callee(st.env, callee_ty, expected_fn_ty, st.sub) {
     Some(s2) -> Some(st_set_sub(st, s2))
     None     -> rigid_row_rejection(st, who, callee_ty, arg_tys, arg_exprs, expected_fn_ty, line, col)
   } }
@@ -621,7 +626,7 @@ fn rigid_row_call(st: InferState, who: Option[String], callee_ty: Ty, arg_tys: [
 
 fn rigid_row_rejection(st: InferState, who: Option[String], callee_ty: Ty, arg_tys: [Ty], arg_exprs: [Expr], expected_fn_ty: Ty,
                        line: Int, col: Int) : Option[InferState] / Console + File + Mutable =
-  match rigid_row_forced(st, callee_ty, expected_fn_ty, expects_pure_fn(apply_ty(st.sub, callee_ty))) {
+  match rigid_row_forced(st, UCallee, callee_ty, expected_fn_ty, expects_pure_fn(apply_ty(st.sub, callee_ty))) {
     None -> None
     Some(RigidWhy(msg, help)) -> {
       let resolved = apply_ty(st.sub, callee_ty)
@@ -946,7 +951,7 @@ fn op_common(st: InferState, ss: [SymId], ty: Option[Ty]) : OpTyped / Mutable = 
       let inst = st_instantiate_report(st, sc)
       match ty {
         None    -> op_common(inst.st, rest, Some(inst.ty))
-        Some(t) -> match unify_env(inst.st.env, t, inst.ty, inst.st.sub) {
+        Some(t) -> match unify_join(inst.st.env, t, inst.ty, inst.st.sub) {
           Some(sub) -> op_common(st_set_sub(inst.st, sub), rest, ty)
           None      -> OpTyped { st: inst.st, ty: None }
         }
