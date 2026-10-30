@@ -89,7 +89,7 @@
 #include "runtime/evidence.h"
 #include "runtime/segments.h"
 
-#if defined(KAI_LLVM) || (defined(__has_include) && __has_include("llvm/llvm_bridge.h"))
+#if defined(KAI_LLVM) || defined(KAI_LLVM_BRIDGE)
 #include "llvm/llvm_bridge.h"
 #endif
 

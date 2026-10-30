@@ -13,8 +13,8 @@
  * right vehicle over the extern-C/FFI shim (which always reboxes the
  * result to `KaiValue *`).
  * =================================================================== */
-/* Compiler-only. runtime.h includes it when this directory ships beside it; the user
- * runtime install does not carry it. */
+/* Compiler-only. runtime.h includes it under KAI_LLVM or KAI_LLVM_BRIDGE, which only builds of
+ * the compiler itself set; the user runtime install does not carry it. */
 #ifndef KAI_RUNTIME_LLVM_BRIDGE_H
 #define KAI_RUNTIME_LLVM_BRIDGE_H
 #ifdef KAI_LLVM

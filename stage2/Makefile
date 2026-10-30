@@ -182,6 +182,9 @@ STDLIB_ABS := $(abspath ../stdlib)
 # representation is isolated to the self-hosted compiler that builds
 # the real programs (and the rb-tree benchmark).
 CPPFLAGS_CORE := -I . -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
+# Set by every build of the compiler itself, never of a user program: it pulls the
+# libLLVM forwarders (or their stubs) from llvm/ into runtime.h.
+COMPILER_DEFS := -DKAI_LLVM_BRIDGE
 
 # The only project header the generated C pulls in: it emits a bare
 # `#include "runtime.h"`, which the `-I .` above binds to stage2/runtime.h,
@@ -242,7 +245,7 @@ LINK_SH := ../tools/kaic-link.sh
 HOP_OPT := $(if $(filter aarch64,$(shell uname -m)),-O1,-O0)
 CFLAGS_HOP := $(filter-out -O2 -O1 -g,$(CFLAGS)) $(HOP_OPT)
 boot-hop:
-	CC='$(CC)' LDLIBS='$(LDLIBS_M)' $(LINK_SH) $(HOP_C) $(HOP_BIN) $(CFLAGS_HOP) $(if $(HOP_INC),-I $(HOP_INC),$(CPPFLAGS_CORE) -I ../stage0) $(KAI_MAIN_STACK)
+	CC='$(CC)' LDLIBS='$(LDLIBS_M)' $(LINK_SH) $(HOP_C) $(HOP_BIN) $(CFLAGS_HOP) $(COMPILER_DEFS) $(if $(HOP_INC),-I $(HOP_INC),$(CPPFLAGS_CORE) -I ../stage0) $(KAI_MAIN_STACK)
 
 # Announce which backend capability got compiled in, so a dev never has
 # to guess why `kai build` behaves differently across two checkouts (the
@@ -253,7 +256,7 @@ ifeq ($(KAI_LLVM),1)
 else
 	@echo "building stage2: C-only$(if $(KAI_LLVM_AUTO), (no $(LLVM_CONFIG) in PATH; run make KAI_LLVM=1 for native),)"
 endif
-	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0
+	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS) $(CPPFLAGS_CORE) $(COMPILER_DEFS) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0
 	@if [ -f $(STAGE2_ID) ]; then $(BOOT_SH) seal $< $@; else rm -f build/$@.id; fi
 ifeq ($(KAI_LLVM),1)
 	@# Linking libLLVM does not prove native works: a kaic2 compiled by kaic2
@@ -283,7 +286,7 @@ endif
 # is for the edit-check loop only, never for CI or the selfhost oracle.
 CFLAGS_DEV := $(filter-out -O2 -O1,$(CFLAGS)) -O0
 kaic2-dev: build/stage2.c $(RUNTIME_H)
-	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS_DEV) $(CPPFLAGS_CORE) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0
+	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS_DEV) $(CPPFLAGS_CORE) $(COMPILER_DEFS) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0
 	@echo "kaic2-dev OK (-O0; edit-loop binary, not for CI/selfhost)"
 
 # --- Dev fast rebuild: modular self-compile ---------------------------
@@ -296,7 +299,7 @@ kaic2-dev: build/stage2.c $(RUNTIME_H)
 # oracle. The stdlib path is baked in exactly as the bootstrap build
 # does, so the result resolves core imports with no --path flags.
 KAIC2_FAST_STAGING := build/kaic2-fast.bin
-KAIC2_FAST_CFLAGS  := $(CFLAGS) -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
+KAIC2_FAST_CFLAGS  := $(CFLAGS) $(COMPILER_DEFS) -DKAI_STDLIB_PATH=\"$(STDLIB_ABS)\"
 
 $(KAIC2_FAST_STAGING): FORCE | build
 	@set -e; \
@@ -362,7 +365,7 @@ kaic-boot-verify-one: | build
 	d=$(BOOT_VERIFY)/$(BOOT); \
 	KAIC_BOOT=$(BOOT) $(BOOT_SH) fresh $$d/stage2.c \
 	  || KAIC_BOOT=$(BOOT) KAIC_BOOT_MODULAR= $(BOOT_SH) emit $$d/stage2.c; \
-	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(KAI_MAIN_STACK) -I ../stage0 $$d/stage2.c -o $$d/kaic2 $(LDLIBS_M); \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) $(COMPILER_DEFS) $(KAI_MAIN_STACK) -I ../stage0 $$d/stage2.c -o $$d/kaic2 $(LDLIBS_M); \
 	./$$d/kaic2 $(EDITION_FLAG) $(SRC) > $$d/self.c; \
 	./$$d/kaic2 $(EDITION_FLAG) ../examples/portfolio/portfolio.kai > $$d/sample.c; \
 	cmp -s $$d/stage2.c $$d/self.c \
@@ -7003,7 +7006,7 @@ test-perceus-1131-modular-escape: $(TARGET) bin-kai build
 	@set -e; \
 	src=../examples/perceus/borrow_modular_escape_1131.kai; \
 	out=$$(pwd)/build/s2-1131modesc.bin; rm -f $$out; \
-	( cd .. && KAI_CACHE=0 KAI_BACKEND=c KAI_MODULAR=1 KAI_MODULAR_CACHE_DIR=$(CMODULAR_SELFHOST_CACHE) KAI_MODULAR_STATS=1 bin/kai build stage2/main.kai -o $$out ) \
+	( cd .. && KAI_CACHE=0 KAI_BACKEND=c KAI_MODULAR=1 KAI_MODULAR_CACHE_DIR=$(CMODULAR_SELFHOST_CACHE) KAI_MODULAR_STATS=1 CFLAGS="$(CFLAGS) $(COMPILER_DEFS)" bin/kai build stage2/main.kai -o $$out ) \
 	  2> build/s2-1131modesc.log \
 	  || { echo "perceus-1131-modular-escape FAIL (modular compiler build/link)"; cat build/s2-1131modesc.log; exit 1; }; \
 	KAIKAI_STDLIB_PATH=$(STDLIB_ABS) $$out $$src > build/s2-1131modesc.c 2> build/s2-1131modesc.err \
@@ -11082,7 +11085,7 @@ test-modular-selfhost: $(TARGET) bin-kai build
 	out=$$(pwd)/build/modular-selfhost.bin; \
 	rm -f $$out; \
 	echo "== test-modular-selfhost: full compiler links under --emit=c-modular =="; \
-	( cd .. && KAI_CACHE=0 KAI_MODULAR=1 KAI_MODULAR_CACHE_DIR=$(CMODULAR_SELFHOST_CACHE) KAI_MODULAR_STATS=1 bin/kai build stage2/main.kai -o $$out ) \
+	( cd .. && KAI_CACHE=0 KAI_MODULAR=1 KAI_MODULAR_CACHE_DIR=$(CMODULAR_SELFHOST_CACHE) KAI_MODULAR_STATS=1 CFLAGS="$(CFLAGS) $(COMPILER_DEFS)" bin/kai build stage2/main.kai -o $$out ) \
 	  2> build/modular-selfhost.log \
 	  || { echo "modular-selfhost FAIL (build/link)"; cat build/modular-selfhost.log; exit 1; }; \
 	[ -x $$out ] || { echo "modular-selfhost FAIL (no binary produced)"; exit 1; }; \
