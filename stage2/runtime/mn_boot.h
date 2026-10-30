@@ -465,9 +465,7 @@ static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiVal
      * `Fiber[T]` handle cannot free the wrapper before `nursery_exit`
      * joins this child; the scope releases it during the join walk. */
     KaiNursery *scope = kai_current_fiber()->nursery_top;
-    /* Actors are not children of the root: one parked in `receive` never
-     * ends, and `main` returning ends the program. */
-    if (scope && !(scope->root && stamp_mb)) {
+    if (scope) {
         kai_incref(v);
         f->scope_nursery      = scope;
         f->scope_sibling_next = scope->children_head;
@@ -900,10 +898,19 @@ static int kai_nursery_join_all(KaiFiber *head, KaiNursery *scope) {
 }
 
 /* A fiber's trap or unrequested cancel is contained at the root: the join
- * waits for every child but neither cancels its siblings nor fails `main`. */
+ * waits for every child but neither cancels its siblings nor fails `main`.
+ * Plain children are joined first; the actors still alive then get a cancel
+ * (a server parked in `receive` never ends on its own) and are joined too. */
 static void kai_root_nursery_join(KaiNursery *root) {
     KaiFiber *head = root->children_head;
-    for (KaiFiber *c = head; c; c = c->scope_sibling_next) kai_nursery_join_child(c, head, 0);
+    for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
+        if (!c->mailbox) kai_nursery_join_child(c, head, 0);
+    }
+    for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
+        if (!c->mailbox) continue;
+        if (c->state != KAI_FIBER_DONE && c->state != KAI_FIBER_CANCELLED) kai_fiber_request_cancel(c);
+        kai_nursery_join_child(c, head, 0);
+    }
     kai_nursery_release(head, root);
 }
 

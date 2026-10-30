@@ -554,6 +554,7 @@ semantics is identical.
 - A sibling in its nursery failing: the nursery cancels the
   survivors.
 - A linked actor crashing.
+- `main` returning while the actor is alive (§*Actor lifetime*).
 
 When cancelled during a `receive`, the scheduler delivers
 `Cancel.raise()` at the receive site. The mailbox is dropped
@@ -569,6 +570,20 @@ the sender's `send` raises `Cancel` and unwinds, leaving the
 message un-delivered.
 
 `Actor.self()` is not a yield point (it is a pure lookup).
+
+### Actor lifetime
+
+An actor started with `spawn_actor` in `main`'s outermost scope belongs
+to the program's root scope. When `main` returns, the root scope joins
+the `Spawn.spawn` children, then cancels every actor still alive and
+joins it: the actor unwinds through its handlers (`finally` clauses and
+`with Cancel` cleanups run) and the program exits only after all of them
+have terminated. A server parked in `receive` therefore never keeps the
+program alive. A trap in an actor is contained and does not fail `main`.
+Same at every `KAI_THREADS` and on both backends. Coverage:
+`examples/effects/actor_cancelled_at_main_return.kai` and
+`actor_server_parked_at_main_return.kai` (each also pinned to one thread
+by the `_n1` variant).
 
 ## Patterns
 
