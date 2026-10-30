@@ -337,6 +337,12 @@ their children before it terminates, so none outlives it. Coverage:
 `receive_timeout` leaves the waiter chain and the wheel before it
 unwinds (`examples/effects/cancel_in_receive_timeout.kai`).
 
+When `main` returns, the root scope joins its `Spawn.spawn` children, then
+cancels the actors still alive (a server parked in `receive` included) and
+joins them, so no fiber outlives `main` and actor cleanup runs. Coverage:
+`examples/effects/actor_cancelled_at_main_return.kai`,
+`actor_server_parked_at_main_return.kai` and their `_n1` variants.
+
 ### 4. Cancel-handler dispatch on remote cancel (shipped)
 
 A user `with Cancel { raise(_) -> cleanup }` installed in a fiber runs
