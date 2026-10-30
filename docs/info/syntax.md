@@ -124,6 +124,7 @@ fn greet(name: String) : Unit / Logger {       # with effect row
   Logger.log("hi #{name}")
 }
 pub fn area(w: Int, h: Int) : Int = w * h      # exported
+fn log_line(s: String) = print(s)              # private, no row: inferred `/ Stdout`
 pub fn twice(^f: (Int) -> Int, x: Int) : Int   # `^` borrows a param: the
   = f(f(x))                                    #   callee reads it, the caller
                                                #   skips the dup. Per-name

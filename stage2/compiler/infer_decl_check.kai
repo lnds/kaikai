@@ -164,6 +164,7 @@ type FnSite = {
   ps: [Param],
   opt_ret: Option[TypeExpr],
   row: RowExpr,
+  inferring: Bool,
   line: Int,
   col: Int
 }
@@ -190,7 +191,8 @@ fn infer_decl(file: String, env: TyEnv, core_len: Int, recs: [RecInfo],
       let entry = decl_types_as_entry(env.ty_homes, fid)
       let site = FnSite {
         is_pub: is_pub, fid: fid, entry: entry, tparams: tparams, tps: tps, tpbinds: tpbinds,
-        rbinds: rbinds, ps: ps, opt_ret: opt_ret, row: row, line: line, col: col
+        rbinds: rbinds, ps: ps, opt_ret: opt_ret, row: row,
+        inferring: row_inferable(is_pub, row, entry, fn_is_c_export_in(env.tab, fid)), line: line, col: col
       }
       let body = name_unit_tparams(body0, tparams)
       let st_init = fn_initial_state(file, env, core_len, recs, op_eff_arities, type_aliases, op_to_eff,
@@ -306,8 +308,9 @@ fn check_fn_rows(file: String, env: TyEnv, sums: [SumInfo], hcar: HandleTab, all
   let st1b = check_no_fiber_escape(st1e, file, fnid_sym(site.fid), nm, site.opt_ret, ret_now,
                                    sums, hcar, site.line, site.col)
   let st1c = check_cont_crossings(st_drop_provided_caps(mask_local_mutable_demand(st1b, site.ps, body), site.ps), body, hcar)
-  let st2pre = check_body_row(st1c, nm, site.entry, site.fid, site.row, site.rbinds, site.tparams,
-                              site.line, site.col, all_decls, mutable_blame(st1c, site.ps, body))
+  let st2pre = if site.inferring { check_inferred_row(st1c, nm, site) }
+               else { check_body_row(st1c, nm, site.entry, site.fid, site.row, site.rbinds, site.tparams,
+                                     site.line, site.col, all_decls, mutable_blame(st1c, site.ps, body)) }
   let st2f = drain_deferred_fields(st2pre, list_reverse(st2pre.deferred_fields),
                                    decl_row_concrete_labels(site.row, env_home_view(env, mo)))
   let hd = drain_deferred_homs(st2f, list_reverse(st2f.deferred_homs), [])
@@ -353,10 +356,14 @@ fn finalise_fn_decl(env: TyEnv, d: Decl, site: FnSite, nm: String, mo: Option[St
 
 # A `main` without a declared row takes the row its body performs, directly
 # and through the helpers it calls, so the wrapper installs the default
-# handlers for every builtin the body uses. Other fns keep their row.
+# handlers for every builtin the body uses. A private fn without a row takes
+# the labels its body performs. Other fns keep their row.
 fn main_inferred_row(site: FnSite, final_body: Expr, st2: InferState) : RowExpr =
   match site.row {
-    REmpty -> if site.entry { inferred_main_row(collect_call_labels(final_body, st2.row)) } else { site.row }
+    REmpty ->
+      if site.entry { inferred_main_row(collect_call_labels(final_body, st2.row)) }
+      else if site.inferring { inferred_main_row(append_labels(apply_labels(st2.sub, st2.row), [])) }
+      else { site.row }
     _ -> site.row
   }
 
@@ -491,6 +498,28 @@ fn check_body_row(st: InferState, fname: String, entry: Bool, f: FnId, declared:
       _  -> check_body_tails(st1, fname, declared_root(st.sub, declared, rbinds), rbinds, tps, st.row_tails)
     }
   }
+
+
+#[doc("True when a fn's row is inferred from its body: private, with no row clause, neither the entry nor a C export.")]
+pub fn row_inferable(is_pub: Bool, row: RowExpr, entry: Bool, exported: Bool) : Bool = match row {
+  REmpty -> not is_pub and not entry and not exported
+  _      -> false
+}
+
+
+# A private fn without a row has no declared row to hold its body to: the body's
+# labels become its row. What a row cannot spell yet stays an error: a label
+# carrying type arguments or naming an instance, and a body tied to a row
+# variable of the signature.
+fn check_inferred_row(st: InferState, fname: String, site: FnSite) : InferState / Console + File + Mutable = {
+  let st1 = match site.rbinds {
+    [] -> st
+    _  -> check_body_tails(st, fname, declared_root(st.sub, site.row, site.rbinds), site.rbinds, site.tparams, st.row_tails)
+  }
+  let unspelled = filter(apply_labels(st.sub, st.row), (l) => not list_is_empty(l.ty_args) or local_raw(l.cell) != 0)
+  foldl(unspelled, st1, (a, l) => report_unhandled_label(a, RowInFn(fname), l, [], ["the row of a private fn is inferred from labels without type arguments or instance names; declare it"],
+                                                          site.line, site.col, None))
+}
 
 
 fn check_body_labels(st: InferState, fname: String, entry: Bool, f: FnId, declared: RowExpr,

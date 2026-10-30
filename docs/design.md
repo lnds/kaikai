@@ -200,7 +200,7 @@ arguments:
 - **Formal effects model**: capability-passing **Effekt + inference**.
   - Effects as an explicit set of capabilities, passed implicitly by the compiler.
   - **Effect inference in local bodies**: lambdas and local bindings get their rows inferred.
-  - **Every top-level function declares its row**, private or `pub`: a signature with no `/ row` performs no effects, and calling an effectful function from it is an error. Only the entry `main` may omit it.
+  - **A `pub` function declares its row**: a signature with no `/ row` performs no effects, and calling an effectful function from it is an error. A **private** top-level function may omit it: the row is inferred from the body, recursive groups included. The entry `main` may omit it too.
   - Fits LLVM (CPS over segmented stacks) and the LLM-friendly / easy-to-learn principles.
 - **Core tooling**: single `kai` binary with subcommands (Go/Rust/Zig style).
   - MVP essentials: `kai build`, `kai run`, `kai test`, `kai fmt`, `kai bench`, `kai check`.

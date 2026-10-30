@@ -15,7 +15,9 @@ kaikai follows Effekt's capability-passing discipline: the effect
 name IS the capability (`Stdout.print("hi")`). The handler installs
 the capability for its body's lexical scope.
 
-Effects are INFERRED in local bodies. Public signatures MUST annotate
+Effects are INFERRED in local bodies and in private top-level fns that
+omit the row (`fn helper() = print("x")` is inferred as `/ Stdout`).
+Public signatures MUST annotate
 the row — that is Tier 1 #1 "safe at compile time". Rows are sets,
 not ordered lists: `Stdout + File` ≡ `File + Stdout`. Duplicates are
 idempotent. Rows unify by equality, with one exception: a function
