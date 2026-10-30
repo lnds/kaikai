@@ -27,7 +27,9 @@ static int kai_read_rc_runs(void) {
     return n < 1 ? 1 : (int) n;
 }
 
+#define KAI_ROOT_REAP_MIN 256
 static void kai_root_nursery_join(KaiNursery *root);
+static void kai_root_reap(KaiNursery *root);
 
 /* The scope of the main run in flight: the nearest scope of an actor spawned
  * by a fiber that has none open. */
@@ -37,7 +39,8 @@ static _Atomic(KaiNursery *) kai_root_scope;
  * any scope are joined before the run ends, at every thread count. */
 static KaiValue *kai_main_once(KaiValue *(*user_main)(void)) {
     KaiFiber *self = kai_current_fiber();
-    KaiNursery root = { .root = 1, .parent = self->nursery_top, .ev_top = self->evidence_top };
+    KaiNursery root = { .root = 1, .parent = self->nursery_top, .ev_top = self->evidence_top,
+                        .reap_at = KAI_ROOT_REAP_MIN };
     self->nursery_top = &root;
     atomic_store(&kai_root_scope, &root);
     KaiValue *r = user_main();
@@ -480,6 +483,9 @@ static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiVal
         do {
             f->scope_sibling_next = head;
         } while (!atomic_compare_exchange_weak(&scope->children_head, &head, f));
+        if (scope->root && atomic_fetch_add(&scope->registered, 1) + 1 >= atomic_load(&scope->reap_at)) {
+            kai_root_reap(scope);
+        }
     }
     f->state = KAI_FIBER_READY;
     kai_sched_enqueue(f);
@@ -907,6 +913,35 @@ static int kai_nursery_join_all(KaiFiber *head, KaiNursery *scope) {
     return failed;
 }
 
+/* Drop the terminated children behind the list head and release their refs.
+ * The head itself stays: a concurrent spawn may be linking in front of it.
+ * Skipped when the final join holds the lock. The next pass waits until the
+ * list has doubled. */
+static void kai_root_reap(KaiNursery *root) {
+    if (atomic_exchange(&root->reap_lock, 1)) return;
+    long live = 0;
+    KaiFiber *head = atomic_load(&root->children_head);
+    if (head) {
+        live = 1;
+        KaiFiber *prev = head;
+        for (KaiFiber *c = head->scope_sibling_next, *next; c; c = next) {
+            next = c->scope_sibling_next;
+            int hl = 0, terminal;
+            if (kai_nthreads > 1) hl = kai_fiber_slot_lock(c);
+            terminal = c->state == KAI_FIBER_DONE || c->state == KAI_FIBER_CANCELLED;
+            if (kai_nthreads > 1) kai_fiber_slot_unlock_at(hl);
+            if (!terminal) { prev = c; live++; continue; }
+            prev->scope_sibling_next = next;
+            c->scope_sibling_next    = NULL;
+            c->scope_nursery         = NULL;
+            if (c->value) kai_decref(c->value);
+        }
+    }
+    atomic_store(&root->reap_at, live * 2 > KAI_ROOT_REAP_MIN ? live * 2 : KAI_ROOT_REAP_MIN);
+    atomic_store(&root->registered, live);
+    atomic_store(&root->reap_lock, 0);
+}
+
 /* A fiber's trap or unrequested cancel is contained at the root: the join
  * waits for every child but neither cancels its siblings nor fails `main`.
  * Plain children are joined first; the actors still alive then get a cancel
@@ -915,7 +950,9 @@ static int kai_nursery_join_all(KaiFiber *head, KaiNursery *scope) {
  * cleanup, from any thread) form the next batch. */
 static void kai_root_nursery_join(KaiNursery *root) {
     for (;;) {
+        while (atomic_exchange(&root->reap_lock, 1)) { }
         KaiFiber *head = atomic_exchange(&root->children_head, NULL);
+        atomic_store(&root->reap_lock, 0);
         if (!head) break;
         for (KaiFiber *c = head; c; c = c->scope_sibling_next) {
             if (!c->root_actor) kai_nursery_join_child(c, head, 0);
