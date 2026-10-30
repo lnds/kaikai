@@ -913,10 +913,11 @@ static int kai_nursery_join_all(KaiFiber *head, KaiNursery *scope) {
     return failed;
 }
 
-/* Drop the terminated children behind the list head and release their refs.
- * The head itself stays: a concurrent spawn may be linking in front of it.
- * Skipped when the final join holds the lock. The next pass waits until the
- * list has doubled. */
+/* Drop the terminated children behind the list head and release the scope's
+ * own ref on each; a handle the program keeps holds its own. Pushers only CAS
+ * `children_head`, so unlinking strictly after the node read as head races
+ * with no one; the head itself stays. Skipped when the final join holds the
+ * lock. The next pass waits until the list has doubled. */
 static void kai_root_reap(KaiNursery *root) {
     if (atomic_exchange(&root->reap_lock, 1)) return;
     long live = 0;

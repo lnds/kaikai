@@ -1431,6 +1431,7 @@ TIER1_ASAN_LEGS_B := \
 	test-perceus-issue703-asan \
 	test-issue-779-asan \
 	test-exit-report-asan \
+	test-root-reaps-children-asan \
 	test-perceus-enum-slot-asan \
 	test-perceus-int-cache-asan \
 	test-int-field-inline-asan \
