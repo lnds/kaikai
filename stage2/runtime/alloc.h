@@ -449,6 +449,7 @@ struct KaiNursery {
     KaiNursery         *parent;
     _Atomic(KaiFiber *) failed_child;
     KaiEvidence        *ev_top;
+    int                 root;   /* implicit scope of `main`: joins, never cancels siblings */
 };
 
 /* A worker's root fiber starts as the OS-thread context, representing the
