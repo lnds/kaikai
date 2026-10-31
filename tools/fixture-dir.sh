@@ -34,6 +34,9 @@
 # A positive fixture may carry `<name>.warn.expected` (C) or `<name>.warn-native.expected` (native):
 # every line of it must appear in the compiler's stderr, so a warning is pinned like an output.
 #
+# A positive fixture may also carry `<name>.warn-once.expected` (C only): every line of it must
+# appear in the compiler's stderr exactly once.
+#
 # FIXTURE_BACKEND picks the backend (c, the default, or native). Native builds
 # through the kai wrapper named by FIXTURE_KAI, which owns the stdlib path and
 # the link, and supports no marks.
@@ -165,6 +168,14 @@ run_one() {
       grep -qF -- "$line" "$b.err" \
         || { echo "$slug FAIL $name (missing warning: $line)"; cat "$b.err"; exit 1; }
     done < "$wf"
+  fi
+  of="$dir/$name.warn-once.expected"
+  if [ -f "$of" ] && [ "$BACKEND" != native ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      n=$(grep -cF -- "$line" "$b.err")
+      [ "$n" = 1 ] \
+        || { echo "$slug FAIL $name (warning not exactly once, $n times: $line)"; cat "$b.err"; exit 1; }
+    done < "$of"
   fi
   if [ -f "$exp_out" ]; then
     diff -q "$exp_out" "$b.out" > /dev/null \
