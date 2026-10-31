@@ -71,10 +71,10 @@ jobs:
           fetch-depth: 0
       # Runs on every PR, doc-only included; `tier1` fails when this job does.
       - name: No Claude attribution trailer in the PR body or commits
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
-        run: tools/check-attribution-trailers.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+        run: tools/check-attribution-trailers.sh "${{ github.event.pull_request.base.sha || github.event.before }}" "${{ github.event.pull_request.head.sha || github.sha }}"
       - name: Detect doc-only diff
         id: doc-only
         run: |
@@ -96,15 +96,15 @@ jobs:
           fi
       # Gates the shard-4 whole-compiler self-hosts: they only detect
       # regressions introduced by changes to the sources they compile.
-      # PR-only — on push/merge_group the self-hosts always run.
+      # On push the diff is event.before..sha; merge_group always runs them.
       - name: Detect compiler-source diff
         id: compiler-touch
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ "${{ github.event_name }}" != "push" ]; then
             echo "touch=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha || github.event.before }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
           CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
           if [ -z "$CHANGED" ]; then
             echo "touch=true" >> "$GITHUB_OUTPUT"; exit 0
@@ -922,13 +922,13 @@ jobs:
             git status; exit 1
           fi
 
-  # Compile-cost A/B against the PR's base, posted as one updating PR comment.
-  # Not in the tier1 aggregator's `needs`: it informs, never blocks, and runs
-  # beside the shards. The base compiler comes from the exact-match bootstrap
+  # Compile-cost A/B against the PR's base (one updating PR comment) or, on
+  # push, against the previous main tip (step summary). Not in the tier1
+  # aggregator's `needs`: it runs beside the shards. The base compiler comes from the exact-match bootstrap
   # cache (main's build saved it) and is built here only on a miss.
   cost-ab:
     needs: [changes, build]
-    if: github.event_name == 'pull_request' && needs.changes.outputs.compiler-touch == 'true' && github.event.pull_request.head.repo.full_name == github.repository
+    if: needs.changes.outputs.compiler-touch == 'true' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: ubuntu-latest
     timeout-minutes: 50
     permissions:
@@ -948,7 +948,10 @@ jobs:
       - name: Pick the base commit
         id: base-sha
         run: |
-          if git rev-parse --verify -q HEAD^2 >/dev/null; then
+          if [ "${{ github.event_name }}" = "push" ]; then
+            sha="${{ github.event.before }}"
+            git fetch --depth=1 origin "$sha"
+          elif git rev-parse --verify -q HEAD^2 >/dev/null; then
             sha="$(git rev-parse HEAD^1)"
           else
             sha="${{ github.event.pull_request.base.sha }}"
@@ -1013,6 +1016,14 @@ jobs:
           head/tools/cost-ab.sh --markdown --rounds 5 --fail-above 1 --base-tree "$PWD" --branch-tree "$PWD/head" \
             stage2/kaic2 pr-artifact/stage2/kaic2 > cost-ab.md || rc=$?
           cat cost-ab.md
+          if [ "${{ github.event_name }}" = "push" ]; then
+            {
+              echo "### Compile cost vs previous main tip (\`${{ steps.base-sha.outputs.sha }}\`)"
+              echo
+              cat cost-ab.md
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit $rc
+          fi
           {
             echo '<!-- cost-ab -->'
             echo "### Compile cost vs \`${GITHUB_BASE_REF}\` (\`${{ steps.base-sha.outputs.sha }}\`)"
