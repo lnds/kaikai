@@ -1,6 +1,7 @@
 #!/bin/sh
-# A native link uses the cached core objects the build already holds: trimming
-# every one of them between the emit and the link does not fail the build.
+# A native link uses the cached objects the build already holds: trimming every
+# one of them between the emit and the link does not fail the build, and the
+# build leaves no hold dir behind. Whole-program and per-module paths.
 set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KAI="$ROOT/bin/kai"
@@ -10,20 +11,28 @@ KAI="$ROOT/bin/kai"
 }
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM
-XDG="$WORK/xdg"
-mkdir -p "$WORK/p"
-printf 'fn main() : Unit / Console = println("hold-ok")\n' > "$WORK/p/main.kai"
-cd "$WORK/p"
 
-XDG_CACHE_HOME="$XDG" KAI_BACKEND=native "$KAI" build main.kai -o "$WORK/warm" > "$WORK/warm.log" 2>&1 || {
-  echo "native-cache-hold FAIL (warm build)"; cat "$WORK/warm.log"; exit 1
+# check <name> <modular 0|1> <store under kai/ whose objects the hook trims>
+check() {
+  name="$1"; modular="$2"; store="$3"
+  xdg="$WORK/xdg-$name"
+  mkdir -p "$WORK/$name"
+  printf 'fn main() : Unit / Console = println("hold-ok")\n' > "$WORK/$name/main.kai"
+  cd "$WORK/$name"
+  XDG_CACHE_HOME="$xdg" KAI_BACKEND=native KAI_NATIVE_MODULAR="$modular" \
+    "$KAI" build main.kai -o "$WORK/warm-$name" > "$WORK/warm-$name.log" 2>&1 || {
+    echo "native-cache-hold FAIL ($name: warm build)"; cat "$WORK/warm-$name.log"; exit 1
+  }
+  [ -n "$(find "$xdg/kai/$store" -name '*.o')" ] || { echo "native-cache-hold FAIL ($name: no cached object)"; exit 1; }
+  XDG_CACHE_HOME="$xdg" KAI_BACKEND=native KAI_NATIVE_MODULAR="$modular" \
+    KAI_PRELINK_HOOK="find '$xdg/kai/$store' -name '*.o' -delete" \
+    "$KAI" build main.kai -o "$WORK/out-$name" > "$WORK/out-$name.log" 2>&1 || {
+    echo "native-cache-hold FAIL ($name: link after trim)"; cat "$WORK/out-$name.log"; exit 1
+  }
+  [ "$("$WORK/out-$name")" = "hold-ok" ] || { echo "native-cache-hold FAIL ($name: wrong output)"; exit 1; }
+  [ -z "$(find "$xdg/kai/holds" -mindepth 1 2> /dev/null)" ] || { echo "native-cache-hold FAIL ($name: hold dir left behind)"; exit 1; }
 }
-[ -n "$(find "$XDG/kai/core" -name 'ncore-*.o')" ] || { echo "native-cache-hold FAIL (no cached core object)"; exit 1; }
 
-XDG_CACHE_HOME="$XDG" KAI_BACKEND=native \
-  KAI_PRELINK_HOOK="find '$XDG/kai/core' -name 'ncore-*.o' -delete" \
-  "$KAI" build main.kai -o "$WORK/out" > "$WORK/out.log" 2>&1 || {
-  echo "native-cache-hold FAIL (link after trim)"; cat "$WORK/out.log"; exit 1
-}
-[ "$("$WORK/out")" = "hold-ok" ] || { echo "native-cache-hold FAIL (wrong output)"; exit 1; }
+check whole 0 core
+check modular 1 nmodular
 echo "native-cache-hold OK"

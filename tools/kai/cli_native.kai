@@ -4,6 +4,7 @@ import path
 import cli_caches
 import cli_err
 import cli_fs
+import cli_gc
 import cli_hash
 import cli_layout
 import cli_plan
@@ -172,13 +173,18 @@ fn emit_modular(p: Plan, objdir: String, cached: Bool) : Result[Outcome, Int] / 
   let emit = ["--emit=native-modular", "--native-obj-dir", objdir, ...kir_verify_flags()]
   let rc = cli_budget.run_threads(cli_plan.kaic2(p, emit, p.job.src), sp)
   let listed = if rc == 0 and cli_sys.size(objs_file) > 0 { cli_plan.listed(objs_file) } else { [] }
-  let held = if cached { hold_objects(p, listed, 0) } else { Some(listed) }
+  let dir = if cached { hold_dir(p.job.tmp) } else { p.job.tmp }
+  let held = if cached { hold_objects(dir, p.job.tmp, listed, 0) } else { Some(listed) }
   if held == None {
+    release_hold(dir, p.job.tmp)
     emit_modular(p, p.job.tmp, false)
   } else if rc == 0 and cli_sys.size(objs_file) > 0 {
     cli_plan.replay(err)
     let defs = if t.inline_bc == "" { [] } else { OWNER_DEFS }
-    modular_link(p, held ?? listed, defs) | u => Linked
+    run_prelink_hook()
+    let r = modular_link(p, held ?? listed, defs) | u => Linked
+    release_hold(dir, p.job.tmp)
+    r
   } else if cli_plan.c_only(err) {
     Ok(NoLlvm(err))
   } else {
@@ -285,9 +291,17 @@ fn emit_whole(p: Plan, pruned: Bool) : Result[Outcome, Int] / Stderr + Env + Fil
     if rc != 0 and cli_plan.c_only(err) {
       Ok(NoLlvm(err))
     } else if rc == 0 and pruned {
-      match hold_objects(p, cli_plan.listed(objs_file), 0) {
-        Some(held) -> link_whole_objects(p, obj, objs_file, held)
-        None -> emit_whole(p, false)
+      let dir = hold_dir(p.job.tmp)
+      match hold_objects(dir, p.job.tmp, cli_plan.listed(objs_file), 0) {
+        Some(held) -> {
+          let r = link_whole_objects(p, obj, objs_file, held)
+          release_hold(dir, p.job.tmp)
+          r
+        }
+        None -> {
+          release_hold(dir, p.job.tmp)
+          emit_whole(p, false)
+        }
       }
     } else {
       cli_plan.replay(err)
@@ -298,17 +312,32 @@ fn emit_whole(p: Plan, pruned: Bool) : Result[Outcome, Int] / Stderr + Env + Fil
 
 fn whole_flags(pruned: Bool) : [String] = if pruned { [] } else { ["--full-core"] }
 
-# The listed objects, each one outside the build's scratch dir hard-linked
-# (else copied) into it so the trim cannot take it before the link; none when
-# one is already gone.
-fn hold_objects(p: Plan, objs: [String], i: Int) : Option[[String]] / File + Ffi =
+# A fresh per-build dir inside the shared cache, so linking an object into it
+# stays on the cache's filesystem; the build's scratch dir when none can be made.
+fn hold_dir(tmp: String) : String / Env + File + Ffi {
+  let root = cli_caches.root("KAI_HOLD_CACHE_DIR", "holds", cli_sys.uname_s())
+  let dir = if cli_fs.mkdir_p(root) { cli_sys.mkdtemp("#{root}/hold.XXXXXX") } else { "" }
+  if dir == "" { tmp } else { dir }
+}
+
+# A hold dir is removed once the link is done; the scratch dir goes with the job.
+fn release_hold(dir: String, tmp: String) : Unit / Ffi =
+  if dir != tmp {
+    let _ = cli_sys.remove_tree(dir)
+  }
+
+# The listed objects, each one outside the build's scratch dir hard-linked into
+# `dir` (copied when the link fails) so the trim cannot take it before the
+# link, and marked used so the trim keeps hot entries; none when one is gone.
+fn hold_objects(dir: String, tmp: String, objs: [String], i: Int) : Option[[String]] / Ffi =
   match objs {
     [] -> Some([])
     [o, ...rest] -> {
-      let mine = "#{p.job.tmp}/held-#{i}-#{cli_fs.basename(o)}"
-      let own = string.starts_with(o, "#{p.job.tmp}/")
+      let mine = "#{dir}/held-#{i}-#{cli_fs.basename(o)}"
+      let own = string.starts_with(o, "#{tmp}/")
       if own or cli_sys.link_file(o, mine) or cli_sys.copy_file(o, mine) {
-        hold_objects(p, rest, i + 1) |> option.map(r => [if own { o } else { mine }, ...r])
+        let _ = own or cli_gc.refresh(o)
+        hold_objects(dir, tmp, rest, i + 1) |> option.map(r => [if own { o } else { mine }, ...r])
       } else {
         None
       }
