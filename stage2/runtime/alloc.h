@@ -781,6 +781,10 @@ KAI_RT_SHARED void kai_trap_land_fiber(void *arg) {
 __attribute__((noinline, noreturn))
 KAI_RT_SHARED void kai_trap_abort(const char *msg) {
     KaiFiber *f = kai_current_fiber();
+    if (kai_worker_here()->ns_active) {
+        kai_eprintf("kai: trap: %s\n", msg ? msg : "runtime trap");
+        kai_native_stack_panic();
+    }
     if (f && f->cancel_pad_set) {
         f->trapped  = 1;
         f->trap_msg = msg;

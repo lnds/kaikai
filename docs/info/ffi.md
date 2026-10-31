@@ -327,7 +327,9 @@ The call is a plain C call: it cannot yield or be cancelled. An exported
 kaikai function it calls back may compute and return; if it suspends the
 fiber (receive, await, I/O, sleep) or leaves the call (an aborting handler
 outside, cancellation), the program panics with `a callback cannot suspend
-or escape a #[native_stack] call`.
+or escape a #[native_stack] call`. A trap in the callback prints its own
+message, then that line, and ends the process: a trap in a spawned fiber
+normally stays contained, but inside a native call it cannot be.
 
 - On a worker thread the stack is the pthread stack, sized by
   `KAI_WORKER_STACK_SIZE` (bytes, 1 MiB to 1 GiB, default 32 MiB). The
