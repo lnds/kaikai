@@ -10,6 +10,10 @@ import compiler.expr_positions
 import compiler.effect_instance
 import compiler.infer_index
 import compiler.infer_unify_rows
+import compiler.infer_tparam_escape
+import compiler.infer_unit_tables
+import compiler.infer_state
+import compiler.infer_clause_holes
 import compiler.infer_env
 import compiler.infer_row_kinds
 import compiler.type_home
@@ -159,10 +163,10 @@ fn zip_rows(ts: [TypedDecl], rs: [[RowLabel]]) : [(TypedDecl, [RowLabel])] = mat
 }
 
 # Rows only grow and the labels are finite, so the rows settle.
-fn solve_group(own: [[RowLabel]], calls: [[(Int, [RowLabel])]], rows: [[RowLabel]]) : [[RowLabel]] = {
+fn solve_group(own: [[RowLabel]], calls: [[(Int, [Handler])]], rows: [[RowLabel]]) : [[RowLabel]] = {
   let next = map(zip_rows_calls(own, calls), (p) => match p {
     (o, cs) -> union_labels(list_append(o, flat_map(cs, (c) => match c {
-      (j, handled) -> filter(nth_row(rows, j), (l) => not any(handled, (h) => rl_same(h, l)))
+      (j, handled) -> filter(nth_row(rows, j), (l) => not any(handled, (h) => handler_discharges(h, l)))
     })), [])
   })
   if total_labels(next) == total_labels(rows) { rows } else { solve_group(own, calls, next) }
@@ -170,7 +174,7 @@ fn solve_group(own: [[RowLabel]], calls: [[(Int, [RowLabel])]], rows: [[RowLabel
 
 fn total_labels(rows: [[RowLabel]]) : Int = foldl(rows, 0, (n, r) => n + list_length(r))
 
-fn zip_rows_calls(own: [[RowLabel]], calls: [[(Int, [RowLabel])]]) : [([RowLabel], [(Int, [RowLabel])])] = match (own, calls) {
+fn zip_rows_calls(own: [[RowLabel]], calls: [[(Int, [Handler])]]) : [([RowLabel], [(Int, [Handler])])] = match (own, calls) {
   ([o, ...os], [c, ...cr]) -> [(o, c), ...zip_rows_calls(os, cr)]
   _ -> []
 }
@@ -185,14 +189,26 @@ fn union_labels(ls: [RowLabel], acc: [RowLabel]) : [RowLabel] = match ls {
   [l, ...rest] -> if any(acc, (a) => rl_same(a, l)) { union_labels(rest, acc) } else { union_labels(rest, [l, ...acc]) }
 }
 
+# A handle as the typer reads it when it filters the body's row.
+type Handler = { eff: SymId, cell: LocalId, tyargs: [Ty] }
+
+# The typer's own discharge rule, so the two cannot drift.
+fn handler_discharges(h: Handler, l: RowLabel) : Bool = match l {
+  RL(r, args) -> {
+    let lab = Label { sym: ref_sym(r), ty_args: map(args, te_as_ty), cell: local_none() }
+    label_same(lab, label_in_cell(h.eff, [], h.cell))
+      and label_args_dischargeable(lab.ty_args, take_first_tys(h.tyargs, list_length(lab.ty_args)), subst_empty())
+  }
+}
+
 # Each call a body makes to a member of the group, with the labels the
 # handles around it discharge.
-fn decl_group_calls(syms: [SymId], d: Decl) : [(Int, [RowLabel])] = match d {
+fn decl_group_calls(syms: [SymId], d: Decl) : [(Int, [Handler])] = match d {
   DFn(_, _, _, _, _, _, body, _, _, _) -> group_calls(syms, body, [], [])
   _ -> []
 }
 
-fn group_calls(syms: [SymId], e: Expr, handled: [RowLabel], acc: [(Int, [RowLabel])]) : [(Int, [RowLabel])] = {
+fn group_calls(syms: [SymId], e: Expr, handled: [Handler], acc: [(Int, [Handler])]) : [(Int, [Handler])] = {
   let here = match e.kind {
     ESym(s, _) -> match index_of_sym(syms, s, 0) {
       Some(j) -> [(j, handled), ...acc]
@@ -201,8 +217,9 @@ fn group_calls(syms: [SymId], e: Expr, handled: [RowLabel], acc: [(Int, [RowLabe
     _ -> acc
   }
   match e.kind {
-    EHandle(body, ref, targs, init, _, cls, oret) -> {
-      let inside = group_calls(syms, body, [RL(ref, targs), ...handled], here)
+    EHandle(body, ref, targs, init, alias, cls, oret) -> {
+      let h = Handler { eff: ref_sym(ref), cell: match alias { Some(a) -> a.id  None -> local_none() }, tyargs: map(targs, te_as_ty) }
+      let inside = group_calls(syms, body, [h, ...handled], here)
       let a1 = match init { Some(i) -> group_calls(syms, i, handled, inside)  None -> inside }
       let a2 = foldl(cls, a1, (a, c) => match c { HC(_, _, b, _, _) -> group_calls(syms, b, handled, a) })
       match oret { Some(HR(_, b, _, _)) -> group_calls(syms, b, handled, a2)  None -> a2 }
