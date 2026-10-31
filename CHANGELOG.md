@@ -84,6 +84,17 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.189.0 (2026-10-31)
+
+### Added
+
+- **ffi**: run #[native_stack] extern calls on the thread's own OS stack
+
+### Fixed
+
+- **runtime**: print a trap's own message before the native-stack panic
+- **runtime**: panic when a native-stack callback suspends or escapes, drop the parameter cap
+
 ## v0.188.0 (2026-10-31)
 
 ### BREAKING CHANGE
