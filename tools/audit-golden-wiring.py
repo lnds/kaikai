@@ -4,7 +4,7 @@
 A golden (`*.expected`, `*.forbidden`) under examples/, demos/ or tests/ is
 consumed when a harness reads it:
   - the directory has a FIXTURES manifest and the golden is `<name>.out.expected`,
-    `<name>.err.expected`, `<name>.warn.expected` or `<name>.warn-native.expected` beside `<name>.kai` (tools/fixture-dir.sh);
+    `<name>.err.expected`, `<name>.warn.expected`, `<name>.warn-native.expected`, `<name>.warn-once.expected` or `<name>.err-exact.expected` beside `<name>.kai` (tools/fixture-dir.sh);
   - a row of stage2/gate-variants.txt names `<name>.kai` and the golden is its `<name>.out.expected` (tools/fixture-gate.sh);
   - a harness source names the golden's path or file name; or
   - a harness source mentions the golden's suffix within WINDOW lines of a
@@ -124,7 +124,7 @@ def golden_consumed(g, corpus):
     if not m:
         m = re.match(r"^(.*?)(\.(?:expected|forbidden))$", b)
     stem, suffix = m.group(1), m.group(2)
-    if (os.path.exists(d + "/FIXTURES") and suffix in (".out.expected", ".err.expected", ".warn.expected", ".warn-native.expected")
+    if (os.path.exists(d + "/FIXTURES") and suffix in (".out.expected", ".err.expected", ".warn.expected", ".warn-native.expected", ".warn-once.expected", ".err-exact.expected")
             and os.path.exists(f"{d}/{stem}.kai")):
         return True
     if suffix == ".out.expected" and f"{d}/{stem}.kai" in GATE_FIXTURES:
