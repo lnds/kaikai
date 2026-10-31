@@ -4,7 +4,6 @@ import path
 import cli_caches
 import cli_err
 import cli_fs
-import cli_gc
 import cli_hash
 import cli_layout
 import cli_plan
@@ -172,15 +171,14 @@ fn emit_modular(p: Plan, objdir: String, cached: Bool) : Result[Outcome, Int] / 
   let sp = cli_plan.kaic2_spawn([("KAI_NATIVE_RUNTIME_INLINE_BC", t.inline_bc), ...target_set(t)], objs_file, err)
   let emit = ["--emit=native-modular", "--native-obj-dir", objdir, ...kir_verify_flags()]
   let rc = cli_budget.run_threads(cli_plan.kaic2(p, emit, p.job.src), sp)
-  let objs = if rc == 0 and cli_sys.size(objs_file) > 0 { cli_plan.listed(objs_file) } else { [] }
-  let trimmed =
-    cached and (objs |> list.any(o => string.starts_with(o, "#{objdir}/") and not cli_gc.refresh(o)))
-  if trimmed {
+  let listed = if rc == 0 and cli_sys.size(objs_file) > 0 { cli_plan.listed(objs_file) } else { [] }
+  let held = if cached { hold_objects(p, listed, 0) } else { Some(listed) }
+  if held == None {
     emit_modular(p, p.job.tmp, false)
   } else if rc == 0 and cli_sys.size(objs_file) > 0 {
     cli_plan.replay(err)
     let defs = if t.inline_bc == "" { [] } else { OWNER_DEFS }
-    modular_link(p, objs, defs) | u => Linked
+    modular_link(p, held ?? listed, defs) | u => Linked
   } else if cli_plan.c_only(err) {
     Ok(NoLlvm(err))
   } else {
@@ -286,33 +284,57 @@ fn emit_whole(p: Plan, pruned: Bool) : Result[Outcome, Int] / Stderr + Env + Fil
     )
     if rc != 0 and cli_plan.c_only(err) {
       Ok(NoLlvm(err))
-    } else if rc == 0 and pruned and cache_object_lost(p, objs_file) {
-      emit_whole(p, false)
+    } else if rc == 0 and pruned {
+      match hold_objects(p, cli_plan.listed(objs_file), 0) {
+        Some(held) -> link_whole_objects(p, obj, objs_file, held)
+        None -> emit_whole(p, false)
+      }
     } else {
       cli_plan.replay(err)
-      if rc != 0 { Err(1) } else { link_whole_objects(p, obj, objs_file) }
+      if rc != 0 { Err(1) } else { link_whole_objects(p, obj, objs_file, cli_plan.listed(objs_file)) }
     }
   }
 }
 
 fn whole_flags(pruned: Bool) : [String] = if pruned { [] } else { ["--full-core"] }
 
-# Whether a listed object outside the build's scratch dir is gone; one still
-# there is marked used, so the trim does not take it before the link.
-fn cache_object_lost(p: Plan, objs_file: String) : Bool / File + Ffi =
-  cli_plan.listed(objs_file)
-    |> list.any(o => not string.starts_with(o, "#{p.job.tmp}/") and not cli_gc.refresh(o))
+# The listed objects, each one outside the build's scratch dir hard-linked
+# (else copied) into it so the trim cannot take it before the link; none when
+# one is already gone.
+fn hold_objects(p: Plan, objs: [String], i: Int) : Option[[String]] / File + Ffi =
+  match objs {
+    [] -> Some([])
+    [o, ...rest] -> {
+      let mine = "#{p.job.tmp}/held-#{i}-#{cli_fs.basename(o)}"
+      let own = string.starts_with(o, "#{p.job.tmp}/")
+      if own or cli_sys.link_file(o, mine) or cli_sys.copy_file(o, mine) {
+        hold_objects(p, rest, i + 1) |> option.map(r => [if own { o } else { mine }, ...r])
+      } else {
+        None
+      }
+    }
+  }
+
+# Test seam: a command run after the objects are held and before the link.
+fn run_prelink_hook() : Unit / Env + Ffi {
+  let cmd = cli_caches.env_or("KAI_PRELINK_HOOK", "")
+  if cmd != "" {
+    let _ = cli_proc.run(["sh", "-c", cmd], cli_proc.inherit())
+  }
+}
 
 # The objects kaic2 listed (else the one it wrote), linked into the job's binary.
 fn link_whole_objects(
   p: Plan,
   obj: String,
-  objs_file: String
+  objs_file: String,
+  listed: [String]
 ) : Result[Outcome, Int] / Stderr + Env + File + Ffi =
   if not cli_sys.is_file(obj) {
     cli_err.die("native backend: no object produced (expected #{obj})")
   } else {
-    let objs = if cli_sys.size(objs_file) > 0 { cli_plan.listed(objs_file) } else { [obj] }
+    let objs = if cli_sys.size(objs_file) > 0 { listed } else { [obj] }
+    run_prelink_hook()
     whole_link(p, objs)!
     collect_dsym(p.job.out)
     Ok(Linked)
