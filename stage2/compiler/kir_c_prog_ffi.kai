@@ -164,18 +164,39 @@ fn kcf_decrefs(ks: [KFfiKind], i: Int) : [String] = match ks {
     else { [concat_all(["    kaix_decref(a", int_to_string(i), ");\n"]), ...kcf_decrefs(rest, i + 1)] }
 }
 
-fn kcf_shim(evf: Bool, sym: String, csym: String, pks: [KFfiKind], rk: KFfiKind) : String = {
+fn kcf_boxed_arg_names(i: Int, n: Int) : [String] =
+  if i >= n { [] } else { [cat2("a", int_to_string(i)), ...kcf_boxed_arg_names(i + 1, n)] }
+
+fn kcf_unpack_slots(i: Int, n: Int) : [String] =
+  if i >= n { [] } else { [concat_all(["args[", int_to_string(i), "]"]), ...kcf_unpack_slots(i + 1, n)] }
+
+fn kcf_native_stack_entry(evf: Bool, sym: String, inner: String, n: Int) : String = {
+  let names = list_append(if evf { ["p_evf"] } else { [] }, kcf_boxed_arg_names(0, n))
+  let unpack = cat2("kc_nsa_", kc_mangle(sym))
+  concat_all([
+    "static void *", unpack, "(void **args) {\n    ",
+    if list_is_empty(names) { "(void) args;\n    " } else { "" },
+    "return ", kc_call(inner, kcf_unpack_slots(0, list_length(names))), ";\n}\n",
+    "KaiValue *", sym, "(", kcf_boxed_params(evf, n), ") {\n",
+    if list_is_empty(names) { "    void **args = NULL;\n" } else { concat_all(["    void *args[] = { ", string_join(names, ", "), " };\n"]) },
+    "    return (KaiValue *)", kc_call("kaix_native_stack_call", [cat2("(void *)", unpack), "args"]), ";\n}\n"
+  ])
+}
+
+fn kcf_shim(evf: Bool, sym: String, csym: String, pks: [KFfiKind], rk: KFfiKind, ns: Bool) : String = {
   let alias = cat2("kc_ffi_", kc_mangle(sym))
   let rname = kcf_sname(sym, "r")
   let call = kc_call(alias, kcf_call_args(sym, pks, 0))
+  let inner = if ns { cat2("kc_ns_", kc_mangle(sym)) } else { sym }
   concat_all([
     concat_all(kcf_param_defs(sym, pks, 0)),
     kcf_struct_defs(rk, rname),
     "extern ", kcf_tyname(rk, rname), " ", alias, "(", kcf_c_param_list(sym, pks), ") __asm__(KC_ASM(", kc_cstr(csym), "));\n",
-    "KaiValue *", sym, "(", kcf_boxed_params(evf, list_length(pks)), ") {\n",
+    if ns { "static " } else { "" }, "KaiValue *", inner, "(", kcf_boxed_params(evf, list_length(pks)), ") {\n",
     if kcf_is_unit(rk) { concat_all(["    ", call, ";\n"]) } else { concat_all(["    ", kcf_tyname(rk, rname), " r = ", call, ";\n"]) },
     concat_all(kcf_decrefs(pks, 0)),
-    "    return ", if kcf_is_unit(rk) { "kaix_unit()" } else { kcf_rebox_s(rk, "r") }, ";\n}\n"
+    "    return ", if kcf_is_unit(rk) { "kaix_unit()" } else { kcf_rebox_s(rk, "r") }, ";\n}\n",
+    if ns { kcf_native_stack_entry(evf, sym, inner, list_length(pks)) } else { "" }
   ])
 }
 
@@ -221,8 +242,8 @@ fn kcf_js_shim(evf: Bool, sym: String, csym: String, pks: [KFfiKind], rk: KFfiKi
   ])
 }
 
-#[doc("The definition of the `extern \"C\"` shim `cx.cur`: it unboxes each argument, calls `csym`, drops the boxed inputs after the call and boxes the result. A struct by value, an unknown boundary type and a `kai_js:` import print a body that aborts at run time.")]
-pub fn kc_ffi_fn(cx: KcCx, f: KFn, csym: String, pks: [KFfiKind], rk: KFfiKind) : String = {
+#[doc("The definition of the `extern \"C\"` shim `cx.cur`: it unboxes each argument, calls `csym`, drops the boxed inputs after the call and boxes the result; under `ns` the shim body runs on the OS stack of the running thread. A struct by value, an unknown boundary type and a `kai_js:` import print a body that aborts at run time.")]
+pub fn kc_ffi_fn(cx: KcCx, f: KFn, csym: String, pks: [KFfiKind], rk: KFfiKind, ns: Bool) : String = {
   let sym = cx.cur
   let arity = list_length(f.params)
   let evf = not list_is_empty(nfnx_frame_keys(cx.fx, f))
@@ -233,7 +254,7 @@ pub fn kc_ffi_fn(cx: KcCx, f: KFn, csym: String, pks: [KFfiKind], rk: KFfiKind) 
   } else if ffi_is_js(csym) {
     kcf_js_shim(evf, sym, csym, pks, rk)
   } else {
-    kcf_shim(evf, sym, csym, pks, rk)
+    kcf_shim(evf, sym, csym, pks, rk, ns)
   }
 }
 

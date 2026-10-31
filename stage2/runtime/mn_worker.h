@@ -317,6 +317,7 @@ static void kai_worker_loop(KaiWorker *w) {
  * swaps to the head of the queue. No-op if the queue is empty (caller
  * is the only ready fiber, nothing to switch to). */
 static void kai_sched_yield(void) {
+    KAI_NS_FORBID_SUSPEND();
     KaiWorker *w = kai_worker_here();
     KaiFiber *current = w->active;
 
@@ -383,6 +384,7 @@ static void kai_drain_requeue_stack(KaiWorker *w) {
  * `ready queue empty AND reactor empty` — only that combination
  * means no path to forward progress. */
 static void kai_sched_park_linked(void) {
+    KAI_NS_FORBID_SUSPEND();
     KaiWorker *w = kai_worker_here();
     KaiFiber *current = w->active;
     /* Any prior park's fired stamp is history; the sites read it only for

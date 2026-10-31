@@ -159,6 +159,28 @@ Three things are happening:
    has `Ffi` in its row. The handler is compiler-synthesised —
    `Ffi` operations lower directly to a C ABI call.
 
+### `#[native_stack]`: calls on the thread's own stack
+
+Fibers, stack segments and `main` run on stacks the runtime maps. A C
+library that checks its stack pointer against the OS thread's bounds
+aborts on them. `#[native_stack]` before `extern "C" fn` runs that call on
+the OS stack of the thread executing it:
+
+```kaikai-fragment
+#[native_stack]
+extern "C" fn js_evaluate(script: String) : Int / Ffi
+```
+
+The runtime notes where the free part of each scheduler thread's OS stack
+starts, switches to it for the call and back on return. A worker's stack
+is its pthread stack (`KAI_WORKER_STACK_SIZE`, default 32 MiB, reserved
+and committed on touch); the thread `main` runs on keeps the process
+stack, bounded by `ulimit -s`. The attribute takes no parameters, applies
+only to an `extern "C" fn` without a body. A callback into kaikai during
+the call may compute and return; suspending the fiber or leaving the call
+panics. Both backends implement it identically; on
+`--target=wasm32-browser` it has no effect.
+
 ### What FFI v1 supports
 
 #### Argument and return types (primitives only)
