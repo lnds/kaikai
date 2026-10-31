@@ -269,6 +269,35 @@ static size_t kai_fiber_stack_size(void) {
     return sz;
 }
 
+/* Stack size of a scheduler worker's pthread: KAI_WORKER_STACK_SIZE, in
+ * bytes, default 32 MiB. The kernel reserves it and commits only touched
+ * pages. It bounds what a native-stack call can use on a worker; thread 0
+ * keeps the stack the OS gave the process. */
+#define KAI_WORKER_STACK_DEFAULT (32 * 1024 * 1024)
+#define KAI_WORKER_STACK_MIN     (1024 * 1024)
+#define KAI_WORKER_STACK_MAX     (1024LL * 1024 * 1024)
+__attribute__((unused)) static size_t kai_worker_stack_size(void) {
+    static _Atomic size_t cached = 0;
+    size_t hit = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (hit != 0) return hit;
+    size_t sz = KAI_WORKER_STACK_DEFAULT;
+    const char *env = getenv("KAI_WORKER_STACK_SIZE");
+    if (env && *env) {
+        char *end = NULL;
+        long long parsed = strtoll(env, &end, 10);
+        if (end != env && *end == '\0' && parsed >= KAI_WORKER_STACK_MIN && parsed <= KAI_WORKER_STACK_MAX) {
+            sz = (size_t) parsed;
+        } else {
+            kai_eprintf("kai: KAI_WORKER_STACK_SIZE=%s out of range [1M, 1G]; using default %zuM\n",
+                        env, sz / (1024 * 1024));
+        }
+    }
+    size_t ps = kai_page_size();
+    if (sz % ps != 0) sz = ((sz / ps) + 1) * ps;
+    atomic_store_explicit(&cached, sz, memory_order_relaxed);
+    return sz;
+}
+
 /* Stack budget for the fiber that runs kai_main: KAI_MAIN_STACK_SIZE at
  * every thread count, whatever the host rlimit or link flags say. A build
  * may define it (the default is in host.h); the environment variable of the

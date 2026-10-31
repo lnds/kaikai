@@ -370,9 +370,10 @@ block, not only in test bodies.
 
 ## Attributes
 
-Four declaration-level `#[...]` meta-instructions exist —
-`#[derive(...)]`, `#[unstable]`, `#[doc("...")]`, and
-`#[constructor]` — plus the field-level `#[json(...)]` family.
+Five declaration-level `#[...]` meta-instructions exist —
+`#[derive(...)]`, `#[unstable]`, `#[doc("...")]`, `#[constructor]`, and
+`#[native_stack]` (before an `extern "C" fn`, see `kai info ffi`) —
+plus the field-level `#[json(...)]` family.
 Attributes come BEFORE `pub`. An unrecognised attribute parses and is
 silently discarded — `#[deprecated]` does nothing.
 

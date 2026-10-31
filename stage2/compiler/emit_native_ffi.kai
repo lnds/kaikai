@@ -81,6 +81,7 @@ LLVM does not derive from a struct value).
 """)]
 
 import compiler.emit_native_fn
+import compiler.emit_native_ops_calls.{nemit_ptr_array}
 import compiler.emit_native_ops_cons
 import compiler.kir
 import compiler.util
@@ -534,10 +535,22 @@ pub fn ffi_unbox_raw(ctx: Handle, k: KFfiKind, boxed: Handle) : Handle / Console
 
 # Synthesise the whole `kai_<name>` wrapper for an `extern "C" fn`.
 pub fn nemit_ffi_fn(ctx: Handle, sym: String, f: KFn, c_symbol: String,
-                    param_kinds: [KFfiKind], ret_kind: KFfiKind) : Unit / Console = {
+                    param_kinds: [KFfiKind], ret_kind: KFfiKind, native_stack: Bool) : Unit / Console = {
   let arity = list_length(f.params)
-  let wrapper = llvm_get_or_declare_fn(native_ctx_m(ctx), sym,
-                                       llvm_fn_type_boxed(native_ctx_ptrt(ctx), arity))
+  let fnty = llvm_fn_type_boxed(native_ctx_ptrt(ctx), arity)
+  let wrapper = llvm_get_or_declare_fn(native_ctx_m(ctx), sym, fnty)
+  if native_stack {
+    let inner = llvm_get_or_declare_fn(native_ctx_m(ctx), cat2(sym, "$ns"), fnty)
+    let _il = llvm_set_internal_linkage(inner)
+    nemit_ffi_define(ctx, inner, c_symbol, param_kinds, ret_kind)
+    nemit_native_stack_forward(ctx, wrapper, inner, arity)
+  } else {
+    nemit_ffi_define(ctx, wrapper, c_symbol, param_kinds, ret_kind)
+  }
+}
+
+fn nemit_ffi_define(ctx: Handle, wrapper: Handle, c_symbol: String,
+                    param_kinds: [KFfiKind], ret_kind: KFfiKind) : Unit / Console = {
   let saved_fnval = native_ctx_fnval(ctx)
   native_ctx_set_fnval(ctx, wrapper)
   let entry = llvm_append_block(native_ctx_m(ctx), wrapper, "entry")
@@ -556,6 +569,27 @@ pub fn nemit_ffi_fn(ctx: Handle, sym: String, f: KFn, c_symbol: String,
   }
   native_ctx_set_fnval(ctx, saved_fnval); ()
 }
+
+# The kaikai-visible symbol of a `#[native_stack]` extern: hands the shim and
+# its boxed arguments to the runtime, which runs it on the thread's own stack.
+fn nemit_native_stack_forward(ctx: Handle, wrapper: Handle, inner: Handle, arity: Int) : Unit / Console = {
+  let saved_fnval = native_ctx_fnval(ctx)
+  native_ctx_set_fnval(ctx, wrapper)
+  llvm_position_at_end(native_ctx_b(ctx), llvm_append_block(native_ctx_m(ctx), wrapper, "entry"))
+  let boxed = llvm_buf_new()
+  collect_boxed_params(wrapper, 0, arity, boxed)
+  let arr = nemit_ptr_array(ctx, boxed)
+  llvm_buf_free(boxed)
+  let p = native_ctx_ptrt(ctx)
+  let r = ncall_sig3(ctx, "kaix_native_stack_call", p, p, native_ctx_i32t(ctx), p,
+                     inner, llvm_const_i32(native_ctx_i32t(ctx), arity), arr)
+  llvm_build_ret(native_ctx_b(ctx), r)
+  native_ctx_set_fnval(ctx, saved_fnval); ()
+}
+
+fn collect_boxed_params(wrapper: Handle, i: Int, n: Int, boxed: Handle) : Unit =
+  if i >= n { () }
+  else { llvm_buf_push(boxed, llvm_get_param(wrapper, i)); collect_boxed_params(wrapper, i + 1, n, boxed) }
 
 # --- extern "js": a WebAssembly import the page host resolves ----------
 #

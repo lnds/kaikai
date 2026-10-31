@@ -1521,6 +1521,28 @@ test-ffi-cflags-shim: $(TARGET) bin-kai build
 	  && echo "ffi-cflags-shim OK (C backend)" \
 	  || { echo "ffi-cflags-shim DIFF (C backend)"; diff ../examples/ffi/cflags_shim_link.out.expected build/cflags-shim-c.out; exit 1; }
 
+# `#[native_stack]` runs the C call on the thread's own stack: the helper
+# aborts when its stack pointer is outside the thread's bounds, and the same
+# helper without the attribute does. Main, a fiber and a stack segment, at one
+# scheduler thread and at eight.
+test-ffi-native-stack: $(TARGET) bin-kai build
+	@set -e; \
+	CFLAGS="$$(../tools/fixture-meta.sh CFLAGS ../examples/ffi_native_stack/native_stack.kai)" ../bin/kai build --backend=c ../examples/ffi_native_stack/native_stack.kai -o build/native-stack-c 2> build/native-stack-c.err \
+	  || { echo "ffi-native-stack BUILD FAIL (C backend)"; cat build/native-stack-c.err; exit 1; }; \
+	CFLAGS="$$(../tools/fixture-meta.sh CFLAGS ../examples/ffi_native_stack/plain_aborts.kai)" ../bin/kai build --backend=c ../examples/ffi_native_stack/plain_aborts.kai -o build/native-stack-plain-c 2> build/native-stack-plain-c.err \
+	  || { echo "ffi-native-stack BUILD FAIL plain_aborts (C backend)"; cat build/native-stack-plain-c.err; exit 1; }; \
+	for n in 1 8; do \
+	  KAI_THREADS=$$n ./build/native-stack-c > build/native-stack-c.out \
+	    || { echo "ffi-native-stack RUN FAIL (C backend, KAI_THREADS=$$n)"; exit 1; }; \
+	  diff -q ../examples/ffi_native_stack/native_stack.out.expected build/native-stack-c.out > /dev/null \
+	    || { echo "ffi-native-stack DIFF (C backend, KAI_THREADS=$$n)"; diff ../examples/ffi_native_stack/native_stack.out.expected build/native-stack-c.out; exit 1; }; \
+	  rc=0; KAI_THREADS=$$n ./build/native-stack-plain-c > build/native-stack-plain-c.out 2> build/native-stack-plain-c.rc || rc=$$?; \
+	  [ $$rc -ne 0 ] || { echo "ffi-native-stack FAIL plain_aborts exited 0 (C backend, KAI_THREADS=$$n)"; exit 1; }; \
+	  grep -qF "stack pointer outside the thread stack" build/native-stack-plain-c.rc \
+	    || { echo "ffi-native-stack FAIL plain_aborts lacks the helper's message (C backend, KAI_THREADS=$$n)"; cat build/native-stack-plain-c.rc; exit 1; }; \
+	done; \
+	echo "ffi-native-stack OK (C backend)"
+
 # `extern "C" fn` with a body exports a kaikai fn to C: a comparator `qsort`
 # calls back, a callback carrying an actor's Pid as userdata, and C threads
 # entering the scheduler. The thread fixture needs the worker pool, so it runs

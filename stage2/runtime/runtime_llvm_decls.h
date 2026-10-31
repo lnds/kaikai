@@ -457,6 +457,7 @@ KaiValue *kaix_map_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_match_panic(KaiValue *msg);
 static inline KaiValue *kaix_mod(KaiValue *a, KaiValue *b);
 static inline KaiValue *kaix_mul(KaiValue *a, KaiValue *b);
+void *kaix_native_stack_call(void *fn, int32_t n, void **args);
 KaiValue *kaix_ne(KaiValue *a, KaiValue *b);
 static inline KaiValue *kaix_neg(KaiValue *a);
 static inline KaiValue *kaix_nil(void);

@@ -84,6 +84,12 @@ size; the budget is a pure runtime parameter, no language surface.
   A reserved stack commits only the pages it reaches; on
   macOS `makecontext` zero-fills its whole `uc_stack`, so it is handed
   just the top 256 KiB and the frames grow on below.
+- **Worker stacks**: scheduler worker pthreads are created with a stack
+  of `KAI_WORKER_STACK_SIZE` bytes (1 MiB to 1 GiB, default 32 MiB).
+  Fibers never run on it. A `#[native_stack]` extern switches from the
+  fiber or segment to the OS stack of the running thread, below the
+  scheduler's own frames, runs the C call and switches back; on the thread
+  `main` runs on that is the process stack, bounded by `ulimit -s`.
 - **Allocation**: `mmap(MAP_PRIVATE | MAP_ANON)` of `stack_size +
   one page`, with the bottom page (low address) flipped to
   `PROT_NONE` via `mprotect`. Stacks grow down on x86_64 / arm64,
