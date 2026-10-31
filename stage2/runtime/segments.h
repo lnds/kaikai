@@ -450,13 +450,19 @@ __attribute__((noreturn)) static void kai_seg_unsupported(void) {
     kai_exit(1);
     __builtin_unreachable();
 }
-KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k) { (void) body; (void) k; kai_seg_unsupported(); }
+KAI_SCHED_FN KaiValue *kai_seg_start(KaiValue *body, KaiValue **k) {
+    (void) body; (void) k;
+    KAI_WASI_NEEDS_SWITCH();
+    kai_seg_unsupported();
+}
 KAI_SCHED_FN KaiValue *kai_seq_apply_far(KaiValue *thunk) { return kai_apply_borrow(thunk, 0, NULL); }
 KAI_SCHED_FN KaiValue *kai_seg_resume(KaiValue *k, KaiValue *v, KaiValue **k_out) {
     (void) k; (void) v; (void) k_out; kai_seg_unsupported();
 }
 KAI_SCHED_FN KaiValue *kai_seg_request(int op, int n, KaiValue **args) {
-    (void) op; (void) n; (void) args; kai_seg_unsupported();
+    (void) op; (void) n; (void) args;
+    KAI_WASI_NEEDS_SWITCH();
+    kai_seg_unsupported();
 }
 KAI_SCHED_FN void kai_seg_cont_drop(KaiValue *box) { (void) box; }
 KAI_SCHED_FN void kai_seg_pool_drain(void) {}

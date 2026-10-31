@@ -104,19 +104,25 @@ them is not reachable (`File` returns an `Err`). The program's exit status is
 `kai`'s. `kai test` has no `--target`: it builds and runs tests on the host.
 
 What runs: pure code, records, sum types, handlers, `Seq`, `File`, `Env`,
-`Stdin`, `Stdout`, `Clock` (a sleep blocks the instance), `Random`,
+`Stdin`, `Stdout`, `Clock`, `Random`,
 `SecureRandom` (`random_get`) and `Process.exit`. Every other `Process`
 operation stops at run time.
 
-There are no fibers. `main` is refused, with a diagnostic naming the target,
-when its final row holds `Spawn`, `Cancel`, `Link`, `Monitor`, `Actor`,
-`Signal`, `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` or `Js`; preview 1 has no
-sockets, and fibers wait for the stack-switching proposal in wasmtime.
-Handle the effect inside `main`, or remove it from the row.
+Fibers and kept continuations run on the stack-switching proposal. A program
+that reaches one (`Spawn`, `Cancel`, `Link`, `Monitor`, `Actor`, a handler that
+keeps `resume`) is built a second time, through the C backend, with the runtime's context switch
+enabled and linked with a dispatcher by binaryen's `wasm-merge` (CI pins binaryen 133), which must be
+on `PATH`; a program that never switches is built and sized as before and needs
+neither. Running the result needs an engine with the proposal: `wasmtime run
+-W stack-switching=y` (`kai run` passes it) on x86_64, which is the only
+platform whose Cranelift implements it; an engine without it rejects the module
+when it loads, and `kai run` says so before running. A sleep parks the fiber
+and the others run meanwhile; a `Clock.sleep` outside any fiber blocks the
+instance.
 
-A handler that keeps `resume` (a generator, a non-tail resume) cannot be seen from
-`main`: it stops at run time with `kai: fibers and kept continuations are not
-available on wasm32-wasi`.
+`main` is refused, with a diagnostic naming the target, when its final row
+holds `Signal`, `NetTcp`, `NetUdp`, `NetUnix`, `NetDns` or `Js`; preview 1 has
+no sockets. Handle the effect inside `main`, or remove it from the row.
 
 ## Native backend
 

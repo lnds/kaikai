@@ -1,7 +1,11 @@
 #[doc("Running a `wasm32-wasi` module on the WASI runtime found on `PATH`.")]
 
 import os.env
+import fs.file as fio
 import cli_err
+import cli_fs
+import cli_io
+import cli_layout
 import cli_proc
 
 const RUNTIME : String = "wasmtime"
@@ -18,6 +22,55 @@ pub fn runtime() : Result[String, Int] / Stderr + Env + Ffi =
     )
   }
 
+# What the dispatcher and the program use: wasm-merge rejects a feature the inputs need and the flags leave off.
+const MERGE_FEATURES : [String] = [
+  "--enable-stack-switching", "--enable-gc", "--enable-reference-types", "--enable-exception-handling",
+  "--enable-multivalue", "--enable-bulk-memory", "--enable-tail-call", "--enable-sign-ext",
+  "--enable-mutable-globals", "--enable-nontrapping-float-to-int", "--enable-extended-const"
+]
+
+const ENGINE_FLAGS : [String] = ["-W", "stack-switching=y"]
+
+#[doc("True when the module at `wasm` still imports the `kai` context switch: the program reaches a fiber or a kept continuation.")]
+pub fn needs_switch(wasm: String) : Bool / Ffi = cli_io.wasm_imports(wasm, "kai")
+
+fn dispatcher(l: Layout) : String =
+  if l.dev { "#{l.root}/stage2/wasi/switch.wat" } else { "#{l.root}/share/kaikai/wasi/switch.wat" }
+
+#[doc("Replace the module at `wasm` by itself merged with the stack-switching dispatcher that implements its `kai` imports.")]
+pub fn merge(l: Layout, wasm: String) : Result[Unit, Int] / Stderr + Env + File + Ffi =
+  match cli_proc.which("wasm-merge") {
+    None -> cli_err.die(
+      "this program uses fibers or kept continuations, which `kai build --target=wasm32-wasi` links with binaryen's `wasm-merge` (binaryen 133 is the version CI pins); it is not on PATH"
+    )
+    Some(tool) -> {
+      let out = "#{wasm}.merged"
+      let argv = [tool] ++ MERGE_FEATURES ++ ["--rename-export-conflicts", dispatcher(l), "kai", wasm, "main", "-o", out]
+      if cli_proc.run(argv, cli_proc.inherit()) == 0 and cli_fs.copy(out, wasm) {
+        let _ = fio.delete(out)
+        Ok(())
+      } else {
+        cli_err.die("cannot link the fiber dispatcher into #{wasm}")
+      }
+    }
+  }
+
+#[doc("An error naming the engines that run a module with fibers when `runtime` is not one of them.")]
+pub fn require_switching(runtime: String) : Result[Unit, Int] / Stderr + File + Env + Ffi {
+  let probe = cli_proc.capture(
+    [runtime, "run", ...ENGINE_FLAGS, "/dev/null"],
+    cli_proc.Spawn { ...cli_proc.inherit(), out: "/dev/null" },
+    "#{cli_fs.scratch_dir()}/engine-probe"
+  )
+  if string.contains(probe.snd, "not supported") {
+    cli_err.die(
+      "this program uses fibers or kept continuations, which need the WebAssembly stack-switching proposal; #{runtime} does not support it on this machine (wasmtime runs it on x86_64 only)"
+    )
+  } else {
+    Ok(())
+  }
+}
+
 fn preopens() : [String] / Env {
   let dirs = match env.get(DIRS_VAR) {
     Some(d) if d != "" -> string.split(d, ":") |> list.filter(x => x != "")
@@ -27,8 +80,8 @@ fn preopens() : [String] / Env {
 }
 
 #[doc("Run `wasm` on `runtime` with `args`, the environment and the preopened directories; the program's status.")]
-pub fn run_module(runtime: String, wasm: String, args: [String]) : Int / Env + Ffi =
+pub fn run_module(runtime: String, wasm: String, args: [String], switching: Bool) : Int / Env + Ffi =
   cli_proc.run(
-    [runtime, "run", "-S", "inherit-env", ...preopens()] ++ ["--", wasm] ++ args,
+    [runtime, "run", "-S", "inherit-env", ...preopens()] ++ (if switching { ENGINE_FLAGS } else { [] }) ++ ["--", wasm] ++ args,
     cli_proc.inherit()
   )

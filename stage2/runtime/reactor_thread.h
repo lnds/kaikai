@@ -250,6 +250,20 @@ static void kai_reactor_wait(void) {
         slack_ms = 0;
     }
     kai_reactor_timer_drain(kai_reactor_now_ns() + (uint64_t) (slack_ms * 1e6));
+#elif defined(__wasm__) && KAI_HOST_FIBERS
+    if (kai_reactor_timer_head == NULL) {
+        kai_eputs("kai: every fiber is parked and nothing can wake one\n");
+        kai_exit(1);
+    }
+    kai_flush_stdout();
+    uint64_t now = kai_reactor_now_ns();
+    uint64_t wake_dl = kai_reactor_timer_head->reactor_deadline_ns;
+    if (wake_dl > now) {
+        uint64_t ns = wake_dl - now;
+        struct timespec nap = { (time_t) (ns / 1000000000), (long) (ns % 1000000000) };
+        while (nanosleep(&nap, &nap) != 0 && errno == EINTR) {}
+    }
+    kai_reactor_timer_drain(kai_reactor_now_ns());
 #else
     kai_host_absent("reactor");
 #endif
@@ -781,7 +795,8 @@ static void kai_fiber_init_ctx_sized(KaiFiber *f, size_t stack_size) {
     makecontext(&f->ctx, kai_fiber_trampoline, 0);
 #else
     (void) f; (void) stack_size;
-    kai_host_absent("fibers");
+    KAI_WASI_NEEDS_SWITCH();
+    kai_fibers_absent();
 #endif
 }
 

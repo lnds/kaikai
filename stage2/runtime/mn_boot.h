@@ -456,7 +456,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     free(root);
     return kai_user_main_result;
 #else
-    kai_host_absent("fibers");
+    kai_fibers_absent();
 #endif
 }
 #endif

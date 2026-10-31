@@ -298,7 +298,7 @@ static void kai_worker_loop(KaiWorker *w) {
 #if KAI_HOST_FIBERS
         swapcontext(&root->ctx, &next->ctx);
 #else
-        kai_host_absent("fibers");
+        kai_fibers_absent();
 #endif
         w->active = root;
         kai_drain_pending_free(w);
@@ -337,7 +337,7 @@ static void kai_sched_yield(void) {
 #if KAI_HOST_FIBERS
         swapcontext(&current->ctx, &w->main_fiber.ctx);
 #else
-        kai_host_absent("fibers");
+        kai_fibers_absent();
 #endif
         kai_drain_pending_free(current->worker);
         return;
@@ -353,7 +353,7 @@ static void kai_sched_yield(void) {
 #if KAI_HOST_FIBERS
     swapcontext(&current->ctx, &next->ctx);
 #else
-    kai_host_absent("fibers");
+    kai_fibers_absent();
 #endif
     /* If the fiber that switched to us was the tail of a now-discarded
      * fiber, its struct and stack wait in pending_free. */
@@ -420,7 +420,7 @@ static void kai_sched_park_linked(void) {
 #if KAI_HOST_FIBERS
         swapcontext(&current->ctx, &w->main_fiber.ctx);
 #else
-        kai_host_absent("fibers");
+        kai_fibers_absent();
 #endif
         kai_drain_pending_free(current->worker);
         /* A reactor park that resumes without the reactor's own splice
@@ -470,7 +470,7 @@ static void kai_sched_park_linked(void) {
 #if KAI_HOST_FIBERS
     swapcontext(&current->ctx, &next->ctx);
 #else
-    kai_host_absent("fibers");
+    kai_fibers_absent();
 #endif
     kai_drain_pending_free(current->worker);
 }

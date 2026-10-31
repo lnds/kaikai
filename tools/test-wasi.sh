@@ -26,6 +26,7 @@ cd "$ROOT" || exit 2
 for f in examples/wasi/*.kai; do
   n="$(basename "$f" .kai)"
   [ -f "examples/wasi/$n.out.expected" ] || continue
+  [ "$n" = wasi_fibers ] && continue
   if KAI_WASI_DIRS=.:/tmp "$KAI" run --target=wasm32-wasi "$f" >"$TMP/$n.out" 2>"$TMP/$n.err" \
     && diff -q "examples/wasi/$n.out.expected" "$TMP/$n.out" >/dev/null; then
     ok "$n"
@@ -64,12 +65,42 @@ else
   bad "build writes one module and nothing beside it"; ls "$TMP/built"; cat "$TMP/build.err"
 fi
 
-if "$KAI" build --target=wasm32-wasi examples/wasi/wasi_refused_spawn.kai -o "$TMP/refused" 2>"$TMP/refused.err"; then
-  bad "a main with Spawn builds"
-elif grep -q "fibers are not available on wasm32-wasi" "$TMP/refused.err"; then
-  ok "Spawn in main is refused"
+if "$KAI" build --target=wasm32-wasi examples/wasi/wasi_refused_signal.kai -o "$TMP/refused" 2>"$TMP/refused.err"; then
+  bad "a main with Signal builds"
+elif grep -q "$(cat examples/wasi/wasi_refused_signal.err.expected)" "$TMP/refused.err"; then
+  ok "Signal in main is refused"
 else
-  bad "the refusal does not say fibers are unavailable"; cat "$TMP/refused.err"
+  bad "the refusal does not name the target"; cat "$TMP/refused.err"
+fi
+
+if command -v wasm-merge >/dev/null; then
+  "$KAI" build --target=wasm32-wasi examples/wasi/wasi_fibers.kai -o "$TMP/fibers" 2>"$TMP/fibers.err" \
+    && ok "a program with fibers builds" || { bad "a program with fibers builds"; cat "$TMP/fibers.err"; }
+  if wasmtime run -W stack-switching=y /dev/null 2>&1 | grep -q "not supported"; then
+    if "$KAI" run --target=wasm32-wasi examples/wasi/wasi_fibers.kai 2>&1 | grep -q "stack-switching proposal"; then
+      ok "an engine without stack switching is named"
+    else
+      bad "an engine without stack switching is named"
+    fi
+  elif [ "$(wasmtime run -W stack-switching=y --dir=. "$TMP/fibers.wasm" 2>&1)" = "$(cat examples/wasi/wasi_fibers.out.expected)" ]; then
+    ok "fibers run under the engine"
+  else
+    bad "fibers run under the engine"
+  fi
+  if grep -aq needs_suspension "$TMP/built/app.wasm"; then
+    bad "a program that never switches imports the context switch"
+  else
+    ok "a program that never switches imports no context switch"
+  fi
+  if PATH="/usr/bin:/bin" "$KAI" build --target=wasm32-wasi examples/wasi/wasi_fibers.kai -o "$TMP/nm" 2>"$TMP/nm.err"; then
+    bad "a fiber program builds without wasm-merge"
+  elif grep -q "wasm-merge" "$TMP/nm.err"; then
+    ok "a missing wasm-merge is named"
+  else
+    bad "the missing wasm-merge diagnostic"; cat "$TMP/nm.err"
+  fi
+else
+  say "skip: fibers (wasm-merge not on PATH)"
 fi
 
 if PATH="/usr/bin:/bin" "$KAI" run --target=wasm32-wasi examples/wasi/run/exit_status.kai 2>"$TMP/nort.err"; then

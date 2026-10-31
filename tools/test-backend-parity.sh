@@ -103,6 +103,9 @@ case "$TARGET_BACKEND" in
       exit 0
     fi
     [ "$WASM_BACKEND" = native ] && wasm_native_probe
+    # A module with fibers needs the stack-switching proposal; a module without them runs the same with it on.
+    export WASI_ENGINE_FLAGS=""
+    wasmtime run -W stack-switching=y /dev/null 2>&1 | grep -q "not supported" || WASI_ENGINE_FLAGS="-W stack-switching=y"
     ;;
   *)
     if ! command -v "${CLANG:-clang}" >/dev/null 2>&1; then
@@ -132,7 +135,8 @@ target_build() {
 
 target_exec() {
   if [ "$TARGET_BACKEND" = wasi ]; then
-    wasmtime run -S inherit-env --dir=. --dir=/tmp -- "$1.wasm"
+    # shellcheck disable=SC2086
+    wasmtime run $WASI_ENGINE_FLAGS -S inherit-env --dir=. --dir=/tmp -- "$1.wasm"
   elif [ "$TARGET_BACKEND" = wasm ]; then
     # node before 24.15 needs a flag for JSPI, which fibers and kept continuations run on.
     # The first attempt keeps stdout and stderr interleaved in one file, in the order written.

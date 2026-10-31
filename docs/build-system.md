@@ -424,9 +424,9 @@ node stage2/web/kai_host.mjs app.wasm
 
 ### wasm32-wasi
 
-`kai build --target=wasm32-wasi` compiles the same way with `-DKAI_HOST_JS=0`: no `kai` or `kai_js` import, no stack exports, and `KAI_HOST_FIBERS` defaults to 0, so the module is one file a WASI runtime loads. `kai run --target=wasm32-wasi` runs it on `wasmtime` from `PATH` with the current directory preopened (`KAI_WASI_DIRS` replaces the list).
+`kai build --target=wasm32-wasi` compiles the same way with `-DKAI_HOST_JS=0`: no `kai` or `kai_js` import, no stack exports, and `KAI_HOST_FIBERS` defaults to 0, so the module is one file a WASI runtime loads. A program whose link still imports the `kai` context switch (fibers, actors, kept continuations) is rebuilt with `-DKAI_WASM_SWITCH=1` and merged with `stage2/wasi/switch.wat` by binaryen's `wasm-merge` (CI pins binaryen 133); it runs only on an engine with the stack-switching proposal (`wasmtime -W stack-switching=y`, x86_64). `kai run --target=wasm32-wasi` runs it on `wasmtime` from `PATH` with the current directory preopened (`KAI_WASI_DIRS` replaces the list).
 
-- **Gate**: `TARGET_BACKEND=wasi NATIVE_PARITY_RATCHET=1 tools/test-backend-parity.sh` builds each corpus fixture with `bin/kai build --target=wasm32-wasi` and runs it under `wasmtime` with `.` and `/tmp` preopened. A fixture whose `main` the target refuses (`Spawn`, sockets, signals, `Js`) is counted `refused`, not as a failure; `tools/wasi-parity-baseline.txt` lists only real differences. CI runs it as `tier1-wasi` (not a required check) together with `tools/test-wasi.sh`, which checks `kai run`'s arguments, environment, stdin, exit status, preopens and diagnostics.
+- **Gate**: `TARGET_BACKEND=wasi NATIVE_PARITY_RATCHET=1 tools/test-backend-parity.sh` builds each corpus fixture with `bin/kai build --target=wasm32-wasi` and runs it under `wasmtime` (with `-W stack-switching=y` where the engine has it) with `.` and `/tmp` preopened. A fixture whose `main` the target refuses (sockets, signals, `Js`, `Process` beside a fiber effect) is counted `refused`, not as a failure; `tools/wasi-parity-baseline.txt` lists only real differences. CI runs it as `tier1-wasi` (not a required check) together with `tools/test-wasi.sh`, which checks `kai run`'s arguments, environment, stdin, exit status, preopens and diagnostics.
 
 ### The native backend for WebAssembly
 

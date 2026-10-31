@@ -73,7 +73,8 @@ mkdir -p "$STAGE/bin" \
          "$STAGE/share/kaikai/include" \
          "$STAGE/share/kaikai/demos" \
          "$STAGE/share/kaikai/info" \
-         "$STAGE/share/kaikai/web"
+         "$STAGE/share/kaikai/web" \
+         "$STAGE/share/kaikai/wasi"
 
 # Static libLLVM for the in-process native backend (Lane 1.5 flip: native
 # is the DEFAULT `kai build` destination, so the shipped kaic2 MUST carry
@@ -258,6 +259,10 @@ fi
 # The browser host the wasm32-browser target ships beside every module.
 cp stage2/web/kai_host.mjs "$STAGE/share/kaikai/web/kai_host.mjs"
 [ -s "$STAGE/share/kaikai/web/kai_host.mjs" ] || { echo "build-release: web host missing from the stage" >&2; exit 1; }
+
+# The stack-switching dispatcher `kai build --target=wasm32-wasi` links into a program with fibers.
+cp stage2/wasi/switch.wat "$STAGE/share/kaikai/wasi/switch.wat"
+[ -s "$STAGE/share/kaikai/wasi/switch.wat" ] || { echo "build-release: wasi dispatcher missing from the stage" >&2; exit 1; }
 
 # User-visible docs.
 cp README.md           "$STAGE/README.md"

@@ -409,13 +409,12 @@ numbers are left out on purpose; the function names are stable.
   wrapper (3.6). Pages that suspend (fibers, waits, events) need the JSPI
   engines of 3.8 (Chrome and Edge 137, Firefox 153, Safari 27); pages that
   never suspend keep phase 1's exnref baseline.
-- **Phase 3 is go, without fibers** (2026-10-23). `wasm32-wasi` ships on
-  wasi-libc preview 1 with `File`, `Env`, `Clock`, `Random`, `Process.exit`
-  and stdin on real WASI calls. `Spawn`, `Cancel`, `Link`, `Monitor`, `Actor`
-  and kept continuations are refused at `main` on this target, as phase 1
-  did for the browser, until the stack-switching proposal is usable in
-  wasmtime; `Signal`, the `Net*` effects and `Js` are refused too. `kai run`
-  and the parity leg use `wasmtime` from `PATH`.
+- **Phase 3 is go** (2026-10-23). `wasm32-wasi` ships on wasi-libc preview 1
+  with `File`, `Env`, `Clock`, `Random`, `Process.exit` and stdin on real WASI
+  calls. `Signal`, the `Net*` effects and `Js` are refused at `main`. Fibers,
+  actors, `Cancel` and kept continuations run on the stack-switching
+  proposal (section 5). `kai run` and the parity leg use `wasmtime` from
+  `PATH`.
 
 ### 3.1 Toolchain and libc
 
@@ -506,9 +505,14 @@ future `fetch`), and handlers that keep `resume`.
 - **The stack-switching proposal** (`cont.new`, `resume`, `suspend`,
   `switch`). The exact shape of `kai_seg_switch`, with no trip through
   JavaScript. Phase 3; Chrome has it behind a flag, Firefox and Safari not at
-  all (R). The probe module does not validate in Chrome 155, deno or bun, and
-  wasmtime 49 on arm64 answers that the feature is not supported in this
-  configuration (M). clang cannot emit it from C.
+  all (R). The probe module does not validate in Chrome 155, deno or bun.
+  wasmtime implements it in Cranelift for x86_64 only (`config.rs` of v50.0.1
+  marks every other architecture, Pulley and Winch unsupported (R)): a probe
+  that suspends, resumes with a value and returns it runs on wasmtime 49.0.2
+  and 50.0.1 x86_64 with `-W stack-switching=y`, and wasmtime 50.0.0 on arm64
+  answers that the feature is not supported on this compiler configuration (M).
+  clang cannot emit it from C; this is the mechanism the WASI target uses
+  (section 5).
 - **A CPS lowering for this target.** Functions whose row carries a switching
   effect are compiled to continuation-passing form; the row says exactly which
   ones. No engine feature. It is a second lowering of the effectful part of
@@ -732,7 +736,7 @@ The standing rule is current systems only, with nothing legacy carried.
 |---|---|---|---|---|
 | exception handling, exnref | every program, under 3.2 | 137 (R), yes in 155 (M) | 131 (R) | 18.4 (R) |
 | JSPI | fibers, waits, kept continuations, under 3.3 | 137 (R), yes in 155 (M) | 153 (R) | 27 (R) |
-| stack switching | nothing yet | flag only (R), no in 155 (M) | no (R) | no (R) |
+| stack switching | WASI fibers, under section 5 | flag only (R), no in 155 (M) | no (R) | no (R) |
 | threads | nothing, under 3.7 | 74 (R) | 79 (R) | 14.1 (R) |
 | JS string builtins | nothing, under 3.5 | 130 (R) | 134 (R) | 26.2 (R) |
 | legacy exception handling | nothing | 95 (R), yes in 155 (M) | 100 (R) | 15.2 (R) |
@@ -1143,12 +1147,34 @@ concept in the wrapper (compiler, flags, cache key); the target-aware check at
 `kai run` and `kai test` need a runtime on the user's machine; sockets depend
 on the WASI version chosen (preview 1 has none; wasi-sdk also carries
 `wasip2` and `wasip3` sysroots (M)); and suspension has no JSPI to stand on.
-For fibers the candidates there are the stack-switching proposal, which
-wasmtime 49 names as an option and does not support on arm64 (M), or
-Asyncify with the third option of 3.2. Until one is chosen, a WASI build is
-what section 1 measured: everything except `spawn`, kept continuations and
-the host facilities of gap 8. Phase 3 is go without fibers (3.0): the
-effects that need them are refused at `main` on `wasm32-wasi`.
+For fibers the target uses the stack-switching proposal, behind the same
+`kai_seg_*` and context seams as the browser.
+
+A context is a continuation. `stage2/wasi/switch.wat` implements the `kai`
+imports of `wasm_ctx.h` (`ctx_switch`, `ctx_exit`, `needs_suspension`) and
+exports `_start`: it runs the program's own `_start` as the root context, and
+a context that switches suspends with the target it wants, so one dispatcher
+loop resumes or starts it on a fresh continuation with the C stack pointer set
+by the runtime. Sleeps park the fiber and the dispatcher waits for the next
+deadline with `nanosleep`.
+
+clang cannot emit the proposal, so the dispatcher is linked after the fact.
+`kai build --target=wasm32-wasi` builds the program as before; when the module
+still imports the `kai` context switch (the program reaches a fiber, an actor
+or a kept continuation; the runtime stubs that refuse it carry the import), it
+rebuilds through the C backend with `KAI_WASM_SWITCH=1` and the stack pointer
+and function table exported, then
+merges the dispatcher with binaryen's `wasm-merge` (CI pins binaryen 133),
+which must be on `PATH` for such a program; without it `kai build` stops
+naming the tool. A program that never switches is the module it was
+before: it imports nothing from `kai`, no type of the proposal appears in it,
+and any engine that runs WASI loads it.
+
+The engine is the constraint. A module that declares continuation types does
+not parse without `-W stack-switching=y`, and wasmtime implements the
+proposal on x86_64 only (3.3): on arm64 macOS and Linux a program with fibers
+builds but cannot run, and `kai run` stops with a message naming the missing
+support before it runs. Asyncify and a CPS lowering stay rejected.
 
 ## Appendix: rebuilding the measurements
 

@@ -20,6 +20,9 @@
  *   KAI_HOST_JS           a JavaScript host beside the module (`kai` and
  *                         `kai_js` imports); 1 on the browser target, 0 on a
  *                         WASI runtime, where fibers default to 0 too */
+#ifndef KAI_WASM_SWITCH
+#  define KAI_WASM_SWITCH 0
+#endif
 #ifndef KAI_HOST_JS
 #  if defined(__wasm__)
 #    define KAI_HOST_JS 1
@@ -29,7 +32,7 @@
 #endif
 #if defined(__wasm__)
 #  ifndef KAI_HOST_FIBERS
-#    define KAI_HOST_FIBERS KAI_HOST_JS
+#    define KAI_HOST_FIBERS (KAI_HOST_JS || KAI_WASM_SWITCH)
 #  endif
 #  ifndef KAI_HOST_STACK_GUARD
 #    define KAI_HOST_STACK_GUARD 0
@@ -166,12 +169,22 @@ static void kai_exit(int code) {
     exit(code);
 }
 
+#if defined(__wasi__) && !KAI_HOST_FIBERS
+/* Called where a second context would be made: only a program that reaches one links the import, and `kai build` then rebuilds it with KAI_WASM_SWITCH. */
+__attribute__((import_module("kai"), import_name("needs_suspension"))) extern void kai_wasi_needs_switch(void);
+#  define KAI_WASI_NEEDS_SWITCH() kai_wasi_needs_switch()
+#else
+#  define KAI_WASI_NEEDS_SWITCH() ((void) 0)
+#endif
+
 #if !KAI_HOST_COMPLETE
 __attribute__((noreturn))
 static void kai_host_absent(const char *facility) {
     kai_eprintf("kai: this host has no %s\n", facility);
     kai_exit(1);
 }
+
+#define kai_fibers_absent() kai_host_absent("fibers")
 #endif
 
 /* Purity attribute for a confirmed memory-clean fn (issue #1139): the C
@@ -382,7 +395,7 @@ static int kai_nthreads = 1;
 #  pragma clang diagnostic push
 #  pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
-#if KAI_HOST_FIBERS && KAI_HOST_JS
+#if KAI_HOST_FIBERS && defined(__wasm__)
 #include "wasm_ctx.h"
 #elif KAI_HOST_FIBERS
 #include <ucontext.h>
