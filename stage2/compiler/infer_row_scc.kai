@@ -1,6 +1,5 @@
-#[doc("Typing order for the private fns that omit their row: each is typed once, after every such fn it calls, so a call reads the row its callee settled on.")]
+#[doc("Typing order for the private fns that omit their row: a fn is typed after every such fn it calls, so a call reads the row its callee settled on; the members of a recursive group are typed together until their rows stop changing.")]
 
-import compiler.util
 import compiler.diag
 import compiler.ast
 import compiler.ast_decl
@@ -10,10 +9,7 @@ import compiler.expr_positions
 import compiler.effect_instance
 import compiler.infer_index
 import compiler.infer_unify_rows
-import compiler.infer_tparam_escape
-import compiler.infer_unit_tables
 import compiler.infer_state
-import compiler.infer_clause_holes
 import compiler.infer_env
 import compiler.infer_row_kinds
 import compiler.type_home
@@ -24,7 +20,7 @@ import compiler.diag_type_text
 #[doc("infer: the env with the scheme of every fn typed ahead, and those fns' typed declarations by identity.")]
 pub(pkg) type RowFirst = { env: TyEnv, done: NameIndex[TypedDecl] }
 
-#[doc("infer: types the declarations in `cands` callee-first, binding each component's settled scheme before the next is typed. A component of several fns shares one row: the union of its members'.")]
+#[doc("infer: types the declarations in `cands` callee-first, binding each component's settled scheme before the next is typed. The members of a component of several fns are re-typed against one another's rows until the rows settle.")]
 pub(pkg) fn type_rowless_first(typeit: (TyEnv, Decl) -> TypedDecl / Console + File + Mutable,
                           file_of: (Decl) -> String,
                           rk: [RowKindEntry], homes: TyHomes, env: TyEnv,
@@ -76,7 +72,7 @@ fn type_components(typeit: (TyEnv, Decl) -> TypedDecl / Console + File + Mutable
   [] -> RowFirst { env: env, done: done }
   [c, ...rest] -> {
     let ds = map(c, (i) => array_get(arr, i))
-    let settled = share_row(file_of, ds, map(ds, (d) => typeit(env, d)))
+    let settled = settle_group(typeit, file_of, rk, homes, env, ds)
     let env2 = foldl(zip_decls(ds, settled), env, (e, p) => match p {
       (d, t) -> match fn_scheme_of_decl(with_row_of(d, t.decl), rk, homes) {
         Some(sc) -> env_bind_sym(e, decl_fn_sym(d), sc)
@@ -114,11 +110,6 @@ fn row_labels(r: RowExpr) : [RowLabel] = match r {
   ROpen(_, ls) -> ls
 }
 
-fn row_is_open(r: RowExpr) : Bool = match r {
-  ROpen(_, _) -> true
-  _ -> false
-}
-
 # Two labels are one when they name one effect at structurally equal types.
 fn rl_same(a: RowLabel, b: RowLabel) : Bool = match (a, b) {
   (RL(ra, xs), RL(rb, ys)) ->
@@ -131,106 +122,59 @@ fn zip_tes(xs: [TypeExpr], ys: [TypeExpr]) : [(TypeExpr, TypeExpr)] = match (xs,
   _ -> []
 }
 
-# The members of a recursive group call one another, so a member performs
-# what its own body does and what its callees do, less what the handlers
-# around each call discharge. Each member's own labels come from its typing;
-# the call sites are read off the typed bodies by identity.
-fn share_row(file_of: (Decl) -> String, ds: [Decl], ts: [TypedDecl]) : [TypedDecl] = match ts {
-  [_] -> ts
-  _ -> {
-    if any(ts, (t) => row_is_open(decl_row(t.decl))) {
-      map(zip_decls(ds, ts), (p) => match p {
-        (d, t) -> TypedDecl { ...t, errs: t.errs + 1,
-          diags: list_append(t.diags, [mk_diag(SevError, file_of(d), decl_line(d), decl_col(d),
-            "cannot infer the row of a recursive group whose row is tied to a row variable of its signature",
-            [])]) }
-      })
-    } else {
-      let syms = map(ds, decl_fn_sym)
-      let own = map(ts, (t) => row_labels(decl_row(t.decl)))
-      let calls = map(ts, (t) => decl_group_calls(syms, t.decl))
-      let rows = solve_group(own, calls, own)
-      map(zip_rows(ts, rows), (p) => match p {
-        (t, ls) -> TypedDecl { ...t, decl: decl_with_row(t.decl, if list_is_empty(ls) { REmpty } else { RClosed(ls) }) }
-      })
-    }
+fn rows_same(a: RowExpr, b: RowExpr) : Bool = {
+  let tails_same = match (a, b) {
+    (ROpen(TpId(x), _), ROpen(TpId(y), _)) -> tlocal_eq(x, y)
+    (ROpen(_, _), _) -> false
+    (_, ROpen(_, _)) -> false
+    _ -> true
   }
+  let la = row_labels(a)
+  let lb = row_labels(b)
+  tails_same and list_length(la) == list_length(lb) and all(la, (x) => any(lb, (y) => rl_same(x, y)))
 }
 
-fn zip_rows(ts: [TypedDecl], rs: [[RowLabel]]) : [(TypedDecl, [RowLabel])] = match (ts, rs) {
-  ([t, ...tr], [r, ...rr]) -> [(t, r), ...zip_rows(tr, rr)]
-  _ -> []
+# A recursive group's rows are a least fixed point: every member is typed
+# against the rows the last round settled for the group, so each call reads
+# the callee's labels and the handlers around it discharge them by the typer's
+# own rule. Rows only grow and the labels are finite, so the rounds end.
+fn settle_group(typeit: (TyEnv, Decl) -> TypedDecl / Console + File + Mutable, file_of: (Decl) -> String,
+                rk: [RowKindEntry], homes: TyHomes, env: TyEnv, ds: [Decl]) : [TypedDecl] / Console + File + Mutable = match ds {
+  [d] -> [typeit(env, d)]
+  _ -> settle_rounds(typeit, file_of, rk, homes, env, ds, map(ds, decl_row), 0)
 }
 
-# Rows only grow and the labels are finite, so the rows settle.
-fn solve_group(own: [[RowLabel]], calls: [[(Int, [Handler])]], rows: [[RowLabel]]) : [[RowLabel]] = {
-  let next = map(zip_rows_calls(own, calls), (p) => match p {
-    (o, cs) -> union_labels(list_append(o, flat_map(cs, (c) => match c {
-      (j, handled) -> filter(nth_row(rows, j), (l) => not any(handled, (h) => handler_discharges(h, l)))
-    })), [])
+fn settle_rounds(typeit: (TyEnv, Decl) -> TypedDecl / Console + File + Mutable, file_of: (Decl) -> String,
+                 rk: [RowKindEntry], homes: TyHomes, env: TyEnv, ds: [Decl], rows: [RowExpr],
+                 round: Int) : [TypedDecl] / Console + File + Mutable = {
+  let env_r = foldl(zip_rows(ds, rows), env, (e, p) => match p {
+    (d, r) -> match fn_scheme_of_decl(decl_with_row(d, r), rk, homes) {
+      Some(sc) -> env_bind_sym(e, decl_fn_sym(d), sc)
+      None -> e
+    }
   })
-  if total_labels(next) == total_labels(rows) { rows } else { solve_group(own, calls, next) }
+  let ts = map(ds, (d) => typeit(env_r, d))
+  let next = map(ts, (t) => decl_row(t.decl))
+  if all(zip_rows_same(rows, next), (b) => b) { ts }
+  else if round >= SETTLE_ROUNDS {
+    map(zip_decls(ds, ts), (p) => match p {
+      (d, t) -> TypedDecl { ...t, errs: t.errs + 1,
+        diags: list_append(t.diags, [mk_diag(SevError, file_of(d), decl_line(d), decl_col(d),
+          "cannot infer the row of a recursive group: its rows do not settle", [])]) }
+    })
+  } else { settle_rounds(typeit, file_of, rk, homes, env, ds, next, round + 1) }
 }
 
-fn total_labels(rows: [[RowLabel]]) : Int = foldl(rows, 0, (n, r) => n + list_length(r))
+const SETTLE_ROUNDS : Int = 64
 
-fn zip_rows_calls(own: [[RowLabel]], calls: [[(Int, [Handler])]]) : [([RowLabel], [(Int, [Handler])])] = match (own, calls) {
-  ([o, ...os], [c, ...cr]) -> [(o, c), ...zip_rows_calls(os, cr)]
+fn zip_rows(ds: [Decl], rs: [RowExpr]) : [(Decl, RowExpr)] = match (ds, rs) {
+  ([d, ...dr], [r, ...rr]) -> [(d, r), ...zip_rows(dr, rr)]
   _ -> []
 }
 
-fn nth_row(rows: [[RowLabel]], j: Int) : [RowLabel] = match rows {
-  [] -> []
-  [r, ...rest] -> if j == 0 { r } else { nth_row(rest, j - 1) }
-}
-
-fn union_labels(ls: [RowLabel], acc: [RowLabel]) : [RowLabel] = match ls {
-  [] -> list_reverse(acc)
-  [l, ...rest] -> if any(acc, (a) => rl_same(a, l)) { union_labels(rest, acc) } else { union_labels(rest, [l, ...acc]) }
-}
-
-# A handle as the typer reads it when it filters the body's row.
-type Handler = { eff: SymId, cell: LocalId, tyargs: [Ty] }
-
-# The typer's own discharge rule, so the two cannot drift.
-fn handler_discharges(h: Handler, l: RowLabel) : Bool = match l {
-  RL(r, args) -> {
-    let lab = Label { sym: ref_sym(r), ty_args: map(args, te_as_ty), cell: local_none() }
-    label_same(lab, label_in_cell(h.eff, [], h.cell))
-      and label_args_dischargeable(lab.ty_args, take_first_tys(h.tyargs, list_length(lab.ty_args)), subst_empty())
-  }
-}
-
-# Each call a body makes to a member of the group, with the labels the
-# handles around it discharge.
-fn decl_group_calls(syms: [SymId], d: Decl) : [(Int, [Handler])] = match d {
-  DFn(_, _, _, _, _, _, body, _, _, _, _, _) -> group_calls(syms, body, [], [])
+fn zip_rows_same(xs: [RowExpr], ys: [RowExpr]) : [Bool] = match (xs, ys) {
+  ([x, ...xr], [y, ...yr]) -> [rows_same(x, y), ...zip_rows_same(xr, yr)]
   _ -> []
-}
-
-fn group_calls(syms: [SymId], e: Expr, handled: [Handler], acc: [(Int, [Handler])]) : [(Int, [Handler])] = {
-  let here = match e.kind {
-    ESym(s, _) -> match index_of_sym(syms, s, 0) {
-      Some(j) -> [(j, handled), ...acc]
-      None -> acc
-    }
-    _ -> acc
-  }
-  match e.kind {
-    EHandle(body, ref, targs, init, alias, cls, oret) -> {
-      let h = Handler { eff: ref_sym(ref), cell: match alias { Some(a) -> a.id  None -> local_none() }, tyargs: map(targs, te_as_ty) }
-      let inside = group_calls(syms, body, [h, ...handled], here)
-      let a1 = match init { Some(i) -> group_calls(syms, i, handled, inside)  None -> inside }
-      let a2 = foldl(cls, a1, (a, c) => match c { HC(_, _, b, _, _) -> group_calls(syms, b, handled, a) })
-      match oret { Some(HR(_, b, _, _)) -> group_calls(syms, b, handled, a2)  None -> a2 }
-    }
-    _ -> foldl(xp_positions(e), here, (a, p) => match p { XP(_, c) -> group_calls(syms, c, handled, a) })
-  }
-}
-
-fn index_of_sym(syms: [SymId], s: SymId, i: Int) : Option[Int] = match syms {
-  [] -> None
-  [m, ...rest] -> if sym_same(m, s) { Some(i) } else { index_of_sym(rest, s, i + 1) }
 }
 
 fn decl_line(d: Decl) : Int = match d {

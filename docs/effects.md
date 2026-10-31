@@ -244,7 +244,9 @@ from the body, and a call to an inferred function carries its row to the
 caller. The inferred row is generalised like the type: it may carry
 effects with type arguments (`Box[Int]`) and stay open on a row variable
 of the signature, so a helper that calls its callback parameter takes the
-callback's row. Recursive and mutually recursive groups share one row.
+callback's row. A handler in such a function discharges its effect from the
+callback's row, so callers may pass callbacks that perform it. The members of
+a recursive group are typed against one another's rows until the rows settle.
 
 ```kaikai
 fn greet(name: String) = print(name)            # private: row inferred as Stdout
@@ -254,7 +256,7 @@ fn main() : Unit / Stdout = greet("a")
 
 A row a signature cannot spell still needs to be declared: a body that
 performs an effect on a named instance that escapes it, one tied to two
-row variables of its signature, or a recursive group tied to one.
+row variables of its signature.
 
 ```kaikai
 fn greet(name: String) / Stdout = print(name)   # OK
