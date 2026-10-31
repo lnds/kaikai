@@ -526,6 +526,8 @@ typedef struct KaiWorker {
     void       *ns_base;        /* top of the free part of this thread's OS stack, NULL if unknown */
     int         ns_active;      /* a native-stack call is running */
     void       *ns_call;        /* the call to run, read by the entry on that stack */
+    void       *ns_ev;          /* evidence top when the call began */
+    void       *ns_seg;         /* stack segment the call began in, NULL outside one */
 #if KAI_HOST_FIBERS
     ucontext_t  uc_link_ctx;
     char        uc_link_stack[KAI_UC_LINK_STACK_SIZE];
@@ -559,6 +561,18 @@ KAI_SCHED_FN __attribute__((noinline)) KaiWorker *kai_worker_here(void)
     return w;
 }
 #endif
+
+/* The frames of a `#[native_stack]` call live on the thread's OS stack: a
+ * callback that suspends the fiber or jumps out of the call would strand or
+ * overwrite them. */
+__attribute__((noreturn, noinline, unused))
+static void kai_native_stack_panic(void) {
+    kai_eprintf("kai: panic: a callback cannot suspend or escape a #[native_stack] call\n");
+    kai_exit(1);
+}
+
+#define KAI_NS_FORBID_SUSPEND() \
+    do { if (kai_worker_here()->ns_active) kai_native_stack_panic(); } while (0)
 
 /* ---------- ThreadSanitizer fiber annotations ----------
  *

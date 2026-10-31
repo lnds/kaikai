@@ -336,7 +336,7 @@ KaiValue *kaix_to_string(KaiValue *v)                           { return kai_to_
    and reported. Keeping the assert entry points in the owner TU keeps every
    test-runner access on the one owner-side copy. */
 #if !defined(KAI_HOT_ONLY)
-void     *kaix_native_stack_call(void *fn, int32_t n, void **args) { return kai_native_stack_call(fn, n, args); }
+void     *kaix_native_stack_call(void *fn, void **args) { return kai_native_stack_call(fn, args); }
 void      kaix_assert_check(KaiValue *cond, const char *msg)    { kai_assert_check(cond, msg); }
 void      kaix_cov_hit(const char *site)                       { kai_cov_hit(site); }
 void      kaix_assert_check_with_value(KaiValue *cond, const char *base_msg,

@@ -322,9 +322,12 @@ extern "C" fn js_evaluate(script: String) : Int / Ffi
 ```
 
 The attribute takes no parameters. It is an error on anything but an
-`extern "C" fn` without a body, and on one with more than 12 parameters.
-The call is a plain C call: it cannot yield or be cancelled, and an
-exported kaikai function it calls back must not suspend the fiber.
+`extern "C" fn` without a body.
+The call is a plain C call: it cannot yield or be cancelled. An exported
+kaikai function it calls back may compute and return; if it suspends the
+fiber (receive, await, I/O, sleep) or leaves the call (an aborting handler
+outside, cancellation), the program panics with `a callback cannot suspend
+or escape a #[native_stack] call`.
 
 - On a worker thread the stack is the pthread stack, sized by
   `KAI_WORKER_STACK_SIZE` (bytes, 1 MiB to 1 GiB, default 32 MiB). The

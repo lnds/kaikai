@@ -543,7 +543,7 @@ pub fn nemit_ffi_fn(ctx: Handle, sym: String, f: KFn, c_symbol: String,
     let inner = llvm_get_or_declare_fn(native_ctx_m(ctx), cat2(sym, "$ns"), fnty)
     let _il = llvm_set_internal_linkage(inner)
     nemit_ffi_define(ctx, inner, c_symbol, param_kinds, ret_kind)
-    nemit_native_stack_forward(ctx, wrapper, inner, arity)
+    nemit_native_stack_forward(ctx, sym, wrapper, inner, fnty, arity)
   } else {
     nemit_ffi_define(ctx, wrapper, c_symbol, param_kinds, ret_kind)
   }
@@ -572,7 +572,11 @@ fn nemit_ffi_define(ctx: Handle, wrapper: Handle, c_symbol: String,
 
 # The kaikai-visible symbol of a `#[native_stack]` extern: hands the shim and
 # its boxed arguments to the runtime, which runs it on the thread's own stack.
-fn nemit_native_stack_forward(ctx: Handle, wrapper: Handle, inner: Handle, arity: Int) : Unit / Console = {
+fn nemit_native_stack_forward(ctx: Handle, sym: String, wrapper: Handle, inner: Handle, fnty: Handle, arity: Int) : Unit / Console = {
+  let p = native_ctx_ptrt(ctx)
+  let unpack = llvm_get_or_declare_fn(native_ctx_m(ctx), cat2(sym, "$nsa"), llvm_fn_type_boxed(p, 1))
+  let _il = llvm_set_internal_linkage(unpack)
+  nemit_native_stack_unpack(ctx, unpack, inner, fnty, arity)
   let saved_fnval = native_ctx_fnval(ctx)
   native_ctx_set_fnval(ctx, wrapper)
   llvm_position_at_end(native_ctx_b(ctx), llvm_append_block(native_ctx_m(ctx), wrapper, "entry"))
@@ -580,12 +584,36 @@ fn nemit_native_stack_forward(ctx: Handle, wrapper: Handle, inner: Handle, arity
   collect_boxed_params(wrapper, 0, arity, boxed)
   let arr = nemit_ptr_array(ctx, boxed)
   llvm_buf_free(boxed)
-  let p = native_ctx_ptrt(ctx)
-  let r = ncall_sig3(ctx, "kaix_native_stack_call", p, p, native_ctx_i32t(ctx), p,
-                     inner, llvm_const_i32(native_ctx_i32t(ctx), arity), arr)
+  let r = ncall_sig2(ctx, "kaix_native_stack_call", p, p, p, unpack, arr)
   llvm_build_ret(native_ctx_b(ctx), r)
   native_ctx_set_fnval(ctx, saved_fnval); ()
 }
+
+# `ptr unpack(ptr args)`: the one signature the runtime calls, reading the
+# boxed arguments of `inner` out of the array.
+fn nemit_native_stack_unpack(ctx: Handle, unpack: Handle, inner: Handle, fnty: Handle, arity: Int) : Unit / Console = {
+  let saved_fnval = native_ctx_fnval(ctx)
+  native_ctx_set_fnval(ctx, unpack)
+  let b = native_ctx_b(ctx)
+  llvm_position_at_end(b, llvm_append_block(native_ctx_m(ctx), unpack, "entry"))
+  let args = llvm_get_param(unpack, 0)
+  let ab = llvm_buf_new()
+  let arrty = llvm_array_type(native_ctx_ptrt(ctx), arity)
+  load_unpacked(ctx, args, arrty, 0, arity, ab)
+  let call = native_build_call(ctx, inner, fnty, ab)
+  llvm_buf_free(ab)
+  llvm_build_ret(b, call)
+  native_ctx_set_fnval(ctx, saved_fnval); ()
+}
+
+fn load_unpacked(ctx: Handle, args: Handle, arrty: Handle, i: Int, n: Int, ab: Handle) : Unit =
+  if i >= n { () }
+  else {
+    let b = native_ctx_b(ctx)
+    let slot = llvm_build_array_gep(b, arrty, args, llvm_const_i32(native_ctx_i32t(ctx), i))
+    llvm_buf_push(ab, llvm_build_load(b, native_ctx_ptrt(ctx), slot))
+    load_unpacked(ctx, args, arrty, i + 1, n, ab)
+  }
 
 fn collect_boxed_params(wrapper: Handle, i: Int, n: Int, boxed: Handle) : Unit =
   if i >= n { () }

@@ -238,6 +238,10 @@ static inline __attribute__((always_inline)) KaiValue *kai_seg_suspend_on(KaiFib
         kai_eputs("kai: internal error: suspend outside a stack segment\n");
         kai_exit(1);
     }
+    {
+        KaiWorker *nsw = kai_worker_here();
+        if (nsw->ns_active && (void *) seg == nsw->ns_seg) kai_native_stack_panic();
+    }
     if (seg->discontinue) kai_trap_abort("continuation suspended while being discontinued");
     seg->xfer  = v;
     seg->state = state;

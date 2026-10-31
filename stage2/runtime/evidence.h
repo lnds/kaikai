@@ -872,6 +872,11 @@ static void kai_nursery_abandon_inside(KaiFiber *f, KaiEvidence *node);
 static void kai_evidence_unwind_to(KaiEvidence *node) {
     node = kai_ev_real(node);
     if (node == NULL) return;
+    KaiWorker *nsw = kai_worker_here();
+    if (nsw->ns_active) {
+        for (KaiEvidence *n = (KaiEvidence *) nsw->ns_ev; n != NULL; n = n->parent)
+            if (kai_ev_real(n) == node) kai_native_stack_panic();
+    }
     kai_nursery_abandon_inside(kai_current_fiber(), node);
     /* Run every `finally` between the jump site and the target, innermost
      * first, before the chain is truncated. `node` itself is included:
@@ -895,6 +900,7 @@ static void kai_evidence_unwind_to(KaiEvidence *node) {
 /* Cancellation longjmps straight to the fiber's `cancel_pad` without a
  * target node, so it needs the whole remaining chain drained. */
 KAI_RT_SHARED void kai_evidence_unwind_all(void) {
+    KAI_NS_FORBID_SUSPEND();
     KaiFiber *f = kai_current_fiber();
     /* Inside a segment the chain below its base belongs to the resumer. */
     KaiEvidence *stop = f->seg != NULL ? f->seg->base : NULL;
