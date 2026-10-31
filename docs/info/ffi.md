@@ -308,6 +308,32 @@ fibers `main` spawns are NOT covered: they migrate across the worker
 pool by design, so a thread-affine call belongs in `main` itself, not
 in a spawned fiber.
 
+## The thread's own stack — `#[native_stack]`
+
+Fibers, stack segments and `main` run on stacks the runtime maps itself.
+A C library that checks its stack pointer against the OS thread's bounds
+(JavaScriptCore is one) aborts on them, however large they are.
+`#[native_stack]` on an `extern "C" fn` makes that call run on the OS
+stack of the thread executing it, and switch back on return:
+
+```kaikai-fragment
+#[native_stack]
+extern "C" fn js_evaluate(script: String) : Int / Ffi
+```
+
+The attribute takes no parameters. It is an error on anything but an
+`extern "C" fn` without a body, and on one with more than 12 parameters.
+The call is a plain C call: it cannot yield or be cancelled, and an
+exported kaikai function it calls back must not suspend the fiber.
+
+- On a worker thread the stack is the pthread stack, sized by
+  `KAI_WORKER_STACK_SIZE` (bytes, 1 MiB to 1 GiB, default 32 MiB). The
+  kernel reserves it and commits only the pages touched.
+- On the thread `main` runs on it is the stack the OS gave the process,
+  bounded by `ulimit -s`; the runtime does not resize it.
+- `--target=wasm32-browser` has a single call stack, so the attribute
+  has no effect there.
+
 ## Still rejected
 
 These are out of scope and rejected at compile time:

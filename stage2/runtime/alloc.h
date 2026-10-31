@@ -523,6 +523,9 @@ typedef struct KaiWorker {
     int         uc_link_ready;
     KaiFiber    main_fiber;
     KaiFreeStack free_stack;    /* the root fiber's */
+    void       *ns_base;        /* top of the free part of this thread's OS stack, NULL if unknown */
+    int         ns_active;      /* a native-stack call is running */
+    void       *ns_call;        /* the call to run, read by the entry on that stack */
 #if KAI_HOST_FIBERS
     ucontext_t  uc_link_ctx;
     char        uc_link_stack[KAI_UC_LINK_STACK_SIZE];

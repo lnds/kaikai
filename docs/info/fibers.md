@@ -184,6 +184,8 @@ KAI_MAIN_STACK_SIZE=8388608 ./my_program
 
 Spawned fibers and the stack segments of handlers that keep their continuation reserve 8 MiB each (`KAI_FIBER_STACK_SIZE`, in bytes); only the pages a fiber touches are committed.
 
+Scheduler worker threads (every thread but the one `main` runs on) get a pthread stack of `KAI_WORKER_STACK_SIZE` bytes (1 MiB to 1 GiB, default 32 MiB), reserved and committed on touch. Fibers do not run on it; it is where a `#[native_stack]` call lands (`kai info ffi`).
+
 ## Mutable state and fibers
 
 Each fiber owns a private heap. A value a spawned thunk captures is

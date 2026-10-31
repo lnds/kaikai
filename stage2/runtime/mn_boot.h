@@ -91,6 +91,100 @@ static void kai_bootstrap_trampoline(void) {
 }
 #endif
 
+/* ---------- Native-stack calls ----------
+ *
+ * A fiber and a stack segment run on a stack the runtime mapped. A C
+ * library that checks the stack pointer against its thread's bounds
+ * rejects that stack, so `#[native_stack]` externs run on the OS stack of
+ * the thread executing them. Each scheduler entry notes where the free part
+ * of that stack starts: below its own frame, with room for the scheduler
+ * frames between it and the switch. */
+#if KAI_HOST_FIBERS && !defined(__wasm__)
+#  define KAI_NS_RESERVE (256 * 1024)
+#  define KAI_NS_WINDOW  (32 * 1024)
+#  define KAI_NATIVE_STACK_NOTE(w) \
+    ((w)->ns_base = (void *) (((uintptr_t) __builtin_frame_address(0) - KAI_NS_RESERVE) & ~(uintptr_t) 15))
+#else
+#  define KAI_NATIVE_STACK_NOTE(w) ((void) (w))
+#endif
+
+#define KAI_NS_MAX_ARGS 13
+
+#if !KAI_SCHED_DECL_ONLY
+#  define KAI_NS_P void *
+#  define KAI_NS_AS(...) ((void *(*)(__VA_ARGS__)) fn)
+
+static void *kai_native_stack_dispatch(void *fn, int32_t n, void **a) {
+    switch (n) {
+    case 0:  return KAI_NS_AS(void)();
+    case 1:  return KAI_NS_AS(KAI_NS_P)(a[0]);
+    case 2:  return KAI_NS_AS(KAI_NS_P, KAI_NS_P)(a[0], a[1]);
+    case 3:  return KAI_NS_AS(KAI_NS_P, KAI_NS_P, KAI_NS_P)(a[0], a[1], a[2]);
+    case 4:  return KAI_NS_AS(KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P)(a[0], a[1], a[2], a[3]);
+    case 5:  return KAI_NS_AS(KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P)(a[0], a[1], a[2], a[3], a[4]);
+    case 6:  return KAI_NS_AS(KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P)(a[0], a[1], a[2], a[3], a[4], a[5]);
+    case 7:  return KAI_NS_AS(KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P)(a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+    case 8:  return KAI_NS_AS(KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+    case 9:  return KAI_NS_AS(KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+    case 10: return KAI_NS_AS(KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9]);
+    case 11: return KAI_NS_AS(KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10]);
+    case 12: return KAI_NS_AS(KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11]);
+    case 13: return KAI_NS_AS(KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P, KAI_NS_P)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12]);
+    default:
+        kai_eprintf("kai: a native-stack call takes at most %d arguments\n", KAI_NS_MAX_ARGS);
+        kai_exit(1);
+    }
+}
+
+#  if KAI_HOST_FIBERS && !defined(__wasm__)
+typedef struct { void *fn; int32_t n; void **args; void *ret; } KaiNsCall;
+
+static void kai_native_stack_entry(void) {
+    KaiNsCall *c = (KaiNsCall *) kai_worker_here()->ns_call;
+    c->ret = kai_native_stack_dispatch(c->fn, c->n, c->args);
+}
+#  endif
+#endif
+
+/* Calls `fn` with `n` pointer arguments on this thread's OS stack and returns
+ * its result. The fiber cannot yield meanwhile, so it stays on this thread.
+ * A call already on the OS stack, or on a thread that has none noted, runs
+ * where it is. */
+KAI_SCHED_FN void *kai_native_stack_call(void *fn, int32_t n, void **args)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+#if KAI_HOST_FIBERS && !defined(__wasm__)
+    KaiWorker *w = kai_worker_here();
+    if (w->ns_base == NULL || w->ns_active) return kai_native_stack_dispatch(fn, n, args);
+    KaiNsCall call = { fn, n, args, NULL };
+    ucontext_t back, ctx;
+    if (getcontext(&ctx) != 0) {
+        kai_eprintf("kai: getcontext failed for a native-stack call\n");
+        kai_exit(1);
+    }
+    kai_ctx_set_stack(&ctx, (char *) w->ns_base - KAI_NS_WINDOW, KAI_NS_WINDOW);
+    ctx.uc_link = &back;
+    makecontext(&ctx, kai_native_stack_entry, 0);
+    w->ns_call = &call;
+    w->ns_active = 1;
+#  if defined(KAI_TSAN_FIBERS)
+    void *tsan_here = __tsan_get_current_fiber();
+    __tsan_switch_to_fiber(w->main_fiber.tsan_fiber, 0);
+#  endif
+    swapcontext(&back, &ctx);
+#  if defined(KAI_TSAN_FIBERS)
+    __tsan_switch_to_fiber(tsan_here, 0);
+#  endif
+    w->ns_active = 0;
+    return call.ret;
+#else
+    return kai_native_stack_dispatch(fn, n, args);
+#endif
+}
+#endif
+
 #if defined(KAI_MAIN_STACK_SIZE)
 static void kai_sized_main_trampoline(void) {
     kai_user_main_result = kai_main_runs(kai_user_main_fn);
@@ -105,7 +199,9 @@ static KaiValue *kai_run_main_on_sized_stack(KaiValue *(*user_main)(void)) {
     size_t ps = kai_page_size();
     if (size % ps != 0) size = ((size / ps) + 1) * ps;
     kai_install_fiber_sigsegv_handler();
-    KaiFiber *root = &kai_worker_here()->main_fiber;
+    KaiWorker *here = kai_worker_here();
+    KAI_NATIVE_STACK_NOTE(here);
+    KaiFiber *root = &here->main_fiber;
     kai_user_main_fn = user_main;
     ucontext_t host, ctx;
     void *region = kai_stack_map(size);
@@ -145,6 +241,7 @@ static void *kai_worker_thread_main(void *arg) {
     KaiWorker *w = kai_worker_here();
     w->id = (int) (intptr_t) arg;
     w->sched = 1;
+    KAI_NATIVE_STACK_NOTE(w);
     /* Per-thread: without it a fiber overflowing here dies undiagnosed. */
     kai_install_thread_sigaltstack(w);
     w->main_fiber.home_thread = w->id;
@@ -206,14 +303,18 @@ static void kai_workers_ensure(void) {
     if (!atomic_load_explicit(&kai_workers_up, memory_order_relaxed)) {
         atomic_fetch_sub(&kai_sched_idle_count, kai_nthreads - 1);
         atomic_fetch_add(&kai_sched_idle_epoch, 1);
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, kai_worker_stack_size());
         for (int i = 1; i < kai_nthreads; i++) {
             kai_rc_go_mt();
-            if (pthread_create(&kai_worker_threads[i], NULL,
+            if (pthread_create(&kai_worker_threads[i], &attr,
                                kai_worker_thread_main, (void *) (intptr_t) i) != 0) {
                 kai_eprintf("kai: scheduler pthread_create failed: %s\n", strerror(errno));
                 kai_exit(1);
             }
         }
+        pthread_attr_destroy(&attr);
         atomic_store_explicit(&kai_workers_up, 1, memory_order_release);
     }
     pthread_mutex_unlock(&kai_pool_mu);
@@ -328,6 +429,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     pthread_mutex_init(&kai_reactor_mu, NULL);
     kai_reactor_init();
     KaiWorker *w = kai_worker_here();
+    KAI_NATIVE_STACK_NOTE(w);
     w->id = 0;
     w->main_fiber.home_thread = 0;
     kai_sched_slots[0].live = 1;
