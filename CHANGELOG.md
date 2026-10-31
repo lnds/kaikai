@@ -84,6 +84,73 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.188.0 (2026-10-31)
+
+### BREAKING CHANGE
+
+- `impl P for U` where U is a union of types is rejected; implement P for each component.
+
+### Added
+
+- **typer**: infer the effect row of a private fn that omits it
+- **typer**: dispatch a union-typed receiver to the component it carries
+- **parser**: record the name position on fn, type, effect, protocol, field and variant declarations
+- **tco**: guarantee closure tail calls in donor, region, borrow and check functions
+- **tco**: lift the arity limit of a tail call through a closure
+- **tco**: guaranteed tail calls through closures
+
+### Fixed
+
+- **typer**: look up fns typed ahead by identity, not by list scan
+- **typer**: keep rejected fixtures rejected under private-fn row inference
+- **typer**: match the widened DFn arity in the row inference
+- **typer**: settle a recursive group's row through the handlers around its calls
+- **typer**: a type listing itself as a component is not a union of types; keep disp_op out of the name census
+- **typer**: a one-variant sum named like its variant is not a union; use Option combinators
+- **typer**: print union names through the registered display helpers
+- **typer**: adapt the union dispatch to the new DFn arity, wire the new fixture goldens
+- **typer**: one error for an operation with several Self on a union
+- **typer**: report union impls from the typer, skip narrowing copies at the source
+- **emit**: keep gcc from inlining a fn that holds a guaranteed tail call
+- **emit**: brace the C tail call so gcc 15 accepts it
+- **typer**: compare repeated fields and variants by name key, tail-recurse, split goldens
+- **typer**: reject a repeated record field or sum variant within a type
+- **tco**: report the calls a donor function leaves as calls
+- **tco**: satisfy the compiler lint ratchet in the bounce plan
+- **typer**: if/else and match type their result as the least upper bound of the branches
+- **typer**: join of two fn types is covariant in the return and absorbs Nothing in the params
+- **typer**: give every unify site an expected/actual order so Nothing flows one way
+- **runtime**: a fiber body owns plain children only; actors spawned outside a nursery stay with the root scope
+- **runtime**: a cancelled fiber ends its children before its handlers' cleanup runs
+- **runtime**: every fiber body is a scope that joins its children
+- **runtime**: install fiber stack guards with MADV_GUARD_INSTALL; bound PROT_NONE guards by vm.max_map_count
+- **runtime**: pool fiber stacks in shared chunks so live fibers are not capped by vm.max_map_count
+- **typer**: abort ops in stream fixtures no longer resume; drop fixed lint baselines
+- **typer**: a pid is contravariant in its message type, so Pid[Nothing] takes any pid
+- **typer**: make Nothing bottom directional: below the top of a type it equals only itself
+- **runtime**: the root scope drops terminated children as it grows
+- **build**: the native shim and the selfhost link of the compiler opt into the libLLVM bridge
+- **runtime**: an actor spawned outside any scope joins the root scope; the root join drains late registrations
+- **runtime**: mark root actors on the fiber; deterministic fixtures; yielding-actor fixture
+- **runtime**: main's return cancels and joins the actors still alive
+- **runtime**: keep the 64 KiB fiber stack on wasm
+- **runtime**: the root scope joins Spawn.spawn children only and contains their faults; classify the pool globals
+- **runtime**: a root child that fails fails the program; share the nursery join with scope_exit
+- **runtime**: root nursery joins its children at every thread count; start the worker pool on first demand
+- **runtime**: keep test-evf-passthrough phony; reflow stack-size comment; pin 20K live fibers
+- **runtime**: reserve 8 MiB per fiber and segment stack; makecontext zeroes only a 32 KiB window
+- **monomorph**: binding extraction is exhaustive over Ty and rejects shape mismatches; no cascaded exhaustiveness error after an unresolved arm pattern; resolver no longer imports migrate
+
+### Changed
+
+- **typer**: discharge a recursive group's labels by the typer's own handler rule
+- **typer**: type private row-less fns once, callee-first, with a generalised row
+- **tco**: use option combinators in the exit scan and the check site
+- **typer**: use option combinators where the unify rewrite touched them; drop fixed lint pins
+- **typer**: give Nothing its own Ty constructor so TyAny only means unknown
+- **build**: the libLLVM bridge is an explicit opt-in set only by builds of the compiler
+- **build**: move the compiler's libLLVM C-API glue out of the user runtime into stage2/llvm
+
 ## v0.187.0 (2026-10-29)
 
 ### BREAKING CHANGE
