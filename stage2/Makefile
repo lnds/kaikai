@@ -1527,7 +1527,7 @@ test-ffi-cflags-shim: $(TARGET) bin-kai build
 # scheduler thread and at eight. A callback that suspends or leaves the call
 # panics; one that computes returns.
 FFI_NATIVE_STACK_OK := native_stack wide callback_computes
-FFI_NATIVE_STACK_TRAP := plain_aborts:stack~pointer~outside~the~thread~stack callback_suspends:cannot~suspend~or~escape callback_escapes:cannot~suspend~or~escape
+FFI_NATIVE_STACK_TRAP := plain_aborts:stack~pointer~outside~the~thread~stack callback_suspends:cannot~suspend~or~escape callback_escapes:cannot~suspend~or~escape callback_traps:cannot~suspend~or~escape
 
 test-ffi-native-stack: $(TARGET) bin-kai build
 	@set -e; \
@@ -1548,6 +1548,8 @@ test-ffi-native-stack: $(TARGET) bin-kai build
 	    [ $$rc -ne 0 ] || { echo "ffi-native-stack FAIL $$f exited 0 (C backend, KAI_THREADS=$$n)"; exit 1; }; \
 	    grep -qF "$$msg" build/ns-$$f-c.rc \
 	      || { echo "ffi-native-stack FAIL $$f lacks '$$msg' (C backend, KAI_THREADS=$$n)"; cat build/ns-$$f-c.rc; exit 1; }; \
+	    [ ! -f ../examples/ffi_native_stack/$$f.err.expected ] || diff ../examples/ffi_native_stack/$$f.err.expected build/ns-$$f-c.rc \
+	      || { echo "ffi-native-stack DIFF $$f stderr (C backend, KAI_THREADS=$$n)"; exit 1; }; \
 	  done; \
 	done; \
 	echo "ffi-native-stack OK (C backend)"
