@@ -4,12 +4,11 @@ import compiler.util
 import compiler.diag
 import compiler.ast
 import compiler.ast_decl
-import compiler.ast_build
-import compiler.scalar_ty
 import compiler.ast_ids
 import compiler.written
 import compiler.symtab
 import compiler.type_text
+import compiler.infer_sig_respell
 import compiler.proto_ids
 import compiler.diag_file
 import compiler.kind_theory
@@ -255,7 +254,7 @@ fn fn_initial_state(file: String, env: TyEnv, core_len: Int, recs: [RecInfo], op
                                               kind_theories)
   let st_init = st_set_sums(st_set_protos(st_set_home(st_set_walker(st_init0, walker()), mo), protos), sums)
   let phantom_extra = if elaborate_phantom_row(site.row, site.entry) { 1 } else { 0 }
-  let st0 = advance_row_fresh(InferState { ...st_init, sig_rows: site.rbinds, sig_tps: site.tps },
+  let st0 = advance_row_fresh(InferState { ...st_init, sig_rows: site.rbinds, sig_open: site.inferring, sig_tps: site.tps },
                               list_length(site.rbinds) + phantom_extra)
   let st0a = st_set_env(st0, advance_fresh(st0.env, list_length(site.tpbinds)))
   let st0b = reserve_unit_tparams(st0a, site.tps)
@@ -346,7 +345,7 @@ fn finalise_fn_decl(env: TyEnv, d: Decl, site: FnSite, nm: String, mo: Option[St
   let row_holes = extract_row_holes(d, site.rbinds, st2.sub, st2.row)
   let stamp = (te: TypeExpr) => resolve_ty_with_binds(te, site.tpbinds, site.rbinds, env.row_kind, env_home_view(env, mo))
   TypedDecl {
-    decl: DFn(site.is_pub, site.fid, site.tparams, stamp_params(site.ps, stamp), stamp_opt(site.opt_ret, stamp),
+    decl: DFn(site.is_pub, site.fid, site.tparams, respell_params(site, st2, stamp_params(site.ps, stamp)), respell_opt(site, st2, stamp_opt(site.opt_ret, stamp)),
               stamp_row_with(main_inferred_row(site, final_body, st2), stamp),
               final_body, site.line, site.col, site.line, site.col, mo),
     errs: st2.errs,
@@ -537,25 +536,6 @@ fn spell_inferred_row(st: InferState, site: FnSite) : RowSpell = {
   }
 }
 
-fn spell_labels(ls: [Label], binds: [TPBind]) : Option[[RowLabel]] =
-  all_some(map(ls, (l) => map(spell_args(l.ty_args, binds), (args) => RL(DrSym(l.sym), args))))
-
-fn spell_args(ts: [Ty], binds: [TPBind]) : Option[[TypeExpr]] =
-  all_some(map(ts, (t) => spell_ty(t, binds)))
-
-fn all_some(xs: [Option[a]]) : Option[[a]] =
-  map(foldl(xs, Some([]), (acc, x) => and_then(acc, (r) => map(x, (v) => [v, ...r]))), list_reverse)
-
-fn spell_ty(t: Ty, binds: [TPBind]) : Option[TypeExpr] = match t {
-  TyVarT(v) -> map(find(binds, (b) => match b { TPB(n, i) -> i == v and tb_is_type(n) }),
-                   (b) => match b { TPB(n, _) -> mk_ty(TyParam(n.id, []), 0, 0) })
-  TyListT(x) -> map(spell_ty(x, binds), (e) => mk_ty(TyList(e), 0, 0))
-  TyCon(s, args) -> map(spell_args(args, binds), (es) => mk_ty(TyName(DrSym(s), es), 0, 0))
-  TyDimT(b, _) -> spell_ty(b, binds)
-  TyRefineT(b, _, _) -> spell_ty(b, binds)
-  _ -> map(scalar_ty_name(t), (n) => mk_ty(TyName(ref_written(n), []), 0, 0))
-}
-
 # The signature row variables the body's row is tied to, each once.
 fn sig_row_tails(st: InferState, rbinds: [RVBind]) : [TLocalId] =
   foldl(st.row_tails, [], (acc, u) => match u {
@@ -569,10 +549,30 @@ fn sig_row_tails(st: InferState, rbinds: [RVBind]) : [TLocalId] =
     }
   })
 
+fn respell_params(site: FnSite, st: InferState, ps: [Param]) : [Param] =
+  match respell_extras(site, st) {
+    [] -> ps
+    xs -> map(ps, (p) => Param { ...p, ptype: map(p.ptype, (te) => respell_te(te, xs)) })
+  }
+
+fn respell_opt(site: FnSite, st: InferState, o: Option[TypeExpr]) : Option[TypeExpr] =
+  match respell_extras(site, st) {
+    [] -> o
+    xs -> map(o, (te) => respell_te(te, xs))
+  }
+
+fn respell_extras(site: FnSite, st: InferState) : [SigExtra] =
+  if site.inferring { unwrap_or(sig_row_extras(st.sub, site.rbinds, site.tpbinds), []) } else { [] }
+
 fn check_inferred_row(st: InferState, fname: String, site: FnSite) : InferState / Mutable = {
   let sta = st_add_tail_labels(st, st.row_tails)
   match spell_inferred_row(sta, site) {
-    Spelled(_) -> sta
+    Spelled(_) -> match sig_row_extras(sta.sub, site.rbinds, site.tpbinds) {
+      Some(_) -> sta
+      None -> st_bump_err(st_push_diag(sta, mk_diag(SevError, sta.file, site.line, site.col,
+        concat_all(["cannot infer the signature of `", fname, "`: a handler discharges an effect a row cannot name"]),
+        [ri_help(sta.file, site.line, site.col, "declare the row with `/ ...`")])))
+    }
     Unspelled(why) -> st_bump_err(st_push_diag(sta, mk_diag(SevError, sta.file, site.line, site.col,
       concat_all(["cannot infer the row of `", fname, "`: ", why]),
       [ri_help(sta.file, site.line, site.col, "declare the row with `/ ...`")])))

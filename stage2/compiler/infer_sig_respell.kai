@@ -1,0 +1,74 @@
+#[doc("The signature of a fn whose row is inferred, re-spelled once its body is typed: a row variable that handlers closed names the labels they discharged from it.")]
+
+import compiler.util
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_ids
+import compiler.scalar_ty
+import compiler.type_text
+import compiler.infer_env
+import compiler.infer_state
+import compiler.infer_apply
+import compiler.infer_row_kinds
+
+#[doc("infer: the labels a signature row variable names beyond what was written.")]
+pub(pkg) type SigExtra = SE(TLocalId, [RowLabel])
+
+#[doc("infer: `ls` spelled as written row labels, or None when one names a type a row cannot spell.")]
+pub(pkg) fn spell_labels(ls: [Label], binds: [TPBind]) : Option[[RowLabel]] =
+  all_some(map(ls, (l) => map(spell_args(l.ty_args, binds), (args) => RL(DrSym(l.sym), args))))
+
+fn spell_args(ts: [Ty], binds: [TPBind]) : Option[[TypeExpr]] =
+  all_some(map(ts, (t) => spell_ty(t, binds)))
+
+fn all_some(xs: [Option[a]]) : Option[[a]] =
+  map(foldl(xs, Some([]), (acc, x) => and_then(acc, (r) => map(x, (v) => [v, ...r]))), list_reverse)
+
+fn spell_ty(t: Ty, binds: [TPBind]) : Option[TypeExpr] = match t {
+  TyVarT(v) -> map(find(binds, (b) => match b { TPB(n, i) -> i == v and tb_is_type(n) }),
+                   (b) => match b { TPB(n, _) -> mk_ty(TyParam(n.id, []), 0, 0) })
+  TyListT(x) -> map(spell_ty(x, binds), (e) => mk_ty(TyList(e), 0, 0))
+  TyCon(s, args) -> map(spell_args(args, binds), (es) => mk_ty(TyName(DrSym(s), es), 0, 0))
+  TyDimT(b, _) -> spell_ty(b, binds)
+  TyRefineT(b, _, _) -> spell_ty(b, binds)
+  _ -> map(scalar_ty_name(t), (n) => mk_ty(TyName(ref_written(n), []), 0, 0))
+}
+
+fn bound_labels(s: Subst, id: Int) : [Label] = match subst_row_lookup(s, id) {
+  None -> []
+  Some(r) -> list_append(apply_labels(s, r.labels), match r.tail { Some(v) -> bound_labels(s, v)  None -> [] })
+}
+
+#[doc("infer: what each signature row variable of the fn names after typing, or None when a label cannot be spelled.")]
+pub(pkg) fn sig_row_extras(sub: Subst, rbinds: [RVBind], binds: [TPBind]) : Option[[SigExtra]] =
+  all_some(map(rbinds, (rb) => match rb {
+    RVB(n, id) -> {
+      let labs = bound_labels(sub, id)
+      if any(labs, (l) => local_raw(l.cell) != 0) { None }
+      else { map(spell_labels(labs, binds), (ls) => SE(n, ls)) }
+    }
+  }))
+
+#[doc("infer: `te` with each signature row variable's extra labels added to the rows it tails.")]
+pub(pkg) fn respell_te(te: TypeExpr, extras: [SigExtra]) : TypeExpr =
+  if all(extras, (x) => match x { SE(_, ls) -> list_is_empty(ls) }) { te }
+  else { TypeExpr { ...te, tkind: respell_kind(te.tkind, extras) } }
+
+fn respell_kind(k: TyKind, extras: [SigExtra]) : TyKind = match k {
+  TyFn(ps, ret, row) -> TyFn(map(ps, (p) => respell_te(p, extras)), respell_te(ret, extras), respell_row(row, extras))
+  TyList(x) -> TyList(respell_te(x, extras))
+  TyName(r, args) -> TyName(r, map(args, (a) => respell_te(a, extras)))
+  _ -> k
+}
+
+fn respell_row(row: RowExpr, extras: [SigExtra]) : RowExpr = match row {
+  ROpen(TpId(n), ls) -> match find(extras, (x) => match x { SE(m, _) -> tlocal_eq(m, n) }) {
+    Some(SE(_, add)) -> ROpen(TpId(n), list_append(ls, filter(add, (a) => not any(ls, (l) => rl_same_effect(l, a)))))
+    None -> row
+  }
+  _ -> row
+}
+
+fn rl_same_effect(a: RowLabel, b: RowLabel) : Bool = match (a, b) {
+  (RL(ra, _), RL(rb, _)) -> sym_same(ref_sym(ra), ref_sym(rb))
+}
