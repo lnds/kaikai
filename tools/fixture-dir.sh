@@ -37,6 +37,9 @@
 # A positive fixture may also carry `<name>.warn-once.expected` (C only): every line of it must
 # appear in the compiler's stderr exactly once.
 #
+# A negative fixture may carry `<name>.err-exact.expected` (C only): the whole of stderr, paths
+# reduced to start at `examples/`, must equal it.
+#
 # FIXTURE_BACKEND picks the backend (c, the default, or native). Native builds
 # through the kai wrapper named by FIXTURE_KAI, which owns the stdlib path and
 # the link, and supports no marks.
@@ -138,6 +141,11 @@ run_one() {
       grep $grepflag -- "$line" "$b.err" \
         || { echo "$slug FAIL $name (missing diagnostic: $line)"; cat "$b.err"; exit 1; }
     done < "$exp_err"
+    ef="$dir/$name.err-exact.expected"
+    if [ -f "$ef" ] && [ "$BACKEND" != native ]; then
+      sed 's#[^ ]*examples/#examples/#' "$b.err" | diff -q "$ef" - > /dev/null \
+        || { echo "$slug FAIL $name (stderr differs from $ef)"; sed 's#[^ ]*examples/#examples/#' "$b.err" | diff "$ef" -; exit 1; }
+    fi
     echo "$slug OK $name (rejected as expected)"
     return 0
   fi
