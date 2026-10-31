@@ -1524,22 +1524,31 @@ test-ffi-cflags-shim: $(TARGET) bin-kai build
 # `#[native_stack]` runs the C call on the thread's own stack: the helper
 # aborts when its stack pointer is outside the thread's bounds, and the same
 # helper without the attribute does. Main, a fiber and a stack segment, at one
-# scheduler thread and at eight.
+# scheduler thread and at eight. A callback that suspends or leaves the call
+# panics; one that computes returns.
+FFI_NATIVE_STACK_OK := native_stack wide callback_computes
+FFI_NATIVE_STACK_TRAP := plain_aborts:stack~pointer~outside~the~thread~stack callback_suspends:cannot~suspend~or~escape callback_escapes:cannot~suspend~or~escape
+
 test-ffi-native-stack: $(TARGET) bin-kai build
 	@set -e; \
-	CFLAGS="$$(../tools/fixture-meta.sh CFLAGS ../examples/ffi_native_stack/native_stack.kai)" ../bin/kai build --backend=c ../examples/ffi_native_stack/native_stack.kai -o build/native-stack-c 2> build/native-stack-c.err \
-	  || { echo "ffi-native-stack BUILD FAIL (C backend)"; cat build/native-stack-c.err; exit 1; }; \
-	CFLAGS="$$(../tools/fixture-meta.sh CFLAGS ../examples/ffi_native_stack/plain_aborts.kai)" ../bin/kai build --backend=c ../examples/ffi_native_stack/plain_aborts.kai -o build/native-stack-plain-c 2> build/native-stack-plain-c.err \
-	  || { echo "ffi-native-stack BUILD FAIL plain_aborts (C backend)"; cat build/native-stack-plain-c.err; exit 1; }; \
+	for f in $(FFI_NATIVE_STACK_OK) $(foreach t,$(FFI_NATIVE_STACK_TRAP),$(firstword $(subst :, ,$(t)))); do \
+	  CFLAGS="$$(../tools/fixture-meta.sh CFLAGS ../examples/ffi_native_stack/$$f.kai)" ../bin/kai build --backend=c ../examples/ffi_native_stack/$$f.kai -o build/ns-$$f-c 2> build/ns-$$f-c.err \
+	    || { echo "ffi-native-stack BUILD FAIL $$f (C backend)"; cat build/ns-$$f-c.err; exit 1; }; \
+	done; \
 	for n in 1 8; do \
-	  KAI_THREADS=$$n ./build/native-stack-c > build/native-stack-c.out \
-	    || { echo "ffi-native-stack RUN FAIL (C backend, KAI_THREADS=$$n)"; exit 1; }; \
-	  diff -q ../examples/ffi_native_stack/native_stack.out.expected build/native-stack-c.out > /dev/null \
-	    || { echo "ffi-native-stack DIFF (C backend, KAI_THREADS=$$n)"; diff ../examples/ffi_native_stack/native_stack.out.expected build/native-stack-c.out; exit 1; }; \
-	  rc=0; KAI_THREADS=$$n ./build/native-stack-plain-c > build/native-stack-plain-c.out 2> build/native-stack-plain-c.rc || rc=$$?; \
-	  [ $$rc -ne 0 ] || { echo "ffi-native-stack FAIL plain_aborts exited 0 (C backend, KAI_THREADS=$$n)"; exit 1; }; \
-	  grep -qF "stack pointer outside the thread stack" build/native-stack-plain-c.rc \
-	    || { echo "ffi-native-stack FAIL plain_aborts lacks the helper's message (C backend, KAI_THREADS=$$n)"; cat build/native-stack-plain-c.rc; exit 1; }; \
+	  for f in $(FFI_NATIVE_STACK_OK); do \
+	    KAI_THREADS=$$n ./build/ns-$$f-c > build/ns-$$f-c.out \
+	      || { echo "ffi-native-stack RUN FAIL $$f (C backend, KAI_THREADS=$$n)"; exit 1; }; \
+	    diff -q ../examples/ffi_native_stack/$$f.out.expected build/ns-$$f-c.out > /dev/null \
+	      || { echo "ffi-native-stack DIFF $$f (C backend, KAI_THREADS=$$n)"; diff ../examples/ffi_native_stack/$$f.out.expected build/ns-$$f-c.out; exit 1; }; \
+	  done; \
+	  for t in $(FFI_NATIVE_STACK_TRAP); do \
+	    f=$${t%%:*}; msg=$$(echo "$${t#*:}" | tr '~' ' '); rc=0; \
+	    KAI_THREADS=$$n ./build/ns-$$f-c > build/ns-$$f-c.out 2> build/ns-$$f-c.rc || rc=$$?; \
+	    [ $$rc -ne 0 ] || { echo "ffi-native-stack FAIL $$f exited 0 (C backend, KAI_THREADS=$$n)"; exit 1; }; \
+	    grep -qF "$$msg" build/ns-$$f-c.rc \
+	      || { echo "ffi-native-stack FAIL $$f lacks '$$msg' (C backend, KAI_THREADS=$$n)"; cat build/ns-$$f-c.rc; exit 1; }; \
+	  done; \
 	done; \
 	echo "ffi-native-stack OK (C backend)"
 

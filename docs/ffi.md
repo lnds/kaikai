@@ -176,8 +176,9 @@ starts, switches to it for the call and back on return. A worker's stack
 is its pthread stack (`KAI_WORKER_STACK_SIZE`, default 32 MiB, reserved
 and committed on touch); the thread `main` runs on keeps the process
 stack, bounded by `ulimit -s`. The attribute takes no parameters, applies
-only to an `extern "C" fn` without a body, and allows at most 12
-parameters. Both backends implement it identically; on
+only to an `extern "C" fn` without a body. A callback into kaikai during
+the call may compute and return; suspending the fiber or leaving the call
+panics. Both backends implement it identically; on
 `--target=wasm32-browser` it has no effect.
 
 ### What FFI v1 supports
