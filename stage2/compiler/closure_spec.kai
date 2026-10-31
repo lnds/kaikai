@@ -33,17 +33,16 @@ pub type CSpecOut = { decls: [Decl], rows: [NEnt] }
 pub fn closure_spec_pass(ds: [Decl], target: String, tab: SymTab, ids: ProtoIds) : CSpecOut = {
   let hofns = collect_hofns(ds, ids)
   if list_length(hofns) == 0 { CSpecOut { decls: ds, rows: [] } }
-  else { cspec_fixpoint(ds, ds, hofns, [], [], [], cspec_fuel(), target, tab, ids) }
+  else { cspec_fixpoint(ds, ds, hofns, [], [], [], target, tab, ids) }
 }
 
 # Specialisation propagates across fn boundaries: specialising `foldl`
 # on lambda L rewrites its body's `foldl_loop(..., f)` — where `f` is
 # now bound to L — into a fresh higher-order call that discovers a new
-# request. A bounded fixpoint drains the worklist; running out of fuel
-# (a cycle of higher-order fns whose specs keep renaming each other)
-# leaves every call indirect rather than half-specialised.
-fn cspec_fuel() : Int = 64
-
+# request. The worklist drains because every spec's chain of ancestors is
+# origin-free of repeats (see `SpecChain`), so each round's
+# requests are finite and the chains cannot deepen forever.
+#
 # Discover + emit specs to a fixpoint over the UN-rewritten decls, then
 # rewrite once at the end. A newly emitted spec's body still carries
 # the raw `inner(..., L)` call whose request the next round must find;
@@ -51,40 +50,49 @@ fn cspec_fuel() : Int = 64
 # stranding the transitive spec (`foldl → foldl_loop`).
 # A spec is a declaration of its own, so each round's specs enter the
 # table: the next round spells a spec's host and callee from it.
-fn cspec_fixpoint(orig: [Decl], ds: [Decl], hofns: [Decl], emitted: [SymId], rows: [NEnt], chains: [SpecChain], fuel: Int, target: String, tab: SymTab, ids: ProtoIds) : CSpecOut =
-  if fuel <= 0 { CSpecOut { decls: orig, rows: [] } }
+fn cspec_fixpoint(orig: [Decl], ds: [Decl], hofns: [Decl], emitted: [SymId], rows: [NEnt], chains: [SpecChain], target: String, tab: SymTab, ids: ProtoIds) : CSpecOut = {
+  let reqs = dedup_reqs(cs_collect_decls(ds, ds, tab, ids, hofns, chains, target), tab, target, emitted, [])
+  if list_length(reqs) == 0 { CSpecOut { decls: rewrite_all(ds, ds, tab, ids, hofns, chains, target), rows: rows } }
   else {
-    let reqs = dedup_reqs(cs_collect_decls(ds, ds, tab, ids, hofns, chains, target), tab, target, emitted, [])
-    if list_length(reqs) == 0 { CSpecOut { decls: rewrite_all(ds, ds, tab, ids, hofns, chains, target), rows: rows } }
-    else {
-      let specs = map(reqs, (r) => emit_cspec(r, req_spec_name(tab, r), target))
-      let rows1 = map(reqs, (r) => req_spec_row(tab, r, target))
-      let ds1 = list_append(ds, specs)
-      let hofns1 = list_append(hofns, filter_hofns(specs))
-      let emitted1 = list_append(emitted, map(reqs, (r) => req_spec_sym(tab, r, target)))
-      let chains1 = list_append(chains, map(reqs, (r) => req_chain(tab, r, target, chains)))
-      cspec_fixpoint(orig, ds1, hofns1, emitted1, list_append(rows, rows1), chains1, fuel - 1, target, st_extend(tab, rows1), ids)
-    }
+    let specs = map(reqs, (r) => emit_cspec(r, req_spec_name(tab, r), target))
+    let rows1 = map(reqs, (r) => req_spec_row(tab, r, target))
+    let ds1 = list_append(ds, specs)
+    let hofns1 = list_append(hofns, filter_hofns(specs))
+    let emitted1 = list_append(emitted, map(reqs, (r) => req_spec_sym(tab, r, target)))
+    let chains1 = list_append(chains, map(reqs, (r) => req_chain(tab, r, target, chains)))
+    cspec_fixpoint(orig, ds1, hofns1, emitted1, list_append(rows, rows1), chains1, target, st_extend(tab, rows1), ids)
   }
+}
 
-# The callees a spec descends from, nearest first: a spec reached through its
-# own callee again is a cycle of specs, and that call stays indirect.
-type SpecChain = SpecChain(SymId, [SymId])
+# A spec's symbol, the declaration it descends from, and the declarations
+# of the callees above it, nearest first. A call whose origin is already
+# above the host stays indirect, so a chain never repeats an origin and is
+# no longer than the number of higher-order fns; each step also consumes
+# one functional parameter of its origin.
+type SpecChain = SpecChain(SymId, SymId, [SymId])
 
 fn req_chain(tab: SymTab, r: CSpecReq, target: String, chains: [SpecChain]) : SpecChain = match r {
-  CSReq(callee, _, _, _, host) -> SpecChain(req_spec_sym(tab, r, target), [cs_decl_sym(callee), ...chain_of(chains, host)])
+  CSReq(callee, _, _, _, host) -> {
+    let o = origin_of(chains, callee)
+    SpecChain(req_spec_sym(tab, r, target), o, [o, ...chain_of(chains, host)])
+  }
+}
+
+fn origin_of(chains: [SpecChain], d: Decl) : SymId = match chains {
+  [] -> cs_decl_sym(d)
+  [SpecChain(s, o, _), ...rest] -> if sym_raw(s) == sym_raw(cs_decl_sym(d)) { o } else { origin_of(rest, d) }
 }
 
 fn chain_of(chains: [SpecChain], host: SymId) : [SymId] = match chains {
   [] -> []
-  [SpecChain(s, up), ...rest] -> if sym_raw(s) == sym_raw(host) { up } else { chain_of(rest, host) }
+  [SpecChain(s, _, up), ...rest] -> if sym_raw(s) == sym_raw(host) { up } else { chain_of(rest, host) }
 }
 
 # The higher-order fns a call inside `host` may specialise: not those the
 # host is itself a spec of.
 fn hofns_in(hofns: [Decl], chains: [SpecChain], host: SymId) : [Decl] = match chain_of(chains, host) {
   [] -> hofns
-  up -> filter(hofns, (d) => not syms_have(up, cs_decl_sym(d)))
+  up -> filter(hofns, (d) => not syms_have(up, origin_of(chains, d)))
 }
 
 fn req_spec_name(tab: SymTab, r: CSpecReq) : String =
