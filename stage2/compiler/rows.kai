@@ -29,7 +29,7 @@ import compiler.ast_build
 import compiler.ast_ids
 import compiler.ast_build
 import compiler.ast_ids
-import compiler.util
+import compiler.symtab
 import compiler.effect_alias
 import compiler.written
 
@@ -68,51 +68,51 @@ pub fn row_labels_concat(a: [RowLabel], b: [RowLabel]) : [RowLabel] {
 # expansion, so the two passes stay sequenced and order-independent.
 
 #[doc("Walk a TypeExpr produced by alias instantiation and expand effect-alias labels (e.g. `Console` → `Stdout + Stderr + Stdin`) in every nested row.")]
-pub fn expand_row_aliases_in_te(te: TypeExpr, aliases: [AliasResult]) : TypeExpr {
+pub fn expand_row_aliases_in_te(te: TypeExpr, tab: SymTab, aliases: [AliasResult]) : TypeExpr {
   match te.tkind {
     TyName(th, targs) ->
       TypeExpr {
-        tkind: TyName(th, expand_row_aliases_in_tes(targs, aliases)),
+        tkind: TyName(th, expand_row_aliases_in_tes(targs, tab, aliases)),
         line: te.line,
         col: te.col
       }
     TyParam(p, targs) ->
       TypeExpr {
-        tkind: TyParam(p, expand_row_aliases_in_tes(targs, aliases)),
+        tkind: TyParam(p, expand_row_aliases_in_tes(targs, tab, aliases)),
         line: te.line,
         col: te.col
       }
     TyList(inner) ->
       TypeExpr {
-        tkind: TyList(expand_row_aliases_in_te(inner, aliases)),
+        tkind: TyList(expand_row_aliases_in_te(inner, tab, aliases)),
         line: te.line,
         col: te.col
       }
     TyFn(ps, ret, row) ->
       TypeExpr {
         tkind: TyFn(
-          expand_row_aliases_in_tes(ps, aliases),
-          expand_row_aliases_in_te(ret, aliases),
-          expand_aliases_in_row_local(row, aliases)
+          expand_row_aliases_in_tes(ps, tab, aliases),
+          expand_row_aliases_in_te(ret, tab, aliases),
+          expand_aliases_in_row_local(row, tab, aliases)
         ),
         line: te.line,
         col: te.col
       }
     TyDim(base, u) ->
       TypeExpr {
-        tkind: TyDim(expand_row_aliases_in_te(base, aliases), u),
+        tkind: TyDim(expand_row_aliases_in_te(base, tab, aliases), u),
         line: te.line,
         col: te.col
       }
     TyRefine(base, p, al) ->
       TypeExpr {
-        tkind: TyRefine(expand_row_aliases_in_te(base, aliases), p, al),
+        tkind: TyRefine(expand_row_aliases_in_te(base, tab, aliases), p, al),
         line: te.line,
         col: te.col
       }
     TyRow(row) ->
       TypeExpr {
-        tkind: TyRow(expand_aliases_in_row_local(row, aliases)),
+        tkind: TyRow(expand_aliases_in_row_local(row, tab, aliases)),
         line: te.line,
         col: te.col
       }
@@ -121,7 +121,7 @@ pub fn expand_row_aliases_in_te(te: TypeExpr, aliases: [AliasResult]) : TypeExpr
         tkind: TySurface(
           tysurface_rebuild(
             ts,
-            expand_row_aliases_in_tes(tysurface_children(ts), aliases)
+            expand_row_aliases_in_tes(tysurface_children(ts), tab, aliases)
           )
         ),
         line: te.line,
@@ -130,12 +130,12 @@ pub fn expand_row_aliases_in_te(te: TypeExpr, aliases: [AliasResult]) : TypeExpr
   }
 }
 
-fn expand_row_aliases_in_tes(tes: [TypeExpr], aliases: [AliasResult]) : [TypeExpr] {
+fn expand_row_aliases_in_tes(tes: [TypeExpr], tab: SymTab, aliases: [AliasResult]) : [TypeExpr] {
   match tes {
     [] -> []
     [t, ...rest] -> [
-      expand_row_aliases_in_te(t, aliases),
-      ...expand_row_aliases_in_tes(rest, aliases)
+      expand_row_aliases_in_te(t, tab, aliases),
+      ...expand_row_aliases_in_tes(rest, tab, aliases)
     ]
   }
 }
@@ -143,12 +143,12 @@ fn expand_row_aliases_in_tes(tes: [TypeExpr], aliases: [AliasResult]) : [TypeExp
 # Expand effect-alias labels in one row. Bare labels (`Console`) whose
 # name matches an alias are replaced by the alias's base labels; every
 # other label passes through. Duplicates introduced by expansion are
-# folded by name. The row tail (a row variable) is never an alias.
-fn expand_aliases_in_row_local(re: RowExpr, aliases: [AliasResult]) : RowExpr {
+# folded by declaration and arguments. The row tail (a row variable) is never an alias.
+fn expand_aliases_in_row_local(re: RowExpr, tab: SymTab, aliases: [AliasResult]) : RowExpr {
   match re {
     REmpty -> REmpty
-    RClosed(labels) -> RClosed(dedup_labels(expand_label_aliases(labels, aliases)))
-    ROpen(rv, labels) -> ROpen(rv, dedup_labels(expand_label_aliases(labels, aliases)))
+    RClosed(labels) -> RClosed(ea_dedup(tab, expand_label_aliases(labels, aliases), []))
+    ROpen(rv, labels) -> ROpen(rv, ea_dedup(tab, expand_label_aliases(labels, aliases), []))
   }
 }
 
@@ -167,33 +167,3 @@ fn expand_label_aliases(ls: [RowLabel], aliases: [AliasResult]) : [RowLabel] {
   }
 }
 
-fn dedup_labels(ls: [RowLabel]) : [RowLabel] = dedup_labels_loop(ls, [], [])
-
-fn dedup_labels_loop(ls: [RowLabel], seen: [String], acc: [RowLabel]) : [RowLabel] {
-  match ls {
-    [] -> list_reverse(acc)
-    [RL(r, targs), ...rest] -> {
-      # Key by declaration and arg-arity: two homonymous effects, or two
-      # instantiations of one parametric effect, both survive. A label
-      # nothing settled keys by its spelling.
-      let key = concat_all([
-        label_spelling(r),
-        "#",
-        int_to_string(sym_raw(ref_sym(r))),
-        "/",
-        int_to_string(list_length(targs))
-      ])
-      if list_has(seen, key) {
-        dedup_labels_loop(rest, seen, acc)
-      } else {
-        dedup_labels_loop(rest, [key, ...seen], [RL(r, targs), ...acc])
-      }
-    }
-  }
-}
-
-fn label_spelling(r: DeclRef) : String = match r {
-  DrSym(_) -> ""
-  DrWritten(None, n) -> written_text(n)
-  DrWritten(Some(q), n) -> concat_all([written_text(q), ".", written_text(n)])
-}
