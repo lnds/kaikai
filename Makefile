@@ -656,7 +656,7 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 # Coverage invariant (do not break): the set
 #   { test-costly-parallel, test-heap-limit, test-user-cache,
 #     test-core-cache, test-modular-selfhost, test-perceus-1131-modular-escape,
-#     light(1/8) .. light(8/8), test-fmt-property,
+#     test-selfcompile-cache-identity, light(1/8) .. light(8/8), test-fmt-property,
 #     test-fmt, test-fmt-package, test-fmt-width, test-fmt-selfhost,
 #     test-fmt-help-scope, test-bench, test-check, test-typecheck,
 #     test-check-parity, test-library-mode, test-lsp,
@@ -755,6 +755,7 @@ tier1-shard-6: kaic2
 	$(tier1-shard-start)
 ifneq ($(TIER1_SELFHOSTS),0)
 	$(MAKE) -C stage2 test-perceus-1131-modular-escape
+	$(MAKE) -C stage2 test-selfcompile-cache-identity
 endif
 	$(MAKE) test-fmt-property FMT_PROPERTY_SHARD=2/3
 	$(call tier1-light-slice,6)
