@@ -117,8 +117,9 @@ grep -q 'unused binding' "$work/warning-warm-memo.out" \
   || { echo "  FAIL warning-warm: a hit dropped the compiler's warning"; fail=$((fail + 1)); }
 scenario back-to-plain 0 "$solo" -- main.kai
 
-for f in "$work"/core/*/bins/*/bin; do
-  [ -f "$f" ] && head -c 100 "$f" > "$f.cut" && mv "$f.cut" "$f"
+# A loose file's entries may sit in its own bucket under the core cache.
+find "$work/core" -path "*/bins/*/bin" -type f | while read -r f; do
+  head -c 100 "$f" > "$f.cut" && mv "$f.cut" "$f"
 done
 scenario truncated-entries 1 "$solo" -- main.kai
 scenario truncated-replaced 0 "$solo" -- main.kai
