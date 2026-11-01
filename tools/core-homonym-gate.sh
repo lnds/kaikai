@@ -41,8 +41,8 @@ builtins=$("$ROOT/stage2/kaic2" --builtin-names | grep -v '^__' | sort -u)
 [ -n "$builtins" ] || { echo "core-homonym-gate: no core names found"; exit 1; }
 # Every protocol operation as `name:arity`, the arity counted from the
 # parameters' colons.
-op_arities=$(grep -rlE '^(pub )?protocol ' "$ROOT/stdlib" \
-      | xargs awk '/^(pub )?protocol /{ on = 1; next } on && /^}/{ on = 0 } on && /^  [a-z_][a-z_0-9]*\(/' \
+op_arities=$(grep -rlE '^(pub )?protocol [A-Z]' "$ROOT/stdlib" \
+      | xargs awk '/^(pub )?protocol [A-Z]/{ on = 1; next } on && /^}/{ on = 0 } on && /^  [a-z_][a-z_0-9]*\(/' \
       | sed -E 's/^  ([a-z_0-9]+)\((.*)\) *:.*/\1 \2/' \
       | awk '{ n = $1; $1 = ""; print n ":" gsub(/:/, ":") }' | sort -u)
 ops=$(echo "$op_arities" | cut -d: -f1 | sort -u)
