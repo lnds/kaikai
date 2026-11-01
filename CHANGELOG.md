@@ -84,6 +84,17 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.191.0 (2026-11-01)
+
+### Added
+
+- **typer**: warn when a statement discards a #[must_use] value
+
+### Fixed
+
+- **typer**: fix diag tests and must_use doc block
+- **typer**: keep every instance of a parametric effect in a function-type row
+
 ## v0.190.0 (2026-11-01)
 
 ### Added
