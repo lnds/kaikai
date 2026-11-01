@@ -10,6 +10,7 @@ import cli_fs
 import cli_guard_memo
 import cli_layout
 import cli_manifest
+import cli_memo_key
 import cli_native
 import cli_nativedeps
 import cli_nativereach
@@ -70,10 +71,13 @@ pub fn edition_flag(l: Layout, manifest: String) : Result[[String], Int] / Stder
   }
 
 #[doc("""
-The per-project incremental cache: on inside a package (or with
-`KAI_CACHE=1`), under `<package>/.kai-cache/<toolchain id>`, which also
-serves as the core cache when the shared one is off. Off when the
-compiler's identity cannot be read.
+The incremental cache, on unless `KAI_CACHE=0`. A package keeps it under
+`<package>/.kai-cache/<toolchain id>`, which also serves as the core cache
+when the shared one is off; `KAI_CACHE=1` gives a loose file the same
+directory beside its source. A loose file otherwise keeps it in the shared
+core cache, in a bucket of its own per absolute source directory, so no
+file lands next to the source. Off when the compiler's identity cannot be
+read.
 """)]
 pub fn user_cache_flags(
   t: Toolchain,
@@ -82,16 +86,45 @@ pub fn user_cache_flags(
 ) : [String] / Env + File + Ffi {
   let mode = cli_caches.env_or("KAI_CACHE", "auto")
   let tid = cli_layout.toolchain_id(t.layout)
-  if (mode == "1" or mode == "auto" and manifest != "") and tid != "" {
-    let root = "#{if manifest == "" { src_dir } else { manifest }}/.kai-cache"
-    let dir = "#{root}/#{tid}"
-    let _ = cli_fs.mkdir_p(dir)
-    prune_other_toolchains(root, tid, dir_list_dir(root))
-    let core = if list.is_empty(t.core_cache) { ["--core-cache-dir", dir] } else { [] }
-    ["--user-cache", "--user-cache-dir", dir] ++ core
-  } else {
+  if mode == "0" or tid == "" {
     []
+  } else if manifest == "" and mode != "1" {
+    shared_loose_flags(t, src_dir)
+  } else {
+    local_cache_flags(t, manifest, src_dir, tid)
   }
+}
+
+fn flag_value(flags: [String], name: String) : String =
+  match flags {
+    [] -> ""
+    [f, v, ..._] if f == name -> v
+    [_, ...rest] -> flag_value(rest, name)
+  }
+
+fn shared_loose_flags(t: Toolchain, src_dir: String) : [String] / File + Ffi =
+  match flag_value(t.core_cache, "--core-cache-dir") {
+    "" -> []
+    core -> {
+      let h = cli_sys.sha_new()
+      cli_memo_key.field(h, cli_fs.absolute(src_dir))
+      let dir = "#{core}/loose/#{string_slice(cli_sys.sha_hex(h), 0, 16)}"
+      if cli_fs.mkdir_p(dir) { ["--user-cache", "--user-cache-dir", dir] } else { [] }
+    }
+  }
+
+fn local_cache_flags(
+  t: Toolchain,
+  manifest: String,
+  src_dir: String,
+  tid: String
+) : [String] / Env + File + Ffi = {
+  let root = "#{if manifest == "" { src_dir } else { manifest }}/.kai-cache"
+  let dir = "#{root}/#{tid}"
+  let _ = cli_fs.mkdir_p(dir)
+  prune_other_toolchains(root, tid, dir_list_dir(root))
+  let core = if list.is_empty(t.core_cache) { ["--core-cache-dir", dir] } else { [] }
+  ["--user-cache", "--user-cache-dir", dir] ++ core
 }
 
 # The cache keys hold nothing of the compiler, so an entry another compiler
