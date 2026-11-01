@@ -84,6 +84,49 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.190.0 (2026-11-01)
+
+### Added
+
+- **kai**: cache loose files by default, in the shared cache
+- **typer**: a handler closes the signature row variables of an inferred-row fn
+- **wasi**: fibers, actors, Cancel and kept continuations through stack switching
+
+### Fixed
+
+- **kai**: build the compiler's modular C against the libLLVM stubs
+- **diagnostics**: find the lambda hint body over the lexer's tokens
+- **diagnostics**: cut the lambda hint body by a balanced, string-aware scan
+- **diagnostics**: rebuild the lambda-ends-at-pipe hint from the AST
+- **kai**: resolve test-discovery imports from the entry's directory and name impl-only files honestly
+- **typer**: join a lambda's param tails once a record-field read settles
+- **fmt**: move the goldens and gate scripts the reflow broke
+- **audit**: read the formatted spelling in the diag-channel audit, re-pin the lint ratchet
+- **symid**: read the formatted spelling in the census scanner
+- **typer**: open a handled tail only when the enclosing lambda minted it
+- **typer**: a handler inside a lambda discharges its labels from the row tails its body calls through
+- **typer**: walk every Ty constructor when collecting a lambda's parameter-owned tails
+- **typer**: a lambda's row follows the row tails its own parameters call through
+- **fmt**: keep parentheses around `and` under `or`
+- **cspec**: follow the id-keyed spec names in the goldens, the m4c gate and the ledger
+- **kai**: replay the emit's stderr before linking on the pruned native path
+- **kai**: hold native cache objects inside the cache, keep them marked used, test the modular link
+- **kai**: hold cached native core objects for the link instead of checking them
+
+### Changed
+
+- **compiler**: index the trap-free fixed point by identity
+- **compiler**: read a module's unused-import scan from the cache and lex only on a miss
+- **diagnostics**: read the hint's source line with and_then
+- **compiler**: drop the issue numbers from the record table comment
+- **typer**: narrow the lambda-tail helpers to pub(pkg)
+- **kai**: cap pinned descriptors at half the descriptor limit
+- **kai**: pin cached native objects by descriptor instead of hard-linking each one
+- **typer**: end a recursive group's rounds by monotonicity, not by fuel
+- **typer**: settle a recursive group's rows by re-typing it, not by label sets
+- **cspec**: key a spec by ids, not by spelled names
+- **cspec**: terminate by construction, delete the fuel
+
 ## v0.189.0 (2026-10-31)
 
 ### Added
