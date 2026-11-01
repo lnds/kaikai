@@ -23,6 +23,13 @@
 # its codegen's C for this tree. The record states the hops taken, so a C
 # is reused only under the KAIC_BOOT_HOPS it was emitted with.
 #
+# KAIC_BOOT_EMITTER=<kaic2> replaces the second hop of a two-hop boot: that
+# binary emits <out.c> in place of the kaic2-a the boot would link. It must
+# have been linked from the C this boot emits for this tree, which is what
+# kaic2-a is, so the C and the record are the ones the literal hop produces;
+# only the -O level it was linked at differs, and the C a compiler emits does
+# not depend on that.
+#
 # KAIC_BOOT_MODULAR=1 makes a kaic2-class boot emit both hops as a
 # `--emit=c-modular` stream, one translation unit per module, which
 # tools/kaic-link.sh compiles in parallel. It shapes a new emit only: a C
@@ -300,7 +307,13 @@ cmd_emit() {
   mkdir -p "$(dirname "$out")"
   rm -f "$out.id"
   key="$(src_key "$BOOT_CLASS")"
-  if [ "$(hops "$BOOT_CLASS")" = 2 ]; then hop_a "$out"; else say "boot $BOOT_ID -> $out"; fi
+  if [ -n "${KAIC_BOOT_EMITTER:-}" ]; then
+    [ "$(hops "$BOOT_CLASS")" = 2 ] || die "KAIC_BOOT_EMITTER needs a two-hop kaic2-class boot"
+    [ -x "$KAIC_BOOT_EMITTER" ] || die "KAIC_BOOT_EMITTER is not an executable: $KAIC_BOOT_EMITTER"
+    say "emitter $KAIC_BOOT_EMITTER -> $out"
+    BOOT_BIN="$KAIC_BOOT_EMITTER"
+  elif [ "$(hops "$BOOT_CLASS")" = 2 ]; then hop_a "$out"
+  else say "boot $BOOT_ID -> $out"; fi
   emit_to "$out"
   printf 'boot=%s\nclass=%s\nhops=%s\nsrc=%s\nout=%s\n' \
     "$BOOT_ID" "$BOOT_CLASS" "$(hops "$BOOT_CLASS")" "$key" "$(sha_of "$out")" > "$out.id.tmp"
