@@ -737,7 +737,8 @@ value-transportable effect resolves through the evidence the caller supplied
 `var`/State/Reader cell resolves by `handler_id` (`kai_evidence_lookup_node_by_id`).
 The walk shown here is retained for fiber-local builtins
 (`Cancel`/`Link`/`Monitor`/`Spawn`/`Actor`) — whose handler is per-fiber and must
-not cross a `spawn` — and for a frameless perform of a default-bearing builtin.
+not cross a `spawn`; an `Actor` instance in a spawned row the child does not
+handle is a compile error — and for a frameless perform of a default-bearing builtin.
 A fiber-local builtin finds its innermost handler through a per-fiber slot that
 `handle` installs and removes (O(1) in handler depth, also inside a clause in dispatch and on a stack segment).
 

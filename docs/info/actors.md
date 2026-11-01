@@ -65,6 +65,12 @@ spawn/install surface:
   `spawn_actor_policy(Bounded(1, BlockSender), () => consumer())`
   for sender-side backpressure.
 
+An `Actor` instance never crosses a spawn. A spawned body (`n.spawn`,
+`Spawn.spawn`, `spawn_actor`) handles every instance it performs, `send`
+included, or the spawn is rejected at compile time. A child that only sends
+carries no instance in its row; one that needs a mailbox installs its own
+`with_mailbox`.
+
 ## Monitoring
 
 `Monitor` lets one actor observe another's lifecycle:
