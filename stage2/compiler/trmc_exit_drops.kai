@@ -29,58 +29,68 @@ import compiler.perceus_exit_drops
 #[doc("The drops a Perceus arm-ret wrap runs after its value; `[]` when `e` is no such wrap or holds anything but drops.")]
 pub fn txd_wrap_drops(e: Expr) : [Stmt] = match e.kind {
   EBlock(stmts, Some(t)) -> txd_ret_drops(stmts, t.kind)
-  _                      -> []
+  _ -> []
 }
 
 fn txd_ret_drops(stmts: [Stmt], k: ExprKind) : [Stmt] = match k {
   ELocal(tn) -> if ret_slot_id_is_scope(tn) { txd_only_drops(txd_after_let(stmts, tn)) } else { [] }
-  _          -> []
+  _ -> []
 }
 
 fn txd_after_let(stmts: [Stmt], tn: LocalId) : [Stmt] = match stmts {
-  []           -> []
+  [] -> []
   [s, ...rest] -> if txd_binds(s, tn) { rest } else { txd_after_let(rest, tn) }
 }
 
 fn txd_binds(s: Stmt, tn: LocalId) : Bool = match s {
   SLet(pat, _, _) -> match pat.pkind {
     PBind(b) -> local_eq(b.id, tn)
-    _        -> false
+    _ -> false
   }
   _ -> false
 }
 
 fn txd_only_drops(stmts: [Stmt]) : [Stmt] =
-  if all(stmts, (s) => txd_named(ppd_drop_name(s))) { stmts } else { [] }
+  if all(stmts, s => txd_named(ppd_drop_name(s))) { stmts } else { [] }
 
 fn txd_named(o: Option[LocalId]) : Bool = match o {
   Some(_) -> true
-  None    -> false
+  None -> false
 }
 
 #[doc("Plant `drops` into every TRMC step and apply leaf of a rewritten body, after the leaf's last read. `ns` names the enclosing declaration's binders: a span reads one by its text.")]
 pub fn txd_plant(ns: LocalNames, e: Expr, drops: [Stmt]) : Expr = txd_walk(ns, e, drops, true)
 
 #[doc("Plant a fn's exit drops `after` into the apply leaves of a TRMC-rewritten body; a step releases its params through the dropmask.")]
-pub fn txd_plant_exit(ns: LocalNames, e: Expr, after: [Stmt]) : Expr = txd_walk(ns, e, txd_only_drops(after), false)
+pub fn txd_plant_exit(ns: LocalNames, e: Expr, after: [Stmt]) : Expr =
+  txd_walk(ns, e, txd_only_drops(after), false)
 
 fn txd_walk(ns: LocalNames, e: Expr, drops: [Stmt], steps: Bool) : Expr = match drops {
-  []         -> e
-  [_, ...__] -> Expr { kind: txd_kind(ns, e.kind, drops, steps), line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+  [] -> e
+  [_, ...__] -> Expr {
+    kind: txd_kind(ns, e.kind, drops, steps),
+    line: e.line,
+    col: e.col,
+    ty: e.ty,
+    mode: e.mode,
+    site: e.site
+  }
 }
 
 fn txd_kind(ns: LocalNames, k: ExprKind, drops: [Stmt], steps: Bool) : ExprKind = match k {
   EIf(c, t, opt_e) -> EIf(c, txd_walk(ns, t, drops, steps), txd_walk_opt(ns, opt_e, drops, steps))
-  EMatch(s, arms)  -> EMatch(s, map(arms, (a) => txd_arm(ns, a, drops, steps)))
+  EMatch(s, arms) -> EMatch(s, map(arms, a => txd_arm(ns, a, drops, steps)))
   EBlock(stmts, opt_tail) -> match opt_tail {
-    Some(t) -> EBlock(stmts, Some(txd_walk(ns, t, txd_unshadowed(drops, ppd_let_names(stmts)), steps)))
-    None    -> k
+    Some(t) ->
+      EBlock(stmts, Some(txd_walk(ns, t, txd_unshadowed(drops, ppd_let_names(stmts)), steps)))
+    None -> k
   }
   ECall(f, xs) -> match f.kind {
-    EMark(MkTrmcStep(s))  -> if steps { ECall(f, txd_step_args(ns, xs, s.hole, drops)) } else { k }
-    EMark(MkTcrecStep(_)) -> if steps { txd_goto(ns, f, xs, filter(drops, (d) => not txd_passed(d, xs))) } else { k }
-    EMark(MkTrmcApply) -> ECall(f, map(xs, (leaf) => txd_apply_leaf(leaf, drops)))
-    _                  -> k
+    EMark(MkTrmcStep(s)) -> if steps { ECall(f, txd_step_args(ns, xs, s.hole, drops)) } else { k }
+    EMark(MkTcrecStep(_)) ->
+      if steps { txd_goto(ns, f, xs, filter(drops, d => not txd_passed(d, xs))) } else { k }
+    EMark(MkTrmcApply) -> ECall(f, map(xs, leaf => txd_apply_leaf(leaf, drops)))
+    _ -> k
   }
   _ -> k
 }
@@ -88,42 +98,65 @@ fn txd_kind(ns: LocalNames, k: ExprKind, drops: [Stmt], steps: Bool) : ExprKind 
 fn txd_apply_leaf(leaf: Expr, drops: [Stmt]) : Expr = match leaf.kind {
   ECall(f, _) -> match f.kind {
     EMark(m) -> if mark_is_reuse(m) { leaf } else { ppd_bind_then(leaf, drops) }
-    _        -> ppd_bind_then(leaf, drops)
+    _ -> ppd_bind_then(leaf, drops)
   }
   _ -> ppd_bind_then(leaf, drops)
 }
 
-fn txd_walk_opt(ns: LocalNames, opt_e: Option[Expr], drops: [Stmt], steps: Bool) : Option[Expr] = match opt_e {
-  Some(e) -> Some(txd_walk(ns, e, drops, steps))
-  None    -> None
-}
+fn txd_walk_opt(ns: LocalNames, opt_e: Option[Expr], drops: [Stmt], steps: Bool) : Option[Expr] =
+  match opt_e {
+    Some(e) -> Some(txd_walk(ns, e, drops, steps))
+    None -> None
+  }
 
 fn txd_arm(ns: LocalNames, a: Arm, drops: [Stmt], steps: Bool) : Arm = match a {
-  Arm(pat, g, body) -> Arm(pat, g, txd_walk(ns, body, txd_unshadowed(drops, prc_pat_bindings(pat, [])), steps))
+  Arm(pat, g, body) ->
+    Arm(pat, g, txd_walk(ns, body, txd_unshadowed(drops, prc_pat_bindings(pat, [])), steps))
 }
 
 # A drop whose binder a nested scope rebinds would release the inner value.
 fn txd_unshadowed(drops: [Stmt], names: [Binder]) : [Stmt] =
-  filter(drops, (d) => not ppd_drop_among(d, names))
+  filter(drops, d => not ppd_drop_among(d, names))
 
-fn txd_step_args(ns: LocalNames, xs: [Expr], hole: Int, drops: [Stmt]) : [Expr] = match txd_nth(xs, hole) {
+fn txd_step_args(ns: LocalNames, xs: [Expr], hole: Int, drops: [Stmt]) : [Expr] = match txd_nth(
+  xs,
+  hole
+) {
   Some(se) -> match se.kind {
-    ECall(sf, sa) -> txd_plant_step(ns, xs, hole, se, sf, sa, filter(drops, (d) => not txd_passed(d, sa)))
-    _             -> xs
+    ECall(sf, sa) ->
+      txd_plant_step(ns, xs, hole, se, sf, sa, filter(drops, d => not txd_passed(d, sa)))
+    _ -> xs
   }
   None -> xs
 }
 
 # Operands in evaluation order: the ctor heads, then the self-call's args.
-fn txd_plant_step(ns: LocalNames, xs: [Expr], hole: Int, se: Expr, sf: Expr, sa: [Expr], kept: [Stmt]) : [Expr] = {
+fn txd_plant_step(
+  ns: LocalNames,
+  xs: [Expr],
+  hole: Int,
+  se: Expr,
+  sf: Expr,
+  sa: [Expr],
+  kept: [Stmt]
+) : [Expr] {
   let heads = txd_without(xs, hole, 0)
-  let j = txd_pick(ns, list_append(heads, sa), map(kept, (d) => txd_drop_binder(d)))
+  let j = txd_pick(ns, list_append(heads, sa), map(kept, d => txd_drop_binder(d)))
   let nh = list_length(heads)
   let wrap = (a: Expr) => ppd_bind_then(a, kept)
-  if j < 0 or list_length(kept) == 0 { xs }
-  else if j < nh { txd_map_nth(xs, if j < hole { j } else { j + 1 }, wrap) }
-  else {
-    let se2 = Expr { kind: ECall(sf, txd_map_nth(sa, j - nh, wrap)), line: se.line, col: se.col, ty: se.ty, mode: se.mode,  site: se.site }
+  if j < 0 or list_length(kept) == 0 {
+    xs
+  } else if j < nh {
+    txd_map_nth(xs, if j < hole { j } else { j + 1 }, wrap)
+  } else {
+    let se2 = Expr {
+      kind: ECall(sf, txd_map_nth(sa, j - nh, wrap)),
+      line: se.line,
+      col: se.col,
+      ty: se.ty,
+      mode: se.mode,
+      site: se.site
+    }
     txd_map_nth(xs, hole, (_a: Expr) => se2)
   }
 }
@@ -132,73 +165,100 @@ fn txd_plant_step(ns: LocalNames, xs: [Expr], hole: Int, se: Expr, sf: Expr, sa:
 # among its args like a step's; with no args they run before the jump.
 fn txd_goto(ns: LocalNames, f: Expr, xs: [Expr], kept: [Stmt]) : ExprKind = match kept {
   [] -> ECall(f, xs)
-  _  -> match xs {
-    [] -> EBlock(kept, Some(Expr { kind: ECall(f, xs), line: f.line, col: f.col, ty: f.ty, mode: f.mode,  site: f.site }))
-    _  -> ECall(f, txd_map_nth(xs, txd_pick(ns, xs, map(kept, txd_drop_binder)), (a: Expr) => ppd_bind_then(a, kept)))
+  _ -> match xs {
+    [] -> EBlock(
+      kept,
+      Some(Expr {
+        kind: ECall(f, xs),
+        line: f.line,
+        col: f.col,
+        ty: f.ty,
+        mode: f.mode,
+        site: f.site
+      })
+    )
+    _ -> ECall(
+      f,
+      txd_map_nth(
+        xs,
+        txd_pick(ns, xs, map(kept, txd_drop_binder)),
+        (a: Expr) => ppd_bind_then(a, kept)
+      )
+    )
   }
 }
 
 fn txd_drop_binder(d: Stmt) : LocalId = match ppd_drop_name(d) {
   Some(l) -> l
-  None    -> local_none()
+  None -> local_none()
 }
 
 # The rightmost boxed operand at or after the last read of any `names`, else
 # the operand holding that read. A span reads a binder by its name.
-fn txd_pick(ns: LocalNames, ops: [Expr], names: [LocalId]) : Int = {
+fn txd_pick(ns: LocalNames, ops: [Expr], names: [LocalId]) : Int {
   let from = txd_last_read(ns, ops, names, 0, 0)
   let j = txd_rightmost_boxed(ops, from, 0, 0 - 1)
   if j < 0 { from } else { j }
 }
 
-fn txd_last_read(ns: LocalNames, ops: [Expr], names: [LocalId], i: Int, acc: Int) : Int = match ops {
-  []           -> acc
-  [a, ...rest] -> txd_last_read(ns, rest, names, i + 1, if any(names, (n) => pcs_mentions(Binder { id: n, name: ln_text(ns, n) }, a)) { i } else { acc })
-}
+fn txd_last_read(ns: LocalNames, ops: [Expr], names: [LocalId], i: Int, acc: Int) : Int =
+  match ops {
+    [] -> acc
+    [a, ...rest] -> txd_last_read(ns, rest, names, i + 1, if any(
+      names,
+      n => pcs_mentions(Binder { id: n, name: ln_text(ns, n) }, a)
+    ) {
+      i
+    } else {
+      acc
+    })
+  }
 
 fn txd_rightmost_boxed(ops: [Expr], from: Int, i: Int, acc: Int) : Int = match ops {
-  []           -> acc
-  [a, ...rest] -> txd_rightmost_boxed(rest, from, i + 1, if i >= from and txd_boxed(a) { i } else { acc })
+  [] -> acc
+  [a, ...rest] ->
+    txd_rightmost_boxed(rest, from, i + 1, if i >= from and txd_boxed(a) { i } else { acc })
 }
 
 fn txd_boxed(a: Expr) : Bool = match a.mode {
   MUnboxed -> false
-  _        -> match a.ty {
+  _ -> match a.ty {
     Some(t) -> not ty_is_unboxable_t(t)
-    None    -> false
+    None -> false
   }
 }
 
 fn txd_nth(xs: [Expr], i: Int) : Option[Expr] = match xs {
-  []           -> None
+  [] -> None
   [a, ...rest] -> if i == 0 { Some(a) } else { txd_nth(rest, i - 1) }
 }
 
 fn txd_without(xs: [Expr], skip: Int, i: Int) : [Expr] = match xs {
-  []           -> []
-  [a, ...rest] -> if i == skip { txd_without(rest, skip, i + 1) } else { [a, ...txd_without(rest, skip, i + 1)] }
+  [] -> []
+  [a, ...rest] ->
+    if i == skip { txd_without(rest, skip, i + 1) } else { [a, ...txd_without(rest, skip, i + 1)] }
 }
 
 fn txd_map_nth(xs: [Expr], j: Int, f: (Expr) -> Expr) : [Expr] = match xs {
-  []           -> []
+  [] -> []
   [a, ...rest] -> if j == 0 { [f(a), ...rest] } else { [a, ...txd_map_nth(rest, j - 1, f)] }
 }
 
 fn txd_passed(d: Stmt, sa: [Expr]) : Bool = match ppd_drop_name(d) {
-  Some(l) -> any(sa, (x) => txd_is_ref_to(x, l))
-  None    -> true
+  Some(l) -> any(sa, x => txd_is_ref_to(x, l))
+  None -> true
 }
 
 fn txd_is_ref_to(x: Expr, l: LocalId) : Bool = match x.kind {
-  ELocal(v)   -> local_eq(v, l)
-  ECall(f, a) -> txd_is_wrapper(f) and any(a, (y) => txd_is_ref_to(y, l))
-  _           -> false
+  ELocal(v) -> local_eq(v, l)
+  ECall(f, a) -> txd_is_wrapper(f) and any(a, y => txd_is_ref_to(y, l))
+  _ -> false
 }
 
 # The RC marks pass the operand through. A dup hands the callee its own
 # reference, so the binder's still needs the drop.
 fn txd_is_wrapper(f: Expr) : Bool = match f.kind {
   EMark(MkDup) -> false
-  EMark(m)     -> not mark_is_prim(m) and not mark_is_tail_step(m)
-  _            -> false
+  EMark(m) -> (not mark_is_prim(m)) and (not mark_is_tail_step(m))
+  _ -> false
 }

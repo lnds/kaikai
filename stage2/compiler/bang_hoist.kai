@@ -23,55 +23,76 @@ import compiler.util
 import compiler.expr_positions
 
 #[doc("Every function of `ds` with its `!` operands moved ahead of the expressions that hold them.")]
-pub fn bang_hoist_decls(ds: [Decl]) : [Decl] = map(ds, (d) => bh_decl(d))
+pub fn bang_hoist_decls(ds: [Decl]) : [Decl] = map(ds, d => bh_decl(d))
 
 fn bh_decl(d: Decl) : Decl = match d {
-  DFn(p, id, tp, ps, rt, row, body, l, c, nl, nc, mo) -> if bh_any_bang(body) { DFn(p, id, tp, ps, rt, row, bh_expr(body), l, c, nl, nc, mo) } else { d }
+  DFn(p, id, tp, ps, rt, row, body, l, c, nl, nc, mo) ->
+    if bh_any_bang(body) { DFn(p, id, tp, ps, rt, row, bh_expr(body), l, c, nl, nc, mo) } else { d }
   _ -> d
 }
 
-fn bh_expr(e: Expr) : Expr = {
-  let e1 = Expr { kind: prc_map_expr_kind(e.kind, (x) => bh_expr(x)), line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site }
+fn bh_expr(e: Expr) : Expr {
+  let e1 = Expr {
+    kind: prc_map_expr_kind(e.kind, x => bh_expr(x)),
+    line: e.line,
+    col: e.col,
+    ty: e.ty,
+    mode: e.mode,
+    site: e.site
+  }
   match e1.kind {
-    ECall(f, xs)     -> bh_call(e1, f, xs)
-    EBinop(op, a, b) -> if binop_is_logical(op) { e1 } else { bh_pair(e1, a, b, (x, y) => EBinop(op, x, y)) }
-    EIndex(a, b)     -> bh_pair(e1, a, b, (x, y) => EIndex(x, y))
-    EList(els)       -> if all(els, (el) => bh_plain(el)) { bh_list(e1, map(els, (el) => bh_elem(el))) } else { e1 }
-    _                -> e1
+    ECall(f, xs) -> bh_call(e1, f, xs)
+    EBinop(op, a, b) ->
+      if binop_is_logical(op) { e1 } else { bh_pair(e1, a, b, (x, y) => EBinop(op, x, y)) }
+    EIndex(a, b) -> bh_pair(e1, a, b, (x, y) => EIndex(x, y))
+    EList(els) ->
+      if all(els, el => bh_plain(el)) { bh_list(e1, map(els, el => bh_elem(el))) } else { e1 }
+    _ -> e1
   }
 }
 
 fn bh_call(e: Expr, f: Expr, xs: [Expr]) : Expr = match f.kind {
   EMark(MkCoalesce) -> e
   _ -> match bh_split(xs, bh_last_bang(xs, 0, -1), 0) {
-    BhSplit([], _)     -> e
-    BhSplit(lets, ys)  -> bh_block(e, lets, ECall(f, ys))
+    BhSplit([], _) -> e
+    BhSplit(lets, ys) -> bh_block(e, lets, ECall(f, ys))
   }
 }
 
-fn bh_pair(e: Expr, a: Expr, b: Expr, mk: (Expr, Expr) -> ExprKind) : Expr = match bh_split([a, b], bh_last_bang([a, b], 0, -1), 0) {
-  BhSplit([], _)          -> e
+fn bh_pair(e: Expr, a: Expr, b: Expr, mk: (Expr, Expr) -> ExprKind) : Expr = match bh_split(
+  [a, b],
+  bh_last_bang([a, b], 0, -1),
+  0
+) {
+  BhSplit([], _) -> e
   BhSplit(lets, [a1, b1]) -> bh_block(e, lets, mk(a1, b1))
-  BhSplit(_, _)           -> e
+  BhSplit(_, _) -> e
 }
 
 fn bh_list(e: Expr, xs: [Expr]) : Expr = match bh_split(xs, bh_last_bang(xs, 0, -1), 0) {
-  BhSplit([], _)    -> e
-  BhSplit(lets, ys) -> bh_block(e, lets, EList(map(ys, (y) => ElPlain(y))))
+  BhSplit([], _) -> e
+  BhSplit(lets, ys) -> bh_block(e, lets, EList(map(ys, y => ElPlain(y))))
 }
 
 fn bh_plain(el: ListElem) : Bool = match el {
-  ElPlain(_)  -> true
+  ElPlain(_) -> true
   ElSpread(_) -> false
 }
 
 fn bh_elem(el: ListElem) : Expr = match el {
-  ElPlain(x)  -> x
+  ElPlain(x) -> x
   ElSpread(x) -> x
 }
 
 fn bh_block(e: Expr, lets: [Stmt], k: ExprKind) : Expr =
-  mk_expr(EBlock(lets, Some(Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode,  site: e.site })), e.line, e.col)
+  mk_expr(
+    EBlock(
+      lets,
+      Some(Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode, site: e.site })
+    ),
+    e.line,
+    e.col
+  )
 
 # The bound operands and the operand list reading them back.
 type BhSplit = BhSplit([Stmt], [Expr])
@@ -82,10 +103,14 @@ fn bh_split(xs: [Expr], last: Int, i: Int) : BhSplit = match xs {
   [] -> BhSplit([], [])
   [x, ...rest] -> match bh_split(rest, last, i + 1) {
     BhSplit(lets, ys) ->
-      if i > last or bh_inert(x) { BhSplit(lets, [x, ...ys]) }
-      else {
+      if i > last or bh_inert(x) {
+        BhSplit(lets, [x, ...ys])
+      } else {
         let nm = concat_all(["__bh_", int_to_string(x.line), "_", int_to_string(x.col)])
-        BhSplit([SLet(mk_pat(PBind(binder_minted(nm)), x.line, x.col), None, x), ...lets], [mk_name(nm, x.line, x.col), ...ys])
+        BhSplit([SLet(mk_pat(PBind(binder_minted(nm)), x.line, x.col), None, x), ...lets], [
+          mk_name(nm, x.line, x.col),
+          ...ys
+        ])
       }
   }
 }
@@ -96,13 +121,13 @@ fn bh_last_bang(xs: [Expr], i: Int, acc: Int) : Int = match xs {
 }
 
 fn bh_inert(x: Expr) : Bool = match x.kind {
-  EName(_)     -> true
-  EInt(_, _)  -> true
+  EName(_) -> true
+  EInt(_, _) -> true
   EReal(_, _) -> true
-  EBool(_)    -> true
-  EChar(_)    -> true
-  EUnit       -> true
-  _           -> false
+  EBool(_) -> true
+  EChar(_) -> true
+  EUnit -> true
+  _ -> false
 }
 
 # Any `!` at all, lambda bodies included: a body without one is left as it is.

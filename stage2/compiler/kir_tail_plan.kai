@@ -17,7 +17,7 @@ import compiler.kir_tail_report
 import compiler.tail_report
 
 #[doc("`kp` with every call whose result reaches the return shaped as a tail call. A recursive call of a function homed in `target` that cannot be shaped is reported on stderr.")]
-pub(pkg) fn kir_tail_program(kp: KProgram, target: String) : KProgram / Console = {
+pub(pkg) fn kir_tail_program(kp: KProgram, target: String) : KProgram / Console {
   let nm = kp_names(kp)
   let rows = ksym_fns(nm, kp.fns)
   let ix = kt_index(rows, idx_empty())
@@ -25,8 +25,14 @@ pub(pkg) fn kir_tail_program(kp: KProgram, target: String) : KProgram / Console 
   let plan = kt_plan(rows, plain, ix, nm)
   let ixp = kt_index_bodies(plan, ix)
   let done = kt_final_all(rows, plain, ixp, plan, [])
-  let shaped = KProgram { ...kp, fns: list_append(map(done, (r) => kb_retarget(r.f, plan)), map(flat_map(done, kt_posts), (f) => kb_retarget(f, plan))) }
-  kt_report(shaped, nm, filter(flat_map(done, kt_misses), (m) => kt_homed(m, target)))
+  let shaped = KProgram {
+    ...kp,
+    fns: list_append(
+      map(done, r => kb_retarget(r.f, plan)),
+      map(flat_map(done, kt_posts), f => kb_retarget(f, plan))
+    )
+  }
+  kt_report(shaped, nm, filter(flat_map(done, kt_misses), m => kt_homed(m, target)))
   shaped
 }
 
@@ -37,32 +43,40 @@ fn kt_posts(r: KtFnRes) : [KFn] = r.posts
 # --- the functions that have a body ------------------------------------
 
 # A lambda is shaped once the functions that have a body are known.
-fn kt_plain_all(fns: [KFn], ix: NameIndex[KSymFn]) : [KtFnRes] = map(fns, (f) => match f.kind {
-  KFnLambda -> KtFnRes { f: f, misses: [], hit: false, posts: [] }
-  _         -> kt_fn(f, ix, kb_none())
-})
+fn kt_plain_all(fns: [KFn], ix: NameIndex[KSymFn]) : [KtFnRes] = map(
+  fns,
+  f => match f.kind {
+    KFnLambda -> KtFnRes { f: f, misses: [], hit: false, posts: [] }
+    _ -> kt_fn(f, ix, kb_none())
+  }
+)
 
 # A declared function whose result can be boxed has a body when a call in it becomes a bounce.
-fn kt_can_body(f: KFn) : Bool = kir_is_tail_fn(f) and not kt_in_region(f.region_id) and kb_boxable(f.ret) and kt_declared(f)
+fn kt_can_body(f: KFn) : Bool =
+  kir_is_tail_fn(f) and (not kt_in_region(f.region_id)) and kb_boxable(f.ret) and kt_declared(f)
 
 fn kt_declared(f: KFn) : Bool = match f.unit {
   EuFn(_) -> true
-  _       -> false
+  _ -> false
 }
 
 fn kt_is_closure_miss(m: KtMiss) : Bool = match m {
   KtMiss(_, _, _, w) -> match w {
     TwClosure -> true
-    _         -> false
+    _ -> false
   }
 }
 
 # The functions that have a call through a closure in tail position.
 fn kt_seeds(rows: [KSymFn], plain: [KtFnRes]) : [KSymFn] = match rows {
-  []           -> []
+  [] -> []
   [w, ...rest] -> match plain {
-    []              -> []
-    [r, ...prest]   -> if kt_can_body(w.f) and any(r.misses, kt_is_closure_miss) { [w, ...kt_seeds(rest, prest)] } else { kt_seeds(rest, prest) }
+    [] -> []
+    [r, ...prest] -> if kt_can_body(w.f) and any(r.misses, kt_is_closure_miss) {
+      [w, ...kt_seeds(rest, prest)]
+    } else {
+      kt_seeds(rest, prest)
+    }
   }
 }
 
@@ -72,88 +86,114 @@ type KtGrow = { plan: KbPlan, ix: NameIndex[KSymFn], work: [String] }
 # A call of `callee` in a function that can have a body.
 type KtEdge = { callee: String, caller: KSymFn }
 
-fn kt_plan(rows: [KSymFn], plain: [KtFnRes], ix: NameIndex[KSymFn], nm: KNames) : KbPlan = match kt_seeds(rows, plain) {
-  [] -> kb_none()
-  seeds -> {
-    let callers = kt_callers(filter(rows, kt_row_can_body), idx_empty())
-    kt_grow(kt_admit_all(KtGrow { plan: kb_named(kb_none(), nm), ix: ix, work: [] }, seeds, nm), callers, nm).plan
+fn kt_plan(rows: [KSymFn], plain: [KtFnRes], ix: NameIndex[KSymFn], nm: KNames) : KbPlan =
+  match kt_seeds(rows, plain) {
+    [] -> kb_none()
+    seeds -> {
+      let callers = kt_callers(filter(rows, kt_row_can_body), idx_empty())
+      kt_grow(
+        kt_admit_all(KtGrow { plan: kb_named(kb_none(), nm), ix: ix, work: [] }, seeds, nm),
+        callers,
+        nm
+      ).plan
+    }
   }
-}
 
 fn kt_callers(rows: [KSymFn], ix: NameIndex[KtEdge]) : NameIndex[KtEdge] = match rows {
-  []           -> ix
+  [] -> ix
   [r, ...rest] -> kt_callers(rest, kt_callers_stmts(r, flat_map(r.f.blocks, kt_block_stmts), ix))
 }
 
 fn kt_block_stmts(b: KBlock) : [KStmt] = b.stmts
 
-fn kt_callers_stmts(r: KSymFn, stmts: [KStmt], ix: NameIndex[KtEdge]) : NameIndex[KtEdge] = match stmts {
-  []           -> ix
-  [s, ...rest] -> match s {
-    KLet(_, _, KCall(sym, _), _) -> kt_callers_stmts(r, rest, idx_prepend(ix, sym, KtEdge { callee: sym, caller: r }))
-    _                            -> kt_callers_stmts(r, rest, ix)
+fn kt_callers_stmts(r: KSymFn, stmts: [KStmt], ix: NameIndex[KtEdge]) : NameIndex[KtEdge] =
+  match stmts {
+    [] -> ix
+    [s, ...rest] -> match s {
+      KLet(_, _, KCall(sym, _), _) ->
+        kt_callers_stmts(r, rest, idx_prepend(ix, sym, KtEdge { callee: sym, caller: r }))
+      _ -> kt_callers_stmts(r, rest, ix)
+    }
   }
-}
 
 fn kt_row_can_body(r: KSymFn) : Bool = kt_can_body(r.f)
 
 fn kt_admit_all(st: KtGrow, rows: [KSymFn], nm: KNames) : KtGrow = match rows {
-  []           -> st
+  [] -> st
   [g, ...rest] -> kt_admit_all(kt_admit(st, g, nm), rest, nm)
 }
 
 # `g` has a body when a call in it becomes a bounce under the plan so far.
-fn kt_admit(st: KtGrow, g: KSymFn, nm: KNames) : KtGrow = {
+fn kt_admit(st: KtGrow, g: KSymFn, nm: KNames) : KtGrow {
   let stub = g.sym
-  if kb_has(st.plan, stub) { st } else {
+  if kb_has(st.plan, stub) {
+    st
+  } else {
     let shell = kb_body_shell(g.f)
-    if (kt_fn(shell, st.ix, st.plan)).hit {
+    if kt_fn(shell, st.ix, st.plan).hit {
       let body = kfn_sym(nm, shell)
-      KtGrow { plan: kb_with(st.plan, stub, body), ix: idx_prepend(st.ix, body, KSymFn { sym: body, f: shell }), work: [stub, ...st.work] }
-    } else { st }
+      KtGrow {
+        plan: kb_with(st.plan, stub, body),
+        ix: idx_prepend(st.ix, body, KSymFn { sym: body, f: shell }),
+        work: [stub, ...st.work]
+      }
+    } else {
+      st
+    }
   }
 }
 
 fn kt_grow(st: KtGrow, callers: NameIndex[KtEdge], nm: KNames) : KtGrow = match st.work {
-  []           -> st
-  [s, ...rest] -> kt_grow(kt_admit_rows(KtGrow { ...st, work: rest }, kt_callers_of(callers, s), nm), callers, nm)
+  [] -> st
+  [s, ...rest] ->
+    kt_grow(kt_admit_rows(KtGrow { ...st, work: rest }, kt_callers_of(callers, s), nm), callers, nm)
 }
 
 fn kt_callers_of(callers: NameIndex[KtEdge], sym: String) : [KSymFn] =
-  flat_map(idx_chain(callers, sym), (e) => if e.callee == sym { [e.caller] } else { [] })
+  flat_map(idx_chain(callers, sym), e => if e.callee == sym { [e.caller] } else { [] })
 
 fn kt_admit_rows(st: KtGrow, rows: [KSymFn], nm: KNames) : KtGrow = match rows {
-  []           -> st
+  [] -> st
   [r, ...rest] -> kt_admit_rows(kt_admit(st, r, nm), rest, nm)
 }
 
-fn kt_index_bodies(plan: KbPlan, ix: NameIndex[KSymFn]) : NameIndex[KSymFn] = kt_index(flat_map(plan.members, (m) => kt_body_row(m, ix)), ix)
+fn kt_index_bodies(plan: KbPlan, ix: NameIndex[KSymFn]) : NameIndex[KSymFn] =
+  kt_index(flat_map(plan.members, m => kt_body_row(m, ix)), ix)
 
 fn kt_body_row(m: KbMember, ix: NameIndex[KSymFn]) : [KSymFn] = match kt_callee(ix, m.stub) {
   Some(f) -> [KSymFn { sym: m.body, f: kb_body_shell(f) }]
-  None    -> []
+  None -> []
 }
 
-fn kt_final_all(rows: [KSymFn], plain: [KtFnRes], ix: NameIndex[KSymFn], plan: KbPlan, acc: [KtFnRes]) : [KtFnRes] = match rows {
-  []           -> list_reverse(acc)
+fn kt_final_all(
+  rows: [KSymFn],
+  plain: [KtFnRes],
+  ix: NameIndex[KSymFn],
+  plan: KbPlan,
+  acc: [KtFnRes]
+) : [KtFnRes] = match rows {
+  [] -> list_reverse(acc)
   [w, ...rest] -> match plain {
-    []            -> list_reverse(acc)
-    [r, ...prest] -> kt_final_all(rest, prest, ix, plan, list_append(list_reverse(kt_final(w, r, ix, plan)), acc))
+    [] -> list_reverse(acc)
+    [r, ...prest] ->
+      kt_final_all(rest, prest, ix, plan, list_append(list_reverse(kt_final(w, r, ix, plan)), acc))
   }
 }
 
-fn kt_final(w: KSymFn, r: KtFnRes, ix: NameIndex[KSymFn], plan: KbPlan) : [KtFnRes] = match w.f.kind {
-  KFnLambda -> [kt_unreported(kt_fn(w.f, ix, plan))]
-  _ -> match kb_body_of(plan, w.sym) {
-    Some(body) -> {
-      let b = kt_fn(kb_body_shell(w.f), ix, plan)
-      [KtFnRes { f: kb_stub(w.f, body), misses: [], hit: false, posts: [] },
-       KtFnRes { ...b, f: kfn_with_blocks(b.f, kb_box_rets(w.f.ret, b.f.blocks)) }]
+fn kt_final(w: KSymFn, r: KtFnRes, ix: NameIndex[KSymFn], plan: KbPlan) : [KtFnRes] =
+  match w.f.kind {
+    KFnLambda -> [kt_unreported(kt_fn(w.f, ix, plan))]
+    _ -> match kb_body_of(plan, w.sym) {
+      Some(body) -> {
+        let b = kt_fn(kb_body_shell(w.f), ix, plan)
+        [
+          KtFnRes { f: kb_stub(w.f, body), misses: [], hit: false, posts: [] },
+          KtFnRes { ...b, f: kfn_with_blocks(b.f, kb_box_rets(w.f.ret, b.f.blocks)) }
+        ]
+      }
+      None -> [r]
     }
-    None -> [r]
   }
-}
 
 # A lambda reports nothing: it is not a function the program names.
 fn kt_unreported(r: KtFnRes) : KtFnRes = KtFnRes { f: r.f, misses: [], hit: r.hit, posts: r.posts }
-

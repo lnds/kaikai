@@ -30,10 +30,14 @@ import compiler.scalar_ty
 fn dim_base_head(ps: PScope, home: Option[String], base: TypeExpr) : SymId = match base.tkind {
   TyName(r, _) -> {
     let s = ps_type_sym(ps, r, home)
-    if sym_raw(s) >= 0 { s } else { match r {
-      DrWritten(None, n) -> core_type_sym_or_none(written_text(n))
-      _                  -> s
-    } }
+    if sym_raw(s) >= 0 {
+      s
+    } else {
+      match r {
+        DrWritten(None, n) -> core_type_sym_or_none(written_text(n))
+        _ -> s
+      }
+    }
   }
   TyRefine(inner, _, _) -> dim_base_head(ps, home, inner)
   _ -> sym_none()
@@ -44,40 +48,66 @@ pub(pkg) type UAliasTy = UAT(SymId, TypeExpr)
 
 fn alias_of(aliases: [UAliasTy], s: SymId) : Option[UAliasTy] = match aliases {
   [] -> None
-  [UAT(al, b), ...rest] -> if sym_raw(al) == sym_raw(s) { Some(UAT(al, b)) } else { alias_of(rest, s) }
+  [UAT(al, b), ...rest] ->
+    if sym_raw(al) == sym_raw(s) { Some(UAT(al, b)) } else { alias_of(rest, s) }
 }
 
 # The scalar a base names, following declared aliases to their bodies. An alias whose body is a
 # type parameter (`Money[t] = t`) names no scalar: its carrier is a habitant slot of the alias.
-fn dim_base_scalar(ps: PScope, home: Option[String], aliases: [UAliasTy], base: TypeExpr, fuel: Int) : Option[Ty] =
-  if fuel <= 0 { None } else { match base.tkind {
-    TyName(r, _) -> {
-      let s = ps_type_sym(ps, r, home)
-      if sym_raw(s) >= 0 { match alias_of(aliases, s) {
-        Some(UAT(_, ab)) -> dim_base_scalar(ps, home, aliases, ab, fuel - 1)
-        None    -> None
-      } } else { match r {
-        DrWritten(None, n) -> scalar_ty_named(written_text(n))
-        _                  -> None
-      } }
+fn dim_base_scalar(
+  ps: PScope,
+  home: Option[String],
+  aliases: [UAliasTy],
+  base: TypeExpr,
+  fuel: Int
+) : Option[Ty] =
+  if fuel <= 0 {
+    None
+  } else {
+    match base.tkind {
+      TyName(r, _) -> {
+        let s = ps_type_sym(ps, r, home)
+        if sym_raw(s) >= 0 {
+          match alias_of(aliases, s) {
+            Some(UAT(_, ab)) -> dim_base_scalar(ps, home, aliases, ab, fuel - 1)
+            None -> None
+          }
+        } else {
+          match r {
+            DrWritten(None, n) -> scalar_ty_named(written_text(n))
+            _ -> None
+          }
+        }
+      }
+      TyRefine(inner, _, _) -> dim_base_scalar(ps, home, aliases, inner, fuel)
+      _ -> None
     }
-    TyRefine(inner, _, _) -> dim_base_scalar(ps, home, aliases, inner, fuel)
-    _ -> None
-  } }
+  }
 
 #[doc("infer: reject a unit annotation on a non-numeric scalar base (`String<m>`, `Bool<m>`), through aliases.")]
-pub(pkg) fn validate_numeric_head(ps: PScope, home: Option[String], aliases: [UAliasTy], base: TypeExpr, file: String,
-                             line: Int, col: Int) : [Diagnostic] = match dim_base_scalar(ps, home, aliases, base, 16) {
+pub(pkg) fn validate_numeric_head(
+  ps: PScope,
+  home: Option[String],
+  aliases: [UAliasTy],
+  base: TypeExpr,
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] = match dim_base_scalar(ps, home, aliases, base, 16) {
   Some(TyString) -> numeric_head_err("String", file, line, col)
-  Some(TyBool)   -> numeric_head_err("Bool", file, line, col)
-  Some(TyChar)   -> numeric_head_err("Char", file, line, col)
-  Some(TyUnit)   -> numeric_head_err("Unit", file, line, col)
+  Some(TyBool) -> numeric_head_err("Bool", file, line, col)
+  Some(TyChar) -> numeric_head_err("Char", file, line, col)
+  Some(TyUnit) -> numeric_head_err("Unit", file, line, col)
   _ -> []
 }
 
 fn numeric_head_err(head: String, file: String, line: Int, col: Int) : [Diagnostic] =
-  unit_err(file, line, col,
-    concat_all(["unit annotations apply only to Int, Real and Decimal, not `", head, "`"]))
+  unit_err(
+    file,
+    line,
+    col,
+    concat_all(["unit annotations apply only to Int, Real and Decimal, not `", head, "`"])
+  )
 
 # The base as a diagnostic spells it.
 fn dim_base_text(tab: SymTab, base: TypeExpr) : String = match base.tkind {
@@ -103,11 +133,14 @@ fn dim_habitant_components(u: UnitExprT) : [UnitExprT] = match u {
 # habitant and yields empty.
 fn dim_habitant_kind(u: UnitExprT, scope: UnitScope) : String = match u {
   USym(s) ->
-    if kind_sym_is_qualified(s) { kind_sym_kind(s) }
-    else { match scope_resolve_sym(scope, s) {
-      SRok(q) -> if kind_sym_is_qualified(q) { kind_sym_kind(q) } else { measure_kind_name() }
-      _ -> ""
-    } }
+    if kind_sym_is_qualified(s) {
+      kind_sym_kind(s)
+    } else {
+      match scope_resolve_sym(scope, s) {
+        SRok(q) -> if kind_sym_is_qualified(q) { kind_sym_kind(q) } else { measure_kind_name() }
+        _ -> ""
+      }
+    }
   _ -> ""
 }
 
@@ -122,8 +155,16 @@ fn unit_err(file: String, line: Int, col: Int, msg: String) : [Diagnostic] =
 # declares no slots, so its annotation is a free brand and this check
 # is a no-op.
 #[doc("infer: check a dimensioned type's unit argument fills its slots with the declared kinds; the base's head is read from the file homed at `home` (`None` = root file).")]
-pub(pkg) fn validate_habitant_slots(ps: PScope, home: Option[String], base: TypeExpr, u: UnitExprT, scope: UnitScope,
-                           file: String, line: Int, col: Int) : [Diagnostic] {
+pub(pkg) fn validate_habitant_slots(
+  ps: PScope,
+  home: Option[String],
+  base: TypeExpr,
+  u: UnitExprT,
+  scope: UnitScope,
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] {
   let head = dim_base_text(ps_tab(ps), base)
   match scope_habitant_slots_of(scope, dim_base_head(ps, home, base)) {
     None -> []
@@ -132,10 +173,20 @@ pub(pkg) fn validate_habitant_slots(ps: PScope, home: Option[String], base: Type
       let nc = list_length(comps)
       let ns = list_length(slot_kinds)
       if not (nc == ns) {
-        unit_err(file, line, col,
-          concat_all(["`", head, "` declares ", int_to_string(ns),
-                      if ns == 1 { " habitant slot" } else { " habitant slots" },
-                      ", but the annotation has ", int_to_string(nc)]))
+        unit_err(
+          file,
+          line,
+          col,
+          concat_all([
+            "`",
+            head,
+            "` declares ",
+            int_to_string(ns),
+            if ns == 1 { " habitant slot" } else { " habitant slots" },
+            ", but the annotation has ",
+            int_to_string(nc)
+          ])
+        )
       } else {
         validate_slot_kinds(head, comps, slot_kinds, scope, file, line, col, 0)
       }
@@ -143,20 +194,41 @@ pub(pkg) fn validate_habitant_slots(ps: PScope, home: Option[String], base: Type
   }
 }
 
-fn validate_slot_kinds(tname: String, comps: [UnitExprT], slot_kinds: [String],
-                       scope: UnitScope, file: String, line: Int, col: Int,
-                       idx: Int) : [Diagnostic] = match comps {
+fn validate_slot_kinds(
+  tname: String,
+  comps: [UnitExprT],
+  slot_kinds: [String],
+  scope: UnitScope,
+  file: String,
+  line: Int,
+  col: Int,
+  idx: Int
+) : [Diagnostic] = match comps {
   [] -> []
   [comp, ...rest] -> match slot_kinds {
     [] -> []
     [want, ...rest_kinds] -> {
       let got = dim_habitant_kind(comp, scope)
-      let e = if got == "" or got == want { [] }
-        else {
-          unit_err(file, line, col,
-            concat_all(["habitant slot ", int_to_string(idx + 1), " of `", tname,
-                        "` expects a `", want, "` habitant, but got a `", got, "` one"]))
-        }
+      let e = if got == "" or got == want {
+        []
+      } else {
+        unit_err(
+          file,
+          line,
+          col,
+          concat_all([
+            "habitant slot ",
+            int_to_string(idx + 1),
+            " of `",
+            tname,
+            "` expects a `",
+            want,
+            "` habitant, but got a `",
+            got,
+            "` one"
+          ])
+        )
+      }
       e ++ validate_slot_kinds(tname, rest, rest_kinds, scope, file, line, col, idx + 1)
     }
   }
@@ -168,8 +240,13 @@ fn validate_slot_kinds(tname: String, comps: [UnitExprT], slot_kinds: [String],
 # `USD^1` collapses cleanly and `USD^2`, `USD*m`, `USD/EUR` are
 # rejected at the source position that wrote them.
 #[doc("infer: check a module unit is a bare symbol rather than a composite expression.")]
-pub(pkg) fn validate_module_unit_shape(u: UnitExprT, scope: UnitScope, file: String,
-                              line: Int, col: Int) : [Diagnostic] {
+pub(pkg) fn validate_module_unit_shape(
+  u: UnitExprT,
+  scope: UnitScope,
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] {
   match u {
     # Each position of a habitant list stands alone; the shape check
     # runs per component, never on their merged table.
@@ -178,27 +255,57 @@ pub(pkg) fn validate_module_unit_shape(u: UnitExprT, scope: UnitScope, file: Str
   }
 }
 
-fn validate_module_unit_shapes(us: [UnitExprT], scope: UnitScope, file: String,
-                               line: Int, col: Int) : [Diagnostic] = match us {
+fn validate_module_unit_shapes(
+  us: [UnitExprT],
+  scope: UnitScope,
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] = match us {
   [] -> []
-  [u, ...rest] -> validate_module_unit_shape(u, scope, file, line, col) ++
-                  validate_module_unit_shapes(rest, scope, file, line, col)
+  [u, ...rest] -> validate_module_unit_shape(u, scope, file, line, col)
+    ++ validate_module_unit_shapes(rest, scope, file, line, col)
 }
 
-fn validate_module_unit_shape_one(u: UnitExprT, scope: UnitScope, file: String,
-                                  line: Int, col: Int) : [Diagnostic] {
+fn validate_module_unit_shape_one(
+  u: UnitExprT,
+  scope: UnitScope,
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] {
   match scope_kind_theories(scope) {
     [] -> []
     kts -> match utable_atom_violation(unit_to_table(u), kts) {
       None -> []
       Some(sym) -> {
         let kind = kind_sym_kind(sym)
-        [mk_diag(SevError, file, line, col,
-          concat_all(["unit `", unit_text(unit_canon(u)),
-                      "` does not exist: `", kind,
-                      "` habitants have no products or powers"]),
-          [ri_note(file, line, col, concat_all(["`", kind,
-            "` habitants stand alone: a quantity is either scalar or carries exactly one habitant with exponent 1"]))])]
+        [
+          mk_diag(
+            SevError,
+            file,
+            line,
+            col,
+            concat_all([
+              "unit `",
+              unit_text(unit_canon(u)),
+              "` does not exist: `",
+              kind,
+              "` habitants have no products or powers"
+            ]),
+            [
+              ri_note(
+                file,
+                line,
+                col,
+                concat_all([
+                  "`", kind,
+                  "` habitants stand alone: a quantity is either scalar or carries exactly one habitant with exponent 1"
+                ])
+              )
+            ]
+          )
+        ]
       }
     }
   }
@@ -210,25 +317,51 @@ fn validate_module_unit_shape_one(u: UnitExprT, scope: UnitScope, file: String,
 # Tree-based on purpose: the canonical table cannot tell `read*write`
 # from `read + write`.
 #[doc("infer: check a semilattice unit matches the shape its theory admits.")]
-pub(pkg) fn validate_semilattice_unit_shape(u: UnitExprT, scope: UnitScope, file: String,
-                                   line: Int, col: Int) : [Diagnostic] {
+pub(pkg) fn validate_semilattice_unit_shape(
+  u: UnitExprT,
+  scope: UnitScope,
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] {
   match scope_kind_theories(scope) {
     [] -> []
     kts -> match sl_shape_violation(u, kts) {
       None -> []
       Some(SlvProduct(sym)) ->
-        unit_err(file, line, col,
-          concat_all(["`", kind_sym_bare(sym), "` is a `", kind_sym_kind(sym),
-                      "` habitant: it joins with `+` and admits no product,",
-                      " inverse, or power"]))
+        unit_err(
+          file,
+          line,
+          col,
+          concat_all([
+            "`",
+            kind_sym_bare(sym),
+            "` is a `",
+            kind_sym_kind(sym),
+            "` habitant: it joins with `+` and admits no product,",
+            " inverse, or power"
+          ])
+        )
       Some(SlvJoinLeaf(what)) ->
-        unit_err(file, line, col,
-          concat_all(["`+` joins habitants of a Semilattice kind, and `",
-                      what, "` is not one"]))
+        unit_err(
+          file,
+          line,
+          col,
+          concat_all([
+            "`+` joins habitants of a Semilattice kind, and `",
+            what, "` is not one"
+          ])
+        )
       Some(SlvJoinMix(k1, k2)) ->
-        unit_err(file, line, col,
-          concat_all(["habitants of `", k1, "` and `", k2,
-                      "` belong to different kinds and cannot join"]))
+        unit_err(
+          file,
+          line,
+          col,
+          concat_all([
+            "habitants of `", k1, "` and `", k2,
+            "` belong to different kinds and cannot join"
+          ])
+        )
     }
   }
 }
@@ -238,48 +371,104 @@ pub(pkg) fn validate_semilattice_unit_shape(u: UnitExprT, scope: UnitScope, file
 fn unit_sym_unknown(s: String, file: String, line: Int, col: Int) : [Diagnostic] =
   match unit_sym_value_domain(s) {
     None ->
-      unit_err(file, line, col,
-        concat_all(["unknown unit `", s, "`; declare it with `unit ", s,
-                    "` (atomic) or `unit ", s, " = <expr>` (alias) before use"]))
+      unit_err(
+        file,
+        line,
+        col,
+        concat_all([
+          "unknown unit `", s, "`; declare it with `unit ", s,
+          "` (atomic) or `unit ", s, " = <expr>` (alias) before use"
+        ])
+      )
     Some(d) -> {
       let dom = value_domain_name(d)
-      unit_err(file, line, col,
-        concat_all(["no kind in scope declares `", dom, "` value habitants — `<",
-                    s, ">` needs a `kind K : ... with ", dom, "` declaration"]))
+      unit_err(
+        file,
+        line,
+        col,
+        concat_all([
+          "no kind in scope declares `", dom, "` value habitants — `<",
+          s, ">` needs a `kind K : ... with ", dom, "` declaration"
+        ])
+      )
     }
   }
 
-fn unit_sym_ambig_kind(s: String, kinds: [String],
-                       file: String, line: Int, col: Int) : [Diagnostic] {
+fn unit_sym_ambig_kind(
+  s: String,
+  kinds: [String],
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] {
   let hint = match unit_sym_value_domain(s) {
-    None    -> concat_all(["qualify it (`<", ambig_first_kind(kinds), ".", s,
-                           ">`) or add `use kind ", ambig_first_kind(kinds), "`"])
+    None -> concat_all([
+      "qualify it (`<",
+      ambig_first_kind(kinds),
+      ".",
+      s,
+      ">`) or add `use kind ",
+      ambig_first_kind(kinds),
+      "`"
+    ])
     Some(_) -> concat_all(["add `use kind ", ambig_first_kind(kinds), "`"])
   }
-  unit_err(file, line, col,
-    concat_all(["unit `", s, "` is ambiguous — it is declared in ",
-                join_with(kinds, " and "), "; ", hint]))
+  unit_err(
+    file,
+    line,
+    col,
+    concat_all([
+      "unit `",
+      s,
+      "` is ambiguous — it is declared in ",
+      join_with(kinds, " and "),
+      "; ",
+      hint
+    ])
+  )
 }
 
-fn unit_sym_ambig_module(s: String, homes: [String],
-                         file: String, line: Int, col: Int) : [Diagnostic] =
-  unit_err(file, line, col,
-    concat_all(["unit `", s, "` is declared in more than one module (",
-                join_with(homes, ", "),
-                ") and none is this module's own — the bare name cannot",
-                " choose between them; declare a local `unit ", s,
-                "` (a module's own declaration wins) or rename one of",
-                " the colliding declarations"]))
+fn unit_sym_ambig_module(
+  s: String,
+  homes: [String],
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] =
+  unit_err(
+    file,
+    line,
+    col,
+    concat_all([
+      "unit `",
+      s,
+      "` is declared in more than one module (",
+      join_with(homes, ", "),
+      ") and none is this module's own — the bare name cannot",
+      " choose between them; declare a local `unit ",
+      s,
+      "` (a module's own declaration wins) or rename one of",
+      " the colliding declarations"
+    ])
+  )
 
-fn validate_unit_sym(s: String, scope: UnitScope,
-                     file: String, line: Int, col: Int) : [Diagnostic] =
-  if kind_sym_is_qualified(s) { validate_qualified_habitant(s, scope, file, line, col) }
-  else { match scope_resolve_sym(scope, s) {
-    SRok(_)           -> []
-    SRunknown         -> unit_sym_unknown(s, file, line, col)
-    SRambig(kinds)    -> unit_sym_ambig_kind(s, kinds, file, line, col)
-    SRambigMod(homes) -> unit_sym_ambig_module(s, homes, file, line, col)
-  } }
+fn validate_unit_sym(
+  s: String,
+  scope: UnitScope,
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] =
+  if kind_sym_is_qualified(s) {
+    validate_qualified_habitant(s, scope, file, line, col)
+  } else {
+    match scope_resolve_sym(scope, s) {
+      SRok(_) -> []
+      SRunknown -> unit_sym_unknown(s, file, line, col)
+      SRambig(kinds) -> unit_sym_ambig_kind(s, kinds, file, line, col)
+      SRambigMod(homes) -> unit_sym_ambig_module(s, homes, file, line, col)
+    }
+  }
 
 # Walk a UnitExprT and emit one diagnostic per unresolved habitant
 # symbol. After kind resolution a resolved symbol is qualified
@@ -287,27 +476,37 @@ fn validate_unit_sym(s: String, scope: UnitScope,
 # (undeclared) or several with no `use kind` (ambiguous). The scope
 # carries the kind context and the decl's local unit-kind tparams.
 #[doc("infer: check every symbol of a unit expression resolves in scope; returns its diagnostics.")]
-pub(pkg) fn validate_unit_expr(u: UnitExprT, scope: UnitScope,
-                         file: String, line: Int, col: Int) : [Diagnostic] = match u {
+pub(pkg) fn validate_unit_expr(
+  u: UnitExprT,
+  scope: UnitScope,
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] = match u {
   UOne -> []
   UVar(_) -> []
   UParam(_) -> []
   USym(s) -> validate_unit_sym(s, scope, file, line, col)
-  UMul(a, b) -> validate_unit_expr(a, scope, file, line, col) ++
-                validate_unit_expr(b, scope, file, line, col)
+  UMul(a, b) -> validate_unit_expr(a, scope, file, line, col)
+    ++ validate_unit_expr(b, scope, file, line, col)
   UInv(a) -> validate_unit_expr(a, scope, file, line, col)
   UPow(a, _) -> validate_unit_expr(a, scope, file, line, col)
-  UJoin(a, b) -> validate_unit_expr(a, scope, file, line, col) ++
-                 validate_unit_expr(b, scope, file, line, col)
+  UJoin(a, b) -> validate_unit_expr(a, scope, file, line, col)
+    ++ validate_unit_expr(b, scope, file, line, col)
   UDims(us) -> validate_unit_exprs(us, scope, file, line, col)
 }
 
 #[doc("infer: check a list of unit expressions; returns their diagnostics.")]
-fn validate_unit_exprs(us: [UnitExprT], scope: UnitScope,
-                       file: String, line: Int, col: Int) : [Diagnostic] = match us {
+fn validate_unit_exprs(
+  us: [UnitExprT],
+  scope: UnitScope,
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] = match us {
   [] -> []
-  [u, ...rest] -> validate_unit_expr(u, scope, file, line, col) ++
-                  validate_unit_exprs(rest, scope, file, line, col)
+  [u, ...rest] -> validate_unit_expr(u, scope, file, line, col)
+    ++ validate_unit_exprs(rest, scope, file, line, col)
 }
 
 # First candidate kind of an ambiguous symbol, for the "qualify as
@@ -322,43 +521,84 @@ fn ambig_first_kind(kinds: [String]) : String = match kinds {
 # habitant policy: a value-domain kind admits only values of its
 # domain; a closed-set kind admits only its fixed atoms. Every other
 # kind passes — the qualifier already pinned it.
-fn habitant_value_domain(bare: String, kind: String, dom: ValueDomain,
-                         file: String, line: Int, col: Int) : [Diagnostic] =
-  if sym_in_value_domain(bare, dom) { [] }
-  else {
-    unit_err(file, line, col,
-      concat_all(["`", bare, "` is not a habitant of `", kind, "` — its habitants",
-                  " are `", value_domain_name(dom), "` values written directly in `<>`",
-                  value_domain_example(dom)]))
+fn habitant_value_domain(
+  bare: String,
+  kind: String,
+  dom: ValueDomain,
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] =
+  if sym_in_value_domain(bare, dom) {
+    []
+  } else {
+    unit_err(
+      file,
+      line,
+      col,
+      concat_all([
+        "`",
+        bare,
+        "` is not a habitant of `",
+        kind,
+        "` — its habitants",
+        " are `",
+        value_domain_name(dom),
+        "` values written directly in `<>`",
+        value_domain_example(dom)
+      ])
+    )
   }
 
 fn sym_in_value_domain(bare: String, dom: ValueDomain) : Bool = match unit_sym_value_domain(bare) {
   Some(d) -> value_domain_eq(d, dom)
-  None    -> false
+  None -> false
 }
 
 fn value_domain_example(dom: ValueDomain) : String = match dom {
-  VdInt    -> " (e.g. `<3>`)"
+  VdInt -> " (e.g. `<3>`)"
   VdString -> " (e.g. `<\"tag\">`)"
 }
 
-fn habitant_closed_kind(bare: String, kind: String, atoms: [String],
-                        file: String, line: Int, col: Int) : [Diagnostic] =
-  if list_has(atoms, bare) { [] }
-  else {
-    unit_err(file, line, col,
-      concat_all(["`", bare, "` is not a habitant of the closed kind `", kind,
-                  "` — its habitants are: ", join_with(atoms, ", ")]))
+fn habitant_closed_kind(
+  bare: String,
+  kind: String,
+  atoms: [String],
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] =
+  if list_has(atoms, bare) {
+    []
+  } else {
+    unit_err(
+      file,
+      line,
+      col,
+      concat_all([
+        "`",
+        bare,
+        "` is not a habitant of the closed kind `",
+        kind,
+        "` — its habitants are: ",
+        join_with(atoms, ", ")
+      ])
+    )
   }
 
-fn validate_qualified_habitant(s: String, scope: UnitScope, file: String,
-                               line: Int, col: Int) : [Diagnostic] {
+fn validate_qualified_habitant(
+  s: String,
+  scope: UnitScope,
+  file: String,
+  line: Int,
+  col: Int
+) : [Diagnostic] {
   let kind = kind_sym_kind(s)
   let bare = kind_sym_bare(s)
   match scope_value_domain_of(scope, kind) {
     Some(dom) -> habitant_value_domain(bare, kind, dom, file, line, col)
     None -> match scope_closed_atoms_of(scope, kind) {
-      []    -> []
+      [] -> []
       atoms -> habitant_closed_kind(bare, kind, atoms, file, line, col)
     }
   }

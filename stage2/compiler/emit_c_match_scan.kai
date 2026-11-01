@@ -36,8 +36,11 @@ pub(pkg) fn pat_lit_raw(p: Pattern) : String {
 # scrutinee expr when the wrap is present.
 pub(pkg) fn match_borrow_inner(scrut: Expr) : Option[Expr] = match scrut.kind {
   ECall(callee, args_) -> match callee.kind {
-    EMark(MkBorrow) -> match args_ { [inner] -> Some(inner)  _ -> None }
-    _               -> None
+    EMark(MkBorrow) -> match args_ {
+      [inner] -> Some(inner)
+      _ -> None
+    }
+    _ -> None
   }
   _ -> None
 }
@@ -85,23 +88,26 @@ fn arms_shared_ctor(arms: [Arm]) : Option[SharedCtor] =
 # Any pattern guard disables hoisting.
 fn arms_shared_ctor_loop(arms: [Arm], acc: Option[SharedCtor]) : Option[SharedCtor] = match arms {
   [] -> acc
-  [a, ...rest] -> match a { Arm(p, g, _) -> match g {
-    Some(_) -> None
-    None    -> match p.pkind {
-      PVariant(r, subs) ->
-        if list_length(subs) == 0 {
-          arms_shared_ctor_loop(rest, acc)
-        } else {
-          match acc {
-            None -> arms_shared_ctor_loop(rest, Some(SC(ref_sym(r), list_length(subs))))
-            Some(SC(s0, _)) -> if sym_same(ref_sym(r), s0) { arms_shared_ctor_loop(rest, acc) } else { None }
+  [a, ...rest] -> match a {
+    Arm(p, g, _) -> match g {
+      Some(_) -> None
+      None -> match p.pkind {
+        PVariant(r, subs) ->
+          if list_length(subs) == 0 {
+            arms_shared_ctor_loop(rest, acc)
+          } else {
+            match acc {
+              None -> arms_shared_ctor_loop(rest, Some(SC(ref_sym(r), list_length(subs))))
+              Some(SC(s0, _)) ->
+                if sym_same(ref_sym(r), s0) { arms_shared_ctor_loop(rest, acc) } else { None }
+            }
           }
-        }
-      PWild    -> arms_shared_ctor_loop(rest, acc)
-      PBind(_) -> arms_shared_ctor_loop(rest, acc)
-      _        -> None
+        PWild -> arms_shared_ctor_loop(rest, acc)
+        PBind(_) -> arms_shared_ctor_loop(rest, acc)
+        _ -> None
+      }
     }
-  } }
+  }
 }
 
 # Slots (positions in the shared-ctor payload) that some arm derefs with
@@ -113,11 +119,16 @@ fn nested_deref_slots(arms: [Arm], tys: [Int]) : [Int] =
 fn nested_deref_slots_loop(arms: [Arm], tys: [Int], acc: [Int]) : [Int] =
   match arms {
     [] -> acc
-    [a, ...rest] -> match a { Arm(p, _, _) -> match p.pkind {
-      PVariant(_, subs) -> nested_deref_slots_loop(rest, tys,
-                             arm_nested_slots(subs, tys, 0, acc))
-      _ -> nested_deref_slots_loop(rest, tys, acc)
-    } }
+    [a, ...rest] -> match a {
+      Arm(p, _, _) -> match p.pkind {
+        PVariant(_, subs) -> nested_deref_slots_loop(
+          rest,
+          tys,
+          arm_nested_slots(subs, tys, 0, acc)
+        )
+        _ -> nested_deref_slots_loop(rest, tys, acc)
+      }
+    }
   }
 
 fn arm_nested_slots(subs: [Pattern], tys: [Int], i: Int, acc: [Int]) : [Int] =
@@ -127,9 +138,10 @@ fn arm_nested_slots(subs: [Pattern], tys: [Int], i: Int, acc: [Int]) : [Int] =
       let k = kind_at(tys, i)
       let acc2 = match sp.pkind {
         # nested PVariant on a pointer slot (k==0): worth hoisting.
-        PVariant(_, _) -> if k == 0 and not hoist_slot_member(acc, i) { [i, ...acc] } else { acc }
+        PVariant(_, _) -> if k == 0 and (not hoist_slot_member(acc, i)) { [i, ...acc] } else { acc }
         _ -> acc
       }
+
       arm_nested_slots(rest, tys, i + 1, acc2)
     }
   }
@@ -140,10 +152,10 @@ fn arm_nested_slots(subs: [Pattern], tys: [Int], i: Int, acc: [Int]) : [Int] =
 # when `match_hoist_slots` found it in the same index.
 pub(pkg) fn emit_hoist_decls(slots: [Int], arms: [Arm], cx: EmitCtx) : String = match slots {
   [] -> ""
-  _  -> match arms_shared_ctor(arms) {
+  _ -> match arms_shared_ctor(arms) {
     None -> ""
     Some(SC(s, _)) -> match ctor_ix_row(cx.ctor_ix, s) {
-      None      -> ""
+      None -> ""
       Some(row) -> emit_hoist_decls_loop(slots, ctor_row_tag(row))
     }
   }
@@ -152,9 +164,13 @@ pub(pkg) fn emit_hoist_decls(slots: [Int], arms: [Arm], cx: EmitCtx) : String = 
 fn emit_hoist_decls_loop(slots: [Int], tag: Int) : String = match slots {
   [] -> ""
   [i, ...rest] -> concat_all([
-    "KaiValue *_hs", int_to_string(i),
-    " = (_scr->tag == KAI_VARIANT && _scr->variant_tag == ", int_to_string(tag),
-    ") ? kai_var_slots(_scr)[", int_to_string(i), "].ptr : NULL; ",
+    "KaiValue *_hs",
+    int_to_string(i),
+    " = (_scr->tag == KAI_VARIANT && _scr->variant_tag == ",
+    int_to_string(tag),
+    ") ? kai_var_slots(_scr)[",
+    int_to_string(i),
+    "].ptr : NULL; ",
     emit_hoist_decls_loop(rest, tag)
   ])
 }
@@ -168,17 +184,26 @@ fn emit_hoist_decls_loop(slots: [Int], tag: Int) : String = match slots {
 # instructions / 4.6% of the rb-tree bench called 2× per Black node).
 # Dropping the dead panic lets clang fold it into insert_loop's dispatch.
 fn arms_have_catchall(arms: [Arm]) : Bool = match arms {
-  []           -> false
-  [a]          -> match a { Arm(p, g, _) -> match g {
-                    Some(_) -> false   # guarded: can fall through
-                    None    -> match p.pkind { PWild -> true PBind(_) -> true _ -> false }
-                  } }
+  [] -> false
+  [a] -> match a {
+    Arm(p, g, _) -> match g {
+      Some(_) -> false  # guarded: can fall through
+      None -> match p.pkind {
+        PWild -> true
+        PBind(_) -> true
+        _ -> false
+      }
+    }
+  }
   [_, ...rest] -> arms_have_catchall(rest)
 }
 
 pub(pkg) fn match_tail_panic(arms: [Arm]) : String =
-  if arms_have_catchall(arms) { "" }
-  else { "    kai_core_panic(kai_str(\"non-exhaustive match\"));\n" }
+  if arms_have_catchall(arms) {
+    ""
+  } else {
+    "    kai_core_panic(kai_str(\"non-exhaustive match\"));\n"
+  }
 
 # Compute the hoistable slot set for a match, applying the soundness
 # gate. Returns [] unless every arm is a PVariant of one shared ctor
@@ -188,8 +213,9 @@ pub(pkg) fn match_hoist_slots(arms: [Arm], cx: EmitCtx) : [Int] =
   match arms_shared_ctor(arms) {
     None -> []
     Some(SC(s, ar)) -> match ctor_ix_row(cx.ctor_ix, s) {
-      Some(EV(_, tys, _, _)) -> if list_length(tys) == ar { nested_deref_slots(arms, tys) } else { [] }
-      None                      -> []
+      Some(EV(_, tys, _, _)) ->
+        if list_length(tys) == ar { nested_deref_slots(arms, tys) } else { [] }
+      None -> []
     }
   }
 
@@ -197,11 +223,18 @@ pub(pkg) fn match_hoist_slots(arms: [Arm], cx: EmitCtx) : [Int] =
 # ones a clause body reads and no node declares: the handler-state
 # aliases and the continuation.
 pub(pkg) fn emit_body_locals(ns: LocalNames) : LocalNames =
-  locals_declaring(ns, list_append(user_state_aliases(), [var_cell_alias(), canonical_continuation()]))
+  locals_declaring(
+    ns,
+    list_append(user_state_aliases(), [var_cell_alias(), canonical_continuation()])
+  )
 
 # `cx` with the C locals the emitter declares under `keys` in scope.
 pub(pkg) fn emit_ctx_declaring(cx: EmitCtx, keys: [String]) : EmitCtx =
-  EmitCtx { ...cx, lcs: list_append(cx.lcs, map(keys, local_minted)), locals: locals_declaring(cx.locals, keys) }
+  EmitCtx {
+    ...cx,
+    lcs: list_append(cx.lcs, map(keys, local_minted)),
+    locals: locals_declaring(cx.locals, keys)
+  }
 
 # The handler-state aliases a stateful clause declares, given which of
 # them the scope around it already binds.
@@ -214,39 +247,53 @@ fn match_arms_have_sentinel(arms: [Arm], cx: EmitCtx) : Bool = match arms {
   [] -> false
   [a, ...rest] -> match a {
     Arm(_, _, body) ->
-      if tcrec_body_has_sentinel(body) or emit_exits_in(body, cx) { true } else { match_arms_have_sentinel(rest, cx) }
+      if tcrec_body_has_sentinel(body) or emit_exits_in(body, cx) {
+        true
+      } else {
+        match_arms_have_sentinel(rest, cx)
+      }
   }
 }
 
 # Whether `body` holds a `!`; only a frame with an early return is scanned.
-fn emit_exits_in(body: Expr, cx: EmitCtx) : Bool = any(cx.unw.sites, (s) => unw_is_exit(s)) and tcl_has_bang(body)
+fn emit_exits_in(body: Expr, cx: EmitCtx) : Bool =
+  any(cx.unw.sites, s => unw_is_exit(s)) and tcl_has_bang(body)
 
 # Ledger entering a non-reuse arm body: enclosing pending entries plus
 # this match's scrutinee alias plus this pattern's RC binders — only
 # when the body can actually reach a goto. A goto-free body never reads
 # the ledger, so it is cleared to skip the branch-refinement scans.
-pub(pkg) fn tcp_arm_body_cx(arm_cx: EmitCtx, scr_alias: Option[String], pat: Pattern,
-                   body: Expr, cx: EmitCtx) : EmitCtx =
+pub(pkg) fn tcp_arm_body_cx(
+  arm_cx: EmitCtx,
+  scr_alias: Option[String],
+  pat: Pattern,
+  body: Expr,
+  cx: EmitCtx
+) : EmitCtx =
   if tcrec_body_has_sentinel(body) or emit_exits_in(body, cx) {
     let with_scr = match scr_alias {
       Some(a) -> list_append(arm_cx.tcpend, [tcl_scr_entry(a)])
-      None    -> arm_cx.tcpend
+      None -> arm_cx.tcpend
     }
     emit_ctx_with_tcpend(arm_cx, tcl_push_binders(with_scr, tcp_rc_binders(pat, cx)))
-  } else { match arm_cx.tcpend {
-    [] -> arm_cx
-    _  -> emit_ctx_with_tcpend(arm_cx, [])
-  } }
+  } else {
+    match arm_cx.tcpend {
+      [] -> arm_cx
+      _ -> emit_ctx_with_tcpend(arm_cx, [])
+    }
+  }
 
 pub(pkg) fn tcp_scr_alias_decl(scr_alias: Option[String]) : String = match scr_alias {
   Some(a) -> concat_all(["KaiValue *", a, " = _scr; (void) ", a, "; "])
-  None    -> ""
+  None -> ""
 }
 
 pub(pkg) fn tcp_new_scr_alias(arms: [Arm], cx: EmitCtx) : Option[String] =
   if match_arms_have_sentinel(arms, cx) {
     Some(cat2("_kai_tcs", int_to_string(tcl_scr_count(cx.tcpend))))
-  } else { None }
+  } else {
+    None
+  }
 
 # A raw zero of the match's result type — the safe initialiser for `_r`
 # (the exhaustivity tail-panic makes it unreachable, but C must see an
@@ -254,7 +301,7 @@ pub(pkg) fn tcp_new_scr_alias(arms: [Arm], cx: EmitCtx) : Option[String] =
 pub(pkg) fn raw_zero(ty: Option[Ty]) : String = match ty {
   Some(t) -> match t {
     TyReal -> "0.0"
-    TyDimT(inner, _)    -> raw_zero(Some(inner))
+    TyDimT(inner, _) -> raw_zero(Some(inner))
     TyRefineT(inner, _, _) -> raw_zero(Some(inner))
     _ -> "0"
   }

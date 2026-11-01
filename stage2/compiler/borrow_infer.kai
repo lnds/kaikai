@@ -38,17 +38,21 @@ import compiler.util
 # emit has no dup-on-bind to rescue it. `pub` functions are excluded — their
 # borrow-ness is ABI, stated with `^`, never inferred.
 
-
 # Borrow the parameters of a non-`pub` function body under the relaxed rule.
 # `self_name` identifies the function's own calls;
 # `explicit` lists positions already borrowed via `^` (a pub signature or an
 # explicit annotation) so inference never contradicts a stated convention.
-pub(pkg) fn borrow_infer_params(tab: SymTab, self_name: SelfRef, pnames: [Binder], body: Expr) : [Binder] =
+pub(pkg) fn borrow_infer_params(
+  tab: SymTab,
+  self_name: SelfRef,
+  pnames: [Binder],
+  body: Expr
+) : [Binder] =
   binf_loop(tab, self_name, pnames, 0, body)
 
 fn binf_loop(tab: SymTab, self_name: SelfRef, rem: [Binder], i: Int, body: Expr) : [Binder] =
   match rem {
-    []           -> []
+    [] -> []
     [h, ...rest] -> {
       let more = binf_loop(tab, self_name, rest, i + 1, body)
       if binf_param_borrowable(tab, self_name, h, i, body) { [h, ...more] } else { more }
@@ -59,81 +63,103 @@ fn binf_loop(tab: SymTab, self_name: SelfRef, rem: [Binder], i: Int, body: Expr)
 # is inspection | callee | self-borrow-through. `binf_uses_ok` walks the
 # body proving the discipline holds; any owned exit returns false.
 fn binf_param_borrowable(tab: SymTab, self_name: SelfRef, b: Binder, i: Int, body: Expr) : Bool =
-  binf_uses_ok(tab, self_name, b.id, i, body) and not binf_unread_rebound(self_name, b, body)
+  binf_uses_ok(tab, self_name, b.id, i, body) and (not binf_unread_rebound(self_name, b, body))
 
 # A self call hands a parameter it never reads a new value. Once the tail
 # call is a loop there is no return for the caller to release that value
 # after, so the function has to own it.
 fn binf_unread_rebound(self_name: SelfRef, b: Binder, body: Expr) : Bool =
-  not pcs_mentions(b, body) and ppd_has_self_call(body, self_name)
+  (not pcs_mentions(b, body)) and ppd_has_self_call(body, self_name)
 
 fn binf_uses_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, e: Expr) : Bool =
   binf_kind_ok(tab, self_name, nm, i, e.kind)
 
-fn binf_kind_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, k: ExprKind) : Bool = match k {
-  # Inspection: `nm` as a bare scrutinee. A component the arm binds is an
-  # interior pointer of the borrowed `nm` (no dup-on-bind), so it is safe
-  # only while it stays borrowed too — `binf_match_ok` disqualifies if any
-  # arm lets a child binder escape, or rebuilds/spine-consumes the scrutinee.
-  EMatch(s, arms)     -> binf_match_ok(tab, self_name, nm, i, s, arms)
-  # Callee position. A call whose callee IS `nm` is an INDIRECT `call_ind` on
-  # a closure param — the runtime CONSUMES it (no `call_ind_borrow`), so `nm`
-  # is not borrowable through it. A self-call passing `nm` at its own
-  # position `i` is borrow-through (see binf_call_ok).
-  ECall(f, xs) -> match f.kind {
-    ELocal(c)  -> if local_eq(c, nm) { false } else { binf_call_ok(tab, self_name, nm, i, f, xs) }
-    ESym(_, _) -> binf_call_ok(tab, self_name, nm, i, f, xs)
-    _          -> binf_uses_ok(tab, self_name, nm, i, f) and binf_args_ok(tab, self_name, nm, i, xs)
+fn binf_kind_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, k: ExprKind) : Bool =
+  match k {
+    # Inspection: `nm` as a bare scrutinee. A component the arm binds is an
+    # interior pointer of the borrowed `nm` (no dup-on-bind), so it is safe
+    # only while it stays borrowed too — `binf_match_ok` disqualifies if any
+    # arm lets a child binder escape, or rebuilds/spine-consumes the scrutinee.
+    EMatch(s, arms) -> binf_match_ok(tab, self_name, nm, i, s, arms)
+    # Callee position. A call whose callee IS `nm` is an INDIRECT `call_ind` on
+    # a closure param — the runtime CONSUMES it (no `call_ind_borrow`), so `nm`
+    # is not borrowable through it. A self-call passing `nm` at its own
+    # position `i` is borrow-through (see binf_call_ok).
+    ECall(f, xs) -> match f.kind {
+      ELocal(c) -> if local_eq(c, nm) { false } else { binf_call_ok(tab, self_name, nm, i, f, xs) }
+      ESym(_, _) -> binf_call_ok(tab, self_name, nm, i, f, xs)
+      _ -> binf_uses_ok(tab, self_name, nm, i, f) and binf_args_ok(tab, self_name, nm, i, xs)
+    }
+    EIntrinsic(_, xs) -> binf_args_ok(tab, self_name, nm, i, xs)
+    ESurface(sf) -> binf_args_ok(tab, self_name, nm, i, surface_children(sf))
+    # A bare read that is NOT a scrutinee nor a callee = an owned use. Field
+    # read / index base / lambda capture of `nm` = owned. Disqualify.
+    ELocal(u) -> not local_eq(u, nm)
+    EField(x, _) -> binf_absent(nm, x)
+    EIndex(a, b) -> binf_absent(nm, a) and binf_uses_ok(tab, self_name, nm, i, b)
+    EBlock(stmts, tail) ->
+      binf_stmts_ok(tab, self_name, nm, i, stmts) and binf_opt_ok(tab, self_name, nm, i, tail)
+    # A lambda body must itself use `nm` borrowably. Stored in a ctor/record/list slot = owned.
+    ELambda(_, b) -> binf_uses_ok(tab, self_name, nm, i, b)
+    ERecordLit(_, fis) -> binf_absent_fields(nm, fis)
+    EList(els) -> binf_absent_elems(nm, els)
+    # Interpolation reads and handlers are owned (conservative).
+    EStr(_, _) -> false
+    EHandle(_, _, _, _, _, _, _) -> false
+    # Transparent forms: `nm` stays borrowable iff it does in every child.
+    _ -> binf_transparent_ok(tab, self_name, nm, i, k)
   }
-  EIntrinsic(_, xs)   -> binf_args_ok(tab, self_name, nm, i, xs)
-  ESurface(sf)   -> binf_args_ok(tab, self_name, nm, i, surface_children(sf))
-  # A bare read that is NOT a scrutinee nor a callee = an owned use. Field
-  # read / index base / lambda capture of `nm` = owned. Disqualify.
-  ELocal(u)           -> not local_eq(u, nm)
-  EField(x, _)        -> binf_absent(nm, x)
-  EIndex(a, b)        -> binf_absent(nm, a) and binf_uses_ok(tab, self_name, nm, i, b)
-  EBlock(stmts, tail) -> binf_stmts_ok(tab, self_name, nm, i, stmts) and binf_opt_ok(tab, self_name, nm, i, tail)
-  # A lambda body must itself use `nm` borrowably. Stored in a ctor/record/list slot = owned.
-  ELambda(_, b)       -> binf_uses_ok(tab, self_name, nm, i, b)
-  ERecordLit(_, fis)  -> binf_absent_fields(nm, fis)
-  EList(els)          -> binf_absent_elems(nm, els)
-  # Interpolation reads and handlers are owned (conservative).
-  EStr(_, _)          -> false
-  EHandle(_, _, _, _, _, _, _) -> false
-  # Transparent forms: `nm` stays borrowable iff it does in every child.
-  _                   -> binf_transparent_ok(tab, self_name, nm, i, k)
-}
 
 # Forms that neither consume nor store `nm` — it stays borrowable iff every
 # sub-expression keeps it borrowable. Leaves (literals) never reference `nm`.
-fn binf_transparent_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, k: ExprKind) : Bool = match k {
-  EBinop(_, a, b)     -> binf_uses_ok(tab, self_name, nm, i, a) and binf_uses_ok(tab, self_name, nm, i, b)
-  EUnop(_, x)         -> binf_uses_ok(tab, self_name, nm, i, x)
-  EIf(c, t, oe)       -> binf_uses_ok(tab, self_name, nm, i, c) and
-                          binf_uses_ok(tab, self_name, nm, i, t) and binf_opt_ok(tab, self_name, nm, i, oe)
-  ERange(a, b, oe)    -> binf_uses_ok(tab, self_name, nm, i, a) and
-                          binf_uses_ok(tab, self_name, nm, i, b) and binf_opt_ok(tab, self_name, nm, i, oe)
-  EPipe(a, b)         -> binf_uses_ok(tab, self_name, nm, i, a) and binf_uses_ok(tab, self_name, nm, i, b)
-  EDispatchPipe(_, a, b) -> binf_uses_ok(tab, self_name, nm, i, a) and binf_uses_ok(tab, self_name, nm, i, b)
-  EBang(x)            -> binf_uses_ok(tab, self_name, nm, i, x)
-  ELitUnit(x, _)      -> binf_uses_ok(tab, self_name, nm, i, x)
-  _                   -> true
-}
+fn binf_transparent_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, k: ExprKind) : Bool =
+  match k {
+    EBinop(_, a, b) ->
+      binf_uses_ok(tab, self_name, nm, i, a) and binf_uses_ok(tab, self_name, nm, i, b)
+    EUnop(_, x) -> binf_uses_ok(tab, self_name, nm, i, x)
+    EIf(c, t, oe) -> binf_uses_ok(tab, self_name, nm, i, c)
+      and binf_uses_ok(tab, self_name, nm, i, t)
+      and binf_opt_ok(tab, self_name, nm, i, oe)
+    ERange(a, b, oe) -> binf_uses_ok(tab, self_name, nm, i, a)
+      and binf_uses_ok(tab, self_name, nm, i, b)
+      and binf_opt_ok(tab, self_name, nm, i, oe)
+    EPipe(a, b) -> binf_uses_ok(tab, self_name, nm, i, a) and binf_uses_ok(tab, self_name, nm, i, b)
+    EDispatchPipe(_, a, b) ->
+      binf_uses_ok(tab, self_name, nm, i, a) and binf_uses_ok(tab, self_name, nm, i, b)
+    EBang(x) -> binf_uses_ok(tab, self_name, nm, i, x)
+    ELitUnit(x, _) -> binf_uses_ok(tab, self_name, nm, i, x)
+    _ -> true
+  }
 
 # `nm` as a bare scrutinee whose arms REBUILD a constructor (rb-tree
 # balance/insert reuse) or DECONSTRUCT a list with a rest-binder (map/filter
 # spine, consumed cell-by-cell) wants OWNERSHIP — borrow is a read/HOF lever,
 # not a reuse or spine-consume lever, so `nm` is disqualified there. A
 # non-bare scrutinee, and every arm body/guard, must stay borrowable.
-fn binf_match_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, s: Expr, arms: [Arm]) : Bool = {
+fn binf_match_ok(
+  tab: SymTab,
+  self_name: SelfRef,
+  nm: LocalId,
+  i: Int,
+  s: Expr,
+  arms: [Arm]
+) : Bool {
   let reuse_target = match s.kind {
-    ELocal(u) -> local_eq(u, nm) and (binf_arms_rebuild_ctor(tab, arms) or binf_arms_list_deconstruct(arms))
-    _         -> false
+    ELocal(u) ->
+      local_eq(u, nm) and (binf_arms_rebuild_ctor(tab, arms) or binf_arms_list_deconstruct(arms))
+    _ -> false
   }
-  if reuse_target { false }
-  else {
-    let scr_bare = match s.kind { ELocal(u) -> local_eq(u, nm)  _ -> false }
-    let scr_ok = match s.kind { ELocal(_) -> true  _ -> binf_uses_ok(tab, self_name, nm, i, s) }
+  if reuse_target {
+    false
+  } else {
+    let scr_bare = match s.kind {
+      ELocal(u) -> local_eq(u, nm)
+      _ -> false
+    }
+    let scr_ok = match s.kind {
+      ELocal(_) -> true
+      _ -> binf_uses_ok(tab, self_name, nm, i, s)
+    }
     # When `nm` is borrowed as a bare scrutinee, a component the arm binds is
     # an INTERIOR pointer of `nm` (the runtime does not dup-on-bind). It is
     # only safe if the body never lets it ESCAPE to an owned position — else
@@ -159,32 +185,53 @@ fn binf_match_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, s: Expr, 
 # owned pass (its borrow map is not assumed). Either way the callee itself
 # (`c`) being `nm` is fine — that is the callee-position read.
 fn binf_call_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, f: Expr, xs: [Expr]) : Bool =
-  if is_self_callee(f, self_name) { binf_self_args_ok(tab, self_name, nm, i, xs, 0) }
-  else if binf_lends_slot0(f) { binf_lent_args_ok(tab, self_name, nm, i, xs) }
-  else { binf_args_ok(tab, self_name, nm, i, xs) }
+  if is_self_callee(f, self_name) {
+    binf_self_args_ok(tab, self_name, nm, i, xs, 0)
+  } else if binf_lends_slot0(f) {
+    binf_lent_args_ok(tab, self_name, nm, i, xs)
+  } else {
+    binf_args_ok(tab, self_name, nm, i, xs)
+  }
 
 # A builtin that only reads its first argument: a bare `nm` there is borrowed.
 fn binf_lends_slot0(f: Expr) : Bool = match builtin_ref(f) {
-  Some(b) -> match builtin_lending_form(b) { Some(_) -> true  None -> builtin_is_lending_form(b) }
-  None    -> false
+  Some(b) -> match builtin_lending_form(b) {
+    Some(_) -> true
+    None -> builtin_is_lending_form(b)
+  }
+  None -> false
 }
 
-fn binf_lent_args_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, xs: [Expr]) : Bool = match xs {
-  []           -> true
-  [a, ...rest] -> {
-    let head = match a.kind { ELocal(u) -> local_eq(u, nm)  _ -> binf_uses_ok(tab, self_name, nm, i, a) }
-    head and binf_args_ok(tab, self_name, nm, i, rest)
+fn binf_lent_args_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, xs: [Expr]) : Bool =
+  match xs {
+    [] -> true
+    [a, ...rest] -> {
+      let head = match a.kind {
+        ELocal(u) -> local_eq(u, nm)
+        _ -> binf_uses_ok(tab, self_name, nm, i, a)
+      }
+      head and binf_args_ok(tab, self_name, nm, i, rest)
+    }
   }
-}
 
 # Self-call args: `nm` at position `i` is borrow-through (skip the owned
 # check on that slot); every other slot must not carry a bare `nm` in owned
 # position but may still inspect/borrow-through it in a sub-expression.
-fn binf_self_args_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, xs: [Expr], j: Int) : Bool = match xs {
-  []           -> true
+fn binf_self_args_ok(
+  tab: SymTab,
+  self_name: SelfRef,
+  nm: LocalId,
+  i: Int,
+  xs: [Expr],
+  j: Int
+) : Bool = match xs {
+  [] -> true
   [a, ...rest] -> {
-    let here = if j == i { binf_arg_is_borrow_through(nm, a) or binf_uses_ok(tab, self_name, nm, i, a) }
-               else { binf_uses_ok(tab, self_name, nm, i, a) }
+    let here = if j == i {
+      binf_arg_is_borrow_through(nm, a) or binf_uses_ok(tab, self_name, nm, i, a)
+    } else {
+      binf_uses_ok(tab, self_name, nm, i, a)
+    }
     here and binf_self_args_ok(tab, self_name, nm, i, rest, j + 1)
   }
 }
@@ -192,14 +239,14 @@ fn binf_self_args_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, xs: [
 # The borrow-through slot carries exactly the bare `nm` (or `nm` inspected).
 fn binf_arg_is_borrow_through(nm: LocalId, a: Expr) : Bool = match a.kind {
   ELocal(u) -> local_eq(u, nm)
-  _         -> false
+  _ -> false
 }
 
 # Any arm whose tail rebuilds a constructor (a constructor call or a
 # record literal in tail position). This is the reuse-in-place shape the
 # recogniser fires on; a scrutinee feeding it wants ownership, not borrow.
 fn binf_arms_rebuild_ctor(tab: SymTab, arms: [Arm]) : Bool = match arms {
-  []           -> false
+  [] -> false
   [a, ...rest] -> match a {
     Arm(_, _, b) -> binf_tail_rebuilds_ctor(tab, b) or binf_arms_rebuild_ctor(tab, rest)
   }
@@ -209,67 +256,90 @@ fn binf_arms_rebuild_ctor(tab: SymTab, arms: [Arm]) : Bool = match arms {
 # scrutinee's spine is consumed cell-by-cell (the loop frees each cons as it
 # advances the tail), so it wants ownership — not borrowable.
 fn binf_arms_list_deconstruct(arms: [Arm]) : Bool = match arms {
-  []           -> false
+  [] -> false
   [a, ...rest] -> match a {
     Arm(p, _, _) -> binf_pat_is_list_rest(p) or binf_arms_list_deconstruct(rest)
   }
 }
 
 fn binf_pat_is_list_rest(p: Pattern) : Bool = match p.pkind {
-  PList(_, opt_rest) -> match opt_rest { Some(_) -> true None -> false }
-  _                  -> false
+  PList(_, opt_rest) -> match opt_rest {
+    Some(_) -> true
+    None -> false
+  }
+  _ -> false
 }
 
 fn binf_tail_rebuilds_ctor(tab: SymTab, e: Expr) : Bool = match e.kind {
   ERecordLit(_, _) -> true
-  ECall(f, _)      -> match f.kind {
+  ECall(f, _) -> match f.kind {
     ESym(s, _) -> sym_is_ctor(tab, s)
-    _          -> false
+    _ -> false
   }
-  EIf(_, t, oe)    -> binf_tail_rebuilds_ctor(tab, t) or (match oe { None -> false Some(e2) -> binf_tail_rebuilds_ctor(tab, e2) })
-  EBlock(_, tail)  -> match tail { None -> false Some(t) -> binf_tail_rebuilds_ctor(tab, t) }
-  EMatch(_, arms)  -> binf_arms_rebuild_ctor(tab, arms)
-  _                -> false
+  EIf(_, t, oe) -> binf_tail_rebuilds_ctor(tab, t)
+    or (match oe {
+      None -> false
+      Some(e2) -> binf_tail_rebuilds_ctor(tab, e2)
+    })
+  EBlock(_, tail) -> match tail {
+    None -> false
+    Some(t) -> binf_tail_rebuilds_ctor(tab, t)
+  }
+  EMatch(_, arms) -> binf_arms_rebuild_ctor(tab, arms)
+  _ -> false
 }
 
 # Non-self call args: `nm` must be absent in owned position. A sub-inspection
 # (`f(is_red(nm))`) is still borrowable; a bare `nm` argument is owned.
-fn binf_args_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, xs: [Expr]) : Bool = match xs {
-  []           -> true
-  [a, ...rest] -> {
-    let here = match a.kind {
-      ELocal(u) -> not local_eq(u, nm)   # bare arg to a non-self call = owned pass
-      _         -> binf_uses_ok(tab, self_name, nm, i, a)
-    }
-    here and binf_args_ok(tab, self_name, nm, i, rest)
-  }
-}
-
-fn binf_arms_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, arms: [Arm]) : Bool = match arms {
-  []           -> true
-  [a, ...rest] -> match a {
-    Arm(_, opt_g, abody) -> {
-      let g_ok = match opt_g { None -> true Some(g) -> binf_uses_ok(tab, self_name, nm, i, g) }
-      if g_ok and binf_uses_ok(tab, self_name, nm, i, abody) { binf_arms_ok(tab, self_name, nm, i, rest) }
-      else { false }
+fn binf_args_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, xs: [Expr]) : Bool =
+  match xs {
+    [] -> true
+    [a, ...rest] -> {
+      let here = match a.kind {
+        ELocal(u) -> not local_eq(u, nm)  # bare arg to a non-self call = owned pass
+        _ -> binf_uses_ok(tab, self_name, nm, i, a)
+      }
+      here and binf_args_ok(tab, self_name, nm, i, rest)
     }
   }
-}
 
-fn binf_opt_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, oe: Option[Expr]) : Bool = match oe {
-  None    -> true
-  Some(e) -> binf_uses_ok(tab, self_name, nm, i, e)
-}
+fn binf_arms_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, arms: [Arm]) : Bool =
+  match arms {
+    [] -> true
+    [a, ...rest] -> match a {
+      Arm(_, opt_g, abody) -> {
+        let g_ok = match opt_g {
+          None -> true
+          Some(g) -> binf_uses_ok(tab, self_name, nm, i, g)
+        }
+        if g_ok and binf_uses_ok(tab, self_name, nm, i, abody) {
+          binf_arms_ok(tab, self_name, nm, i, rest)
+        } else {
+          false
+        }
+      }
+    }
+  }
 
-fn binf_stmts_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, stmts: [Stmt]) : Bool = match stmts {
-  []           -> true
-  [s, ...rest] -> binf_exprs_ok(tab, self_name, nm, i, stmt_exprs(s)) and binf_stmts_ok(tab, self_name, nm, i, rest)
-}
+fn binf_opt_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, oe: Option[Expr]) : Bool =
+  match oe {
+    None -> true
+    Some(e) -> binf_uses_ok(tab, self_name, nm, i, e)
+  }
 
-fn binf_exprs_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, es: [Expr]) : Bool = match es {
-  []           -> true
-  [e, ...rest] -> binf_uses_ok(tab, self_name, nm, i, e) and binf_exprs_ok(tab, self_name, nm, i, rest)
-}
+fn binf_stmts_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, stmts: [Stmt]) : Bool =
+  match stmts {
+    [] -> true
+    [s, ...rest] -> binf_exprs_ok(tab, self_name, nm, i, stmt_exprs(s))
+      and binf_stmts_ok(tab, self_name, nm, i, rest)
+  }
+
+fn binf_exprs_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, es: [Expr]) : Bool =
+  match es {
+    [] -> true
+    [e, ...rest] ->
+      binf_uses_ok(tab, self_name, nm, i, e) and binf_exprs_ok(tab, self_name, nm, i, rest)
+  }
 
 # Escape analysis for the relaxed borrow inference (issue #1131).
 #
@@ -289,24 +359,26 @@ fn binf_exprs_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, es: [Expr
 # borrow reader and this escape reader consult it (kaikai forbids import
 # cycles, so the shared leaf sits at the lower module).
 
-
 # Every child binder of every arm must NOT escape its body. `i` is the
 # enclosing param's position — the one self-call slot that carries a bare
 # child on as a borrow-through (not an owned pass).
 fn binf_arms_binders_borrowed(self_name: SelfRef, i: Int, arms: [Arm]) : Bool = match arms {
-  []           -> true
+  [] -> true
   [a, ...rest] -> match a {
     Arm(p, _, abody) -> {
       let names = binf_pat_binders(p, [])
-      binf_none_escapes(self_name, i, names, abody) and binf_arms_binders_borrowed(self_name, i, rest)
+      binf_none_escapes(self_name, i, names, abody)
+        and binf_arms_binders_borrowed(self_name, i, rest)
     }
   }
 }
 
-fn binf_none_escapes(self_name: SelfRef, i: Int, names: [LocalId], abody: Expr) : Bool = match names {
-  []           -> true
-  [h, ...rest] -> not binf_escapes(self_name, i, h, true, abody) and binf_none_escapes(self_name, i, rest, abody)
-}
+fn binf_none_escapes(self_name: SelfRef, i: Int, names: [LocalId], abody: Expr) : Bool =
+  match names {
+    [] -> true
+    [h, ...rest] -> (not binf_escapes(self_name, i, h, true, abody))
+      and binf_none_escapes(self_name, i, rest, abody)
+  }
 
 # `h` escapes `e` iff a reference to it survives the evaluation of `e`: `e`
 # yields `h` in TAIL position (its value becomes the arm result), or `h` is
@@ -318,73 +390,95 @@ fn binf_none_escapes(self_name: SelfRef, i: Int, names: [LocalId], abody: Expr) 
 # out as the result; a bare `h` escapes only in tail position. The one safe
 # owned-looking site: a self-call carrying `h` at the enclosing param's
 # borrow-through slot `i` — the fixpoint carries the borrow on.
-fn binf_escapes(self_name: SelfRef, i: Int, h: LocalId, tail: Bool, e: Expr) : Bool = binf_escapes_k(self_name, i, h, tail, e.kind)
+fn binf_escapes(self_name: SelfRef, i: Int, h: LocalId, tail: Bool, e: Expr) : Bool =
+  binf_escapes_k(self_name, i, h, tail, e.kind)
 
-fn binf_escapes_k(self_name: SelfRef, i: Int, h: LocalId, tail: Bool, k: ExprKind) : Bool = match k {
-  # Bare `h`: escapes only if it is the returned value (tail).
-  ELocal(u)           -> tail and local_eq(u, h)
-  # Stored in a slot / captured / field-projected: retains past the arm.
-  ERecordLit(_, fis)     -> not binf_absent_fields(h, fis)
-  EList(els)          -> not binf_absent_elems(h, els)
-  ELambda(_, b)       -> not binf_absent(h, b)
-  EField(x, _)        -> tail and (not binf_absent(h, x))
-  # A ctor/user call storing `h` in an argument retains it; a call that only
-  # inspects (`is_red(h)`) does not. A self-call carrying `h` at position `i`
-  # (the enclosing param's borrow-through slot) is safe.
-  ECall(f, xs)        -> match f.kind {
-    ELocal(c)  -> if local_eq(c, h) { false } else { binf_call_escapes(self_name, i, h, f, xs, tail) }
-    ESym(_, _) -> binf_call_escapes(self_name, i, h, f, xs, tail)
-    _          -> binf_escapes(self_name, i, h, false, f) or binf_any_arg_escapes(self_name, i, h, xs)
+fn binf_escapes_k(self_name: SelfRef, i: Int, h: LocalId, tail: Bool, k: ExprKind) : Bool =
+  match k {
+    # Bare `h`: escapes only if it is the returned value (tail).
+    ELocal(u) -> tail and local_eq(u, h)
+    # Stored in a slot / captured / field-projected: retains past the arm.
+    ERecordLit(_, fis) -> not binf_absent_fields(h, fis)
+    EList(els) -> not binf_absent_elems(h, els)
+    ELambda(_, b) -> not binf_absent(h, b)
+    EField(x, _) -> tail and (not binf_absent(h, x))
+    # A ctor/user call storing `h` in an argument retains it; a call that only
+    # inspects (`is_red(h)`) does not. A self-call carrying `h` at position `i`
+    # (the enclosing param's borrow-through slot) is safe.
+    ECall(f, xs) -> match f.kind {
+      ELocal(c) ->
+        if local_eq(c, h) { false } else { binf_call_escapes(self_name, i, h, f, xs, tail) }
+      ESym(_, _) -> binf_call_escapes(self_name, i, h, f, xs, tail)
+      _ -> binf_escapes(self_name, i, h, false, f) or binf_any_arg_escapes(self_name, i, h, xs)
+    }
+    EIntrinsic(_, xs) -> binf_any_arg_escapes(self_name, i, h, xs)
+    ESurface(sf) -> binf_any_arg_escapes(self_name, i, h, surface_children(sf))
+    # Control-flow propagates `tail` to branches / block tail; the discriminant
+    # / condition is a non-tail read.
+    EIf(c, t, oe) -> binf_escapes(self_name, i, h, false, c)
+      or binf_escapes(self_name, i, h, tail, t)
+      or binf_opt_escapes(self_name, i, h, tail, oe)
+    EBlock(stmts, tail2) ->
+      binf_stmts_escape(self_name, i, h, stmts) or binf_opt_escapes(self_name, i, h, tail, tail2)
+    EMatch(s, arms) ->
+      binf_escapes(self_name, i, h, false, s) or binf_arms_escape(self_name, i, h, tail, arms)
+    EBang(x) -> binf_escapes(self_name, i, h, tail, x)
+    EIndex(a, b) -> (tail and (not binf_absent(h, a))) or binf_escapes(self_name, i, h, false, b)
+    # Pure reads (operands inspected, not stored) and pipes / ranges (thread `h`
+    # owned into a callee) are grouped in `binf_escapes_other`.
+    _ -> binf_escapes_other(self_name, i, h, k)
   }
-  EIntrinsic(_, xs)   -> binf_any_arg_escapes(self_name, i, h, xs)
-  ESurface(sf)   -> binf_any_arg_escapes(self_name, i, h, surface_children(sf))
-  # Control-flow propagates `tail` to branches / block tail; the discriminant
-  # / condition is a non-tail read.
-  EIf(c, t, oe)       -> binf_escapes(self_name, i, h, false, c) or binf_escapes(self_name, i, h, tail, t) or
-                          binf_opt_escapes(self_name, i, h, tail, oe)
-  EBlock(stmts, tail2) -> binf_stmts_escape(self_name, i, h, stmts) or binf_opt_escapes(self_name, i, h, tail, tail2)
-  EMatch(s, arms)     -> binf_escapes(self_name, i, h, false, s) or binf_arms_escape(self_name, i, h, tail, arms)
-  EBang(x)            -> binf_escapes(self_name, i, h, tail, x)
-  EIndex(a, b)        -> (tail and (not binf_absent(h, a))) or binf_escapes(self_name, i, h, false, b)
-  # Pure reads (operands inspected, not stored) and pipes / ranges (thread `h`
-  # owned into a callee) are grouped in `binf_escapes_other`.
-  _                   -> binf_escapes_other(self_name, i, h, k)
-}
 
 # The read-through and pipe forms. A binop/unop operand is a non-tail read
 # (no retention); a pipe/range carrying `h` threads it owned into a callee,
 # so any presence escapes. Split out to keep `binf_escapes_k` shallow.
 fn binf_escapes_other(self_name: SelfRef, i: Int, h: LocalId, k: ExprKind) : Bool = match k {
-  EBinop(_, a, b)     -> binf_escapes(self_name, i, h, false, a) or binf_escapes(self_name, i, h, false, b)
-  EUnop(_, x)         -> binf_escapes(self_name, i, h, false, x)
-  ELitUnit(x, _)      -> binf_escapes(self_name, i, h, false, x)
-  EPipe(a, b)         -> binf_pipe_escapes(h, a, b)
+  EBinop(_, a, b) ->
+    binf_escapes(self_name, i, h, false, a) or binf_escapes(self_name, i, h, false, b)
+  EUnop(_, x) -> binf_escapes(self_name, i, h, false, x)
+  ELitUnit(x, _) -> binf_escapes(self_name, i, h, false, x)
+  EPipe(a, b) -> binf_pipe_escapes(h, a, b)
   EDispatchPipe(_, a, b) -> binf_pipe_escapes(h, a, b)
-  ERange(a, b, oe)    -> binf_pipe_escapes(h, a, b) or (not binf_opt_absent(h, oe))
-  _                   -> false
+  ERange(a, b, oe) -> binf_pipe_escapes(h, a, b) or (not binf_opt_absent(h, oe))
+  _ -> false
 }
 
-fn binf_pipe_escapes(h: LocalId, a: Expr, b: Expr) : Bool = not binf_absent(h, a) or not binf_absent(h, b)
+fn binf_pipe_escapes(h: LocalId, a: Expr, b: Expr) : Bool =
+  (not binf_absent(h, a)) or (not binf_absent(h, b))
 
-fn binf_opt_escapes(self_name: SelfRef, i: Int, h: LocalId, tail: Bool, oe: Option[Expr]) : Bool = match oe {
-  None    -> false
-  Some(e) -> binf_escapes(self_name, i, h, tail, e)
-}
+fn binf_opt_escapes(self_name: SelfRef, i: Int, h: LocalId, tail: Bool, oe: Option[Expr]) : Bool =
+  match oe {
+    None -> false
+    Some(e) -> binf_escapes(self_name, i, h, tail, e)
+  }
 
 fn binf_opt_absent(h: LocalId, oe: Option[Expr]) : Bool = match oe {
-  None    -> true
+  None -> true
   Some(e) -> binf_absent(h, e)
 }
 
-fn binf_call_escapes(self_name: SelfRef, i: Int, h: LocalId, f: Expr, xs: [Expr], tail: Bool) : Bool =
-  if is_self_callee(f, self_name) { binf_self_args_escape(self_name, i, h, xs, 0, tail) }
-  else { binf_any_arg_escapes(self_name, i, h, xs) }
+fn binf_call_escapes(
+  self_name: SelfRef,
+  i: Int,
+  h: LocalId,
+  f: Expr,
+  xs: [Expr],
+  tail: Bool
+) : Bool =
+  if is_self_callee(f, self_name) {
+    binf_self_args_escape(self_name, i, h, xs, 0, tail)
+  } else {
+    binf_any_arg_escapes(self_name, i, h, xs)
+  }
 
 # A bare `h` in any arg is passed owned → escapes. A sub-inspection does not.
 fn binf_any_arg_escapes(self_name: SelfRef, i: Int, h: LocalId, xs: [Expr]) : Bool = match xs {
-  []           -> false
+  [] -> false
   [a, ...rest] -> {
-    let here = match a.kind { ELocal(u) -> local_eq(u, h)  _ -> binf_escapes(self_name, i, h, false, a) }
+    let here = match a.kind {
+      ELocal(u) -> local_eq(u, h)
+      _ -> binf_escapes(self_name, i, h, false, a)
+    }
     here or binf_any_arg_escapes(self_name, i, h, rest)
   }
 }
@@ -395,63 +489,86 @@ fn binf_any_arg_escapes(self_name: SelfRef, i: Int, h: LocalId, xs: [Expr]) : Bo
 # out of `h` (a field) at `i` is a fresh reference: a plain call drops it
 # after returning, but a tail call becomes the loop back-edge, with no
 # point after it to release that reference — it escapes there.
-fn binf_self_args_escape(self_name: SelfRef, i: Int, h: LocalId, xs: [Expr], j: Int, tail: Bool) : Bool = match xs {
-  []           -> false
+fn binf_self_args_escape(
+  self_name: SelfRef,
+  i: Int,
+  h: LocalId,
+  xs: [Expr],
+  j: Int,
+  tail: Bool
+) : Bool = match xs {
+  [] -> false
   [a, ...rest] -> {
-    let here = if j == i { match a.kind {
-                 ELocal(_) -> false
-                 _         -> (tail and not binf_absent(h, a)) or binf_escapes(self_name, i, h, false, a)
-               } }
-               else { match a.kind { ELocal(u) -> local_eq(u, h)  _ -> binf_escapes(self_name, i, h, false, a) } }
+    let here = if j == i {
+      match a.kind {
+        ELocal(_) -> false
+        _ -> (tail and (not binf_absent(h, a))) or binf_escapes(self_name, i, h, false, a)
+      }
+    } else {
+      match a.kind {
+        ELocal(u) -> local_eq(u, h)
+        _ -> binf_escapes(self_name, i, h, false, a)
+      }
+    }
     here or binf_self_args_escape(self_name, i, h, rest, j + 1, tail)
   }
 }
 
 fn binf_exprs_escape(self_name: SelfRef, i: Int, h: LocalId, es: [Expr]) : Bool = match es {
-  []           -> false
-  [e, ...rest] -> binf_escapes(self_name, i, h, false, e) or binf_exprs_escape(self_name, i, h, rest)
+  [] -> false
+  [e, ...rest] ->
+    binf_escapes(self_name, i, h, false, e) or binf_exprs_escape(self_name, i, h, rest)
 }
 
 fn binf_stmts_escape(self_name: SelfRef, i: Int, h: LocalId, stmts: [Stmt]) : Bool = match stmts {
-  []           -> false
+  [] -> false
   [s, ...rest] -> {
     let here = match s {
       SLet(_, _, rhs) -> not binf_absent(h, rhs)
-      _               -> binf_exprs_escape(self_name, i, h, stmt_exprs(s))
+      _ -> binf_exprs_escape(self_name, i, h, stmt_exprs(s))
     }
     here or binf_stmts_escape(self_name, i, h, rest)
   }
 }
 
-fn binf_arms_escape(self_name: SelfRef, i: Int, h: LocalId, tail: Bool, arms: [Arm]) : Bool = match arms {
-  []           -> false
-  [a, ...rest] -> match a {
-    Arm(_, _, b) -> binf_escapes(self_name, i, h, tail, b) or binf_arms_escape(self_name, i, h, tail, rest)
+fn binf_arms_escape(self_name: SelfRef, i: Int, h: LocalId, tail: Bool, arms: [Arm]) : Bool =
+  match arms {
+    [] -> false
+    [a, ...rest] -> match a {
+      Arm(_, _, b) ->
+        binf_escapes(self_name, i, h, tail, b) or binf_arms_escape(self_name, i, h, tail, rest)
+    }
   }
-}
 
 # Collect the binders a pattern introduces (the `PBind`/`PAs`/`PNarrow`
 # leaves), recursing through variant / record / list sub-patterns.
 fn binf_pat_binders(p: Pattern, acc: [LocalId]) : [LocalId] = match p.pkind {
-  PBind(b)               -> [b.id, ...acc]
-  PAs(b, inner)          -> binf_pat_binders(inner, [b.id, ...acc])
-  PNarrow(b, _)          -> [b.id, ...acc]
-  PVariant(_, sub)       -> binf_pats_binders(sub, acc)
+  PBind(b) -> [b.id, ...acc]
+  PAs(b, inner) -> binf_pat_binders(inner, [b.id, ...acc])
+  PNarrow(b, _) -> [b.id, ...acc]
+  PVariant(_, sub) -> binf_pats_binders(sub, acc)
   PVariantRecord(_, fps) -> binf_fieldpats_binders(fps, acc)
-  PRecord(fps)           -> binf_fieldpats_binders(fps, acc)
-  PList(sub, orst)       -> {
+  PRecord(fps) -> binf_fieldpats_binders(fps, acc)
+  PList(sub, orst) -> {
     let a1 = binf_pats_binders(sub, acc)
-    match orst { Some(b) -> [b.id, ...a1] None -> a1 }
+    match orst {
+      Some(b) -> [b.id, ...a1]
+      None -> a1
+    }
   }
-  _                      -> acc
+  _ -> acc
 }
+
 fn binf_pats_binders(ps: [Pattern], acc: [LocalId]) : [LocalId] = match ps {
-  []           -> acc
+  [] -> acc
   [p, ...rest] -> binf_pats_binders(rest, binf_pat_binders(p, acc))
 }
+
 fn binf_fieldpats_binders(fps: [PField], acc: [LocalId]) : [LocalId] = match fps {
-  []           -> acc
-  [f, ...rest] -> match f { PField(_, p, _) -> binf_fieldpats_binders(rest, binf_pat_binders(p, acc)) }
+  [] -> acc
+  [f, ...rest] -> match f {
+    PField(_, p, _) -> binf_fieldpats_binders(rest, binf_pat_binders(p, acc))
+  }
 }
 
 # `nm` does not appear as a read anywhere in `e` — a pure structural walk for
@@ -462,117 +579,148 @@ fn binf_absent(nm: LocalId, e: Expr) : Bool = not binf_var_present(nm, e)
 fn binf_var_present(nm: LocalId, e: Expr) : Bool = binf_var_present_k(nm, e.kind)
 
 fn binf_var_present_k(nm: LocalId, k: ExprKind) : Bool = match k {
-  ELocal(u)           -> local_eq(u, nm)
-  ECall(f, xs)        -> binf_var_present(nm, f) or binf_any_present(nm, xs)
-  EIntrinsic(_, xs)   -> binf_any_present(nm, xs)
-  ESurface(sf)   -> binf_any_present(nm, surface_children(sf))
-  EField(x, _)        -> binf_var_present(nm, x)
-  EMatch(s, arms)     -> binf_var_present(nm, s) or binf_present_arms(nm, arms)
+  ELocal(u) -> local_eq(u, nm)
+  ECall(f, xs) -> binf_var_present(nm, f) or binf_any_present(nm, xs)
+  EIntrinsic(_, xs) -> binf_any_present(nm, xs)
+  ESurface(sf) -> binf_any_present(nm, surface_children(sf))
+  EField(x, _) -> binf_var_present(nm, x)
+  EMatch(s, arms) -> binf_var_present(nm, s) or binf_present_arms(nm, arms)
   EBlock(stmts, tail) -> binf_present_stmts(nm, stmts) or binf_present_opt(nm, tail)
-  ELambda(_, b)       -> binf_var_present(nm, b)
-  ERecordLit(_, fis)     -> binf_present_fields(nm, fis)
-  EList(els)          -> binf_present_elems(nm, els)
-  _                   -> binf_present_transparent(nm, k)
+  ELambda(_, b) -> binf_var_present(nm, b)
+  ERecordLit(_, fis) -> binf_present_fields(nm, fis)
+  EList(els) -> binf_present_elems(nm, els)
+  _ -> binf_present_transparent(nm, k)
 }
 
 # The binary/unary transparent forms — `nm` present iff present in any child.
 fn binf_present_transparent(nm: LocalId, k: ExprKind) : Bool = match k {
-  EIndex(a, b)        -> binf_var_present(nm, a) or binf_var_present(nm, b)
-  EBinop(_, a, b)     -> binf_var_present(nm, a) or binf_var_present(nm, b)
-  EUnop(_, x)         -> binf_var_present(nm, x)
-  EIf(c, t, oe)       -> binf_var_present(nm, c) or binf_var_present(nm, t) or binf_present_opt(nm, oe)
-  ERange(a, b, oe)    -> binf_var_present(nm, a) or binf_var_present(nm, b) or binf_present_opt(nm, oe)
-  EPipe(a, b)         -> binf_var_present(nm, a) or binf_var_present(nm, b)
+  EIndex(a, b) -> binf_var_present(nm, a) or binf_var_present(nm, b)
+  EBinop(_, a, b) -> binf_var_present(nm, a) or binf_var_present(nm, b)
+  EUnop(_, x) -> binf_var_present(nm, x)
+  EIf(c, t, oe) -> binf_var_present(nm, c) or binf_var_present(nm, t) or binf_present_opt(nm, oe)
+  ERange(a, b, oe) -> binf_var_present(nm, a) or binf_var_present(nm, b) or binf_present_opt(nm, oe)
+  EPipe(a, b) -> binf_var_present(nm, a) or binf_var_present(nm, b)
   EDispatchPipe(_, a, b) -> binf_var_present(nm, a) or binf_var_present(nm, b)
-  EBang(x)            -> binf_var_present(nm, x)
-  ELitUnit(x, _)      -> binf_var_present(nm, x)
-  _                   -> false
+  EBang(x) -> binf_var_present(nm, x)
+  ELitUnit(x, _) -> binf_var_present(nm, x)
+  _ -> false
 }
 
 fn binf_any_present(nm: LocalId, es: [Expr]) : Bool = match es {
-  []           -> false
+  [] -> false
   [e, ...rest] -> binf_var_present(nm, e) or binf_any_present(nm, rest)
 }
 
 fn binf_present_opt(nm: LocalId, oe: Option[Expr]) : Bool = match oe {
-  None    -> false
+  None -> false
   Some(e) -> binf_var_present(nm, e)
 }
 
 fn binf_present_arms(nm: LocalId, arms: [Arm]) : Bool = match arms {
-  []           -> false
+  [] -> false
   [a, ...rest] -> match a {
     Arm(_, g, b) -> {
-      let g_here = match g { None -> false Some(gg) -> binf_var_present(nm, gg) }
+      let g_here = match g {
+        None -> false
+        Some(gg) -> binf_var_present(nm, gg)
+      }
       g_here or binf_var_present(nm, b) or binf_present_arms(nm, rest)
     }
   }
 }
 
 fn binf_present_stmts(nm: LocalId, stmts: [Stmt]) : Bool = match stmts {
-  []           -> false
+  [] -> false
   [s, ...rest] -> binf_present_exprs(nm, stmt_exprs(s)) or binf_present_stmts(nm, rest)
 }
 
 fn binf_present_exprs(nm: LocalId, es: [Expr]) : Bool = match es {
-  []           -> false
+  [] -> false
   [e, ...rest] -> binf_var_present(nm, e) or binf_present_exprs(nm, rest)
 }
 
 fn binf_absent_fields(nm: LocalId, fis: [FieldInit]) : Bool = match fis {
-  []           -> true
-  [f, ...rest] -> match f { FI(_, v) -> binf_absent(nm, v) and binf_absent_fields(nm, rest) }
+  [] -> true
+  [f, ...rest] -> match f {
+    FI(_, v) -> binf_absent(nm, v) and binf_absent_fields(nm, rest)
+  }
 }
 
 fn binf_absent_elems(nm: LocalId, els: [ListElem]) : Bool = match els {
-  []           -> true
+  [] -> true
   [el, ...rest] -> {
-    let ok = match el { ElPlain(e) -> binf_absent(nm, e) ElSpread(e) -> binf_absent(nm, e) }
+    let ok = match el {
+      ElPlain(e) -> binf_absent(nm, e)
+      ElSpread(e) -> binf_absent(nm, e)
+    }
     ok and binf_absent_elems(nm, rest)
   }
 }
 
 fn binf_present_fields(nm: LocalId, fis: [FieldInit]) : Bool = match fis {
-  []           -> false
-  [f, ...rest] -> match f { FI(_, v) -> binf_var_present(nm, v) or binf_present_fields(nm, rest) }
+  [] -> false
+  [f, ...rest] -> match f {
+    FI(_, v) -> binf_var_present(nm, v) or binf_present_fields(nm, rest)
+  }
 }
 
 fn binf_present_elems(nm: LocalId, els: [ListElem]) : Bool = match els {
-  []           -> false
+  [] -> false
   [el, ...rest] -> {
-    let here = match el { ElPlain(e) -> binf_var_present(nm, e) ElSpread(e) -> binf_var_present(nm, e) }
+    let here = match el {
+      ElPlain(e) -> binf_var_present(nm, e)
+      ElSpread(e) -> binf_var_present(nm, e)
+    }
     here or binf_present_elems(nm, rest)
   }
 }
 
-pub(pkg) fn bbe_keep_borrowed(tab: SymTab, self_name: SelfRef, pnames: [Binder], borrowed: [Binder], body: Expr) : [Binder] =
+pub(pkg) fn bbe_keep_borrowed(
+  tab: SymTab,
+  self_name: SelfRef,
+  pnames: [Binder],
+  borrowed: [Binder],
+  body: Expr
+) : [Binder] =
   match borrowed {
     [] -> borrowed
-    _  -> {
-      let kept = filter(borrowed, (b) => not bbe_owned_at(tab, self_name, pnames, borrowed, b, body))
-      if list_length(kept) == list_length(borrowed) { borrowed }
-      else { bbe_keep_borrowed(tab, self_name, pnames, kept, body) }
+    _ -> {
+      let kept = filter(borrowed, b => not bbe_owned_at(tab, self_name, pnames, borrowed, b, body))
+      if list_length(kept) == list_length(borrowed) {
+        borrowed
+      } else {
+        bbe_keep_borrowed(tab, self_name, pnames, kept, body)
+      }
     }
   }
 
-pub(pkg) fn bbe_stamp_borrowed(params: [Param], names: [Binder], raw: [Binder]) : [Param] = match params {
-  []           -> []
-  [p, ...rest] -> {
-    let id = p.binder.id
-    let stamp = pcs_has(names, id) or (p.pborrow and pcs_has(raw, id))
-    let p1 = if stamp == p.pborrow { p } else { Param { ...p, pborrow: stamp } }
-    [p1, ...bbe_stamp_borrowed(rest, names, raw)]
+pub(pkg) fn bbe_stamp_borrowed(params: [Param], names: [Binder], raw: [Binder]) : [Param] =
+  match params {
+    [] -> []
+    [p, ...rest] -> {
+      let id = p.binder.id
+      let stamp = pcs_has(names, id) or (p.pborrow and pcs_has(raw, id))
+      let p1 = if stamp == p.pborrow { p } else { Param { ...p, pborrow: stamp } }
+      [p1, ...bbe_stamp_borrowed(rest, names, raw)]
+    }
   }
-}
 
-fn bbe_owned_at(tab: SymTab, self_name: SelfRef, pnames: [Binder], borrowed: [Binder], b: Binder, body: Expr) : Bool =
+fn bbe_owned_at(
+  tab: SymTab,
+  self_name: SelfRef,
+  pnames: [Binder],
+  borrowed: [Binder],
+  b: Binder,
+  body: Expr
+) : Bool =
   match bbe_index(pnames, b.id, 0) {
-    Some(i) -> bbe_tail_owns(body, BbeCx { tab: tab, self_name: self_name, slot: i, lent: borrowed })
-    None    -> false
+    Some(i) ->
+      bbe_tail_owns(body, BbeCx { tab: tab, self_name: self_name, slot: i, lent: borrowed })
+    None -> false
   }
 
 fn bbe_index(pnames: [Binder], l: LocalId, i: Int) : Option[Int] = match pnames {
-  []           -> None
+  [] -> None
   [p, ...rest] -> if local_eq(p.id, l) { Some(i) } else { bbe_index(rest, l, i + 1) }
 }
 
@@ -580,27 +728,41 @@ fn bbe_index(pnames: [Binder], l: LocalId, i: Int) : Option[Int] = match pnames 
 type BbeCx = { tab: SymTab, self_name: SelfRef, slot: Int, lent: [Binder] }
 
 fn bbe_tail_owns(e: Expr, cx: BbeCx) : Bool = match e.kind {
-  ECall(f, xs)     ->
-    if is_self_callee(f, cx.self_name) { bbe_slot_owns(xs, 0, cx) }
-    else { bbe_is_ctor(f, cx.tab) and any(xs, (x) => bbe_tail_owns(x, cx)) }
-  EPipe(a, g)      -> bbe_tail_owns(pipe_as_call(a, g), cx)
-  EList(els)       -> any(els, (el) => match el { ElPlain(x) -> bbe_tail_owns(x, cx)  ElSpread(x) -> bbe_tail_owns(x, cx) })
-  EIf(_, t, oe)    -> bbe_tail_owns(t, cx) or bbe_opt_owns(oe, cx)
-  EBlock(_, bt)    -> bbe_opt_owns(bt, cx)
-  EMatch(s, arms)  -> {
+  ECall(f, xs) ->
+    if is_self_callee(f, cx.self_name) {
+      bbe_slot_owns(xs, 0, cx)
+    } else {
+      bbe_is_ctor(f, cx.tab) and any(xs, x => bbe_tail_owns(x, cx))
+    }
+  EPipe(a, g) -> bbe_tail_owns(pipe_as_call(a, g), cx)
+  EList(els) -> any(
+    els,
+    el => match el {
+      ElPlain(x) -> bbe_tail_owns(x, cx)
+      ElSpread(x) -> bbe_tail_owns(x, cx)
+    }
+  )
+  EIf(_, t, oe) -> bbe_tail_owns(t, cx) or bbe_opt_owns(oe, cx)
+  EBlock(_, bt) -> bbe_opt_owns(bt, cx)
+  EMatch(s, arms) -> {
     let lends = bbe_is_lent(s, cx)
-    any(arms, (a) => match a { Arm(p, _, ab) -> bbe_tail_owns(ab, bbe_arm_cx(p, lends, cx)) })
+    any(
+      arms,
+      a => match a {
+        Arm(p, _, ab) -> bbe_tail_owns(ab, bbe_arm_cx(p, lends, cx))
+      }
+    )
   }
-  _                -> false
+  _ -> false
 }
 
 fn bbe_is_ctor(f: Expr, tab: SymTab) : Bool = match f.kind {
   ESym(s, _) -> sym_is_ctor(tab, s)
-  _          -> false
+  _ -> false
 }
 
 fn bbe_opt_owns(oe: Option[Expr], cx: BbeCx) : Bool = match oe {
-  None    -> false
+  None -> false
   Some(x) -> bbe_tail_owns(x, cx)
 }
 
@@ -608,22 +770,25 @@ fn bbe_arm_cx(p: Pattern, lends: Bool, cx: BbeCx) : BbeCx =
   if lends { BbeCx { ...cx, lent: pat_binders(p, cx.lent) } } else { cx }
 
 fn bbe_slot_owns(xs: [Expr], i: Int, cx: BbeCx) : Bool = match xs {
-  []           -> false
+  [] -> false
   [a, ...rest] ->
-    if i == cx.slot { not bbe_is_lent(a, cx) and not bbe_holds_no_ref(a) }
-    else { bbe_slot_owns(rest, i + 1, cx) }
+    if i == cx.slot {
+      (not bbe_is_lent(a, cx)) and (not bbe_holds_no_ref(a))
+    } else {
+      bbe_slot_owns(rest, i + 1, cx)
+    }
 }
 
 fn bbe_is_lent(a: Expr, cx: BbeCx) : Bool = match a.kind {
   ELocal(l) -> pcs_has(cx.lent, l)
-  _         -> false
+  _ -> false
 }
 
 fn bbe_holds_no_ref(a: Expr) : Bool = match a.kind {
   EIntrinsic(InAbsent, _) -> true
-  EUnit                   -> true
-  EBool(_)                -> true
-  _                       -> false
+  EUnit -> true
+  EBool(_) -> true
+  _ -> false
 }
 
 #[doc("One borrow-map row: a callee's identity and the parameter positions the callee borrows.")]
@@ -635,7 +800,8 @@ const BUCKETS : Int = 4096
 
 pub(pkg) fn bm_empty() : BorrowMap = BEmpty
 
-pub(pkg) fn bm_of(es: [BorrowEntry]) : BorrowMap = BMap([], bm_fill(array_make(BUCKETS, []), list_reverse(es)))
+pub(pkg) fn bm_of(es: [BorrowEntry]) : BorrowMap =
+  BMap([], bm_fill(array_make(BUCKETS, []), list_reverse(es)))
 
 pub(pkg) fn bm_lookup(bm: BorrowMap, key: FnId) : [Int] = match bm {
   BEmpty -> []
@@ -646,18 +812,19 @@ pub(pkg) fn bm_lookup(bm: BorrowMap, key: FnId) : [Int] = match bm {
 }
 
 # Filled back to front, so each bucket keeps its rows in list order.
-fn bm_fill(buckets: Array[[BorrowEntry]], es: [BorrowEntry]) : Array[[BorrowEntry]] / Mutable = match es {
-  [] -> buckets
-  [BwE(k, ps), ...rest] -> {
-    let b = bm_bucket(buckets, k)
-    buckets[b] := [BwE(k, ps), ...array_get(buckets, b)]
-    bm_fill(buckets, rest)
+fn bm_fill(buckets: Array[[BorrowEntry]], es: [BorrowEntry]) : Array[[BorrowEntry]] / Mutable =
+  match es {
+    [] -> buckets
+    [BwE(k, ps), ...rest] -> {
+      let b = bm_bucket(buckets, k)
+      buckets[b] := [BwE(k, ps), ...array_get(buckets, b)]
+      bm_fill(buckets, rest)
+    }
   }
-}
 
-fn bm_bucket(buckets: Array[[BorrowEntry]], key: FnId) : Int = {
+fn bm_bucket(buckets: Array[[BorrowEntry]], key: FnId) : Int {
   let m = array_length(buckets)
-  (((sym_raw(fnid_sym(key)) + fnid_inst(key)) % m) + m) % m
+  ((sym_raw(fnid_sym(key)) + fnid_inst(key)) % m + m) % m
 }
 
 # A bucket holds every key that falls in it, so each row re-tests the key.
@@ -673,14 +840,18 @@ pub type BorrowDecl = BD(FnId, [Int])
 pub(pkg) fn bv_build(bds: [BorrowDecl], seed: [BorrowEntry]) : BorrowMap = bm_of(bv_rows(bds, seed))
 
 fn bv_rows(bds: [BorrowDecl], acc: [BorrowEntry]) : [BorrowEntry] = match bds {
-  []                 -> acc
+  [] -> acc
   [BD(fid, ps), ...rest] -> match ps {
     [] -> bv_rows(rest, acc)
-    _  -> bv_rows(rest, if sym_raw(fnid_sym(fid)) < 0 { acc } else { [BwE(fid, ps), ...acc] })
+    _ -> bv_rows(rest, if sym_raw(fnid_sym(fid)) < 0 { acc } else { [BwE(fid, ps), ...acc] })
   }
 }
 
-pub(pkg) fn bv_fid_key(fid: FnId) : String = {
+pub(pkg) fn bv_fid_key(fid: FnId) : String {
   let k = string_concat("#", int_to_string(sym_raw(fnid_sym(fid))))
-  if fnid_inst(fid) == spec_none() { k } else { concat_all([k, "/", int_to_string(fnid_inst(fid))]) }
+  if fnid_inst(fid) == spec_none() {
+    k
+  } else {
+    concat_all([k, "/", int_to_string(fnid_inst(fid))])
+  }
 }

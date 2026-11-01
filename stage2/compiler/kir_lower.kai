@@ -59,114 +59,129 @@ pub fn reuse_plan_none() : ReusePlan = ReusePlan { rot: RNInone, flat: [], cells
 # its rows keyed by constructor id, the lifted-lambda table (`find_lam`),
 # the lifted clauses (a handle reads its env layout from them), and the
 # enclosing unit both lookups are scoped by.
-pub(pkg) type LowerSt = { rc: Int, bc: Int, bs: [KBlock], cl: String, ss: [KStmt],
-                     fns: [EFn], fx: FnIndex, core_ix: CoreIx, ctor_ix: CtorIx, vs: [VariantEntry], lams: [LamInfo], cls: [ClauseInfo], enc_fn: EncFn,
-                     consts: [Decl],
-                     # `regs` is the names of the registers live in the
-                     # current lexical scope: params, captures, and every
-                     # `KLet` / `KStore` destination. Registers are
-                     # name-keyed allocas, so a binder whose name is taken
-                     # binds a fresh one (`ls_bind`). Seeded at fn entry,
-                     # extended at each binding statement, restored at a
-                     # block's exit.
-                     regs: NameIndex[String],
-                     # `ffi` is the set of `extern "C" fn` declarations.
-                     # An FFI wrapper's kaikai-visible symbol is mangled to
-                     # `__ffi_<c_sym>` (via `ffi_wrapper_sym`) so it does NOT
-                     # collide with the bare C symbol it calls (`puts`, `abs`)
-                     # in the same module. Both the wrapper def and EVERY
-                     # call site must mint the same mangled name.
-                     ffi: [SymId],
-                     # `scope` maps each local in scope to the register it
-                     # was bound to, innermost first: every read of a local
-                     # goes through it. A block restores it on exit.
-                     scope: [Rename],
-                     # `mscr` is the FRESH owned-scrutinee exit-drop binder
-                     # (`<join>$sd`) of the match CURRENTLY being lowered, or ""
-                     # outside any owned match. The TRMC cons-modulo step
-                     # (`__kai_cons_s`, map/filter) drops the consumed scrutinee
-                     # in the native emitter, but it lowers via the `ECall`
-                     # dispatch, far from the match arm where the drop binder is
-                     # named — so the name travels here. Nested owned matches
-                     # mint distinct `$sd` names (the `max([T])`/`min([T])`
-                     # double-free fix); a fixed literal would alias them into
-                     # one native alloca. Saved/restored around each match like
-                     # `regs`.
-                     mscr: String,
-                     # `reuse_gc` carries the POINTER-kind scrutinee binders
-                     # a variant REUSE arm projects (top-level + one-level
-                     # nested grand-children — the rb-tree rotation kept
-                     # children). Like `mscr`, the reuse op lowers far from the
-                     # arm pattern (inside the body, possibly under an `if`), so
-                     # the names travel here. `lower_reuse_con` counts each
-                     # binder's uses in the rebuild and emits one
-                     # `kai_incref_if_shared(donor, child)` per use, so a SHARED
-                     # donor's fresh-alloc keeps a ref the match-exit decref
-                     # would otherwise cascade-free. Set per reuse arm, restored
-                     # around each match like `mscr`; "" / [] outside one.
-                     reuse_gc: [LocalId],
-                     # `rnested` is the slot plan of the current variant REUSE
-                     # arm. Like `reuse_gc`, the rebuild site
-                     # (`lower_reuse_con`) sits far from the arm pattern, so
-                     # the plan travels here. Set per reuse arm alongside
-                     # `reuse_gc`; `reuse_plan_none()` everywhere else.
-                     rnested: ReusePlan,
-                     # `recs` is the program's record table. Record-literal and
-                     # reuse-rebuild assembly index through `rec_field_index` to
-                     # emit fields in DECLARATION order, the canonical layout the
-                     # constant-index field read relies on. Shared (never reset);
-                     # threaded verbatim through every fn-entry / state rebuild.
-                     recs: [RecInfo],
-                     # Head tags of the stamped record types (`rec_stamp`).
-                     stamps: [RecStamp],
-                     # `in_region` is true while lowering a body that bump-
-                     # allocates into the ambient arena: a region-branded fn
-                     # (`fn_has_region_brand` on its signature) sets it for the
-                     # whole body, a lexical `region { }` block sets it for the
-                     # block's extent (saved/restored around the block like
-                     # `scope`). Each `KCon`/`KRecord` reads it, so the native
-                     # emitter routes the ctor to `kaix_arena_*`. The C oracle
-                     # reads the same predicate via `EmitCtx.in_region`.
-                     in_region: Bool,
-                     # `regions` is the `region { }` side table (keyed by the
-                     # block's source position), the SAME list the C oracle
-                     # carries as `EmitCtx.regions`. `lower_block` consults it
-                     # to bracket a lexical region body with arena push/pop +
-                     # deep-copy-out. Shared (never reset).
-                     regions: [RegionMark],
-                     # `raw_binders` is the native-raw match-arm Int binder side
-                     # table (keyed by `PBind` source position), decided once in
-                     # the unbox phase (`native_raw_arm_binders`) and READ here by
-                     # `bind_slot_kslot` so the KSlot verdict never re-derives
-                     # rawness from the perceus-mutated body (#1229). Shared
-                     # (never reset); empty under the C backend.
-                     raw_binders: [RawArmBinder],
-                     # `tcpend` is the pending-release ledger for the tcrec
-                     # goto-tail path (emit_tcrec_live entries): enclosing owned
-                     # match scrutinee registers plus not-yet-consumed arm-binder
-                     # dups. Seeded per arm body that can reach a goto, refined
-                     # across branch points, and read by `lower_tcrec`, which
-                     # drops each surviving entry before sealing the back-edge.
-                     # Restored around each match like `mscr`; [] outside one.
-                     tcpend: [TclEntry],
-                     # The current frame's unwind sites (unwind_pend.kai).
-                     unw: UnwFrame,
-                     # The program's root file basename — see EmitCtx.root_mod
-                     # in emit_c.kai.
-                     root_mod: Option[String],
-                     # An enclosing arm holds the fn-wide arm-top reuse token,
-                     # so a nested arm must not capture over it.
-                     arm_tok: Bool,
-                     # The instances the `handle`s around the walk position
-                     # install, innermost first: an op of one of them reaches
-                     # that handler, not the fn's frame slot. A handle's body
-                     # extends it; restored at the body's exit.
-                     handles: [InstKey],
-                     # The symbol table and the specialisations' emitted
-                     # names, which spell a declaration's symbol; the
-                     # binders of the declaration being lowered, which spell
-                     # a local's register.
-                     tab: SymTab, specs: SpecNames, locals: LocalNames }
+pub(pkg) type LowerSt = {
+  rc: Int,
+  bc: Int,
+  bs: [KBlock],
+  cl: String,
+  ss: [KStmt],
+  fns: [EFn],
+  fx: FnIndex,
+  core_ix: CoreIx,
+  ctor_ix: CtorIx,
+  vs: [VariantEntry],
+  lams: [LamInfo],
+  cls: [ClauseInfo],
+  enc_fn: EncFn,
+  consts: [Decl],
+  # `regs` is the names of the registers live in the
+  # current lexical scope: params, captures, and every
+  # `KLet` / `KStore` destination. Registers are
+  # name-keyed allocas, so a binder whose name is taken
+  # binds a fresh one (`ls_bind`). Seeded at fn entry,
+  # extended at each binding statement, restored at a
+  # block's exit.
+  regs: NameIndex[String],
+  # `ffi` is the set of `extern "C" fn` declarations.
+  # An FFI wrapper's kaikai-visible symbol is mangled to
+  # `__ffi_<c_sym>` (via `ffi_wrapper_sym`) so it does NOT
+  # collide with the bare C symbol it calls (`puts`, `abs`)
+  # in the same module. Both the wrapper def and EVERY
+  # call site must mint the same mangled name.
+  ffi: [SymId],
+  # `scope` maps each local in scope to the register it
+  # was bound to, innermost first: every read of a local
+  # goes through it. A block restores it on exit.
+  scope: [Rename],
+  # `mscr` is the FRESH owned-scrutinee exit-drop binder
+  # (`<join>$sd`) of the match CURRENTLY being lowered, or ""
+  # outside any owned match. The TRMC cons-modulo step
+  # (`__kai_cons_s`, map/filter) drops the consumed scrutinee
+  # in the native emitter, but it lowers via the `ECall`
+  # dispatch, far from the match arm where the drop binder is
+  # named — so the name travels here. Nested owned matches
+  # mint distinct `$sd` names (the `max([T])`/`min([T])`
+  # double-free fix); a fixed literal would alias them into
+  # one native alloca. Saved/restored around each match like
+  # `regs`.
+  mscr: String,
+  # `reuse_gc` carries the POINTER-kind scrutinee binders
+  # a variant REUSE arm projects (top-level + one-level
+  # nested grand-children — the rb-tree rotation kept
+  # children). Like `mscr`, the reuse op lowers far from the
+  # arm pattern (inside the body, possibly under an `if`), so
+  # the names travel here. `lower_reuse_con` counts each
+  # binder's uses in the rebuild and emits one
+  # `kai_incref_if_shared(donor, child)` per use, so a SHARED
+  # donor's fresh-alloc keeps a ref the match-exit decref
+  # would otherwise cascade-free. Set per reuse arm, restored
+  # around each match like `mscr`; "" / [] outside one.
+  reuse_gc: [LocalId],
+  # `rnested` is the slot plan of the current variant REUSE
+  # arm. Like `reuse_gc`, the rebuild site
+  # (`lower_reuse_con`) sits far from the arm pattern, so
+  # the plan travels here. Set per reuse arm alongside
+  # `reuse_gc`; `reuse_plan_none()` everywhere else.
+  rnested: ReusePlan,
+  # `recs` is the program's record table. Record-literal and
+  # reuse-rebuild assembly index through `rec_field_index` to
+  # emit fields in DECLARATION order, the canonical layout the
+  # constant-index field read relies on. Shared (never reset);
+  # threaded verbatim through every fn-entry / state rebuild.
+  recs: [RecInfo],
+  # Head tags of the stamped record types (`rec_stamp`).
+  stamps: [RecStamp],
+  # `in_region` is true while lowering a body that bump-
+  # allocates into the ambient arena: a region-branded fn
+  # (`fn_has_region_brand` on its signature) sets it for the
+  # whole body, a lexical `region { }` block sets it for the
+  # block's extent (saved/restored around the block like
+  # `scope`). Each `KCon`/`KRecord` reads it, so the native
+  # emitter routes the ctor to `kaix_arena_*`. The C oracle
+  # reads the same predicate via `EmitCtx.in_region`.
+  in_region: Bool,
+  # `regions` is the `region { }` side table (keyed by the
+  # block's source position), the SAME list the C oracle
+  # carries as `EmitCtx.regions`. `lower_block` consults it
+  # to bracket a lexical region body with arena push/pop +
+  # deep-copy-out. Shared (never reset).
+  regions: [RegionMark],
+  # `raw_binders` is the native-raw match-arm Int binder side
+  # table (keyed by `PBind` source position), decided once in
+  # the unbox phase (`native_raw_arm_binders`) and READ here by
+  # `bind_slot_kslot` so the KSlot verdict never re-derives
+  # rawness from the perceus-mutated body (#1229). Shared
+  # (never reset); empty under the C backend.
+  raw_binders: [RawArmBinder],
+  # `tcpend` is the pending-release ledger for the tcrec
+  # goto-tail path (emit_tcrec_live entries): enclosing owned
+  # match scrutinee registers plus not-yet-consumed arm-binder
+  # dups. Seeded per arm body that can reach a goto, refined
+  # across branch points, and read by `lower_tcrec`, which
+  # drops each surviving entry before sealing the back-edge.
+  # Restored around each match like `mscr`; [] outside one.
+  tcpend: [TclEntry],
+  # The current frame's unwind sites (unwind_pend.kai).
+  unw: UnwFrame,
+  # The program's root file basename — see EmitCtx.root_mod
+  # in emit_c.kai.
+  root_mod: Option[String],
+  # An enclosing arm holds the fn-wide arm-top reuse token,
+  # so a nested arm must not capture over it.
+  arm_tok: Bool,
+  # The instances the `handle`s around the walk position
+  # install, innermost first: an op of one of them reaches
+  # that handler, not the fn's frame slot. A handle's body
+  # extends it; restored at the body's exit.
+  handles: [InstKey],
+  # The symbol table and the specialisations' emitted
+  # names, which spell a declaration's symbol; the
+  # binders of the declaration being lowered, which spell
+  # a local's register.
+  tab: SymTab,
+  specs: SpecNames,
+  locals: LocalNames
+}
 
 # A local in scope paired with the register it is read from.
 pub type Rename = Rn(LocalId, String)
@@ -197,12 +212,58 @@ pub type RecPlan = RecPlan([KFieldInit], LowerSt)
 # An optional lowered value (handler state init) + threaded state.
 pub type LResOpt = LResOpt(Option[KVal], LowerSt)
 
-pub fn ls_new(fns: [EFn], fx: FnIndex, variants: [VariantEntry], ctors: CtorIx, lams: [LamInfo], cls: [ClauseInfo],
-              consts: [Decl], ffi: [SymId], recs: [RecInfo], stamps: [RecStamp], regions: [RegionMark], raw_binders: [RawArmBinder], root_mod: Option[String],
-              tab: SymTab, specs: SpecNames) : LowerSt =
-  LowerSt { rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: fns, fx: fx, core_ix: core_ix_build(), ctor_ix: ctors, vs: variants,
-            lams: lams, cls: cls, enc_fn: enc_none(), consts: consts, regs: idx_empty(), ffi: ffi, scope: [], mscr: "", reuse_gc: [], rnested: reuse_plan_none(), recs: recs, stamps: stamps, in_region: false, regions: regions, raw_binders: raw_binders, tcpend: [], unw: unw_frame_none(unw_cx_empty()), root_mod: root_mod, arm_tok: false, handles: [],
-            tab: tab, specs: specs, locals: ln_empty() }
+pub fn ls_new(
+  fns: [EFn],
+  fx: FnIndex,
+  variants: [VariantEntry],
+  ctors: CtorIx,
+  lams: [LamInfo],
+  cls: [ClauseInfo],
+  consts: [Decl],
+  ffi: [SymId],
+  recs: [RecInfo],
+  stamps: [RecStamp],
+  regions: [RegionMark],
+  raw_binders: [RawArmBinder],
+  root_mod: Option[String],
+  tab: SymTab,
+  specs: SpecNames
+) : LowerSt =
+  LowerSt {
+    rc: 0,
+    bc: 0,
+    bs: [],
+    cl: "entry",
+    ss: [],
+    fns: fns,
+    fx: fx,
+    core_ix: core_ix_build(),
+    ctor_ix: ctors,
+    vs: variants,
+    lams: lams,
+    cls: cls,
+    enc_fn: enc_none(),
+    consts: consts,
+    regs: idx_empty(),
+    ffi: ffi,
+    scope: [],
+    mscr: "",
+    reuse_gc: [],
+    rnested: reuse_plan_none(),
+    recs: recs,
+    stamps: stamps,
+    in_region: false,
+    regions: regions,
+    raw_binders: raw_binders,
+    tcpend: [],
+    unw: unw_frame_none(unw_cx_empty()),
+    root_mod: root_mod,
+    arm_tok: false,
+    handles: [],
+    tab: tab,
+    specs: specs,
+    locals: ln_empty()
+  }
 
 #[doc("`st` with the arm-top token marked held (or released).")]
 pub fn ls_set_arm_tok(st: LowerSt, held: Bool) : LowerSt = LowerSt { ...st, arm_tok: held }
@@ -213,11 +274,34 @@ pub fn ls_set_arm_tok(st: LowerSt, held: Bool) : LowerSt = LowerSt { ...st, arm_
 # params and captures are read from; `locals` the binders of the declaration
 # it belongs to; `body_fns` the EFn table. Called at the head of every KFn
 # lowering.
-pub fn ls_enter_fn_with(st: LowerSt, enc_fn: EncFn, entry: EntryRegs, locals: LocalNames,
-                        body_fns: [EFn]) : LowerSt =
-  LowerSt { ...st, rc: 0, bc: 0, bs: [], cl: "entry", ss: [], fns: body_fns, enc_fn: enc_fn,
-            regs: regs_of_names(entry.regs, idx_empty()), scope: list_append(entry.scope, implicit_scope()), mscr: "", reuse_gc: [], rnested: reuse_plan_none(), in_region: false,
-            tcpend: [], unw: unw_blank(st.unw), arm_tok: false, handles: [], locals: kir_body_locals(locals) }
+pub fn ls_enter_fn_with(
+  st: LowerSt,
+  enc_fn: EncFn,
+  entry: EntryRegs,
+  locals: LocalNames,
+  body_fns: [EFn]
+) : LowerSt =
+  LowerSt {
+    ...st,
+    rc: 0,
+    bc: 0,
+    bs: [],
+    cl: "entry",
+    ss: [],
+    fns: body_fns,
+    enc_fn: enc_fn,
+    regs: regs_of_names(entry.regs, idx_empty()),
+    scope: list_append(entry.scope, implicit_scope()),
+    mscr: "",
+    reuse_gc: [],
+    rnested: reuse_plan_none(),
+    in_region: false,
+    tcpend: [],
+    unw: unw_blank(st.unw),
+    arm_tok: false,
+    handles: [],
+    locals: kir_body_locals(locals)
+  }
 
 #[doc("What a body starts with: the register each param and capture is read from, and the names of the registers they take.")]
 pub type EntryRegs = { scope: [Rename], regs: [String] }
@@ -228,16 +312,21 @@ fn regs_of_names(names: [String], ix: NameIndex[String]) : NameIndex[String] = m
 }
 
 #[doc("The register of the local `l`, one per binder of the declaration `locals` lists.")]
-pub(pkg) fn kir_local_reg(locals: LocalNames, l: LocalId) : String = emitted_text(ln_emitted(locals, l))
+pub(pkg) fn kir_local_reg(locals: LocalNames, l: LocalId) : String =
+  emitted_text(ln_emitted(locals, l))
 
 #[doc("The entry registers of a parameter list on top of `captured`: each param is read from its binder's register.")]
-pub fn entry_params(params: [Param], locals: LocalNames, captured: EntryRegs) : EntryRegs = match params {
-  [] -> captured
-  [p, ...rest] -> {
-    let reg = kir_local_reg(locals, p.binder.id)
-    entry_params(rest, locals, EntryRegs { scope: [Rn(p.binder.id, reg), ...captured.scope], regs: [reg, ...captured.regs] })
+pub fn entry_params(params: [Param], locals: LocalNames, captured: EntryRegs) : EntryRegs =
+  match params {
+    [] -> captured
+    [p, ...rest] -> {
+      let reg = kir_local_reg(locals, p.binder.id)
+      entry_params(rest, locals, EntryRegs {
+        scope: [Rn(p.binder.id, reg), ...captured.scope],
+        regs: [reg, ...captured.regs]
+      })
+    }
   }
-}
 
 #[doc("The entry registers of a lambda's or clause's captures: a captured binder is read from its register; an alias is known by its register, which holds nothing here, and takes the register holding its handler id.")]
 pub fn entry_captures(caps: [Capture], locals: LocalNames) : EntryRegs = match caps {
@@ -245,7 +334,10 @@ pub fn entry_captures(caps: [Capture], locals: LocalNames) : EntryRegs = match c
   [c, ...rest] -> {
     let name = kir_local_reg(locals, capture_local(c))
     let more = entry_captures(rest, locals)
-    EntryRegs { scope: [Rn(capture_local(c), name), ...more.scope], regs: list_append(capture_taken(c, name), more.regs) }
+    EntryRegs {
+      scope: [Rn(capture_local(c), name), ...more.scope],
+      regs: list_append(capture_taken(c, name), more.regs)
+    }
   }
 }
 
@@ -270,18 +362,19 @@ pub fn kir_body_locals(ns: LocalNames) : LocalNames =
   body_locals_loop([canonical_continuation(), var_cell_alias(), ...user_state_aliases()], ns)
 
 fn body_locals_loop(keys: [String], ns: LocalNames) : LocalNames = match keys {
-  []           -> ns
+  [] -> ns
   [k, ...rest] -> body_locals_loop(rest, ln_with_binder(ns, binder_minted(k)))
 }
 
 #[doc("`st` inside the body of a `handle` that installs the instance `k`.")]
-pub fn ls_in_handle(st: LowerSt, k: InstKey) : LowerSt = LowerSt { ...st, handles: [k, ...st.handles] }
+pub fn ls_in_handle(st: LowerSt, k: InstKey) : LowerSt =
+  LowerSt { ...st, handles: [k, ...st.handles] }
 
 #[doc("`st` with the enclosing `handle`s restored to `hs`.")]
 pub fn ls_set_handles(st: LowerSt, hs: [InstKey]) : LowerSt = LowerSt { ...st, handles: hs }
 
 #[doc("True when a `handle` around the walk position installs an instance the op of instance `k` reaches.")]
-pub fn ls_handled_here(st: LowerSt, k: InstKey) : Bool = any(st.handles, (h) => inst_keys_match(h, k))
+pub fn ls_handled_here(st: LowerSt, k: InstKey) : Bool = any(st.handles, h => inst_keys_match(h, k))
 
 #[doc("The state with `u` as the current frame's unwind sites.")]
 pub fn ls_with_unw(st: LowerSt, u: UnwFrame) : LowerSt = LowerSt { ...st, unw: u }
@@ -315,7 +408,7 @@ pub fn ls_set_rnested(st: LowerSt, rn: ReusePlan) : LowerSt = LowerSt { ...st, r
 # --- The register scope ----------------------------------------------------
 
 #[doc("Bind `b` to its register, the one of its id. The caller emits the statement that defines it.")]
-pub fn ls_bind(st: LowerSt, b: Binder) : LSReg = {
+pub fn ls_bind(st: LowerSt, b: Binder) : LSReg {
   let reg = kir_local_reg(st.locals, b.id)
   LSReg(reg, ls_scope_put(ls_bind_reg(st, reg), b.id, reg))
 }
@@ -327,7 +420,9 @@ pub fn ls_bind_alias(st: LowerSt, b: Binder) : LSReg = match ls_bind(st, b) {
 
 #[doc("Bind `b` to its register and define it as `op` at `slot`.")]
 pub fn ls_let(st: LowerSt, b: Binder, slot: KSlot, op: KOp, pos: KPos) : LowerSt =
-  match ls_bind(st, b) { LSReg(reg, st1) -> ls_emit(st1, KLet(reg, slot, op, pos)) }
+  match ls_bind(st, b) {
+    LSReg(reg, st1) -> ls_emit(st1, KLet(reg, slot, op, pos))
+  }
 
 #[doc("`st` with the local `l` read from `reg`. A block restores the prior scope on exit.")]
 pub fn ls_scope_put(st: LowerSt, l: LocalId, reg: String) : LowerSt =
@@ -335,26 +430,48 @@ pub fn ls_scope_put(st: LowerSt, l: LocalId, reg: String) : LowerSt =
 
 # The innermost binding wins.
 fn ls_scope_find(rs: [Rename], l: LocalId) : Option[String] = match rs {
-  []                -> None
+  [] -> None
   [Rn(n, r), ...rest] -> if local_eq(n, l) { Some(r) } else { ls_scope_find(rest, l) }
 }
 
 #[doc("True when the local `l` is bound to a register in the current scope.")]
 pub fn ls_local_bound(st: LowerSt, l: LocalId) : Bool = match ls_scope_find(st.scope, l) {
   Some(_) -> true
-  None    -> false
+  None -> false
 }
 
 #[doc("The register the local `l` was bound to.")]
 pub fn ls_reg_of(st: LowerSt, l: LocalId) : String = match ls_scope_find(st.scope, l) {
   Some(reg) -> reg
-  None      -> panic(concat_all(["identity: local ", int_to_string(local_raw(l)), " (", written_text(ln_text(st.locals, l)), ") of ", st.enc_fn.sym, " is read outside its scope"]))
+  None -> panic(
+    concat_all([
+      "identity: local ",
+      int_to_string(local_raw(l)),
+      " (",
+      written_text(ln_text(st.locals, l)),
+      ") of ",
+      st.enc_fn.sym,
+      " is read outside its scope"
+    ])
+  )
 }
 
 #[doc("The name the local `l` was written with.")]
-pub fn ls_local_name(st: LowerSt, l: LocalId) : String = {
+pub fn ls_local_name(st: LowerSt, l: LocalId) : String {
   let w = written_text(ln_text(st.locals, l))
-  if w == "" { panic(concat_all(["identity: the name of local ", int_to_string(local_raw(l)), " of ", st.enc_fn.sym, " in ls_local_name"])) } else { w }
+  if w == "" {
+    panic(
+      concat_all([
+        "identity: the name of local ",
+        int_to_string(local_raw(l)),
+        " of ",
+        st.enc_fn.sym,
+        " in ls_local_name"
+      ])
+    )
+  } else {
+    w
+  }
 }
 
 #[doc("The register a lambda or clause reads the capture `c` from inside its own body: the captured binder's, or the one holding the alias's handler id.")]
@@ -365,7 +482,7 @@ pub fn kir_capture_name(locals: LocalNames, c: Capture) : String = match c {
 
 #[doc("True when `l` is one of `xs`.")]
 pub fn lid_has(xs: [LocalId], l: LocalId) : Bool = match xs {
-  []           -> false
+  [] -> false
   [h, ...rest] -> local_eq(h, l) or lid_has(rest, l)
 }
 
@@ -373,8 +490,9 @@ pub fn lid_has(xs: [LocalId], l: LocalId) : Bool = match xs {
 pub fn lid_uniq(xs: [LocalId]) : [LocalId] = lid_uniq_go(xs, [])
 
 fn lid_uniq_go(xs: [LocalId], seen: [LocalId]) : [LocalId] = match xs {
-  []           -> []
-  [x, ...rest] -> if lid_has(seen, x) { lid_uniq_go(rest, seen) } else { [x, ...lid_uniq_go(rest, [x, ...seen])] }
+  [] -> []
+  [x, ...rest] ->
+    if lid_has(seen, x) { lid_uniq_go(rest, seen) } else { [x, ...lid_uniq_go(rest, [x, ...seen])] }
 }
 
 # Restore `scope` to a snapshot taken at block entry. `rc` (the fresh-reg
@@ -432,8 +550,8 @@ pub(pkg) fn ls_emit(st: LowerSt, s: KStmt) : LowerSt =
 # The register a binder statement introduces, if any (`KLet`/`KStore` dest).
 fn ls_bind_reg_of(st: LowerSt, s: KStmt) : LowerSt = match s {
   KLet(name, _, _, _) -> ls_bind_reg(st, name)
-  KStore(name, _, _)  -> ls_bind_reg(st, name)
-  _                   -> st
+  KStore(name, _, _) -> ls_bind_reg(st, name)
+  _ -> st
 }
 
 fn ls_emit_raw(st: LowerSt, s: KStmt) : LowerSt = LowerSt { ...st, ss: [s, ...st.ss] }
@@ -441,29 +559,37 @@ fn ls_emit_raw(st: LowerSt, s: KStmt) : LowerSt = LowerSt { ...st, ss: [s, ...st
 # Seal the current block with a terminator and start a fresh block under
 # `next_label`. The sealed block joins `blocks` in generation order.
 pub(pkg) fn ls_seal(st: LowerSt, term: KTerm, next_label: String) : LowerSt =
-  LowerSt { ...st,
-            bs: [KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None }, ...st.bs],
-            cl: next_label, ss: [] }
+  LowerSt {
+    ...st,
+    bs: [
+      KBlock { label: st.cl, stmts: list_reverse(st.ss), term: term, region_id: None },
+      ...st.bs
+    ],
+    cl: next_label,
+    ss: []
+  }
 
 # Seal the final block without opening a successor (function exit). When
 # the body ends in a tail terminator, the final block is the dead successor
 # `seal_tail` opened: nothing branches to it and no value reaches its `ret`,
 # so it ends in `unreachable` rather than returning a placeholder.
-pub fn ls_finish(st: LowerSt, term: KTerm) : [KBlock] = {
+pub fn ls_finish(st: LowerSt, term: KTerm) : [KBlock] {
   let t = match term {
     KRet(_, p) if ls_cursor_dead(st) -> KUnreachable(p)
-    _                                -> term
+    _ -> term
   }
-  list_reverse([KBlock { label: st.cl, stmts: list_reverse(st.ss), term: t, region_id: None }, ...st.bs])
+  list_reverse([
+    KBlock { label: st.cl, stmts: list_reverse(st.ss), term: t, region_id: None },
+    ...st.bs
+  ])
 }
 
 # The open block is past the entry and no sealed block branches to it.
 fn ls_cursor_dead(st: LowerSt) : Bool =
-  not list_is_empty(st.bs) and not any(st.bs, (b) => list_has(klc_succ(b.term), st.cl))
+  (not list_is_empty(st.bs)) and (not any(st.bs, b => list_has(klc_succ(b.term), st.cl)))
 
 pub fn name_in_list(xs: [String], target: String) : Bool = match xs {
   [] -> false
   [h, ...rest] -> if h == target { true } else { name_in_list(rest, target) }
 }
-
 # --- Top-level consts (inlined at their use site) -----------------------
