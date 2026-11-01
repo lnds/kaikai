@@ -288,6 +288,8 @@ The cost is instructions retired (`/usr/bin/time -l` on macOS, `perf stat` on Li
 
 CI runs it on PRs that touch the compiler (the `compiler-touch` filter of `tier1.yml`) as the required `cost-ab` job: the PR's `kaic2-c` artifact against the base commit's bootstrap-cache `kaic2`, posted as one PR comment that later pushes update in place. The job fails when self-compile or the empty program rises by more than 1 %.
 
+`tools/pkg-cost-ab.py <base-tree> <branch-tree>` covers what `cost-ab` cannot: the wall time of `kai build` on a generated 41-module package (native, `KAI_BIN_MEMO=0`, each side with its own warm cache, alternating rounds, medians), which exercises the wrapper's per-module work (cache lookups, object holds, link). The `pkg-cost-ab` job of `tier1-native.yml` runs it on PRs that reach the native build and fails above +3 % on the median; it is not in the aggregator's `needs`.
+
 ### Where the cost goes — `KAI_PASS_CLOCK`
 
 `KAI_PASS_CLOCK=1 kaic2 …` prints one `pass-clock <pass> <monotonic ns>` line per driver pass to stderr (`core` is the core load, then `open` … `emit`); a pass costs the difference from the previous line. It reads the runtime's monotonic clock (the `PassClock` effect), so it is wall time, not instructions: use it to see which pass a cost sits in, and `cost-ab` to size it. The variable is left out of the native-core pre-key. Without it each pass boundary costs one `Env.get`.
