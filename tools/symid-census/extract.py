@@ -71,6 +71,9 @@ def operand(s, i, step):
     """The operand of a comparison that ends (step -1) or starts (step +1) at s[i]."""
     depth, j = 0, i
     inward, outward = (CLOSE, OPEN) if step < 0 else (OPEN, CLOSE)
+    while 0 <= j < len(s) and s[j] in " \t\n":
+        j += step
+    first = j
     while 0 <= j < len(s):
         ch = s[j]
         if depth == 0 and (ch in ",;\n{}" or s[j:j + 2] in ("->", "=>")): break
@@ -79,7 +82,7 @@ def operand(s, i, step):
             if depth == 0: break
             depth -= 1
         j += step
-    text = s[j + 1:i + 1] if step < 0 else s[i:j]
+    text = s[j + 1:first + 1] if step < 0 else s[first:j]
     return SEPARATES.split(text)[-1 if step < 0 else 0]
 
 
@@ -121,6 +124,9 @@ class Fn:
     def statement(self, i):
         """The right-hand side starting at body[i]: to the end of the line, or of the open bracket."""
         depth, j = 0, i
+        while j < len(self.body) and self.body[j] in " \t\n":
+            j += 1
+        start = j
         while j < len(self.body):
             ch = self.body[j]
             if ch in OPEN: depth += 1
@@ -129,7 +135,7 @@ class Fn:
                 depth -= 1
             elif ch == "\n" and depth == 0: break
             j += 1
-        return self.body[i:j]
+        return self.body[start:j]
 
     def line(self, i):
         return self.first_line + self.body.count("\n", 0, i)
