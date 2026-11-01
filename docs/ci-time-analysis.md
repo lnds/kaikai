@@ -199,8 +199,8 @@ parallelism.
   built kaic2: the compiled half of the symid names gate, builtin tables,
   kaic1 rejections, then the slow cache/demos gates. CI runs them as three
   matrix groups on three runners (`kaic2-gates-symid`, `-demos`, `-rest`).
-  The fmt-corpus classification (`test-fmt-classify`) is not in the list:
-  the fmt-property shards parse and classify the same corpus.
+  The fmt-corpus classification has no gate of its own: the fmt-property
+  shards parse and classify the same corpus.
 
 A gate lives in exactly one half; `tier0-gates` is their union and
 `make tier0` still runs everything plus the selfhost. A gate belongs in
