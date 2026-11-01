@@ -22,6 +22,7 @@ import compiler.diag_type_text
 import compiler.infer_apply
 import compiler.infer_instantiate
 import compiler.infer_fuse_arith
+import compiler.infer_unify_rows
 import compiler.written
 import compiler.local_names
 import compiler.handler_alias
@@ -491,7 +492,8 @@ pub fn synth_lambda_pinned(
 
 # The tails among `us` that the function types inside `tys` run through: rows
 # the lambda's own parameters introduced.
-fn param_owned_tails(s: Subst, tys: [Ty], us: [TailUse]) : [TailUse] / Mutable {
+#[doc("The tails among `us` that the function types inside `tys` run through.")]
+pub fn param_owned_tails(s: Subst, tys: [Ty], us: [TailUse]) : [TailUse] / Mutable {
   let roots = foldl(tys, [], (acc, t) => ty_fn_roots(s, apply_ty(s, t), acc))
   filter(
     us,
@@ -500,6 +502,39 @@ fn param_owned_tails(s: Subst, tys: [Ty], us: [TailUse]) : [TailUse] / Mutable {
     }
   )
 }
+
+# A field read on a parameter whose record type is still unknown hides the
+# function types the parameter carries; the join reruns once the read settles.
+fn defer_param_tails(
+  st: InferState,
+  before: [DeferredField],
+  tys: [Ty],
+  tail: Int,
+  us: [TailUse],
+  line: Int,
+  col: Int
+) : InferState / Mutable {
+  let fresh = list_length(st.deferred_fields) - list_length(before)
+  if fresh <= 0
+    or us == []
+    or (not params_hold_receiver(st, take(st.deferred_fields, fresh), tys)) {
+    st
+  } else {
+    st_push_deferred_field(st, DLamTail(tail, tys, us, line, col))
+  }
+}
+
+fn params_hold_receiver(st: InferState, dfs: [DeferredField], tys: [Ty]) : Bool / Mutable =
+  any(
+    dfs,
+    df => match df {
+      DFd(recv, _, _, _, _, _) -> match apply_ty(st.sub, TyVarT(recv)) {
+        TyVarT(rep) -> occurs_any(rep, tys, st.sub)
+        _ -> false
+      }
+      DLamTail(_, _, _, _, _) -> false
+    }
+  )
 
 fn ty_fn_roots(s: Subst, t: Ty, acc: [Int]) : [Int] / Mutable = match t {
   TyFnT(ps, r, row) -> {
@@ -673,6 +708,8 @@ fn synth_lambda_body(
     line,
     col
   )
+  let st4 =
+    defer_param_tails(st3, outer.deferred_fields, added.tys, fr.id, rb_masked.row_tails, line, col)
   let lam_row = Row {
     labels: lambda_row_labels,
     tail: Some(fr.id),
@@ -682,7 +719,7 @@ fn synth_lambda_body(
   # rebuilt the body's type at every level of a lambda nest.
   let lam_ty = TyFnT(added.tys, rb.ty, lam_row)
   let root = with_ty(mk_expr(ELambda(ps, rb.expr), line, col), lam_ty)
-  mk_inferred(st3, lam_ty, root)
+  mk_inferred(st4, lam_ty, root)
 }
 
 #[doc("Typer-internal helper `synth_list_expr` shared across the infer modules.")]

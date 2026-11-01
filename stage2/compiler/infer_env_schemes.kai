@@ -32,6 +32,7 @@ import compiler.infer_unify_rows
 import compiler.infer_instantiate
 import compiler.infer_tparam_escape
 import compiler.infer_fuse_arith
+import compiler.infer_forms
 
 #[doc("Typer-internal helper `build_uvar_canon_map` shared across the infer modules.")]
 pub fn build_uvar_canon_map(bound: [Int], sub: Subst, acc: [IntPair]) : [IntPair] {
@@ -788,6 +789,74 @@ fn hom_commit(
 #     non-record value.
 #   - still an unbound tyvar                    -> "type annotation needed"
 #     (the body never pins the receiver; mirrors OCaml's warning 18).
+#[doc("Settles the field reads whose receiver is already a type and reruns the lambda tail joins that waited on them, ahead of the body-row check.")]
+pub fn presettle_lambda_tails(st: InferState) : InferState / Console + File + Mutable =
+  if any(
+    st.deferred_fields,
+    df => match df {
+      DLamTail(_, _, _, _, _) -> true
+      DFd(_, _, _, _, _, _) -> false
+    }
+  ) {
+    let r = settle_fields(st, list_reverse(st.deferred_fields), [])
+    InferState { ...r.st, deferred_fields: r.keep }
+  } else {
+    st
+  }
+
+# Unifies the lambda's row with each tail's whole row, labels included: the
+# tail was bound by the field read after the lambda closed.
+fn rejoin_param_tails(
+  st: InferState,
+  tail: Int,
+  us: [TailUse],
+  line: Int,
+  col: Int
+) : InferState / Console + File + Mutable =
+  foldl(
+    us,
+    st,
+    (acc, u) => match u {
+      TU(t, _, _) -> st_unify_join(
+        acc,
+        row_arg_carrier(row_with_tail(tail)),
+        row_arg_carrier(row_with_tail(t)),
+        "lambda effect row",
+        line,
+        col
+      )
+    }
+  )
+
+type SettledFields = { st: InferState, keep: [DeferredField] }
+
+fn settle_fields(
+  st: InferState,
+  dfs: [DeferredField],
+  keep: [DeferredField]
+) : SettledFields / Console + File + Mutable {
+  match dfs {
+    [] -> SettledFields { st: st, keep: keep }
+    [df, ...rest] -> match df {
+      DFd(recv_id, fnm, res_id, line, col, in_pat) -> match apply_ty(st.sub, TyVarT(recv_id)) {
+        TyVarT(_) -> settle_fields(st, rest, [df, ...keep])
+        recv -> settle_fields(
+          drain_one_deferred_field(st, recv, fnm, res_id, line, col, in_pat),
+          rest,
+          keep
+        )
+      }
+      DLamTail(tail, tys, us, line, col) -> {
+        settle_fields(
+          rejoin_param_tails(st, tail, param_owned_tails(st.sub, tys, us), line, col),
+          rest,
+          [df, ...keep]
+        )
+      }
+    }
+  }
+}
+
 #[doc("Typer-internal helper `drain_deferred_fields` shared across the infer modules.")]
 pub fn drain_deferred_fields(
   st: InferState,
@@ -811,6 +880,13 @@ pub fn drain_deferred_fields(
         let recv = apply_ty(stp.sub, TyVarT(recv_id))
         let st1 = drain_one_deferred_field(stp, recv, fnm, res_id, line, col, in_pat)
         drain_deferred_fields(st1, rest, declared)
+      }
+      DLamTail(tail, tys, us, line, col) -> {
+        drain_deferred_fields(
+          rejoin_param_tails(st, tail, param_owned_tails(st.sub, tys, us), line, col),
+          rest,
+          declared
+        )
       }
     }
   }
