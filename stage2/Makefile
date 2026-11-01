@@ -5642,8 +5642,8 @@ test-m4c: $(TARGET) build
 	  && ! grep -qE "= kaiu_m4c_run_with__run_with\(" build/s2-m4c_run_with.kir \
 	  && echo "m4c OK m4c_run_with call sites rewritten to mangled names" \
 	  || { echo "m4c FAIL m4c_run_with — main still calls the polymorphic run_with"; exit 1; }; \
-	grep -qE "= kaiu_m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__Int__Int\(" build/s2-m4c_handler_in_body.kir \
-	  && grep -qE "= kaiu_m4c_handler_in_body__process_with_log(__cspec__F[A-Za-z0-9_]+)?__mono__String__Int\(" build/s2-m4c_handler_in_body.kir \
+	grep -qE "= kaiu_m4c_handler_in_body__process_with_log(__cspec__[0-9]+_F[0-9]+)?__mono__Int__Int\(" build/s2-m4c_handler_in_body.kir \
+	  && grep -qE "= kaiu_m4c_handler_in_body__process_with_log(__cspec__[0-9]+_F[0-9]+)?__mono__String__Int\(" build/s2-m4c_handler_in_body.kir \
 	  && echo "m4c OK m4c_handler_in_body call sites rewritten to mangled names" \
 	  || { echo "m4c FAIL m4c_handler_in_body — main still calls the polymorphic process_with_log"; exit 1; }; \
 	for t in Int String; do \
@@ -11475,7 +11475,6 @@ test-user-cache: $(TARGET)
 	  sh "$$f" || { echo "user-cache FAIL: $$f"; exit 1; }; \
 	done; \
 	echo "user-cache OK (Phase B invalidation + typed interface-hash fixtures passed)"
-
 # Issue #825 — core (auto-loaded stdlib) post-parse cache invalidation
 # gate. Runs the positive cold==warm==oracle differential plus three
 # negatives (edit a core file / version bump / corrupt blob). Serving a
