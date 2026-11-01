@@ -1,0 +1,122 @@
+name: pkg-cost-ab-noise
+
+# Runs pkg-cost-ab with the same tree on both sides, so every delta is runner
+# noise. Each matrix entry is a separate runner; one dispatch yields N samples.
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Rounds per sample
+        default: '9'
+      samples:
+        description: Number of runners measuring (max 20)
+        default: '12'
+      cache_bust:
+        description: Non-empty forces a native-chain cache miss
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  KAIC_BOOT: release
+  KAIC_BOOT_HOPS: 1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      indices: ${{ steps.idx.outputs.indices }}
+    steps:
+      - id: idx
+        run: |
+          n="${{ inputs.samples }}"
+          echo "indices=$(seq -s, 1 "$n" | sed 's/^/[/;s/$/]/')" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+      - name: Install toolchain (clang + libLLVM)
+        run: ./tools/ci-install-toolchain.sh llvm
+      - name: Fingerprint toolchain for cache key
+        id: cc-fp
+        run: echo "id=$( (clang --version | head -1; "$LLVM_CONFIG" --version) | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
+      - name: Resolve the release boot
+        id: boot
+        run: |
+          id="$(tools/kaic-boot.sh release-id)"
+          echo "id=$(printf '%s' "$id" | tr -c 'A-Za-z0-9.' '-')" >> "$GITHUB_OUTPUT"
+      - name: Restore the native bootstrap chain
+        id: chain-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            stage0/*.o
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/stage2.c
+            stage2/build/stage2.c.id
+            stage2/build/kaic2.id
+            stage0/runtime_llvm.bc
+            stage0/runtime_llvm.bc.stamp
+            stage0/runtime_inline.bc
+          key: kaic2-native-${{ steps.cc-fp.outputs.id }}-${{ steps.boot.outputs.id }}-${{ hashFiles('Makefile', 'EDITION', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/kaic-boot.sh', 'tools/kaic-link.sh', 'tools/assert-runtime-bc.sh', 'tools/gen-runtime-bc.sh') }}${{ inputs.cache_bust && format('-bust-{0}', inputs.cache_bust) || '' }}
+      - name: Build the compiler
+        if: steps.chain-cache.outputs.cache-hit != 'true'
+        env:
+          KAIC_BOOT_MODULAR: 1
+        run: |
+          start=$SECONDS
+          rm -f stage2/kaic2
+          make kaic1
+          make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" kaic2
+          echo "chain build took $((SECONDS - start)) s"
+      - name: Mark the chain fresh (no rebuild)
+        if: steps.chain-cache.outputs.cache-hit == 'true'
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: Build bin/kai
+        run: make -s CC=clang -C tools/kai kai
+      - uses: actions/upload-artifact@v4
+        with:
+          name: noise-tree
+          path: |
+            bin/kai
+            tools/pkg-cost-ab.py
+            stage0/*.o
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/stage2.c
+            stage2/build/stage2.c.id
+            stage2/build/kaic2.id
+            stage0/runtime_llvm.bc
+            stage0/runtime_llvm.bc.stamp
+            stage0/runtime_inline.bc
+          retention-days: 1
+          if-no-files-found: error
+
+  measure:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: ${{ fromJSON(needs.build.outputs.indices) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain (clang + libLLVM)
+        run: ./tools/ci-install-toolchain.sh llvm
+      - uses: actions/download-artifact@v4
+        with:
+          name: noise-tree
+      - name: Restore mtimes (no rebuild)
+        run: |
+          chmod +x bin/kai stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: Measure identical trees
+        run: |
+          python3 -I tools/pkg-cost-ab.py --rounds "${{ inputs.rounds }}" "$PWD" "$PWD" | sed "s/^/sample ${{ matrix.sample }}: /"
