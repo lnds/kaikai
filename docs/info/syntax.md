@@ -402,7 +402,7 @@ fn main() : Int = addone(double(20)) + experimental() + Wallet("ana").pin
 ```
 
 `#[must_use]` / `#[must_use("message")]` goes on a `type` declaration.
-The compiler warns (`rule: must_use_discard`, message appended) when a
+The compiler warns (`rule: must_use_discard`, the message in a `= note:` line) when a
 statement discards a value of that type; `Result` and `Stream` carry it.
 Close the value with `|> ignore` or `let _ =`, bind it, match on it, or
 make it the block's result:
@@ -411,11 +411,11 @@ make it the block's result:
 #[must_use("the fault is lost unless it is checked")]
 type Checked = Checked(Int)
 
-fn check(n: Int) : Checked = Checked(n)
+fn tag(n: Int) : Checked = Checked(n)
 
-fn main() : Unit {
-  check(1) |> ignore
-  let _ = check(2)
+fn main() : Unit / Stdout {
+  tag(1) |> ignore
+  let _ = tag(2)
   Stdout.print("ok")
 }
 ```
