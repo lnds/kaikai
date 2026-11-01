@@ -11,7 +11,9 @@ warm cache, and compares medians.
                        <base-tree> <branch-tree>
 
 A tree is a directory whose `bin/kai` runs on its own. Exit 1 when the branch
-median is above the base median by more than PCT percent.
+median AND the branch min are both above the base's by more than PCT percent:
+runner noise is additive and inflates a median on a loaded round, but it cannot
+raise the fastest build, while a real regression raises both.
 """
 import argparse
 import os
@@ -107,20 +109,21 @@ def main():
         )
         (bmin, bmed), (rmin, rmed) = stat["base"], stat["branch"]
         pct = 100.0 * (rmed - bmed) / bmed
-        over = a.fail_above is not None and pct > a.fail_above
+        pct_min = 100.0 * (rmin - bmin) / bmin
+        over = a.fail_above is not None and min(pct, pct_min) > a.fail_above
         verdict = f"up, over the {a.fail_above}% budget" if over else "ok"
         if a.markdown:
-            print("| probe | base min / median (s) | branch min / median (s) | delta (%) | per-round delta min / median / max (%) | verdict |")
-            print("|---|---:|---:|---:|---:|---|")
+            print("| probe | base min / median (s) | branch min / median (s) | median delta (%) | min delta (%) | per-round delta min / median / max (%) | verdict |")
+            print("|---|---:|---:|---:|---:|---:|---|")
             print(
                 f"| {a.modules}-module package build | {bmin:.3f} / {bmed:.3f} | "
-                f"{rmin:.3f} / {rmed:.3f} | {pct:+.2f} | "
+                f"{rmin:.3f} / {rmed:.3f} | {pct:+.2f} | {pct_min:+.2f} | "
                 f"{spread[0]:+.1f} / {statistics.median(spread):+.1f} / {spread[-1]:+.1f} | {verdict} |"
             )
         else:
             print(
                 f"{a.modules}-module package build: base {bmin:.3f}/{bmed:.3f} s, "
-                f"branch {rmin:.3f}/{rmed:.3f} s, {pct:+.2f}% "
+                f"branch {rmin:.3f}/{rmed:.3f} s, median {pct:+.2f}%, min {pct_min:+.2f}% "
                 f"(per-round {spread[0]:+.1f}/{statistics.median(spread):+.1f}/{spread[-1]:+.1f}%, {verdict})"
             )
         return 1 if over else 0
