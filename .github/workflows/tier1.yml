@@ -37,8 +37,13 @@ permissions:
 
 # The boot of stage2.c (docs/build-system.md §KAIC_BOOT). Workflow-wide: a
 # job whose mode disagrees with the artifact's stage2.c.id rebuilds stage2.c.
+# The shared artifact takes one hop (the release's codegen compiles this
+# tree's compiler: it runs every user program the shards throw at it). The
+# jobs that measure the compiler as a subject (allocation, memory, cost)
+# take the two-hop artifact of `bootstrap` and say KAIC_BOOT_HOPS: 2.
 env:
   KAIC_BOOT: release
+  KAIC_BOOT_HOPS: 1
 
 # CI structure (docs/ci-time-analysis.md). The tier1 gate's light fixture
 # pool is CPU-bound + independent, so it is sharded across SEPARATE
@@ -275,7 +280,7 @@ jobs:
             stage2/build/stage2.c
             stage2/build/stage2.c.id
             stage2/build/kaic2.id
-          key: kaic2-c-${{ steps.cc-fp.outputs.id }}-${{ steps.boot.outputs.id }}-${{ hashFiles('Makefile', 'EDITION', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/kaic-boot.sh', 'tools/kaic-link.sh') }}
+          key: kaic2-c-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ steps.boot.outputs.id }}-${{ hashFiles('Makefile', 'EDITION', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/kaic-boot.sh', 'tools/kaic-link.sh') }}
       # Both hops are linked from one translation unit per module, compiled on
       # every core (tools/kaic-link.sh). Each object is keyed by everything
       # cc reads for it, so a near-miss restore is sound here: an object whose
@@ -286,9 +291,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: stage2/build/obj-cache
-          key: kaic2-c-obj-${{ steps.cc-fp.outputs.id }}-${{ github.sha }}
+          key: kaic2-c-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ github.sha }}
           restore-keys: |
-            kaic2-c-obj-${{ steps.cc-fp.outputs.id }}-
+            kaic2-c-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-
       # kaic1 is not the boot; it ships because tier1 still tests stage 1.
       - name: Build kaic1 and the release-booted C-only kaic2
         if: steps.bootstrap-cache.outputs.cache-hit != 'true'
@@ -300,7 +305,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: stage2/build/obj-cache
-          key: kaic2-c-obj-${{ steps.cc-fp.outputs.id }}-${{ github.sha }}
+          key: kaic2-c-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ github.sha }}
       - name: Mark cached chain fresh (no rebuild)
         if: steps.bootstrap-cache.outputs.cache-hit == 'true'
         run: |
@@ -327,6 +332,135 @@ jobs:
             stage2/build/kaic2.id
           retention-days: 1
           if-no-files-found: error
+
+  # The two-hop chain: the release compiles this tree's compiler, and that
+  # compiler compiles it again, so the C that is linked is this tree's own
+  # codegen. Publishes `kaic2-c-full` as soon as it is linked; the jobs that
+  # measure the compiler itself start from it. `selfhost-fixed-point` below
+  # proves the one-hop artifact and this one are the same compiler.
+  bootstrap:
+    needs: changes
+    if: needs.changes.outputs.doc-only != 'true'
+    env:
+      KAIC_BOOT_HOPS: 2
+    runs-on: ubuntu-latest
+    # A release boot compiles the whole compiler twice. Headroom for a slow
+    # runner: a cancel here re-runs every job behind it.
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: ./tools/ci-install-toolchain.sh
+      # Exact-match cache of the whole bootstrap chain: a hit means the
+      # sources that feed kaic2 are byte-identical to a prior green build,
+      # so the bootstrap is skipped (docs/CI/examples-only PRs).
+      # Deliberately NO restore-keys: a near-miss chain plus the mtime touch
+      # would masquerade as fresh and make would rebuild nothing — a stale
+      # kaic2 presented as current. Exact hit or full bootstrap, nothing
+      # in between.
+      - name: Fingerprint toolchain for cache key
+        id: cc-fp
+        run: echo "id=$(clang --version | head -1 | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
+      # The boot is part of the chain's identity: the key names the release it resolves to.
+      - name: Resolve the release boot
+        id: boot
+        run: |
+          id="$(tools/kaic-boot.sh release-id)"
+          echo "id=$(printf '%s' "$id" | tr -c 'A-Za-z0-9.' '-')" >> "$GITHUB_OUTPUT"
+      - name: Cache bootstrap chain (exact source match only)
+        id: bootstrap-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            stage0/*.o
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/stage2.c
+            stage2/build/stage2.c.id
+            stage2/build/kaic2.id
+          key: kaic2-c-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ steps.boot.outputs.id }}-${{ hashFiles('Makefile', 'EDITION', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/kaic-boot.sh', 'tools/kaic-link.sh') }}
+      # Both hops are linked from one translation unit per module, compiled on
+      # every core (tools/kaic-link.sh). Each object is keyed by everything
+      # cc reads for it, so a near-miss restore is sound here: an object whose
+      # inputs changed is not found, and is compiled. Saved from main only: a
+      # PR restores main's objects and compiles the modules it touches.
+      - name: Restore boot objects
+        if: steps.bootstrap-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: stage2/build/obj-cache
+          key: kaic2-c-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ github.sha }}
+          restore-keys: |
+            kaic2-c-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-
+      # kaic1 is not the boot; it ships because tier1 still tests stage 1.
+      - name: Build kaic1 and the release-booted C-only kaic2
+        if: steps.bootstrap-cache.outputs.cache-hit != 'true'
+        env:
+          KAIC_BOOT_MODULAR: 1
+        run: make CC=clang kaic1 kaic2
+      - name: Save boot objects
+        if: steps.bootstrap-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: stage2/build/obj-cache
+          key: kaic2-c-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ github.sha }}
+      - name: Mark cached chain fresh (no rebuild)
+        if: steps.bootstrap-cache.outputs.cache-hit == 'true'
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: Build bin/kai (shipped in the artifact so no consumer rebuilds it)
+        run: make -s CC=clang -C tools/kai kai
+      - name: Upload bootstrap artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaic2-c-full
+          # Only the dependency chain `make` consults to decide up-to-date.
+          # NOT stage2/build/*.c fixture outputs (hundreds of MB of test
+          # litter that the test jobs regenerate anyway).
+          path: |
+            bin/kai
+            stage0/*.o
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/stage2.c
+            stage2/build/stage2.c.id
+            stage2/build/kaic2.id
+          retention-days: 1
+          if-no-files-found: error
+
+  # The compiler built by the two-hop chain compiles itself twice and the
+  # two emissions must be byte-identical. Required: it is what lets the
+  # shards run on the one-hop artifact.
+  selfhost-fixed-point:
+    needs: [changes, bootstrap]
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      KAIC_BOOT_HOPS: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: ./tools/ci-install-toolchain.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-c-full
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: Self-host determinism (kaic2b.c == kaic2c.c)
+        run: make CC=clang -C stage2 selfhost
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after selfhost-fixed-point"; git status; exit 1
+          fi
 
   # Every fenced kaikai block in the current docs builds, parses or is
   # rejected as its tag says. Runs on every PR, doc-only ones included.
@@ -400,10 +534,43 @@ jobs:
             git status; exit 1
           fi
 
-  tier1-shard-1:
-    needs: [changes, build]
+  # The tier0 gates that measure the compiler as a subject (what it
+  # allocates, how much memory it takes): they run on the two-hop artifact,
+  # whose codegen is this tree's.
+  tier0-subject:
+    needs: [changes, bootstrap]
     if: needs.changes.outputs.doc-only != 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      KAIC_BOOT_HOPS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain
+        run: ./tools/ci-install-toolchain.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-c-full
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: tier0 gates that measure the compiler (subject)
+        run: make CC=clang kaic2-gates-subject
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after tier0-subject"; git status; exit 1
+          fi
+
+  tier1-shard-1:
+    needs: [changes, bootstrap]
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    env:
+      KAIC_BOOT_HOPS: 2
     # A ceiling adjacent to the nominal time turns a slow runner into cancel
     # + full re-run, which costs far more than headroom.
     timeout-minutes: 45
@@ -415,7 +582,7 @@ jobs:
         run: ./tools/ci-install-toolchain.sh
       - uses: actions/download-artifact@v4
         with:
-          name: kaic2-c
+          name: kaic2-c-full
       - name: Restore artifact mtimes (no rebuild)
         run: |
           chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
@@ -945,6 +1112,8 @@ jobs:
     if: github.event_name == 'pull_request' && needs.changes.outputs.compiler-touch == 'true' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 50
+    env:
+      KAIC_BOOT_HOPS: 2
     steps:
       # The base sits at the workspace root, like the build job's tree: the
       # cache version is derived from the path list, so a restore finds
@@ -995,15 +1164,15 @@ jobs:
             stage2/build/stage2.c
             stage2/build/stage2.c.id
             stage2/build/kaic2.id
-          key: kaic2-c-${{ steps.cc-fp.outputs.id }}-${{ steps.boot.outputs.id }}-${{ hashFiles('Makefile', 'EDITION', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/kaic-boot.sh', 'tools/kaic-link.sh') }}
+          key: kaic2-c-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ steps.boot.outputs.id }}-${{ hashFiles('Makefile', 'EDITION', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/kaic-boot.sh', 'tools/kaic-link.sh') }}
       - name: Restore boot objects
         if: steps.base-cache.outputs.cache-hit != 'true'
         uses: actions/cache/restore@v4
         with:
           path: stage2/build/obj-cache
-          key: kaic2-c-obj-${{ steps.cc-fp.outputs.id }}-${{ steps.base-sha.outputs.sha }}
+          key: kaic2-c-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ steps.base-sha.outputs.sha }}
           restore-keys: |
-            kaic2-c-obj-${{ steps.cc-fp.outputs.id }}-
+            kaic2-c-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-
       - name: Build the base compiler
         if: steps.base-cache.outputs.cache-hit != 'true'
         env:
@@ -1018,7 +1187,7 @@ jobs:
           if-no-files-found: error
 
   cost-ab:
-    needs: [changes, build, cost-ab-base]
+    needs: [changes, bootstrap, cost-ab-base]
     if: github.event_name == 'pull_request' && needs.changes.outputs.compiler-touch == 'true' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 50
@@ -1056,7 +1225,7 @@ jobs:
         run: ./tools/ci-install-toolchain.sh
       - uses: actions/download-artifact@v4
         with:
-          name: kaic2-c
+          name: kaic2-c-full
           path: pr-artifact
       - uses: actions/download-artifact@v4
         with:
@@ -1098,7 +1267,7 @@ jobs:
   # branch protection needs no edit. A doc-only PR reaches here via the
   # skipped jobs and still reports SUCCESS, satisfying the required check.
   tier1:
-    needs: [changes, fast-gates, doc-blocks, tier0, tier1-shard-1, tier1-shard-2, tier1-shard-3, tier1-shard-4, tier1-shard-5, tier1-shard-6, tier1-shard-7, tier1-asan, tier1-gcc15]
+    needs: [changes, fast-gates, doc-blocks, tier0, tier0-subject, bootstrap, selfhost-fixed-point, tier1-shard-1, tier1-shard-2, tier1-shard-3, tier1-shard-4, tier1-shard-5, tier1-shard-6, tier1-shard-7, tier1-asan, tier1-gcc15]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1116,6 +1285,9 @@ jobs:
           fi
           rf='${{ needs.fast-gates.result }}'
           r0='${{ needs.tier0.result }}'
+          rs='${{ needs.tier0-subject.result }}'
+          rb='${{ needs.bootstrap.result }}'
+          rx='${{ needs.selfhost-fixed-point.result }}'
           r1='${{ needs.tier1-shard-1.result }}'
           r2='${{ needs.tier1-shard-2.result }}'
           r3='${{ needs.tier1-shard-3.result }}'
@@ -1125,12 +1297,15 @@ jobs:
           r7='${{ needs.tier1-shard-7.result }}'
           ra='${{ needs.tier1-asan.result }}'
           asan='${{ needs.changes.outputs.asan }}'
-          echo "results: fast-gates=$rf tier0=$r0 shards 1=$r1 2=$r2 3=$r3 4=$r4 5=$r5 6=$r6 7=$r7 asan=$ra (in scope: $asan)"
+          echo "results: fast-gates=$rf tier0=$r0 subject=$rs bootstrap=$rb fixed-point=$rx shards 1=$r1 2=$r2 3=$r3 4=$r4 5=$r5 6=$r6 7=$r7 asan=$ra (in scope: $asan)"
           if [ "$rf" != "success" ]; then
             echo "::error::tier1 FAIL — fast-gates did not succeed"; exit 1
           fi
-          if [ "$r0" != "success" ]; then
+          if [ "$r0" != "success" ] || [ "$rs" != "success" ]; then
             echo "::error::tier1 FAIL — tier0 did not succeed"; exit 1
+          fi
+          if [ "$rb" != "success" ] || [ "$rx" != "success" ]; then
+            echo "::error::tier1 FAIL — the two-hop bootstrap or its self-host fixed point did not succeed"; exit 1
           fi
           if [ "$r1" != "success" ] || [ "$r2" != "success" ] || [ "$r3" != "success" ] || [ "$r4" != "success" ] || [ "$r5" != "success" ] || [ "$r6" != "success" ] || [ "$r7" != "success" ]; then
             echo "::error::tier1 FAIL — a shard did not succeed"; exit 1
