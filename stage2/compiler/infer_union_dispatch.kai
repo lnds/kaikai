@@ -22,117 +22,233 @@ import compiler.infer_index
 import compiler.infer_state
 
 #[doc("The call of the dispatcher `callee` on a receiver typed `recv` as a union of types, rewritten to a match that calls the operation on the component the receiver carries; `done` is the call typed as written, kept for the error of an operation with several `Self` parameters. `None` for any other call, or when no component has an impl of the operation.")]
-pub fn try_union_dispatch(st: InferState, settled: Expr, callee: Expr, args_: [Expr], callee_ty: Ty, recv: Ty,
-                          done: Inferred, line: Int, col: Int) : Option[Inferred] / Console + File + Mutable =
-  and_then(map(pid_ref_disp(st.protos.ids, settled), disp_op), (op) => match args_ {
-    []                     -> None
-    [first, ...rest_args] -> match union_receiver(st, recv, op) {
-      None                      -> None
-      Some(UnionRecv(u, comps)) ->
-        if repeats_self(callee_ty) { Some(self_repeat_error(done, st, op, u, line, col)) }
-        else { Some(w_synth(st, union_call(callee, first, rest_args, comps, line, col))) }
+pub fn try_union_dispatch(
+  st: InferState,
+  settled: Expr,
+  callee: Expr,
+  args_: [Expr],
+  callee_ty: Ty,
+  recv: Ty,
+  done: Inferred,
+  line: Int,
+  col: Int
+) : Option[Inferred] / Console + File + Mutable =
+  and_then(
+    map(pid_ref_disp(st.protos.ids, settled), disp_op),
+    op => match args_ {
+      [] -> None
+      [first, ...rest_args] -> match union_receiver(st, recv, op) {
+        None -> None
+        Some(UnionRecv(u, comps)) ->
+          if repeats_self(callee_ty) {
+            Some(self_repeat_error(done, st, op, u, line, col))
+          } else {
+            Some(w_synth(st, union_call(callee, first, rest_args, comps, line, col)))
+          }
+      }
     }
-  })
+  )
 
 type UnionRecv = UnionRecv(SymId, [SymId])
 
 # The components of the receiver type when it is a union of types at least
 # one of whose components has an impl of `op`.
-fn union_receiver(st: InferState, t: Ty, op: String) : Option[UnionRecv] = match ty_dispatch_head(t) {
-  TyCon(s, []) ->
-    if sym_raw(s) >= 0 and is_union_of_types(st.env, s) {
-      let comps = filter(map(ut_components(st.env.unions, s), ut_ty_sym), (c) => sym_raw(c) >= 0)
-      if any(comps, (c) => is_some(pipe_op_impl(st.protos.impls, TyCon(c, []), op))) { Some(UnionRecv(s, comps)) } else { None }
-    } else { None }
-  _ -> None
-}
+fn union_receiver(st: InferState, t: Ty, op: String) : Option[UnionRecv] =
+  match ty_dispatch_head(t) {
+    TyCon(s, []) ->
+      if sym_raw(s) >= 0 and is_union_of_types(st.env, s) {
+        let comps = filter(map(ut_components(st.env.unions, s), ut_ty_sym), c => sym_raw(c) >= 0)
+        if any(comps, c => is_some(pipe_op_impl(st.protos.impls, TyCon(c, []), op))) {
+          Some(UnionRecv(s, comps))
+        } else {
+          None
+        }
+      } else {
+        None
+      }
+    _ -> None
+  }
 
 # A dispatcher shares one type variable between its receiver and any other
 # `Self` parameter.
 fn repeats_self(callee_ty: Ty) : Bool = match callee_ty {
-  TyFnT([TyVarT(v), ...ps], _, _) -> any(ps, (p) => inf_ty_eq(p, TyVarT(v)))
-  _                               -> false
+  TyFnT([TyVarT(v), ...ps], _, _) -> any(ps, p => inf_ty_eq(p, TyVarT(v)))
+  _ -> false
 }
 
-fn self_repeat_error(done: Inferred, st: InferState, op: String, u: SymId, line: Int, col: Int) : Inferred = {
-  let msg = concat_all(["`", op, "` has more than one `Self` parameter, so it cannot dispatch on the union `",
-                        ref_text(st.env.tab, DrSym(u)), "`; narrow the value with `match` first"])
-  mk_inferred(st_bump_err(st_push_diag(done.st, mk_diag(SevError, st.file, line, col, msg, []))), TyAny, unsettled(done.expr))
+fn self_repeat_error(
+  done: Inferred,
+  st: InferState,
+  op: String,
+  u: SymId,
+  line: Int,
+  col: Int
+) : Inferred {
+  let msg = concat_all([
+    "`",
+    op,
+    "` has more than one `Self` parameter, so it cannot dispatch on the union `",
+    ref_text(st.env.tab, DrSym(u)),
+    "`; narrow the value with `match` first"
+  ])
+  mk_inferred(
+    st_bump_err(st_push_diag(done.st, mk_diag(SevError, st.file, line, col, msg, []))),
+    TyAny,
+    unsettled(done.expr)
+  )
 }
 
 # The call with its receiver left untyped, so the impl lookup the error already answered is not tried.
 fn unsettled(e: Expr) : Expr = match e.kind {
-  ECall(c, [recv, ...rest]) -> with_ty(mk_expr(ECall(c, [with_ty(recv, TyAny), ...rest]), e.line, e.col), TyAny)
-  _                         -> e
+  ECall(c, [recv, ...rest]) ->
+    with_ty(mk_expr(ECall(c, [with_ty(recv, TyAny), ...rest]), e.line, e.col), TyAny)
+  _ -> e
 }
 
 #[doc("The error of each impl block whose target is a union of types, at its first method.")]
-pub fn union_impl_diags(df: DiagFiles, env: TyEnv, protos: ProtoView, decls: [Decl]) : [Diagnostic] =
-  flat_map(decls, (d) => match d {
-    DFn(_, fid, _, _, _, _, _, line, col, _, _, _) -> match find(protos.impls, (p) => sym_same(pir_sym(p), fnid_sym(fid))) {
-      Some(p) -> union_impl_diag(df, env, protos.impls, p, d, line, col)
-      None    -> []
+pub fn union_impl_diags(
+  df: DiagFiles,
+  env: TyEnv,
+  protos: ProtoView,
+  decls: [Decl]
+) : [Diagnostic] =
+  flat_map(
+    decls,
+    d => match d {
+      DFn(_, fid, _, _, _, _, _, line, col, _, _, _) -> match find(
+        protos.impls,
+        p => sym_same(pir_sym(p), fnid_sym(fid))
+      ) {
+        Some(p) -> union_impl_diag(df, env, protos.impls, p, d, line, col)
+        None -> []
+      }
+      _ -> []
     }
-    _ -> []
-  })
+  )
 
-fn union_impl_diag(df: DiagFiles, env: TyEnv, impls: [ProtoImplReg], p: ProtoImplReg, d: Decl, line: Int, col: Int) : [Diagnostic] =
+fn union_impl_diag(
+  df: DiagFiles,
+  env: TyEnv,
+  impls: [ProtoImplReg],
+  p: ProtoImplReg,
+  d: Decl,
+  line: Int,
+  col: Int
+) : [Diagnostic] =
   match p {
     PIR(proto, target, _, _, _, _, _) -> {
       let t = ref_sym(target)
       if sym_raw(t) >= 0 and is_union_of_types(env, t) and is_first_method(impls, p, proto, t) {
         let uname = ref_text(env.tab, DrSym(t))
         let pname = ref_text(env.tab, DrSym(proto))
-        let comps = join_with(map(sym_names(env.tab, map(ut_components(env.unions, t), ut_ty_sym)), (n) => concat_all(["`", n, "`"])), ", ")
-        [mk_diag(SevError, decl_diag_file(d, df), line, col,
-                 concat_all(["`impl ", pname, " for ", uname, "`: `", uname, "` is a union of types, which dispatches to the impl of the component it holds; implement `",
-                             pname, "` for each of ", comps]), [])]
-      } else { [] }
+        let comps = join_with(
+          map(
+            sym_names(env.tab, map(ut_components(env.unions, t), ut_ty_sym)),
+            n => concat_all(["`", n, "`"])
+          ),
+          ", "
+        )
+        [
+          mk_diag(
+            SevError,
+            decl_diag_file(d, df),
+            line,
+            col,
+            concat_all([
+              "`impl ", pname, " for ", uname, "`: `", uname,
+              "` is a union of types, which dispatches to the impl of the component it holds; implement `",
+              pname, "` for each of ", comps
+            ]),
+            []
+          )
+        ]
+      } else {
+        []
+      }
     }
   }
 
 fn is_first_method(impls: [ProtoImplReg], p: ProtoImplReg, proto: SymId, t: SymId) : Bool =
-  match find(impls, (q) => match q { PIR(qp, qt, _, _, _, _, _) -> sym_same(qp, proto) and sym_same(ref_sym(qt), t) }) {
+  match find(
+    impls,
+    q => match q {
+      PIR(qp, qt, _, _, _, _, _) -> sym_same(qp, proto) and sym_same(ref_sym(qt), t)
+    }
+  ) {
     Some(q) -> sym_same(pir_sym(q), pir_sym(p))
-    None    -> false
+    None -> false
   }
 
 # `{ let u = first; let r_i = rest_i; match u { b : C -> callee(b, r_i...) ... } }`:
 # the receiver and the other arguments evaluate once, in source order.
-fn union_call(callee: Expr, first: Expr, rest_args: [Expr], comps: [SymId], line: Int, col: Int) : Expr = {
+fn union_call(
+  callee: Expr,
+  first: Expr,
+  rest_args: [Expr],
+  comps: [SymId],
+  line: Int,
+  col: Int
+) : Expr {
   let site = concat_all([int_to_string(line), ":", int_to_string(col)])
   let recv = union_binder(concat_all(["union dispatch receiver ", site]))
   let rest_binders = union_arg_binders(site, 0, list_length(rest_args))
   let scr = if rest_args == [] { first } else { mk_expr(ELocal(recv.id), line, col) }
-  let arg_tail = map(rest_binders, (b) => mk_expr(ELocal(b.id), line, col))
+  let arg_tail = map(rest_binders, b => mk_expr(ELocal(b.id), line, col))
   let m = mk_expr(EMatch(scr, union_arms(callee, comps, 0, arg_tail, site, line, col)), line, col)
-  if rest_args == [] { m } else {
-    mk_expr(EBlock([union_let(recv, first, line, col), ...union_arg_lets(rest_binders, rest_args, line, col)], Some(m)), line, col)
+  if rest_args == [] {
+    m
+  } else {
+    mk_expr(
+      EBlock(
+        [union_let(recv, first, line, col), ...union_arg_lets(rest_binders, rest_args, line, col)],
+        Some(m)
+      ),
+      line,
+      col
+    )
   }
 }
 
-fn union_arms(callee: Expr, comps: [SymId], i: Int, arg_tail: [Expr], site: String, line: Int, col: Int) : [Arm] = match comps {
+fn union_arms(
+  callee: Expr,
+  comps: [SymId],
+  i: Int,
+  arg_tail: [Expr],
+  site: String,
+  line: Int,
+  col: Int
+) : [Arm] = match comps {
   [] -> []
   [comp, ...rest] -> {
     let b = union_binder(concat_all(["union dispatch arm ", int_to_string(i), " ", site]))
     let te = mk_ty(TyName(DrSym(comp), []), line, col)
     let call = mk_expr(ECall(callee, [mk_expr(ELocal(b.id), line, col), ...arg_tail]), line, col)
-    [Arm(mk_pat(PNarrow(b, te), line, col), None, call), ...union_arms(callee, rest, i + 1, arg_tail, site, line, col)]
+    [
+      Arm(mk_pat(PNarrow(b, te), line, col), None, call),
+      ...union_arms(callee, rest, i + 1, arg_tail, site, line, col)
+    ]
   }
 }
 
 fn union_binder(key: String) : Binder = Binder { id: local_minted(key), name: written("u") }
 
 fn union_arg_binders(site: String, i: Int, n: Int) : [Binder] =
-  if i >= n { [] }
-  else { [union_binder(concat_all(["union dispatch argument ", int_to_string(i), " ", site])), ...union_arg_binders(site, i + 1, n)] }
+  if i >= n {
+    []
+  } else {
+    [
+      union_binder(concat_all(["union dispatch argument ", int_to_string(i), " ", site])),
+      ...union_arg_binders(site, i + 1, n)
+    ]
+  }
 
 fn union_arg_lets(bs: [Binder], rhs: [Expr], line: Int, col: Int) : [Stmt] = match bs {
   [] -> []
   [b, ...brest] -> match rhs {
-    []             -> []
+    [] -> []
     [e, ...erest] -> [union_let(b, e, line, col), ...union_arg_lets(brest, erest, line, col)]
   }
 }
 
-fn union_let(b: Binder, rhs: Expr, line: Int, col: Int) : Stmt = SLet(mk_pat(PBind(b), line, col), None, rhs)
+fn union_let(b: Binder, rhs: Expr, line: Int, col: Int) : Stmt =
+  SLet(mk_pat(PBind(b), line, col), None, rhs)

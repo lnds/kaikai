@@ -40,10 +40,12 @@ import compiler.kir_lower_sig
 # Non-`MUnboxed` nodes (the boxed families other lanes own) never enter
 # the raw branch: purely additive.
 pub fn lower_expr(x: Expr, st: LowerSt) : LRes / Console = match unw_pad_of(st.unw, x) {
-  Some(ns) -> match lower_pad_begin(x, ns, st) { PadB(outer, st1) -> match lower_expr_unpadded(x, st1) {
-    LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
-  } }
-  None     -> lower_expr_unpadded(x, st)
+  Some(ns) -> match lower_pad_begin(x, ns, st) {
+    PadB(outer, st1) -> match lower_expr_unpadded(x, st1) {
+      LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
+    }
+  }
+  None -> lower_expr_unpadded(x, st)
 }
 
 fn lower_expr_unpadded(x: Expr, st: LowerSt) : LRes / Console =
@@ -51,50 +53,53 @@ fn lower_expr_unpadded(x: Expr, st: LowerSt) : LRes / Console =
     match lower_expr_raw(x, st) {
       LRes(rawv, st1) -> bind_op(st1, KPrim(kir_raw_box_prim(x.ty), [rawv]), kpos_of(x))
     }
-  } else if fixed_vec_needs_materialize(x) { lower_fixed_vec_materialize(x, st) }
-  else { lower_expr_boxed(x, st) }
+  } else if fixed_vec_needs_materialize(x) {
+    lower_fixed_vec_materialize(x, st)
+  } else {
+    lower_expr_boxed(x, st)
+  }
 
 # The boxed-position dispatch (the original `lower_expr` body). Reached
 # either directly (non-raw node) or as the boxed fallback inside the raw
 # path (`lower_expr_raw`'s box→raw border lowers boxed here then unboxes).
 pub(pkg) fn lower_expr_boxed(x: Expr, st: LowerSt) : LRes / Console = match unw_pad_of(st.unw, x) {
-  Some(ns) -> match lower_pad_begin(x, ns, st) { PadB(outer, st1) -> match lower_expr_boxed_unpadded(x, st1) {
-    LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
-  } }
-  None     -> lower_expr_boxed_unpadded(x, st)
+  Some(ns) -> match lower_pad_begin(x, ns, st) {
+    PadB(outer, st1) -> match lower_expr_boxed_unpadded(x, st1) {
+      LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
+    }
+  }
+  None -> lower_expr_boxed_unpadded(x, st)
 }
 
 fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   # Atoms: no statement, the literal IS the value.
   EInt(n, _) -> LRes(kir_int_atom(x, n), st)
-  EReal(RealLit(r), _)  -> LRes(KRealV(r), st)
-  EFixed(span, ty)      -> LRes(KFixedV(span, ty), st)
-  EBool(b)           -> LRes(KBoolV(b), st)
-  EChar(c)           -> LRes(KCharV(c), st)
-  EStr(span, _)      -> LRes(KStrV(span), st)
-  EUnit              -> LRes(KUnitV, st)
-  EUnder             -> LRes(KUnitV, st)
-  EPlaceholder       -> LRes(KUnitV, st)
-  ELocal(l)          -> lower_local(l, st)
-  ESym(s, inst)      -> lower_sym(FnId(s, inst), st)
+  EReal(RealLit(r), _) -> LRes(KRealV(r), st)
+  EFixed(span, ty) -> LRes(KFixedV(span, ty), st)
+  EBool(b) -> LRes(KBoolV(b), st)
+  EChar(c) -> LRes(KCharV(c), st)
+  EStr(span, _) -> LRes(KStrV(span), st)
+  EUnit -> LRes(KUnitV, st)
+  EUnder -> LRes(KUnitV, st)
+  EPlaceholder -> LRes(KUnitV, st)
+  ELocal(l) -> lower_local(l, st)
+  ESym(s, inst) -> lower_sym(FnId(s, inst), st)
   # In value position a mark reads the register an earlier pass bound under
   # its spelling — the match preamble's scrutinee alias. Without this the
   # donor of a reuse-in-place lowers to unit, the rebuild stops recognising
   # it, and the reuse is silently lost: no leak, just no reuse.
-  EMark(m)           -> LRes(KVar(mark_name(m)), st)
-
+  EMark(m) -> LRes(KVar(mark_name(m)), st)
   # A call / constructor / perceus mark / sentinel — the dense dispatch.
   # A fixed-width `Vec[t]<n>` intrinsic lowers inline (a flat header-less
   # aggregate), NOT to the dynamic `vec_*` chain — mirroring the C backend's
   # inline representation.
-  ECall(f, cargs)    -> match lower_fixed_vec_call(x, f, cargs, st) {
+  ECall(f, cargs) -> match lower_fixed_vec_call(x, f, cargs, st) {
     Some(r) -> r
     None -> match lower_vec_write_rec_fused(x, f, cargs, st) {
       Some(r) -> r
-      None    -> lower_call(x, f, cargs, st)
+      None -> lower_call(x, f, cargs, st)
     }
   }
-
   # `e.field` → a field read over the base atom. When `base.ty` resolves to
   # a known record, the field's slot is a compile-time constant (layout is
   # canonical, declaration order) → `kai_op_field_at` indexed load, skipping
@@ -104,7 +109,6 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
   # through the result, so drop it to balance — the C oracle's `kai_decref(_b)`
   # after the field load.
   EField(base, fname) -> lower_field_boxed(x, base, fname, st)
-
   # Binary / unary operators → a KPrim over their operand atoms. The
   # specific runtime helper is the translator's concern.
   #
@@ -116,82 +120,80 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
   # whose arguments are already materialised.) Route them through the
   # branch machinery instead: `a and b` is `if a { b } else { false }`,
   # `a or b` is `if a { true } else { b }`.
-  EBinop(op, a, b)   -> lower_binop_boxed(x, op, a, b, st)
-  EUnop(op, a)       -> {
+  EBinop(op, a, b) -> lower_binop_boxed(x, op, a, b, st)
+  EUnop(op, a) -> {
     let ra = lower_expr(a, st)
-    match ra { LRes(av, st1) -> bind_op(st1, KPrim(KpUn(op), [av]), kpos_of(x)) }
+    match ra {
+      LRes(av, st1) -> bind_op(st1, KPrim(KpUn(op), [av]), kpos_of(x))
+    }
   }
-
-  EIf(c, t, e_opt)   -> lower_if(x, c, t, e_opt, st)
-  EMatch(scr, arms)  -> lower_match(x, scr, arms, st)
+  EIf(c, t, e_opt) -> lower_if(x, c, t, e_opt, st)
+  EMatch(scr, arms) -> lower_match(x, scr, arms, st)
   EBlock(stmts, tail) -> lower_block(x, stmts, tail, st)
-
   # `[e0, e1, ..., ...spread]` → a cons/nil/append spine, reproducing the
   # C emitter's `emit_list_tail` shape (the oracle). Interpolation
   # desugars to `string_concat_all([parts])` long upstream, so closing
   # EList closes interpolation too.
-  EList(elems)       -> lower_list(elems, kpos_of(x), st)
-
+  EList(elems) -> lower_list(elems, kpos_of(x), st)
   # Unit-annotated literal (`1.0<USD>`) is codegen-erased to its inner.
   ELitUnit(inner, _) -> lower_expr(inner, st)
-
   # An unfilled hole / `todo!(msg)` lowers to a loud runtime panic stub
   # (mirror of the emitters: a binary with holes is runnable but aborts
   # on first reach). The message bundles the location like emit_c does.
-  EHole(nm_opt)      -> lower_panic_stub(kir_hole_message(st.tab, nm_opt, x), st)
-  ETodo(msg)         -> lower_panic_stub(kir_quote(cat2("todo: ", msg)), st)
-  EExternBody(_, _)  -> lower_panic_stub(kir_quote("extern body in expression position"), st)
+  EHole(nm_opt) -> lower_panic_stub(kir_hole_message(st.tab, nm_opt, x), st)
+  ETodo(msg) -> lower_panic_stub(kir_quote(cat2("todo: ", msg)), st)
+  EExternBody(_, _) -> lower_panic_stub(kir_quote("extern body in expression position"), st)
   # Textual literals are minted away by the typer; reaching lowering is a
   # compiler bug.
-  EIntLit(_)         -> lower_panic_stub(kir_quote("EIntLit reached lowering"), st)
-  EDecimalLit(_)     -> lower_panic_stub(kir_quote("EDecimalLit reached lowering"), st)
-
+  EIntLit(_) -> lower_panic_stub(kir_quote("EIntLit reached lowering"), st)
+  EDecimalLit(_) -> lower_panic_stub(kir_quote("EDecimalLit reached lowering"), st)
   # `variants[T]()` — the typer baked the resolved nullary constructors in;
   # materialise them as a cons spine of nullary constructors.
   EVariantsOf(_, ctors) -> lower_variants_of(ctors, kpos_of(x), st)
-
   # A record literal `T { f: v, ... }` → a `kai_record(n, fields, names)`
   # allocation. Lower each field value (left-to-right), pairing with its
   # name; the translator builds the parallel value/name buffers.
   ERecordLit(_, fis) -> lower_record_lit(fis, rec_stamp_of(st.stamps, x.ty), kpos_of(x), st)
-
   # A range `lo..hi` / `lo..hi:step` → the runtime range builder.
   ERange(lo, hi, stp) -> lower_range(lo, hi, stp, kpos_of(x), st)
-
   # An inline lambda → a `KClosure` over its lifted-body thunk symbol
   # (`lam_symbol`), carrying its captures as atoms. The lifted body
   # itself is a separate `KFnLambda` (generated in `lower_to_kir`); here
   # we only build the closure value. The `LamInfo` is found by
   # (enclosing-fn, line, col) — the key the collector stamped.
-  ELambda(_, _)      -> lower_lambda_ref(x, st)
-
+  ELambda(_, _) -> lower_lambda_ref(x, st)
   # An effect handler. Materialises the handler frame as a double fork
   # (install + setjmp-split + inline body + return clause), the same
   # block-building discipline as if/match (asu review). The clause bodies
   # are separate `KFnClause`s generated in `lower_to_kir`.
   EHandle(body, eff, tas, init_opt, alias_opt, clauses, ret_opt) ->
-    lower_handle(x, body, inst_key_of_tes(ref_sym(eff), tas), init_opt, alias_opt, clauses, ret_opt, st)
-
+    lower_handle(
+      x,
+      body,
+      inst_key_of_tes(ref_sym(eff), tas),
+      init_opt,
+      alias_opt,
+      clauses,
+      ret_opt,
+      st
+    )
   # Postfix `!` — Option/Result propagation. `expr!` unwraps the success
   # payload, or EARLY-RETURNS the whole `None`/`Err` from the enclosing fn
   # (mirror of emit_c's `emit_bang`). The discriminator (`Some` vs `Ok`) is
   # read from `inner.ty` via the shared `bang_success_variant`.
-  EBang(inner)       -> lower_bang(x, inner, st)
-
+  EBang(inner) -> lower_bang(x, inner, st)
   # A promoted var cell in boxed position: a read boxes the raw register
   # at its scalar type; a write stores the raw value and yields unit. A
   # loop intrinsic pastes its pred/body lambda bodies into an inline
   # block loop in the enclosing fn (the C emitter's `for (;;)` mirror).
   EIntrinsic(inm, iargs) -> lower_intrinsic_boxed(x, inm, iargs, st)
-
   # Forms the resolve / desugar / typer passes rewrite away before codegen
   # (every pipe → ECall, `EIndex` → call, `EUnder`/`EPlaceholder`
   # pattern-only). These never reach a post-perceus AST; lowering to unit
   # keeps the match exhaustive and mirrors the emitters' dead arms.
-  EPipe(_, _)        -> LRes(KUnitV, st)
+  EPipe(_, _) -> LRes(KUnitV, st)
   EDispatchPipe(_, _, _) -> LRes(KUnitV, st)
-  EIndex(_, _)       -> LRes(KUnitV, st)
-
+  EIndex(_, _) -> LRes(KUnitV, st)
   # Anything else reaching here is a node codegen DOES handle that the
   # lowering has not yet covered — a silent unit would mis-lower it (the
   # Lane 0 gap class). Trap it loudly during development so the next
@@ -205,43 +207,55 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
 fn lower_field_boxed(x: Expr, base: Expr, fname: String, st: LowerSt) : LRes / Console =
   match lower_vec_get_field_fused(x, base, fname, st) {
     Some(r) -> r
-    None -> match lower_expr(base, st) { LRes(bv, st1) ->
-      match field_index_of(st1.recs, base.ty, fname) {
-        Some(n) -> lower_field_read(st1, KPrim(KpFieldAt, [bv, KIntV(n)]), bv, kpos_of(x))
-        None    -> lower_field_read(st1, KPrim(KpField, [bv, KStrV(fname)]), bv, kpos_of(x))
-      } }
+    None -> match lower_expr(base, st) {
+      LRes(bv, st1) ->
+        match field_index_of(st1.recs, base.ty, fname) {
+          Some(n) -> lower_field_read(st1, KPrim(KpFieldAt, [bv, KIntV(n)]), bv, kpos_of(x))
+          None -> lower_field_read(st1, KPrim(KpField, [bv, KStrV(fname)]), bv, kpos_of(x))
+        }
+    }
   }
 
 # `and` / `or` short-circuit, so they lower as branches: a `KPrim` would
 # evaluate both operand atoms before the helper runs.
-fn lower_binop_boxed(x: Expr, op: BinOp, a: Expr, b: Expr, st: LowerSt) : LRes / Console = match op {
-  BoAnd -> lower_if(x, a, b, Some(mk_typed_bool(false, x)), st)
-  BoOr  -> lower_if(x, a, mk_typed_bool(true, x), Some(b), st)
-  _     -> match lower_expr(a, st) { LRes(av, st1) ->
-    match lower_expr(b, lower_flight_add(a, av, st1)) { LRes(bv, st2) -> {
-      let st3 = lower_flight_end(st1, st2)
-      match lower_consumed_pad(x, op, [(a, av), (b, bv)], st3) { PadB(outer, st4) ->
-        match bind_op(st4, KPrim(binop_prim(op, a, st4), [av, bv]), kpos_of(x)) {
-          LRes(v, st5) -> LRes(v, lower_pad_end(x, outer, st5))
-        } }
-    } } }
-}
+fn lower_binop_boxed(x: Expr, op: BinOp, a: Expr, b: Expr, st: LowerSt) : LRes / Console =
+  match op {
+    BoAnd -> lower_if(x, a, b, Some(mk_typed_bool(false, x)), st)
+    BoOr -> lower_if(x, a, mk_typed_bool(true, x), Some(b), st)
+    _ -> match lower_expr(a, st) {
+      LRes(av, st1) ->
+        match lower_expr(b, lower_flight_add(a, av, st1)) {
+          LRes(bv, st2) -> {
+            let st3 = lower_flight_end(st1, st2)
+            match lower_consumed_pad(x, op, [(a, av), (b, bv)], st3) {
+              PadB(outer, st4) ->
+                match bind_op(st4, KPrim(binop_prim(op, a, st4), [av, bv]), kpos_of(x)) {
+                  LRes(v, st5) -> LRes(v, lower_pad_end(x, outer, st5))
+                }
+            }
+          }
+        }
+    }
+  }
 
 # A cell read boxes its raw register; a loop intrinsic pastes its predicate and
 # body lambdas into an inline loop in the enclosing function.
-fn lower_intrinsic_boxed(x: Expr, inm: Intrinsic, iargs: [Expr], st: LowerSt) : LRes / Console = match inm {
-  InCellGet     -> bind_op(st, KPrim(kir_raw_box_prim(x.ty), [KVar(lower_cell_reg(iargs, st))]), kpos_of(x))
-  InCellSet     -> lower_cell_set(x, inm, iargs, st)
-  InLoopWhile   -> lower_loop_intrinsic(x, inm, iargs, st)
-  InLoopUntil   -> lower_loop_intrinsic(x, inm, iargs, st)
-  InLoopRepeat  -> lower_loop_intrinsic(x, inm, iargs, st)
-  InResumeFrame -> lower_resume_frame(x, iargs, st)
-  InSegHandle   -> lower_seg_handle(x, iargs, st)
-  InSegRequest  -> lower_seg_request(x, iargs, st)
-  InAbsent      -> LRes(KUnitV, st)
-  InCovHit(s)   -> LRes(KUnitV, ls_emit(st, KDo(KPrim(KpCovHit, [KStrV(json_quote(s))]), kpos_of(x))))
-  _             -> lower_unhandled(x, st)
-}
+fn lower_intrinsic_boxed(x: Expr, inm: Intrinsic, iargs: [Expr], st: LowerSt) : LRes / Console =
+  match inm {
+    InCellGet ->
+      bind_op(st, KPrim(kir_raw_box_prim(x.ty), [KVar(lower_cell_reg(iargs, st))]), kpos_of(x))
+    InCellSet -> lower_cell_set(x, inm, iargs, st)
+    InLoopWhile -> lower_loop_intrinsic(x, inm, iargs, st)
+    InLoopUntil -> lower_loop_intrinsic(x, inm, iargs, st)
+    InLoopRepeat -> lower_loop_intrinsic(x, inm, iargs, st)
+    InResumeFrame -> lower_resume_frame(x, iargs, st)
+    InSegHandle -> lower_seg_handle(x, iargs, st)
+    InSegRequest -> lower_seg_request(x, iargs, st)
+    InAbsent -> LRes(KUnitV, st)
+    InCovHit(s) ->
+      LRes(KUnitV, ls_emit(st, KDo(KPrim(KpCovHit, [KStrV(json_quote(s))]), kpos_of(x))))
+    _ -> lower_unhandled(x, st)
+  }
 
 # --- raw (unboxed) scalar lowering ----------------------------------------
 #
@@ -250,35 +264,40 @@ fn lower_intrinsic_boxed(x: Expr, inm: Intrinsic, iargs: [Expr], st: LowerSt) : 
 # natively raw; any other crosses the box→raw border (`raw_border.kai`). The
 # mutual recursion with `lower_expr` is why this lives in the Expr-SCC.
 pub(pkg) fn lower_expr_raw(x: Expr, st: LowerSt) : LRes / Console = match unw_pad_of(st.unw, x) {
-  Some(ns) -> match lower_pad_begin(x, ns, st) { PadB(outer, st1) -> match lower_expr_raw_unpadded(x, st1) {
-    LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
-  } }
-  None     -> lower_expr_raw_unpadded(x, st)
+  Some(ns) -> match lower_pad_begin(x, ns, st) {
+    PadB(outer, st1) -> match lower_expr_raw_unpadded(x, st1) {
+      LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
+    }
+  }
+  None -> lower_expr_raw_unpadded(x, st)
 }
 
-fn lower_expr_raw_unpadded(x: Expr, st: LowerSt) : LRes / Console = {
+fn lower_expr_raw_unpadded(x: Expr, st: LowerSt) : LRes / Console {
   let xb = raw_operand(x)
   match xb.mode {
     MUnboxed -> lower_expr_raw_kind(xb, st)
-    _        -> lower_scalar_unbox_border(xb, st)
+    _ -> lower_scalar_unbox_border(xb, st)
   }
 }
 
 # Lower `x` raw at a KNOWN destination slot (a call arg at its param's raw
 # slot). The border keys off the param's slot, not `x.ty`: an arg the typer
 # left untyped would otherwise cross as a Real.
-pub(pkg) fn lower_expr_raw_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console = match unw_pad_of(st.unw, x) {
-  Some(ns) -> match lower_pad_begin(x, ns, st) { PadB(outer, st1) -> match lower_expr_raw_at_unpadded(x, slot, st1) {
-    LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
-  } }
-  None     -> lower_expr_raw_at_unpadded(x, slot, st)
-}
+pub(pkg) fn lower_expr_raw_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console =
+  match unw_pad_of(st.unw, x) {
+    Some(ns) -> match lower_pad_begin(x, ns, st) {
+      PadB(outer, st1) -> match lower_expr_raw_at_unpadded(x, slot, st1) {
+        LRes(v, st2) -> LRes(v, lower_pad_end(x, outer, st2))
+      }
+    }
+    None -> lower_expr_raw_at_unpadded(x, slot, st)
+  }
 
-fn lower_expr_raw_at_unpadded(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console = {
+fn lower_expr_raw_at_unpadded(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console {
   let xb = raw_operand(x)
   match xb.mode {
     MUnboxed -> lower_expr_raw_kind(xb, st)
-    _        -> lower_scalar_unbox_border_at(xb, slot, st)
+    _ -> lower_scalar_unbox_border_at(xb, slot, st)
   }
 }
 
@@ -288,7 +307,7 @@ fn lower_expr_raw_at_unpadded(x: Expr, slot: KSlot, st: LowerSt) : LRes / Consol
 fn lower_scalar_unbox_border_at(x: Expr, slot: KSlot, st: LowerSt) : LRes / Console =
   match border_unbox_prim(slot) {
     Some(prim) -> lower_unbox_border(x, prim, slot, st)
-    None       -> lower_expr_boxed(x, st)
+    None -> lower_expr_boxed(x, st)
   }
 
 # The type-driven border. The type gate is load-bearing: a Bool crossing
@@ -300,16 +319,32 @@ pub(pkg) fn lower_unbox_border(x: Expr, prim: PrimOp, slot: KSlot, st: LowerSt) 
   lower_unbox_at(x, prim, slot, raw_border_owns(x), st)
 
 # Unbox `x`'s boxed form through `prim`, releasing the box when it is owned.
-pub(pkg) fn lower_unbox_at(x: Expr, prim: PrimOp, slot: KSlot, owned: Bool, st: LowerSt) : LRes / Console =
-  match lower_expr_boxed(x, st) { LRes(bv, st1) -> lower_unbox_owned(x, bv, prim, slot, owned, st1) }
+pub(pkg) fn lower_unbox_at(
+  x: Expr,
+  prim: PrimOp,
+  slot: KSlot,
+  owned: Bool,
+  st: LowerSt
+) : LRes / Console =
+  match lower_expr_boxed(x, st) {
+    LRes(bv, st1) -> lower_unbox_owned(x, bv, prim, slot, owned, st1)
+  }
 
 # The call result `bv` of `x`, unwrapped and released as the border does.
 fn lower_unbox_value(x: Expr, bv: KVal, prim: PrimOp, slot: KSlot, st: LowerSt) : LRes / Console =
   lower_unbox_owned(x, bv, prim, slot, raw_border_owns(x), st)
 
-fn lower_unbox_owned(x: Expr, bv: KVal, prim: PrimOp, slot: KSlot, owned: Bool, st: LowerSt) : LRes / Console =
+fn lower_unbox_owned(
+  x: Expr,
+  bv: KVal,
+  prim: PrimOp,
+  slot: KSlot,
+  owned: Bool,
+  st: LowerSt
+) : LRes / Console =
   match bind_op_slot(st, KPrim(prim, [bv]), slot, kpos_of(x)) {
-    LRes(rv, st2) -> if owned { LRes(rv, release_border_box(x, slot, bv, st2)) } else { LRes(rv, st2) }
+    LRes(rv, st2) ->
+      if owned { LRes(rv, release_border_box(x, slot, bv, st2)) } else { LRes(rv, st2) }
   }
 
 # The natively-raw forms (the `MUnboxed` kinds the unbox pass produces).
@@ -321,16 +356,16 @@ fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   EReal(RealLit(r), _) -> LRes(KRealV(r), st)
   EInt(n, _) -> LRes(KIntV(n), st)
   EFixed(span, ty) -> LRes(KFixedV(span, ty), st)
-  EBool(b)    -> LRes(KBoolV(b), st)
-  EChar(c)    -> LRes(KCharV(c), st)
-  ELocal(l)   -> lower_local(l, st)
+  EBool(b) -> LRes(KBoolV(b), st)
+  EChar(c) -> LRes(KCharV(c), st)
+  ELocal(l) -> lower_local(l, st)
   ELitUnit(inner, _) -> lower_expr_raw(inner, st)
   EBinop(op, a, b) -> lower_raw_arith(x, op, a, b, st)
   EUnop(op, a) -> lower_raw_unop(x, op, a, st)
   ECall(f, cargs) -> lower_raw_call(x, f, cargs, st)
   EField(_, _) -> match vec_raw_read(st.recs, x.kind, x.ty) {
     Some(rd) -> lower_vec_raw_read(x, rd, st)
-    None     -> lower_scalar_unbox_border(x, st)
+    None -> lower_scalar_unbox_border(x, st)
   }
   EBlock(stmts, tail) -> lower_raw_block(x, stmts, tail, st)
   EIntrinsic(inm, iargs) -> lower_raw_intrinsic(x, inm, iargs, st)
@@ -344,27 +379,34 @@ fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
 fn lower_raw_arith(x: Expr, op: BinOp, a: Expr, b: Expr, st: LowerSt) : LRes / Console =
   if kir_ty_is_real(x.ty) and kir_op_is_raw_freal_arith(op) {
     lower_raw_binop(x, KpRawBin(RwReal, op), SReal, a, b, st)
-  }
-  else if kir_ty_is_int(x.ty) and kir_op_is_raw_iint_arith(op) {
+  } else if kir_ty_is_int(x.ty) and kir_op_is_raw_iint_arith(op) {
     lower_raw_binop(x, KpRawBin(RwInt, op), SInt64, a, b, st)
-  }
-  else if kir_ty_is_byte(x.ty) and kir_op_is_raw_iint_arith(op) {
+  } else if kir_ty_is_byte(x.ty) and kir_op_is_raw_iint_arith(op) {
     lower_raw_binop(x, KpRawBin(RwByte, op), SByte, a, b, st)
-  }
-  else if kir_ty_is_fixed_raw(x.ty) and kir_op_is_raw_iint_arith(op) {
+  } else if kir_ty_is_fixed_raw(x.ty) and kir_op_is_raw_iint_arith(op) {
     lower_raw_binop(x, KpRawBin(kir_fixed_raw_scalar(x.ty), op), kir_fixed_raw_slot(x.ty), a, b, st)
+  } else if kir_op_is_raw_cmp(op) {
+    lower_raw_cmp(x, op, a, b, st)
+  } else if kir_op_is_raw_logical(op) {
+    lower_raw_binop(x, KpRawBin(RwBool, op), SBool, a, b, st)
+  } else {
+    lower_scalar_unbox_border(x, st)
   }
-  else if kir_op_is_raw_cmp(op) { lower_raw_cmp(x, op, a, b, st) }
-  else if kir_op_is_raw_logical(op) { lower_raw_binop(x, KpRawBin(RwBool, op), SBool, a, b, st) }
-  else { lower_scalar_unbox_border(x, st) }
 
 fn lower_raw_cmp(x: Expr, op: BinOp, a: Expr, b: Expr, st: LowerSt) : LRes / Console =
-  if kir_ty_is_int(a.ty) { lower_raw_binop(x, KpRawBin(RwInt, op), SBool, a, b, st) }
-  else if kir_ty_is_byte(a.ty) { lower_raw_binop(x, KpRawBin(RwByte, op), SBool, a, b, st) }
-  else if kir_ty_is_bool(a.ty) { lower_raw_binop(x, KpRawBin(RwBool, op), SBool, a, b, st) }
-  else if kir_ty_is_char(a.ty) { lower_raw_binop(x, KpRawBin(RwChar, op), SBool, a, b, st) }
-  else if kir_ty_is_fixed_raw(a.ty) { lower_raw_binop(x, KpRawBin(kir_fixed_raw_scalar(a.ty), op), SBool, a, b, st) }
-  else { lower_raw_binop(x, KpRawBin(RwReal, op), SBool, a, b, st) }
+  if kir_ty_is_int(a.ty) {
+    lower_raw_binop(x, KpRawBin(RwInt, op), SBool, a, b, st)
+  } else if kir_ty_is_byte(a.ty) {
+    lower_raw_binop(x, KpRawBin(RwByte, op), SBool, a, b, st)
+  } else if kir_ty_is_bool(a.ty) {
+    lower_raw_binop(x, KpRawBin(RwBool, op), SBool, a, b, st)
+  } else if kir_ty_is_char(a.ty) {
+    lower_raw_binop(x, KpRawBin(RwChar, op), SBool, a, b, st)
+  } else if kir_ty_is_fixed_raw(a.ty) {
+    lower_raw_binop(x, KpRawBin(kir_fixed_raw_scalar(a.ty), op), SBool, a, b, st)
+  } else {
+    lower_raw_binop(x, KpRawBin(RwReal, op), SBool, a, b, st)
+  }
 
 # Unary `-` is raw only for Real: an Int `-x` has no raw form and crosses the
 # border, since `fneg` over a boxed or i64 operand miscompiles.
@@ -374,7 +416,9 @@ fn lower_raw_unop(x: Expr, op: UnOp, a: Expr, st: LowerSt) : LRes / Console = ma
       match lower_expr_raw(a, st) {
         LRes(av, st1) -> bind_op_slot(st1, KPrim(KpRawUn(UoNeg), [av]), SReal, kpos_of(x))
       }
-    } else { lower_scalar_unbox_border(x, st) }
+    } else {
+      lower_scalar_unbox_border(x, st)
+    }
   UoNot -> match lower_expr_raw(a, st) {
     LRes(av, st1) -> bind_op_slot(st1, KPrim(KpRawUn(UoNot), [av]), SBool, kpos_of(x))
   }
@@ -384,14 +428,17 @@ fn lower_raw_unop(x: Expr, op: UnOp, a: Expr, st: LowerSt) : LRes / Console = ma
 # the result at the callee's return slot; a boxed return is unbox-borrowed by
 # the consumer. A fixed-vec read has no callee and lowers to the inline prim.
 fn lower_raw_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console =
-  if kir_is_scalar_conv(f, cargs) { lower_scalar_conv_raw(x, f, cargs, st) }
-  else { match lower_fixed_vec_read_raw(x, f, cargs, st) {
-    Some(r) -> r
-    None    -> match vec_raw_read(st.recs, x.kind, x.ty) {
-      Some(rd) -> lower_vec_raw_read(x, rd, st)
-      None     -> lower_raw_call_result(x, f, lower_call(x, f, cargs, st))
+  if kir_is_scalar_conv(f, cargs) {
+    lower_scalar_conv_raw(x, f, cargs, st)
+  } else {
+    match lower_fixed_vec_read_raw(x, f, cargs, st) {
+      Some(r) -> r
+      None -> match vec_raw_read(st.recs, x.kind, x.ty) {
+        Some(rd) -> lower_vec_raw_read(x, rd, st)
+        None -> lower_raw_call_result(x, f, lower_call(x, f, cargs, st))
+      }
     }
-  } }
+  }
 
 # A callee that returns a boxed scalar leaves it for the raw reader to unwrap
 # and release; a raw-return callee already landed its register.
@@ -399,50 +446,62 @@ fn lower_raw_call_result(x: Expr, f: Expr, r: LRes) : LRes / Console = match r {
   LRes(v, st1) -> if call_returns_boxed(f, st1) {
     match border_unbox_prim(border_slot_of(x.ty)) {
       Some(prim) -> lower_unbox_value(x, v, prim, border_slot_of(x.ty), st1)
-      None       -> r
+      None -> r
     }
-  } else { r }
+  } else {
+    r
+  }
 }
 
 fn call_returns_boxed(f: Expr, st: LowerSt) : Bool = match f.kind {
   ESym(s, inst) -> match ls_ctor_lay(st, s) {
     Some(_) -> false
-    None    -> match ls_classify(st, FnId(s, inst)) {
-      CkDirect -> match ret_slot_of_sig(ls_call_sig(st, FnId(s, inst))) { SBoxed -> true _ -> false }
-      _        -> false
+    None -> match ls_classify(st, FnId(s, inst)) {
+      CkDirect -> match ret_slot_of_sig(ls_call_sig(st, FnId(s, inst))) {
+        SBoxed -> true
+        _ -> false
+      }
+      _ -> false
     }
   }
   ELocal(_) -> true
-  _         -> false
+  _ -> false
 }
 
 # A plain block lowers its statements in its own scope and its tail at the raw
 # slot; a region block lowers boxed and unbox-borrows at the border.
 fn lower_raw_block(x: Expr, stmts: [Stmt], tail: Option[Expr], st: LowerSt) : LRes / Console =
   match stmts {
-    [] -> match tail { Some(t) -> lower_expr_raw(t, st) None -> lower_scalar_unbox_border(x, st) }
-    _  -> if block_is_region(st.regions, x.line, x.col) { lower_scalar_unbox_border(x, st) }
-          else { lower_plain_block_at(x, stmts, tail, border_slot_of(x.ty), st) }
+    [] -> match tail {
+      Some(t) -> lower_expr_raw(t, st)
+      None -> lower_scalar_unbox_border(x, st)
+    }
+    _ -> if block_is_region(st.regions, x.line, x.col) {
+      lower_scalar_unbox_border(x, st)
+    } else {
+      lower_plain_block_at(x, stmts, tail, border_slot_of(x.ty), st)
+    }
   }
 
 # A promoted var cell reads as its raw register; the init forwards its literal.
-fn lower_raw_intrinsic(x: Expr, inm: Intrinsic, iargs: [Expr], st: LowerSt) : LRes / Console = match inm {
-  InCellGet  -> LRes(KVar(lower_cell_reg(iargs, st)), st)
-  InCellInit -> match iargs {
-    [init] -> lower_expr_raw(init, st)
-    _      -> lower_scalar_unbox_border(x, st)
+fn lower_raw_intrinsic(x: Expr, inm: Intrinsic, iargs: [Expr], st: LowerSt) : LRes / Console =
+  match inm {
+    InCellGet -> LRes(KVar(lower_cell_reg(iargs, st)), st)
+    InCellInit -> match iargs {
+      [init] -> lower_expr_raw(init, st)
+      _ -> lower_scalar_unbox_border(x, st)
+    }
+    InAbsent -> lower_absent_raw(x, st)
+    _ -> lower_scalar_unbox_border(x, st)
   }
-  InAbsent   -> lower_absent_raw(x, st)
-  _          -> lower_scalar_unbox_border(x, st)
-}
 
 # A zero of the slot's scalar type; a width with no immediate goes
 # through the border from the boxed absent value.
 fn lower_absent_raw(x: Expr, st: LowerSt) : LRes / Console = match border_slot_of(x.ty) {
   SInt64 -> LRes(KIntV(0), st)
-  SBool  -> LRes(KBoolV(false), st)
-  SReal  -> LRes(KRealV(0.0), st)
-  _      -> lower_scalar_unbox_border(x, st)
+  SBool -> LRes(KBoolV(false), st)
+  SReal -> LRes(KRealV(0.0), st)
+  _ -> lower_scalar_unbox_border(x, st)
 }
 
 # `a <op> b` raw binary op → one native instruction over two raw operands.
@@ -450,11 +509,20 @@ fn lower_absent_raw(x: Expr, st: LowerSt) : LRes / Console = match border_slot_o
 # register carries `slot` (SReal for arith, SBool for cmp/logical). No
 # boxed `kaix_*` consume, so a multi-use operand never double-frees (the
 # family's root bug).
-fn lower_raw_binop(x: Expr, prim: PrimOp, slot: KSlot, a: Expr, b: Expr, st: LowerSt) : LRes / Console =
-  match lower_expr_raw(a, st) { LRes(av, st1) ->
-    match lower_expr_raw(b, st1) { LRes(bv, st2) ->
-      bind_op_slot(st2, KPrim(prim, [av, bv]), slot, kpos_of(x))
-    }
+fn lower_raw_binop(
+  x: Expr,
+  prim: PrimOp,
+  slot: KSlot,
+  a: Expr,
+  b: Expr,
+  st: LowerSt
+) : LRes / Console =
+  match lower_expr_raw(a, st) {
+    LRes(av, st1) ->
+      match lower_expr_raw(b, st1) {
+        LRes(bv, st2) ->
+          bind_op_slot(st2, KPrim(prim, [av, bv]), slot, kpos_of(x))
+      }
   }
 
 # A declaration in value position resolves in this order:
@@ -468,25 +536,27 @@ fn lower_raw_binop(x: Expr, prim: PrimOp, slot: KSlot, a: Expr, b: Expr, st: Low
 # native walk aborts on as unbound.
 fn lower_sym(fid: FnId, st: LowerSt) : LRes / Console = match ls_ctor_lay(st, fnid_sym(fid)) {
   Some(c) -> bind_op(st, KCon(c.name, c.tag, 0, [], false), KNoPos)
-  None    -> match kir_const_body(st.consts, fnid_sym(fid)) {
+  None -> match kir_const_body(st.consts, fnid_sym(fid)) {
     Some(body) -> lower_expr(body, st)
-    None       -> match ls_fn_value(st, fid) {
+    None -> match ls_fn_value(st, fid) {
       Some(FV(thunk, arity)) -> bind_op(st, KClosure(thunk, arity, []), KNoPos)
-      None                   -> LRes(KVar(ls_fn_name(st, fid)), st)
+      None -> LRes(KVar(ls_fn_name(st, fid)), st)
     }
   }
 }
 
 # Lower a list of expressions left-to-right (Risk 2a), collecting atoms.
-pub fn lower_exprs(xs: [Expr], st: LowerSt, acc: [KVal]) : LResMany / Console = match lower_exprs_flying(xs, st, acc) {
-  LResMany(vs, st1) -> LResMany(vs, lower_flight_end(st, st1))
-}
+pub fn lower_exprs(xs: [Expr], st: LowerSt, acc: [KVal]) : LResMany / Console =
+  match lower_exprs_flying(xs, st, acc) {
+    LResMany(vs, st1) -> LResMany(vs, lower_flight_end(st, st1))
+  }
 
 # Each value computed stays in flight while the later operands run.
 fn lower_exprs_flying(xs: [Expr], st: LowerSt, acc: [KVal]) : LResMany / Console = match xs {
   [] -> LResMany(acc, st)
   [e, ...rest] -> match lower_expr(e, st) {
-    LRes(v, st1) -> lower_exprs_flying(rest, lower_flight_next(e, v, rest == [], st1), list_append(acc, [v]))
+    LRes(v, st1) ->
+      lower_exprs_flying(rest, lower_flight_next(e, v, rest == [], st1), list_append(acc, [v]))
   }
 }
 
@@ -512,7 +582,13 @@ pub(pkg) fn lower_tcrec_args(xs: [Expr], sig: Option[UFnSig], st: LowerSt) : LRe
     LResMany(vs, st1) -> LResMany(vs, lower_flight_end(st, st1))
   }
 
-fn lower_tcrec_args_idx(xs: [Expr], ptys: [Ty], mask: [Bool], st: LowerSt, acc: [KVal]) : LResMany / Console = match xs {
+fn lower_tcrec_args_idx(
+  xs: [Expr],
+  ptys: [Ty],
+  mask: [Bool],
+  st: LowerSt,
+  acc: [KVal]
+) : LResMany / Console = match xs {
   [] -> LResMany(acc, st)
   [e, ...rest] -> {
     let pslot = param_slot_for(ptys, mask)
@@ -525,7 +601,13 @@ fn lower_tcrec_args_idx(xs: [Expr], ptys: [Ty], mask: [Bool], st: LowerSt, acc: 
       [] -> []
     }
     match lower_tcrec_arg(e, pslot, list_length(acc), st) {
-      LRes(v, st1) -> lower_tcrec_args_idx(rest, trest, mrest, lower_flight_next(e, v, rest == [], st1), list_append(acc, [v]))
+      LRes(v, st1) -> lower_tcrec_args_idx(
+        rest,
+        trest,
+        mrest,
+        lower_flight_next(e, v, rest == [], st1),
+        list_append(acc, [v])
+      )
     }
   }
 }
@@ -536,16 +618,19 @@ fn lower_tcrec_args_idx(xs: [Expr], ptys: [Ty], mask: [Bool], st: LowerSt, acc: 
 # param keeps the plain boxed `lower_expr`.
 fn lower_tcrec_arg(e: Expr, pslot: KSlot, i: Int, st: LowerSt) : LRes / Console = match pslot {
   SBoxed -> lower_expr(e, st)
-  _      -> if raw_border_owns_tail_arg(e, i) { lower_tail_slot_raw(e, pslot, st) }
-            else { lower_expr_raw_at(e, pslot, st) }
+  _ -> if raw_border_owns_tail_arg(e, i) {
+    lower_tail_slot_raw(e, pslot, st)
+  } else {
+    lower_expr_raw_at(e, pslot, st)
+  }
 }
 
 # A hoisted argument read back from its slot at a raw param: the read
 # consumes the slot's reference.
 fn lower_tail_slot_raw(e: Expr, pslot: KSlot, st: LowerSt) : LRes / Console = match e.mode {
   MUnboxed -> lower_expr_raw_kind(e, st)
-  _        -> match border_unbox_prim(pslot) {
+  _ -> match border_unbox_prim(pslot) {
     Some(prim) -> lower_unbox_at(e, prim, pslot, true, st)
-    None       -> lower_expr_boxed(e, st)
+    None -> lower_expr_boxed(e, st)
   }
 }

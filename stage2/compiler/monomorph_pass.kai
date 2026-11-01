@@ -42,8 +42,13 @@ import compiler.fiber_cross
 pub(pkg) type MonoOutput = MonoOut([Decl], SpecNames, [MLeakRecord], [BoundViolation])
 
 #[doc("Specialise every generic decl against the concrete instantiations the typer resolved (tp.insts), one spec per (declaration, tys, units) tuple: a spec is `FnId(<the generic's id>, <instance>)`, and the name it is emitted under rides in the returned table. Also returns the leak records and the fn-bound violations at concrete instantiations. The table of `ps` holds the row of every generic.")]
-pub(pkg) fn monomorphise(tp: TypedProgram, reg: ProtocolReg, fn_bounds: [SymBounds],
-                  ps: PScope, target_mod: String) : MonoOutput {
+pub(pkg) fn monomorphise(
+  tp: TypedProgram,
+  reg: ProtocolReg,
+  fn_bounds: [SymBounds],
+  ps: PScope,
+  target_mod: String
+) : MonoOutput {
   let polys = collect_poly_fns(tp.decls, target_mod, reg.ids)
   # `resolve_protocol_calls` retargets a dispatcher call to its impl
   # function AFTER `infer_program` has populated tp.insts, so no inst
@@ -64,7 +69,8 @@ pub(pkg) fn monomorphise(tp: TypedProgram, reg: ProtocolReg, fn_bounds: [SymBoun
   # concrete tuples (the spec of `f` at `Int` calls `g(x : Int)`);
   # those new tuples enter the worklist and produce additional specs.
   # Each spec also accumulates a per-spec leak record.
-  let r = generate_specs_iter(ps_tab(ps), polys, initial_tuples, insts_ix, [], initial_ts, [], reg, [])
+  let r =
+    generate_specs_iter(ps_tab(ps), polys, initial_tuples, insts_ix, [], initial_ts, [], reg, [])
   match r {
     GenSpecsOut(specs, all_items, leaks, op_viols) -> {
       # Every concrete instantiation (direct + transitive) surfaces as a
@@ -73,9 +79,25 @@ pub(pkg) fn monomorphise(tp: TypedProgram, reg: ProtocolReg, fn_bounds: [SymBoun
       # reaches here (it isn't concrete), so a generic caller forwarding
       # its own tparam defers to its own instantiation — no constraint
       # propagation.
-      let viols = list_append(check_fn_bounds(all_items, fn_bounds, insts_ix, polys, reg, mono_eq_env(ps, reg, tp.decls), []), op_viols)
+      let viols = list_append(
+        check_fn_bounds(
+          all_items,
+          fn_bounds,
+          insts_ix,
+          polys,
+          reg,
+          mono_eq_env(ps, reg, tp.decls),
+          []
+        ),
+        op_viols
+      )
       let ordered = spec_sort(specs)
-      MonoOut(list_append(rewritten, map(ordered, spec_decl_of)), spec_names_of(map(ordered, spec_name_row)), leaks, viols)
+      MonoOut(
+        list_append(rewritten, map(ordered, spec_decl_of)),
+        spec_names_of(map(ordered, spec_name_row)),
+        leaks,
+        viols
+      )
     }
   }
 }
@@ -83,11 +105,17 @@ pub(pkg) fn monomorphise(tp: TypedProgram, reg: ProtocolReg, fn_bounds: [SymBoun
 # A spec and the name it is emitted under.
 type Spec = Spec(Decl, String)
 
-fn spec_decl_of(sp: Spec) : Decl = match sp { Spec(d, _) -> d }
+fn spec_decl_of(sp: Spec) : Decl = match sp {
+  Spec(d, _) -> d
+}
 
-fn spec_emitted(sp: Spec) : String = match sp { Spec(_, n) -> n }
+fn spec_emitted(sp: Spec) : String = match sp {
+  Spec(_, n) -> n
+}
 
-fn spec_name_row(sp: Spec) : SpecName = match sp { Spec(d, n) -> SpecName(poly_decl_fid(d), written(n)) }
+fn spec_name_row(sp: Spec) : SpecName = match sp {
+  Spec(d, n) -> SpecName(poly_decl_fid(d), written(n))
+}
 
 # Emit-stable spec order: sorted by emitted name, not worklist discovery
 # order — a new call site in one module must not permute the spec
@@ -100,8 +128,11 @@ fn spec_sort(ds: [Spec]) : [Spec] = match ds {
 fn spec_insert(d: Spec, sorted: [Spec]) : [Spec] = match sorted {
   [] -> [d]
   [h, ...rest] ->
-    if string_lt(spec_emitted(d), spec_emitted(h)) { [d, h, ...rest] }
-    else { [h, ...spec_insert(d, rest)] }
+    if string_lt(spec_emitted(d), spec_emitted(h)) {
+      [d, h, ...rest]
+    } else {
+      [h, ...spec_insert(d, rest)]
+    }
 }
 
 type GenSpecsResult = GenSpecsOut([Spec], [MonoTuple], [MLeakRecord], [BoundViolation])
@@ -113,59 +144,95 @@ type GenSpecsResult = GenSpecsOut([Spec], [MonoTuple], [MLeakRecord], [BoundViol
 # alongside the list of newly-discovered tuples.
 type SpecEmitOut = SEO(Spec, [MonoTuple], [MLeakRecord], [BoundViolation])
 
-fn emit_spec(tab: SymTab, d: Decl, mt: MonoTuple, insts: InstIndex, polys: PolyIx,
-              all_tuples: TupleSet, reg: ProtocolReg) : SpecEmitOut {
-  match mt { MT(_, tys, units) -> {
-    let sm = build_subst_map(d, tys, units)
-    let spec0 = specialise_decl(d, tys, ts_inst(all_tuples, mt))
-    let spec1a = subst_decl(spec0, sm)
-    # Post-subst, the spec body's `Expr.ty` annotations are concrete.
-    # Re-run the protocol-call resolver so a dispatcher call inside the
-    # spec body retargets to the matching impl function. Without this
-    # step polymorphic impls that recurse on the type parameter (e.g.
-    # `impl[T: Show] Show for [T]` calling `show(x: T)` per element)
-    # leave the dispatcher in place and panic at runtime.
-    let spec1 = resolve_protocol_calls_decl(spec1a, reg)
-    # Discover transitive tuples introduced by body subst: for each call
-    # to a generic inside the spec body, look up the original CS, apply
-    # sm, and collect concrete poly tuples not yet known.
-    let new_tuples = discover_new_tuples_decl(spec1, insts, polys, all_tuples, sm)
-    let updated_tuples = ts_add_all(all_tuples, new_tuples)
-    let spec2 = rewrite_callsites_decl_sm(spec1, insts, updated_tuples, polys, sm)
-    # A self-recursive call must name the spec itself: left on the
-    # generic, TCO never fires on the spec (the loop lives in the
-    # generic) and every recursion bounces spec -> generic.
-    let spec3 = retarget_self_calls_decl(spec2)
-    let name = mono_mangle_name(tab, written_text(decl_name(tab, poly_decl_sym(d))), tys, units)
-    # Invariant: no TyVarT/UVar of `sm`'s domain survives in the spec
-    # body. Out-of-domain ids belong to unrelated free typer tyvars.
-    let atv = subst_map_tvar_ids(sm)
-    let auv = subst_map_uvar_ids(sm)
-    let leaks = match spec3 {
-      DFn(_, _, _, _, _, _, sbody, _, _, _, _, _) ->
-        match first_spec_leak(sbody, atv, auv) {
-          Some(LeakTy(line, col, t)) ->
-            [MLeakRec(name, count_spec_leaks(sbody, atv, auv), Some(MLeakAt(line, col, inf_ty_to_string(tab, t))))]
-          None -> []
-        }
-      _ -> []
+fn emit_spec(
+  tab: SymTab,
+  d: Decl,
+  mt: MonoTuple,
+  insts: InstIndex,
+  polys: PolyIx,
+  all_tuples: TupleSet,
+  reg: ProtocolReg
+) : SpecEmitOut {
+  match mt {
+    MT(_, tys, units) -> {
+      let sm = build_subst_map(d, tys, units)
+      let spec0 = specialise_decl(d, tys, ts_inst(all_tuples, mt))
+      let spec1a = subst_decl(spec0, sm)
+      # Post-subst, the spec body's `Expr.ty` annotations are concrete.
+      # Re-run the protocol-call resolver so a dispatcher call inside the
+      # spec body retargets to the matching impl function. Without this
+      # step polymorphic impls that recurse on the type parameter (e.g.
+      # `impl[T: Show] Show for [T]` calling `show(x: T)` per element)
+      # leave the dispatcher in place and panic at runtime.
+      let spec1 = resolve_protocol_calls_decl(spec1a, reg)
+      # Discover transitive tuples introduced by body subst: for each call
+      # to a generic inside the spec body, look up the original CS, apply
+      # sm, and collect concrete poly tuples not yet known.
+      let new_tuples = discover_new_tuples_decl(spec1, insts, polys, all_tuples, sm)
+      let updated_tuples = ts_add_all(all_tuples, new_tuples)
+      let spec2 = rewrite_callsites_decl_sm(spec1, insts, updated_tuples, polys, sm)
+      # A self-recursive call must name the spec itself: left on the
+      # generic, TCO never fires on the spec (the loop lives in the
+      # generic) and every recursion bounces spec -> generic.
+      let spec3 = retarget_self_calls_decl(spec2)
+      let name = mono_mangle_name(tab, written_text(decl_name(tab, poly_decl_sym(d))), tys, units)
+      # Invariant: no TyVarT/UVar of `sm`'s domain survives in the spec
+      # body. Out-of-domain ids belong to unrelated free typer tyvars.
+      let atv = subst_map_tvar_ids(sm)
+      let auv = subst_map_uvar_ids(sm)
+      let leaks = match spec3 {
+        DFn(_, _, _, _, _, _, sbody, _, _, _, _, _) ->
+          match first_spec_leak(sbody, atv, auv) {
+            Some(LeakTy(line, col, t)) ->
+              [
+                MLeakRec(
+                  name,
+                  count_spec_leaks(sbody, atv, auv),
+                  Some(MLeakAt(line, col, inf_ty_to_string(tab, t)))
+                )
+              ]
+            None -> []
+          }
+        _ -> []
+      }
+      SEO(Spec(spec3, name), new_tuples, leaks, spec_body_violations(tab, d, mt, spec3, insts))
     }
-    SEO(Spec(spec3, name), new_tuples, leaks, spec_body_violations(tab, d, mt, spec3, insts))
-  } }
+  }
 }
 
 # Iterate spec emission to fixpoint. `worklist` holds tuples not yet
 # emitted; `all_tuples` is the running set used by per-spec rewrite to
 # know which retargets are reachable.
-fn generate_specs_iter(tab: SymTab, polys: PolyIx, worklist: [MonoTuple],
-                        insts: InstIndex, specs_acc: [Spec],
-                        all_tuples: TupleSet,
-                        leaks_acc: [MLeakRecord],
-                        reg: ProtocolReg, viols_acc: [BoundViolation]) : GenSpecsResult {
+fn generate_specs_iter(
+  tab: SymTab,
+  polys: PolyIx,
+  worklist: [MonoTuple],
+  insts: InstIndex,
+  specs_acc: [Spec],
+  all_tuples: TupleSet,
+  leaks_acc: [MLeakRecord],
+  reg: ProtocolReg,
+  viols_acc: [BoundViolation]
+) : GenSpecsResult {
   match worklist {
-    [] -> GenSpecsOut(list_reverse(specs_acc), all_tuples.items, list_reverse(leaks_acc), list_reverse(viols_acc))
+    [] -> GenSpecsOut(
+      list_reverse(specs_acc),
+      all_tuples.items,
+      list_reverse(leaks_acc),
+      list_reverse(viols_acc)
+    )
     [t, ...rest] -> match lookup_poly_fn_sym(poly_ix_fns(polys), mt_sym(t)) {
-      None -> generate_specs_iter(tab, polys, rest, insts, specs_acc, all_tuples, leaks_acc, reg, viols_acc)
+      None -> generate_specs_iter(
+        tab,
+        polys,
+        rest,
+        insts,
+        specs_acc,
+        all_tuples,
+        leaks_acc,
+        reg,
+        viols_acc
+      )
       Some(d) -> {
         let r = emit_spec(tab, d, t, insts, polys, all_tuples, reg)
         match r {
@@ -173,9 +240,17 @@ fn generate_specs_iter(tab: SymTab, polys: PolyIx, worklist: [MonoTuple],
             let next_worklist = list_append(rest, new_ts)
             let next_all = ts_add_all(all_tuples, new_ts)
             let next_leaks = prepend_leaks(new_leaks, leaks_acc)
-            generate_specs_iter(tab, polys, next_worklist, insts,
-                                 [spec, ...specs_acc], next_all, next_leaks, reg,
-                                 list_append(list_reverse(new_viols), viols_acc))
+            generate_specs_iter(
+              tab,
+              polys,
+              next_worklist,
+              insts,
+              [spec, ...specs_acc],
+              next_all,
+              next_leaks,
+              reg,
+              list_append(list_reverse(new_viols), viols_acc)
+            )
           }
         }
       }
@@ -183,8 +258,15 @@ fn generate_specs_iter(tab: SymTab, polys: PolyIx, worklist: [MonoTuple],
   }
 }
 
-fn spec_body_violations(tab: SymTab, d: Decl, mt: MonoTuple, spec: Decl, insts: InstIndex) : [BoundViolation] = match spec {
-  DFn(_, _, _, _, _, _, body, _, _, _, _, _) -> spec_op_violations(tab, mt_sym(mt), body, mono_inst_loc(insts, d, mt))
+fn spec_body_violations(
+  tab: SymTab,
+  d: Decl,
+  mt: MonoTuple,
+  spec: Decl,
+  insts: InstIndex
+) : [BoundViolation] = match spec {
+  DFn(_, _, _, _, _, _, body, _, _, _, _, _) ->
+    spec_op_violations(tab, mt_sym(mt), body, mono_inst_loc(insts, d, mt))
   _ -> []
 }
 
@@ -204,12 +286,26 @@ fn prepend_leaks(xs: [MLeakRecord], acc: [MLeakRecord]) : [MLeakRecord] {
 # keeps a check-only run's verdict identical to a build's.
 
 #[doc("The program fed to mono, the specialised decls, the name each specialisation is emitted under, the rows of the declarations these passes minted, and the verdict of the post-mono checks.")]
-pub(pkg) type MonoFront = { prog: TypedProgram, decls: [Decl], specs: SpecNames, rows: [NEnt], verdict: Verdict }
+pub(pkg) type MonoFront = {
+  prog: TypedProgram,
+  decls: [Decl],
+  specs: SpecNames,
+  rows: [NEnt],
+  verdict: Verdict
+}
 
 #[doc("Run the passes from the typed program through monomorphisation and report the bound, leak and dispatch errors found on the specialised decls.")]
-pub(pkg) fn mono_front(typed: TypedProgram, reg: ProtocolReg,
-                  fn_bounds: [SymBounds], ps: PScope, target_mod: String,
-                  file: String, df: DiagFiles, roots: Roots, plan: PkgPlan) : MonoFront / Console + File {
+pub(pkg) fn mono_front(
+  typed: TypedProgram,
+  reg: ProtocolReg,
+  fn_bounds: [SymBounds],
+  ps: PScope,
+  target_mod: String,
+  file: String,
+  df: DiagFiles,
+  roots: Roots,
+  plan: PkgPlan
+) : MonoFront / Console + File {
   let tab = ps_tab(ps)
   # The typer leaves a builtin it chose over a module's homonym, and a
   # constructor only the expected type settles, as written names.
@@ -222,56 +318,89 @@ pub(pkg) fn mono_front(typed: TypedProgram, reg: ProtocolReg,
   # its own: mono names a generic from the table holding its row.
   let closed = closure_spec_pass(fwd0.decls, target_mod, tab, reg.ids)
   let fwd = typed_prog_with_decls(fwd0, closed.decls)
-  let ps1 = match ps { PScope(t, views, root) -> PScope(st_extend(t, closed.rows), views, root) }
+  let ps1 = match ps {
+    PScope(t, views, root) -> PScope(st_extend(t, closed.rows), views, root)
+  }
   match monomorphise(fwd, reg, fn_bounds, ps1, target_mod) {
     MonoOut(ds, specs, leaks, viols) -> {
-      let bounds = vd_render(map(viols, (v) => bound_diag(file, v)))
+      let bounds = vd_render(map(viols, v => bound_diag(file, v)))
       let leaks_vd = vd_render(mono_leak_diags(file, leaks))
       let op_warns = vd_render(unbounded_op_diags(typed.decls, fn_bounds, target_mod, df))
       # A dispatcher call left on a concrete receiver is a polymorphic
       # body instantiated at a type with no impl.
       let dispatch = dispatch_diags_at_user_sites(ds, ps_tab(ps1), reg, df, file, plan)
       let cmps = vd_render(cmp_diags(mono_eq_env(ps1, reg, ds), ds, df, ps_tab(ps1), []))
-      let crossings = vd_render(match ps1 { PScope(t, views, _) -> fiber_crossings(df, t, views, target_mod, roots, typed.decls, ds) })
-      MonoFront { prog: fwd, decls: canon_handle_instances(contest_strand_decls(ds, ps_tab(ps1), reg.ids)), specs: specs, rows: closed.rows,
-                  verdict: vd_merge([bounds, leaks_vd, op_warns, vd_render(dispatch), cmps, crossings]) }
+      let crossings = vd_render(match ps1 {
+        PScope(t, views, _) -> fiber_crossings(df, t, views, target_mod, roots, typed.decls, ds)
+      })
+      MonoFront {
+        prog: fwd,
+        decls: canon_handle_instances(contest_strand_decls(ds, ps_tab(ps1), reg.ids)),
+        specs: specs,
+        rows: closed.rows,
+        verdict: vd_merge([bounds, leaks_vd, op_warns, vd_render(dispatch), cmps, crossings])
+      }
     }
   }
 }
 
 fn mono_eq_env(ps: PScope, reg: ProtocolReg, ds: [Decl]) : EqEnv =
-  eq_env_of(ps, (s) => prc_reg_has_impl(reg, core_proto_id(CpEq), DhSym(s)),
-            (s) => prc_reg_has_impl(reg, core_proto_id(CpOrd), DhSym(s)), ds)
+  eq_env_of(
+    ps,
+    s => prc_reg_has_impl(reg, core_proto_id(CpEq), DhSym(s)),
+    s => prc_reg_has_impl(reg, core_proto_id(CpOrd), DhSym(s)),
+    ds
+  )
 
-fn cmp_diags(env: EqEnv, ds: [Decl], df: DiagFiles, tab: SymTab, acc: [Diagnostic]) : [Diagnostic] = match ds {
-  []           -> acc
-  [d, ...rest] -> {
-    let sites = match d {
-      DFn(_, _, _, _, _, _, body, _, _, _, _, _) -> cmp_sites(env, body, [])
-      DTest(_, body, _, _, _)              -> cmp_sites(env, body, [])
-      DBench(_, body, _, _, _)             -> cmp_sites(env, body, [])
-      DCheck(_, _, body, _, _, _)          -> cmp_sites(env, body, [])
-      DConst(_, _, _, body, _, _, _, _, _)       -> cmp_sites(env, body, [])
-      _                                    -> []
+fn cmp_diags(env: EqEnv, ds: [Decl], df: DiagFiles, tab: SymTab, acc: [Diagnostic]) : [Diagnostic] =
+  match ds {
+    [] -> acc
+    [d, ...rest] -> {
+      let sites = match d {
+        DFn(_, _, _, _, _, _, body, _, _, _, _, _) -> cmp_sites(env, body, [])
+        DTest(_, body, _, _, _) -> cmp_sites(env, body, [])
+        DBench(_, body, _, _, _) -> cmp_sites(env, body, [])
+        DCheck(_, _, body, _, _, _) -> cmp_sites(env, body, [])
+        DConst(_, _, _, body, _, _, _, _, _) -> cmp_sites(env, body, [])
+        _ -> []
+      }
+      let file = decl_diag_file(d, df)
+      cmp_diags(
+        env,
+        rest,
+        df,
+        tab,
+        list_append(acc, map(list_reverse(sites), s => cmp_diag(file, tab, s)))
+      )
     }
-    let file = decl_diag_file(d, df)
-    cmp_diags(env, rest, df, tab, list_append(acc, map(list_reverse(sites), (s) => cmp_diag(file, tab, s))))
   }
-}
 
 fn cmp_diag(file: String, tab: SymTab, s: CmpSite) : Diagnostic = match s {
   CS(line, col, t, is_eq) -> {
     let ty = inf_ty_to_string(tab, t)
-    let msg = if is_eq { concat_all(["cannot compare `", ty, "`: it is a function or holds one"]) }
-              else { concat_all(["cannot order `", ty, "`: it has no `Ord` impl"]) }
+    let msg = if is_eq {
+      concat_all(["cannot compare `", ty, "`: it is a function or holds one"])
+    } else {
+      concat_all(["cannot order `", ty, "`: it has no `Ord` impl"])
+    }
     mk_diag(SevError, file, line, col, msg, [])
   }
 }
 
-fn unbounded_op_diags(ds: [Decl], fn_bounds: [SymBounds], target_mod: String, df: DiagFiles) : [Diagnostic] =
-  flat_map(ds, (d) => {
+fn unbounded_op_diags(
+  ds: [Decl],
+  fn_bounds: [SymBounds],
+  target_mod: String,
+  df: DiagFiles
+) : [Diagnostic] =
+  flat_map(ds, d => {
     let file = decl_diag_file(d, df)
-    map(unbounded_op_warnings(d, fn_bounds, target_mod), (w) => match w { OpWarn(msg, l, c) -> mk_diag(SevWarning, file, l, c, msg, []) })
+    map(
+      unbounded_op_warnings(d, fn_bounds, target_mod),
+      w => match w {
+        OpWarn(msg, l, c) -> mk_diag(SevWarning, file, l, c, msg, [])
+      }
+    )
   })
 
 fn bound_diag(file: String, v: BoundViolation) : Diagnostic = match v {
@@ -288,8 +417,14 @@ fn mono_leak_diags(file: String, rs: [MLeakRecord]) : [Diagnostic] = match rs {
         concat_all([" first at ", int_to_string(line), ":", int_to_string(col), " ty=", ty_s])
       None -> ""
     }
-    let msg = concat_all(["m4c Phase 3 invariant: spec '", name, "' has ", int_to_string(n),
-                          " TyVarT/UVar leak(s) in body Expr.ty", loc_s])
+    let msg = concat_all([
+      "m4c Phase 3 invariant: spec '",
+      name,
+      "' has ",
+      int_to_string(n),
+      " TyVarT/UVar leak(s) in body Expr.ty",
+      loc_s
+    ])
     [mk_diag(SevError, file, 0, 0, msg, []), ...mono_leak_diags(file, rest)]
   }
 }

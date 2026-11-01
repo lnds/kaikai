@@ -18,32 +18,49 @@ import compiler.trmc_self_call
 pub(pkg) type TailTargets = { cands: SymSet, bmap: BorrowMap }
 
 #[doc("The targets of a program: every function its declarations define, but the core builtins they bind.")]
-pub(pkg) fn tailplan_targets(decls: [Decl], bmap: BorrowMap) : TailTargets = {
+pub(pkg) fn tailplan_targets(decls: [Decl], bmap: BorrowMap) : TailTargets {
   let builtins = kai_builtins(decls)
-  TailTargets { cands: sym_set_of(filter(flat_map(decls, tp_decl_sym), (s) => not kai_builtin_declares(builtins, s))), bmap: bmap }
+  TailTargets {
+    cands: sym_set_of(
+      filter(flat_map(decls, tp_decl_sym), s => not kai_builtin_declares(builtins, s))
+    ),
+    bmap: bmap
+  }
 }
 
 #[doc("No target: only self calls are tail steps.")]
-pub(pkg) fn tailplan_no_targets(bmap: BorrowMap) : TailTargets = TailTargets { cands: sym_set_empty(), bmap: bmap }
+pub(pkg) fn tailplan_no_targets(bmap: BorrowMap) : TailTargets =
+  TailTargets { cands: sym_set_empty(), bmap: bmap }
 
 fn tp_decl_sym(d: Decl) : [SymId] = match d {
   DFn(_, fid, _, _, _, _, _, _, _, _, _, _) -> [fnid_sym(fid)]
-  _                                    -> []
+  _ -> []
 }
 
 #[doc("The declared function a call in tail position can jump to: `f` names one other than `me`.")]
 pub(pkg) fn tailplan_target(f: Expr, me: SelfRef, tt: TailTargets) : Option[FnId] =
-  and_then(callee_fnid(f), (g) => if not tcrec_callee_is_self(f, me) and sym_set_has(tt.cands, fnid_sym(g)) { Some(g) } else { None })
+  and_then(
+    callee_fnid(f),
+    g => if (not tcrec_callee_is_self(f, me)) and sym_set_has(tt.cands, fnid_sym(g)) {
+      Some(g)
+    } else {
+      None
+    }
+  )
 
 #[doc("True when the callee `f` borrows an argument: the caller keeps it and releases it after the call, so the call jumps only when the caller has nothing left to release.")]
-pub(pkg) fn tailplan_lends(f: Expr, tt: TailTargets) : Bool = pcs_borrow_lookup(tt.bmap, pcs_callee_key(f)) != []
+pub(pkg) fn tailplan_lends(f: Expr, tt: TailTargets) : Bool =
+  pcs_borrow_lookup(tt.bmap, pcs_callee_key(f)) != []
 
 #[doc("True when a tail leaf of `body` is a call that jumps to another declared function.")]
 pub(pkg) fn tailplan_has_target(body: Expr, me: SelfRef, tt: TailTargets) : Bool =
-  any(tail_leaves(body), (leaf) => match leaf.kind {
-    ECall(f, _) -> is_some(tailplan_target(f, me, tt))
-    _           -> false
-  })
+  any(
+    tail_leaves(body),
+    leaf => match leaf.kind {
+      ECall(f, _) -> is_some(tailplan_target(f, me, tt))
+      _ -> false
+    }
+  )
 
 # What one function does to the call graph, outside and inside its lambdas: the functions it calls, the ones it takes as values, whether it calls through a closure.
 type TpPart = { calls: [SymId], taken: [SymId], indirect: Bool }
@@ -53,88 +70,120 @@ type TpFn = { sym: SymId, own: TpPart, lam: Option[TpPart] }
 fn tp_part_none() : TpPart = TpPart { calls: [], taken: [], indirect: false }
 
 #[doc("The functions on a cycle of direct calls, a function calling itself included. A lambda is a node of its own, made by the function that holds it; a call through a closure may reach any function or lambda a closure is made of, so it is an edge to each of them.")]
-pub(pkg) fn tailplan_cyclic(decls: [Decl]) : SymSet = {
+pub(pkg) fn tailplan_cyclic(decls: [Decl]) : SymSet {
   let fns = flat_map(decls, tp_fn)
   let n = list_length(fns)
   let slot = tp_slots(fns, 0, idx_empty())
-  let taken = list_append(tp_lam_nodes(fns, 0, n, []), flat_map(fns, (f) => tp_value_nodes(f, slot)))
+  let taken = list_append(tp_lam_nodes(fns, 0, n, []), flat_map(fns, f => tp_value_nodes(f, slot)))
   let edges = tp_edges_all(fns, 0, n, slot, taken, [])
-  let loops = flat_map(edges, (e) => if e.fst == e.snd { [e.fst] } else { [] })
-  let ring = tp_mark(flat_map(scc_groups(2 * n, edges), (g) => g), tp_mark(loops, array_make(2 * n, false)))
+  let loops = flat_map(edges, e => if e.fst == e.snd { [e.fst] } else { [] })
+  let ring =
+    tp_mark(flat_map(scc_groups(2 * n, edges), g => g), tp_mark(loops, array_make(2 * n, false)))
   sym_set_of(tp_marked(fns, 0, ring, []))
 }
 
 fn tp_mark(is: [Int], ring: Array[Bool]) : Array[Bool] / Mutable = match is {
-  []           -> ring
+  [] -> ring
   [i, ...rest] -> tp_mark(rest, array_set(ring, i, true))
 }
 
 fn tp_marked(fns: [TpFn], i: Int, ring: Array[Bool], acc: [SymId]) : [SymId] = match fns {
-  []           -> acc
-  [f, ...rest] -> tp_marked(rest, i + 1, ring, if array_get(ring, i) { [f.sym, ...acc] } else { acc })
+  [] -> acc
+  [f, ...rest] ->
+    tp_marked(rest, i + 1, ring, if array_get(ring, i) { [f.sym, ...acc] } else { acc })
 }
 
 fn tp_slots(fns: [TpFn], i: Int, slot: NameIndex[Int]) : NameIndex[Int] = match fns {
-  []           -> slot
+  [] -> slot
   [f, ...rest] -> tp_slots(rest, i + 1, idx_prepend_sym(slot, f.sym, i))
 }
 
 # The lambda node of function `i` is `n + i`; only a function that makes a lambda has one worth reaching.
 fn tp_lam_nodes(fns: [TpFn], i: Int, n: Int, acc: [Int]) : [Int] = match fns {
-  []           -> acc
-  [f, ...rest] -> tp_lam_nodes(rest, i + 1, n, match f.lam { Some(_) -> [n + i, ...acc]  None -> acc })
+  [] -> acc
+  [f, ...rest] -> tp_lam_nodes(rest, i + 1, n, match f.lam {
+    Some(_) -> [n + i, ...acc]
+    None -> acc
+  })
 }
 
 fn tp_value_nodes(f: TpFn, slot: NameIndex[Int]) : [Int] =
-  flat_map(list_append(f.own.taken, match f.lam { Some(l) -> l.taken  None -> [] }), (c) => tp_node(c, slot))
+  flat_map(
+    list_append(f.own.taken, match f.lam {
+      Some(l) -> l.taken
+      None -> []
+    }),
+    c => tp_node(c, slot)
+  )
 
 fn tp_node(c: SymId, slot: NameIndex[Int]) : [Int] = match idx_chain_sym(slot, c) {
   [j, ..._] -> [j]
-  []        -> []
+  [] -> []
 }
 
-fn tp_edges_all(fns: [TpFn], i: Int, n: Int, slot: NameIndex[Int], taken: [Int], acc: [(Int, Int)]) : [(Int, Int)] = match fns {
-  []           -> acc
-  [f, ...rest] -> tp_edges_all(rest, i + 1, n, slot, taken, list_append(tp_fn_edges(i, n, f, slot, taken), acc))
+fn tp_edges_all(
+  fns: [TpFn],
+  i: Int,
+  n: Int,
+  slot: NameIndex[Int],
+  taken: [Int],
+  acc: [(Int, Int)]
+) : [(Int, Int)] = match fns {
+  [] -> acc
+  [f, ...rest] ->
+    tp_edges_all(rest, i + 1, n, slot, taken, list_append(tp_fn_edges(i, n, f, slot, taken), acc))
 }
 
-fn tp_fn_edges(i: Int, n: Int, f: TpFn, slot: NameIndex[Int], taken: [Int]) : [(Int, Int)] = {
+fn tp_fn_edges(i: Int, n: Int, f: TpFn, slot: NameIndex[Int], taken: [Int]) : [(Int, Int)] {
   let own = tp_part_edges(i, f.own, slot, taken)
   match f.lam {
-    None    -> own
+    None -> own
     Some(l) -> list_append([(i, n + i), ...own], tp_part_edges(n + i, l, slot, taken))
   }
 }
 
-fn tp_part_edges(i: Int, p: TpPart, slot: NameIndex[Int], taken: [Int]) : [(Int, Int)] = {
-  let direct = map(flat_map(list_append(p.calls, p.taken), (c) => tp_node(c, slot)), (j) => (i, j))
-  if p.indirect { list_append(direct, map(taken, (j) => (i, j))) } else { direct }
+fn tp_part_edges(i: Int, p: TpPart, slot: NameIndex[Int], taken: [Int]) : [(Int, Int)] {
+  let direct = map(flat_map(list_append(p.calls, p.taken), c => tp_node(c, slot)), j => (i, j))
+  if p.indirect { list_append(direct, map(taken, j => (i, j))) } else { direct }
 }
 
 fn tp_fn(d: Decl) : [TpFn] = match d {
-  DFn(_, fid, _, _, _, _, body, _, _, _, _, _) -> [tp_walk(body, false, TpFn { sym: fnid_sym(fid), own: tp_part_none(), lam: None })]
+  DFn(_, fid, _, _, _, _, body, _, _, _, _, _) ->
+    [tp_walk(body, false, TpFn { sym: fnid_sym(fid), own: tp_part_none(), lam: None })]
   _ -> []
 }
 
 fn tp_with(acc: TpFn, inlam: Bool, f: (TpPart) -> TpPart) : TpFn =
-  if inlam { TpFn { ...acc, lam: Some(f(unwrap_or(acc.lam, tp_part_none()))) } } else { TpFn { ...acc, own: f(acc.own) } }
+  if inlam {
+    TpFn { ...acc, lam: Some(f(unwrap_or(acc.lam, tp_part_none()))) }
+  } else {
+    TpFn { ...acc, own: f(acc.own) }
+  }
 
 fn tp_walk(e: Expr, inlam: Bool, acc: TpFn) : TpFn = match e.kind {
   ECall(f, xs) -> match f.kind {
-    ESym(s, _)           -> tp_walk_all(xs, inlam, tp_with(acc, inlam, (p) => TpPart { ...p, calls: [s, ...p.calls] }))
-    EMark(MkApplyBorrow) -> tp_walk_all(xs, inlam, tp_with(acc, inlam, (p) => TpPart { ...p, indirect: true }))
-    EMark(_)             -> tp_walk_all(xs, inlam, acc)
-    EOp(_)               -> tp_walk_all(xs, inlam, acc)
-    _                    -> tp_walk_all(xs, inlam, tp_walk(f, inlam, tp_with(acc, inlam, (p) => TpPart { ...p, indirect: true })))
+    ESym(s, _) ->
+      tp_walk_all(xs, inlam, tp_with(acc, inlam, p => TpPart { ...p, calls: [s, ...p.calls] }))
+    EMark(MkApplyBorrow) ->
+      tp_walk_all(xs, inlam, tp_with(acc, inlam, p => TpPart { ...p, indirect: true }))
+    EMark(_) -> tp_walk_all(xs, inlam, acc)
+    EOp(_) -> tp_walk_all(xs, inlam, acc)
+    _ -> tp_walk_all(
+      xs,
+      inlam,
+      tp_walk(f, inlam, tp_with(acc, inlam, p => TpPart { ...p, indirect: true }))
+    )
   }
-  ESym(s, _)    -> tp_with(acc, inlam, (p) => TpPart { ...p, taken: [s, ...p.taken] })
+  ESym(s, _) -> tp_with(acc, inlam, p => TpPart { ...p, taken: [s, ...p.taken] })
   ELambda(_, b) -> tp_walk(b, true, TpFn { ...acc, lam: Some(unwrap_or(acc.lam, tp_part_none())) })
-  _             -> tp_walk_all(map(xp_positions(e), tp_child), inlam, acc)
+  _ -> tp_walk_all(map(xp_positions(e), tp_child), inlam, acc)
 }
 
-fn tp_child(p: XPos) : Expr = match p { XP(_, c) -> c }
+fn tp_child(p: XPos) : Expr = match p {
+  XP(_, c) -> c
+}
 
 fn tp_walk_all(es: [Expr], inlam: Bool, acc: TpFn) : TpFn = match es {
-  []           -> acc
+  [] -> acc
   [x, ...rest] -> tp_walk_all(rest, inlam, tp_walk(x, inlam, acc))
 }

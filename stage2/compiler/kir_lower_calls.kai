@@ -41,74 +41,155 @@ import compiler.kir_lower_sig
 # path stores the discarded value. The return clause (if any) lowers
 # inline over `result` at the merge. The clause bodies are separate
 # `KFnClause`s (generated in `lower_to_kir`).
-pub(pkg) fn lower_handle(x: Expr, body: Expr, inst: InstKey, init_opt: Option[Expr],
-                alias_opt: Option[Binder], clauses: [HClause],
-                ret_opt: Option[HReturn], st: LowerSt) : LRes / Console {
+pub(pkg) fn lower_handle(
+  x: Expr,
+  body: Expr,
+  inst: InstKey,
+  init_opt: Option[Expr],
+  alias_opt: Option[Binder],
+  clauses: [HClause],
+  ret_opt: Option[HReturn],
+  st: LowerSt
+) : LRes / Console {
   let eff = inst_key_text(st.tab, inst)
   let sym = user_handler_sym(st.enc_fn.sym, x.line, x.col)
   let has_fin = handle_has_finally(clauses)
   let uw = unw_handle_at(st.unw.sites, x.site)
   let ho = kir_unw_handle_vars(uw, x, st)
-  match lower_init_opt(init_opt, ho.st) { LResOpt(initv, st1) ->
-    match ls_fresh_reg(st1) { LSReg(result, st2) -> {
-      let st3 = ls_emit(st2, KLet(result, SBoxed, KLitOp(KUnitV), kpos_of(x)))
-      let hs = kir_unw_handle_state(uw, init_opt, sym, x, st3)
-      let env = handle_env_regs(handle_captures_at(st.cls, st.enc_fn, x.line, x.col), hs.st)
-      let al = bind_handle_alias(alias_opt, hs.st)
-      let st3b = ls_emit(al.st, KInstall(if is_named_instance(inst.eff, alias_opt) { named_label(eff) } else { eff }, sym, initv, al.reg, env, kpos_of(x)))
-      # Arm the cleanup right after the push, so every unwind past this
-      # node runs it; the normal exit runs it explicitly before the pop.
-      let st4 = if has_fin {
-        ls_emit(st3b, KSetCleanup(eff, sym, user_cleanup_sym(st.enc_fn.sym, x.line, x.col), kpos_of(x)))
-      } else { st3b }
-      # A handle carrying `init` state is stateful — its return clause sees
-      # `state`/`log` (gated in `lower_handle_ret` via `KBindEvState`).
-      let stateful = match initv { Some(_) -> true None -> false }
-      # `sym` (the install-site id) threads into the setjmp/pop so each site's
-      # evidence-frame storage is named per-SITE, not per-EFFECT: two nested
-      # handlers of the same effect must NOT share a `__node_<eff>` alloca, or
-      # the second push self-cycles the parent chain (refs #789).
-      let fork = HandleFork { stateful: stateful, has_fin: has_fin, frames: rs_clauses_push_frames(clauses), inst: inst, aliased: is_named_instance(inst.eff, alias_opt) }
-      lower_handle_fork(x, body, eff, sym, result, fork, ret_opt, list_append(hs.pops, ho.pops), st4)
-    } } }
+  match lower_init_opt(init_opt, ho.st) {
+    LResOpt(initv, st1) ->
+      match ls_fresh_reg(st1) {
+        LSReg(result, st2) -> {
+          let st3 = ls_emit(st2, KLet(result, SBoxed, KLitOp(KUnitV), kpos_of(x)))
+          let hs = kir_unw_handle_state(uw, init_opt, sym, x, st3)
+          let env = handle_env_regs(handle_captures_at(st.cls, st.enc_fn, x.line, x.col), hs.st)
+          let al = bind_handle_alias(alias_opt, hs.st)
+          let st3b = ls_emit(
+            al.st,
+            KInstall(
+              if is_named_instance(inst.eff, alias_opt) { named_label(eff) } else { eff },
+              sym,
+              initv,
+              al.reg,
+              env,
+              kpos_of(x)
+            )
+          )
+          # Arm the cleanup right after the push, so every unwind past this
+          # node runs it; the normal exit runs it explicitly before the pop.
+          let st4 = if has_fin {
+            ls_emit(
+              st3b,
+              KSetCleanup(eff, sym, user_cleanup_sym(st.enc_fn.sym, x.line, x.col), kpos_of(x))
+            )
+          } else {
+            st3b
+          }
+          # A handle carrying `init` state is stateful — its return clause sees
+          # `state`/`log` (gated in `lower_handle_ret` via `KBindEvState`).
+          let stateful = match initv {
+            Some(_) -> true
+            None -> false
+          }
+          # `sym` (the install-site id) threads into the setjmp/pop so each site's
+          # evidence-frame storage is named per-SITE, not per-EFFECT: two nested
+          # handlers of the same effect must NOT share a `__node_<eff>` alloca, or
+          # the second push self-cycles the parent chain (refs #789).
+          let fork = HandleFork {
+            stateful: stateful,
+            has_fin: has_fin,
+            frames: rs_clauses_push_frames(clauses),
+            inst: inst,
+            aliased: is_named_instance(inst.eff, alias_opt)
+          }
+          lower_handle_fork(
+            x,
+            body,
+            eff,
+            sym,
+            result,
+            fork,
+            ret_opt,
+            list_append(hs.pops, ho.pops),
+            st4
+          )
+        }
+      }
+  }
 }
 
-fn lower_handle_fork(x: Expr, body: Expr, eff: String, sym: String, result: String,
-                     fork: HandleFork, ret_opt: Option[HReturn], pops: [String], st: LowerSt) : LRes / Console =
-  match bind_op(st, KSetjmp(eff, sym), kpos_of(x)) { LRes(jmpv, st1) ->
-    match three_labels(st1) { LSL3(ldisc, lbody, lret, st2) -> {
-      let st3 = ls_seal(st2, KCondBr(jmpv, ldisc, lbody, kpos_of(x)), lbody)
-      let st4 = lower_handle_body(body, eff, sym, result, fork, ret_opt, lret, st3)
-      let st5 = lower_handle_discard(sym, result, lret, ldisc, st4)
-      lower_handle_ret(eff, sym, result, fork, pops, lret, st5)
-    } } }
+fn lower_handle_fork(
+  x: Expr,
+  body: Expr,
+  eff: String,
+  sym: String,
+  result: String,
+  fork: HandleFork,
+  ret_opt: Option[HReturn],
+  pops: [String],
+  st: LowerSt
+) : LRes / Console =
+  match bind_op(st, KSetjmp(eff, sym), kpos_of(x)) {
+    LRes(jmpv, st1) ->
+      match three_labels(st1) {
+        LSL3(ldisc, lbody, lret, st2) -> {
+          let st3 = ls_seal(st2, KCondBr(jmpv, ldisc, lbody, kpos_of(x)), lbody)
+          let st4 = lower_handle_body(body, eff, sym, result, fork, ret_opt, lret, st3)
+          let st5 = lower_handle_discard(sym, result, lret, ldisc, st4)
+          lower_handle_ret(eff, sym, result, fork, pops, lret, st5)
+        }
+      }
+  }
 
 # Lbody: lower the body inline, pop the evidence, apply the return
 # clause, store into result, branch to the merge. The pop sits on the
 # NORMAL exit only — the discard path's longjmp already unwound past it.
-fn lower_handle_body(body: Expr, eff: String, sym: String, result: String,
-                     fork: HandleFork, ret_opt: Option[HReturn],
-                     lret: String, st: LowerSt) : LowerSt / Console =
-  match lower_expr(body, if fork.aliased { st } else { ls_in_handle(st, fork.inst) }) { LRes(bv, st0) -> {
-    let has_fin = fork.has_fin
-    let stateful = fork.stateful
-    let st1 = ls_set_handles(ls_set_regs(st0, st.regs), st.handles)
-    match ret_opt {
-      None -> {
-        let st2 = ls_emit(st1, KStore(result, bv, kpos_of(body)))
-        ls_seal(lower_handle_exit(eff, sym, has_fin, body, st2), KBr(lret, kpos_of(body)), lret)
-      }
-      Some(r) -> match lower_handle_ret_value(eff, sym, bv, stateful, r, lower_handle_exit(eff, sym, has_fin, body, st1)) {
-        LRes(rv, st2) -> ls_seal(ls_emit(st2, KStore(result, rv, kpos_of(body))), KBr(lret, kpos_of(body)), lret)
+fn lower_handle_body(
+  body: Expr,
+  eff: String,
+  sym: String,
+  result: String,
+  fork: HandleFork,
+  ret_opt: Option[HReturn],
+  lret: String,
+  st: LowerSt
+) : LowerSt / Console =
+  match lower_expr(body, if fork.aliased { st } else { ls_in_handle(st, fork.inst) }) {
+    LRes(bv, st0) -> {
+      let has_fin = fork.has_fin
+      let stateful = fork.stateful
+      let st1 = ls_set_handles(ls_set_regs(st0, st.regs), st.handles)
+      match ret_opt {
+        None -> {
+          let st2 = ls_emit(st1, KStore(result, bv, kpos_of(body)))
+          ls_seal(lower_handle_exit(eff, sym, has_fin, body, st2), KBr(lret, kpos_of(body)), lret)
+        }
+        Some(r) -> match lower_handle_ret_value(
+          eff,
+          sym,
+          bv,
+          stateful,
+          r,
+          lower_handle_exit(eff, sym, has_fin, body, st1)
+        ) {
+          LRes(rv, st2) ->
+            ls_seal(ls_emit(st2, KStore(result, rv, kpos_of(body))), KBr(lret, kpos_of(body)), lret)
+        }
       }
     }
-  } }
+  }
 
 # The return clause over the body's value. A stateful handle's clause sees
 # the state aliases the handle site leaves unbound, each in a register of
 # its own: a later binder of the same name is a different binder.
-fn lower_handle_ret_value(eff: String, sym: String, bv: KVal, stateful: Bool,
-                          r: HReturn, st: LowerSt) : LRes / Console = match r {
+fn lower_handle_ret_value(
+  eff: String,
+  sym: String,
+  bv: KVal,
+  stateful: Bool,
+  r: HReturn,
+  st: LowerSt
+) : LRes / Console = match r {
   HR(b, rexpr, _, _) -> {
     let st1 = if stateful { bind_ret_state(eff, sym, st) } else { st }
     match lower_expr(rexpr, ls_let(st1, b, SBoxed, KLitOp(bv), KNoPos)) {
@@ -118,8 +199,10 @@ fn lower_handle_ret_value(eff: String, sym: String, bv: KVal, stateful: Bool,
 }
 
 fn lower_init_opt(init_opt: Option[Expr], st: LowerSt) : LResOpt / Console = match init_opt {
-  None    -> LResOpt(None, st)
-  Some(e) -> match lower_expr(e, st) { LRes(v, st1) -> LResOpt(Some(v), st1) }
+  None -> LResOpt(None, st)
+  Some(e) -> match lower_expr(e, st) {
+    LRes(v, st1) -> LResOpt(Some(v), st1)
+  }
 }
 
 # --- Calls: dispatch by callee shape -----------------------------------
@@ -134,10 +217,16 @@ pub(pkg) fn lower_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Co
     None -> lower_call_at(x, f, cargs, st)
     Some(names) -> {
       let clo = kir_unw_closure(f, st)
-      match lp_union(map(unw_callee_held(unw_held(st.unw, names, (n) => ls_local_bound(st, n)), clo), (n) => ls_reg_of(st, n)), lower_flight_free(st)) {
+      match lp_union(
+        map(
+          unw_callee_held(unw_held(st.unw, names, n => ls_local_bound(st, n)), clo),
+          n => ls_reg_of(st, n)
+        ),
+        lower_flight_free(st)
+      ) {
         [] -> match clo {
           Some(UnwDup(n)) -> lower_apply_borrow(x, [unw_callee_var(f, n), ...cargs], st)
-          _              -> lower_call_at(x, f, cargs, st)
+          _ -> lower_call_at(x, f, cargs, st)
         }
         held -> lower_call_bracketed(x, f, cargs, clo, held, st)
       }
@@ -146,138 +235,204 @@ pub(pkg) fn lower_call(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Co
 
 # `regs` are the registers the bracket holds: the binders registered at
 # the call and the operand values in flight across it.
-fn lower_call_bracketed(x: Expr, f: Expr, cargs: [Expr], clo: Option[UnwCallee], regs: [String], st: LowerSt) : LRes / Console =
-  match ls_fresh_reg(st) { LSReg(fr, st0) -> {
-      let st1 = ls_emit(st0, KLet(fr, SBoxed, KPrim(KpUnwPush, [KVar(unw_fib(st0.unw)), ...map(regs, (r) => KVar(r))]), kpos_of(x)))
-      let r = match lower_bracket_begin(x, regs, st1) { PadB(outer, sb) ->
-        match lower_call_in_bracket(x, f, cargs, clo, sb) { LRes(v, se) -> LRes(v, lower_bracket_end(outer, se)) }
+fn lower_call_bracketed(
+  x: Expr,
+  f: Expr,
+  cargs: [Expr],
+  clo: Option[UnwCallee],
+  regs: [String],
+  st: LowerSt
+) : LRes / Console =
+  match ls_fresh_reg(st) {
+    LSReg(fr, st0) -> {
+      let st1 = ls_emit(
+        st0,
+        KLet(
+          fr,
+          SBoxed,
+          KPrim(KpUnwPush, [KVar(unw_fib(st0.unw)), ...map(regs, r => KVar(r))]),
+          kpos_of(x)
+        )
+      )
+      let r = match lower_bracket_begin(x, regs, st1) {
+        PadB(outer, sb) ->
+          match lower_call_in_bracket(x, f, cargs, clo, sb) {
+            LRes(v, se) -> LRes(v, lower_bracket_end(outer, se))
+          }
       }
-      match r { LRes(v, st2) -> {
-        let st3 = ls_emit(st2, KDo(KPrim(KpUnwPop, [KVar(fr)]), kpos_of(x)))
-        match clo {
-          Some(UnwTransfer(n)) -> LRes(v, ls_emit(st3, KRC(KDrop(KVar(ls_reg_of(st3, n))), kpos_of(x))))
-          _                   -> LRes(v, st3)
+      match r {
+        LRes(v, st2) -> {
+          let st3 = ls_emit(st2, KDo(KPrim(KpUnwPop, [KVar(fr)]), kpos_of(x)))
+          match clo {
+            Some(UnwTransfer(n)) ->
+              LRes(v, ls_emit(st3, KRC(KDrop(KVar(ls_reg_of(st3, n))), kpos_of(x))))
+            _ -> LRes(v, st3)
+          }
         }
-      } }
-    } }
+      }
+    }
+  }
 
-fn lower_call_in_bracket(x: Expr, f: Expr, cargs: [Expr], clo: Option[UnwCallee], st: LowerSt) : LRes / Console = match clo {
+fn lower_call_in_bracket(
+  x: Expr,
+  f: Expr,
+  cargs: [Expr],
+  clo: Option[UnwCallee],
+  st: LowerSt
+) : LRes / Console = match clo {
   Some(UnwTransfer(n)) -> lower_apply_borrow(x, [unw_callee_var(f, n), ...cargs], st)
-  Some(UnwDup(n))      -> lower_apply_borrow(x, [unw_callee_var(f, n), ...cargs], st)
-  None                -> lower_call_at(x, f, cargs, st)
+  Some(UnwDup(n)) -> lower_apply_borrow(x, [unw_callee_var(f, n), ...cargs], st)
+  None -> lower_call_at(x, f, cargs, st)
 }
 
 fn lower_call_at(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match f.kind {
   # A local in callee position holds a function value, called through
   # `kaix_apply`; the clause's continuation is resumed instead.
-  ELocal(l) -> if local_is_continuation(l) { lower_resume(x, cargs, st) } else { lower_local_call(x, l, cargs, st) }
+  ELocal(l) -> if local_is_continuation(l) {
+    lower_resume(x, cargs, st)
+  } else {
+    lower_local_call(x, l, cargs, st)
+  }
   ESym(s, inst) -> match ls_ctor_lay(st, s) {
     Some(c) -> lower_ctor_call(x, c, cargs, st)
-    None    -> lower_sym_call(x, FnId(s, inst), cargs, st)
+    None -> lower_sym_call(x, FnId(s, inst), cargs, st)
   }
-  EOp(r)       -> lower_perform(x, r, cargs, st)
+  EOp(r) -> lower_perform(x, r, cargs, st)
   # A mark in callee position asks for a lowering, not for a call: the
   # mark decides which.
-  EMark(m)     -> lower_mark_call(x, m, cargs, st)
+  EMark(m) -> lower_mark_call(x, m, cargs, st)
   _ -> {
     let rf = lower_expr(f, st)
-    match rf { LRes(fv, st1) -> match lower_exprs(cargs, st1, []) {
-      LResMany(avs, st2) -> bind_op(st2, KCallIndirect(fv, avs), kpos_of(x)) } }
+    match rf {
+      LRes(fv, st1) -> match lower_exprs(cargs, st1, []) {
+        LResMany(avs, st2) -> bind_op(st2, KCallIndirect(fv, avs), kpos_of(x))
+      }
+    }
   }
 }
 
 # The base is a borrowed read; the field is taken from it when its cell is unique.
 fn lower_take_field(x: Expr, f: String, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
-  [b] -> match lower_expr(b, st) { LRes(bv, st1) -> match field_index_of(st1.recs, b.ty, f) {
-    Some(n) -> bind_op(st1, KPrim(KpFieldTakeDupAt, [bv, KIntV(n)]), kpos_of(x))
-    None    -> lower_field_read(st1, KPrim(KpField, [bv, KStrV(f)]), bv, kpos_of(x))
-  } }
-  _   -> LRes(KUnitV, st)
+  [b] -> match lower_expr(b, st) {
+    LRes(bv, st1) -> match field_index_of(st1.recs, b.ty, f) {
+      Some(n) -> bind_op(st1, KPrim(KpFieldTakeDupAt, [bv, KIntV(n)]), kpos_of(x))
+      None -> lower_field_read(st1, KPrim(KpField, [bv, KStrV(f)]), bv, kpos_of(x))
+    }
+  }
+  _ -> LRes(KUnitV, st)
 }
 
 fn lower_mark_call(x: Expr, m: Mark, cargs: [Expr], st: LowerSt) : LRes / Console =
-  if mark_is_drop(m) { lower_rc_unary(cargs, KDropMk, st) }
-  else if mark_is_transparent(m) { lower_borrow_through(cargs, st) }
-  else { match m {
-    MkApplyBorrow -> lower_apply_borrow(x, cargs, st)
-    MkTcrecStep(s) -> lower_tcrec(x, s, cargs, st)
-    MkTailStep(_)  -> lower_borrow_through(cargs, st)
-    MkTrmcStep(s)  -> lower_trmc_step(x, s, cargs, st)
-    MkTrmcApply   -> lower_trmc_apply(x, cargs, st)
-    MkDup         -> lower_rc_unary(cargs, KDupMk, st)
-    MkTakeField(f) -> lower_take_field(x, f, cargs, st)
-    MkTakeState    -> bind_op(st, KPrim(KpStateTake, []), kpos_of(x))
-    MkReuseCons    -> lower_reuse(x, m, cargs, st)
-    MkReuseVariant -> lower_reuse(x, m, cargs, st)
-    MkReuseRecord  -> lower_reuse(x, m, cargs, st)
-    _ -> {
-      eprint(concat_all(["kir: mark ", mark_name(m), " has no lowering"]))
-      LRes(KUnitV, st)
+  if mark_is_drop(m) {
+    lower_rc_unary(cargs, KDropMk, st)
+  } else if mark_is_transparent(m) {
+    lower_borrow_through(cargs, st)
+  } else {
+    match m {
+      MkApplyBorrow -> lower_apply_borrow(x, cargs, st)
+      MkTcrecStep(s) -> lower_tcrec(x, s, cargs, st)
+      MkTailStep(_) -> lower_borrow_through(cargs, st)
+      MkTrmcStep(s) -> lower_trmc_step(x, s, cargs, st)
+      MkTrmcApply -> lower_trmc_apply(x, cargs, st)
+      MkDup -> lower_rc_unary(cargs, KDupMk, st)
+      MkTakeField(f) -> lower_take_field(x, f, cargs, st)
+      MkTakeState -> bind_op(st, KPrim(KpStateTake, []), kpos_of(x))
+      MkReuseCons -> lower_reuse(x, m, cargs, st)
+      MkReuseVariant -> lower_reuse(x, m, cargs, st)
+      MkReuseRecord -> lower_reuse(x, m, cargs, st)
+      _ -> {
+        eprint(concat_all(["kir: mark ", mark_name(m), " has no lowering"]))
+        LRes(KUnitV, st)
+      }
     }
-  } }
+  }
 
 # A call of a declaration that is no constructor.
 fn lower_sym_call(x: Expr, fid: FnId, cargs: [Expr], st: LowerSt) : LRes / Console =
   match ls_classify(st, fid) {
     # `__strip_unit(e)` is a compile-time unit erasure — identity at
     # runtime, so lower the inner expr directly (like `__perceus_borrow`).
-    CkStripUnit -> if kir_node_is_raw(x) { lower_raw_through(cargs, st) } else { lower_borrow_through(cargs, st) }
+    CkStripUnit -> if kir_node_is_raw(x) {
+      lower_raw_through(cargs, st)
+    } else {
+      lower_borrow_through(cargs, st)
+    }
     # `unit_name(e)` is COMPILE-TIME reflection (m12.8.x phase 2): the unit is
     # phantom (no runtime value carries it), so it CANNOT be a runtime call —
     # the C-direct oracle inlines the canonical unit symbol as a `kai_str`
     # literal read from the arg's `.ty` (emit_c's `unit_name` case).
-    CkUnitName  -> lower_unit_name(cargs, st)
-    CkDirect    -> lower_callee_dispatch(x, fid, cargs, st)
+    CkUnitName -> lower_unit_name(cargs, st)
+    CkDirect -> lower_callee_dispatch(x, fid, cargs, st)
   }
 
 # An effect op call → a `KPerform`. The dispatch (evidence lookup + clause
 # call) is the backend's; `KPerform` carries the effect, the instance the
 # typer settled it to, the op, the evidence it goes through and the args.
-fn lower_perform(x: Expr, r: OpRef, cargs: [Expr], st: LowerSt) : LRes / Console = {
+fn lower_perform(x: Expr, r: OpRef, cargs: [Expr], st: LowerSt) : LRes / Console {
   let targs = perform_inst_args(x)
-  match lower_exprs(cargs, st, []) { LResMany(avs, st1) ->
-    bind_op(st1, KPerform(r.eff, targs, written_text(r.op), perform_via(r, targs, st), avs), kpos_of(x)) }
+  match lower_exprs(cargs, st, []) {
+    LResMany(avs, st1) ->
+      bind_op(
+        st1,
+        KPerform(r.eff, targs, written_text(r.op), perform_via(r, targs, st), avs),
+        kpos_of(x)
+      )
+  }
 }
 
 fn lower_rc_unary(cargs: [Expr], kind: RCKind, st: LowerSt) : LRes / Console = match cargs {
-  [a] -> match lower_expr(a, st) { LRes(v, st1) -> {
-    let op = match kind { KDupMk -> KDup(v) KDropMk -> KDrop(v) }
-    let st2 = ls_emit(st1, KRC(op, kpos_of(a)))
-    # A dup evaluates to its operand; a drop evaluates to unit.
-    match kind { KDupMk -> LRes(v, st2) KDropMk -> LRes(KUnitV, st2) }
-  } }
+  [a] -> match lower_expr(a, st) {
+    LRes(v, st1) -> {
+      let op = match kind {
+        KDupMk -> KDup(v)
+        KDropMk -> KDrop(v)
+      }
+      let st2 = ls_emit(st1, KRC(op, kpos_of(a)))
+      # A dup evaluates to its operand; a drop evaluates to unit.
+      match kind {
+        KDupMk -> LRes(v, st2)
+        KDropMk -> LRes(KUnitV, st2)
+      }
+    }
+  }
   _ -> LRes(KUnitV, st)
 }
 
 # `__perceus_borrow(e)` reads `e` without an RC op — transparent.
 fn lower_borrow_through(cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
   [a] -> lower_expr(a, st)
-  _   -> LRes(KUnitV, st)
+  _ -> LRes(KUnitV, st)
 }
 
 # `int_to_real` / `real_to_int` in raw position: one raw instruction; the operand crosses raw, borrowing a boxed binder.
-pub(pkg) fn lower_scalar_conv_raw(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
-  [a] -> match lower_expr_raw(a, st) { LRes(av, st1) ->
-    match builtin_ref(f) {
-      Some(CbIntToReal) -> bind_op_slot(st1, KPrim(KpIntToReal, [av]), SReal, kpos_of(x))
-      _                 -> bind_op_slot(st1, KPrim(KpRealToInt, [av]), SInt64, kpos_of(x))
-    } }
-  _ -> LRes(KUnitV, st)
-}
+pub(pkg) fn lower_scalar_conv_raw(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) : LRes / Console =
+  match cargs {
+    [a] -> match lower_expr_raw(a, st) {
+      LRes(av, st1) ->
+        match builtin_ref(f) {
+          Some(CbIntToReal) -> bind_op_slot(st1, KPrim(KpIntToReal, [av]), SReal, kpos_of(x))
+          _ -> bind_op_slot(st1, KPrim(KpRealToInt, [av]), SInt64, kpos_of(x))
+        }
+    }
+    _ -> LRes(KUnitV, st)
+  }
 
 # A raw coercion hands its raw argument through without a box round trip.
 fn lower_raw_through(cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
   [a] -> lower_expr_raw(a, st)
-  _   -> LRes(KUnitV, st)
+  _ -> LRes(KUnitV, st)
 }
 
 # A borrowing indirect call. The first arg is the closure value, invoked
 # WITHOUT being consumed; the rest are the owned call arguments.
 fn lower_apply_borrow(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
   [fe, ...rest] ->
-    match lower_expr(fe, st) { LRes(fv, st1) ->
-      match lower_exprs(rest, st1, []) {
-        LResMany(avs, st2) -> bind_op(st2, KCallIndirectBorrow(fv, avs), kpos_of(x)) } }
+    match lower_expr(fe, st) {
+      LRes(fv, st1) ->
+        match lower_exprs(rest, st1, []) {
+          LResMany(avs, st2) -> bind_op(st2, KCallIndirectBorrow(fv, avs), kpos_of(x))
+        }
+    }
   _ -> LRes(KUnitV, st)
 }
 
@@ -303,12 +458,30 @@ fn lower_apply_borrow(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = ma
 # args nor the raw result register attract a KDup/KDrop. The raw slots here
 # only change the repr, never the RC plan.
 #[doc("Lower the direct call `sym(cargs)` at `x`, of a callee whose unboxed signature is `sig`.")]
-pub fn lower_direct_call(x: Expr, sym: String, sig: Option[UFnSig], cargs: [Expr], st: LowerSt) : LRes / Console = {
-  match lower_tcrec_args(cargs, sig, st) { LResMany(avs0, st0) ->
-    match ob_pin_literals(cargs, avs0, st0, []) { LResMany(avs, st1) -> {
-      let held = ob_held(x, cargs, avs, st1)
-      ob_drop_after(ob_release(held, bind_op_slot(held.st, KCall(sym, avs), ret_slot_of_sig(sig), kpos_of(x))),
-                    cargs, avs, kpos_of(x)) } } }
+pub fn lower_direct_call(
+  x: Expr,
+  sym: String,
+  sig: Option[UFnSig],
+  cargs: [Expr],
+  st: LowerSt
+) : LRes / Console {
+  match lower_tcrec_args(cargs, sig, st) {
+    LResMany(avs0, st0) ->
+      match ob_pin_literals(cargs, avs0, st0, []) {
+        LResMany(avs, st1) -> {
+          let held = ob_held(x, cargs, avs, st1)
+          ob_drop_after(
+            ob_release(
+              held,
+              bind_op_slot(held.st, KCall(sym, avs), ret_slot_of_sig(sig), kpos_of(x))
+            ),
+            cargs,
+            avs,
+            kpos_of(x)
+          )
+        }
+      }
+  }
 }
 
 # A top-level fn or a core builtin is a direct `KCall`; any other
@@ -316,7 +489,9 @@ pub fn lower_direct_call(x: Expr, sym: String, sig: Option[UFnSig], cargs: [Expr
 fn lower_callee_dispatch(x: Expr, fid: FnId, cargs: [Expr], st: LowerSt) : LRes / Console =
   if callee_is_direct(st, fid) {
     lower_direct_call(x, c_sym_of_callee_st(st, fid), ls_call_sig(st, fid), cargs, st)
-  } else { lower_reg_call(x, ls_fn_name(st, fid), cargs, st) }
+  } else {
+    lower_reg_call(x, ls_fn_name(st, fid), cargs, st)
+  }
 
 # A local holding a function value, called through `kaix_apply` from its
 # register.
@@ -324,10 +499,18 @@ fn lower_local_call(x: Expr, l: LocalId, cargs: [Expr], st: LowerSt) : LRes / Co
   lower_reg_call(x, ls_reg_of(st, l), cargs, st)
 
 fn lower_reg_call(x: Expr, reg: String, cargs: [Expr], st: LowerSt) : LRes / Console =
-  match lower_exprs(cargs, st, []) { LResMany(avs0, st0) ->
-    match ob_pin_literals(cargs, avs0, st0, []) { LResMany(avs, st1) ->
-      ob_drop_after(bind_op(st1, KCallIndirect(KVar(reg), avs), kpos_of(x)),
-                    cargs, avs, kpos_of(x)) } }
+  match lower_exprs(cargs, st, []) {
+    LResMany(avs0, st0) ->
+      match ob_pin_literals(cargs, avs0, st0, []) {
+        LResMany(avs, st1) ->
+          ob_drop_after(
+            bind_op(st1, KCallIndirect(KVar(reg), avs), kpos_of(x)),
+            cargs,
+            avs,
+            kpos_of(x)
+          )
+      }
+  }
 
 # --- Resume / sentinels → typed terminators ----------------------------
 
@@ -368,10 +551,15 @@ pub(pkg) fn lower_resume_frame(x: Expr, iargs: [Expr], st: LowerSt) : LRes / Con
 }
 
 fn lower_resume(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
-  [a] -> match lower_expr(a, st) { LRes(av, st1) ->
-    bind_op(st1, KResumeOp(KVar(kir_resume_reg()), av), kpos_of(x)) }
-  [a, s] -> match lower_expr(a, st) { LRes(av, st1) -> match lower_expr(s, st1) {
-    LRes(sv, st2) -> bind_op(st2, KResume2Op(KVar(kir_resume_reg()), av, sv), kpos_of(x)) } }
+  [a] -> match lower_expr(a, st) {
+    LRes(av, st1) ->
+      bind_op(st1, KResumeOp(KVar(kir_resume_reg()), av), kpos_of(x))
+  }
+  [a, s] -> match lower_expr(a, st) {
+    LRes(av, st1) -> match lower_expr(s, st1) {
+      LRes(sv, st2) -> bind_op(st2, KResume2Op(KVar(kir_resume_reg()), av, sv), kpos_of(x))
+    }
+  }
   _ -> LRes(KUnitV, st)
 }
 
@@ -388,9 +576,15 @@ fn lower_tcrec(x: Expr, step: TcrecStep, cargs: [Expr], st: LowerSt) : LRes / Co
       # The goto leaves every enclosing match block, skipping their
       # continuation scrutinee drops and this path's unconsumed binder
       # dups — release the pending ledger entries before the back-edge.
-      seal_tail(tcp_goto_drops(cargs, st1),
-                KTcrecGoto(cat3("_kai_", ls_fn_c_sym(st1, step.fid), "_entry"), assigns_of(avs, 0, []),
-                           step.dropmask, kpos_of(x)))
+      seal_tail(
+        tcp_goto_drops(cargs, st1),
+        KTcrecGoto(
+          cat3("_kai_", ls_fn_c_sym(st1, step.fid), "_entry"),
+          assigns_of(avs, 0, []),
+          step.dropmask,
+          kpos_of(x)
+        )
+      )
   }
 
 # A `MkTrmcStep` call → KTrmcStep.
@@ -409,7 +603,7 @@ fn lower_tcrec(x: Expr, step: TcrecStep, cargs: [Expr], st: LowerSt) : LRes / Co
 # The dropmask threads identically to `KTcrecGoto` (it reconciles the
 # exit-drops the goto skips); the hole-slot arg is never materialised, so it
 # carries no ref to drop.
-fn lower_trmc_step(x: Expr, step: TrmcStep, cargs: [Expr], st: LowerSt) : LRes / Console = {
+fn lower_trmc_step(x: Expr, step: TrmcStep, cargs: [Expr], st: LowerSt) : LRes / Console {
   let hole = step.hole
   let spine = trmc_spine(step.spine, st)
   # The full slot mask of the spine ctor (0 for the builtin cons spine),
@@ -417,11 +611,17 @@ fn lower_trmc_step(x: Expr, step: TrmcStep, cargs: [Expr], st: LowerSt) : LRes /
   # the same mask (`variant_slot_mask`) the fresh route reads.
   let slot_mask = match trmc_spine_lay(step.spine, st) {
     Some(c) -> c.mask
-    None    -> 0
+    None -> 0
   }
   # Lower the non-hole ctor args (head value(s)) left-to-right, then the
   # self-call's args (the rebinds) — preserving evaluation order.
-  match lower_kinds_vals(trmc_drop_nth(cargs, hole, 0, []), mask_kinds_but(slot_mask, hole, 0, list_length(cargs)), 0, st, []) {
+  match lower_kinds_vals(
+    trmc_drop_nth(cargs, hole, 0, []),
+    mask_kinds_but(slot_mask, hole, 0, list_length(cargs)),
+    0,
+    st,
+    []
+  ) {
     LResMany(heads, st1) ->
       lower_trmc_seal(x, step, spine, slot_mask, heads, cargs, st1)
   }
@@ -430,8 +630,15 @@ fn lower_trmc_step(x: Expr, step: TrmcStep, cargs: [Expr], st: LowerSt) : LRes /
 # Lower the self-call's args into the loop-param rebinds and seal the step.
 # Split out of `lower_trmc_step` so the head/rebind lowerings sit at one
 # nesting level each (the back-edge mirrors `lower_tcrec`'s `KTcrecGoto`).
-fn lower_trmc_seal(x: Expr, step: TrmcStep, spine: KSpine,
-                   slot_mask: Int, heads: [KVal], cargs: [Expr], st: LowerSt) : LRes / Console =
+fn lower_trmc_seal(
+  x: Expr,
+  step: TrmcStep,
+  spine: KSpine,
+  slot_mask: Int,
+  heads: [KVal],
+  cargs: [Expr],
+  st: LowerSt
+) : LRes / Console =
   # P3: lower the rebinds at the recursing fn's param slots (raw for a raw
   # param), so the TRMC back-edge re-stores them raw — no per-step
   # `kaix_int` re-box. Same `lower_tcrec_args` the `KTcrecGoto` path uses.
@@ -442,17 +649,29 @@ fn lower_trmc_seal(x: Expr, step: TrmcStep, spine: KSpine,
       # cons spine is not a registered variant → tag -1 (its backend path
       # is cons-specific and ignores the tag).
       let tag = match spine {
-        KSpineCons(_)  -> 0 - 1
-        KSpineCtor(_)  -> match trmc_spine_lay(step.spine, st1) {
+        KSpineCons(_) -> 0 - 1
+        KSpineCtor(_) -> match trmc_spine_lay(step.spine, st1) {
           Some(c) -> c.tag
-          None    -> 0
+          None -> 0
         }
       }
       # Like the tcrec goto, the step leaves every enclosing match: it
       # releases the ledger's pending entries the ctor args do not consume.
-      seal_tail(tcp_goto_drops(cargs, ls_set_tcpend(st1, tcl_without_tok(st1.tcpend))),
-                KTrmcStep(cat3("_kai_", ls_fn_c_sym(st1, step.fid), "_entry"), step.hole, spine, tag, slot_mask, step.dropmask,
-                          heads, assigns_of(reb, 0, []), st1.in_region, kpos_of(x)))
+      seal_tail(
+        tcp_goto_drops(cargs, ls_set_tcpend(st1, tcl_without_tok(st1.tcpend))),
+        KTrmcStep(
+          cat3("_kai_", ls_fn_c_sym(st1, step.fid), "_entry"),
+          step.hole,
+          spine,
+          tag,
+          slot_mask,
+          step.dropmask,
+          heads,
+          assigns_of(reb, 0, []),
+          st1.in_region,
+          kpos_of(x)
+        )
+      )
     }
   }
 
@@ -463,9 +682,18 @@ fn lower_trmc_seal(x: Expr, step: TrmcStep, spine: KSpine,
 # seeds no entry for its own scrutinee; a leaf that con-reuses it increfs the
 # donor to survive the skipped exit drop, so that drop is emitted here.
 fn lower_trmc_apply(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
-  [leaf] -> match lower_expr(leaf, st) { LRes(lv, st1) -> {
-    let st2 = if st1.mscr == "" or not trmc_apply_leaf_reuses_scr(leaf) { st1 }
-              else { ls_emit(st1, KRC(KDrop(KVar(st1.mscr)), kpos_of(x))) }
-    seal_tail(tcp_goto_drops(cargs, ls_set_tcpend(st2, tcl_without_tok(st2.tcpend))), KTrmcApply(lv, kpos_of(x))) } }
+  [leaf] -> match lower_expr(leaf, st) {
+    LRes(lv, st1) -> {
+      let st2 = if st1.mscr == "" or (not trmc_apply_leaf_reuses_scr(leaf)) {
+        st1
+      } else {
+        ls_emit(st1, KRC(KDrop(KVar(st1.mscr)), kpos_of(x)))
+      }
+      seal_tail(
+        tcp_goto_drops(cargs, ls_set_tcpend(st2, tcl_without_tok(st2.tcpend))),
+        KTrmcApply(lv, kpos_of(x))
+      )
+    }
+  }
   _ -> LRes(KUnitV, st)
 }
