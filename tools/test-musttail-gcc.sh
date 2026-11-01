@@ -39,7 +39,7 @@ for f in examples/musttail_gcc/*.kai; do
   fi
 done
 
-if CC="$GCC" CFLAGS="-std=c99 -O2 -DKAI_LLVM_BRIDGE" KAI_BACKEND=c KAI_CACHE=0 KAI_MODULAR=1 KAI_MODULAR_CACHE_DIR="$tmp/cache" \
+if CC="$GCC" CFLAGS="-std=c99 -O2" KAI_BACKEND=c KAI_CACHE=0 KAI_MODULAR=1 KAI_MODULAR_CACHE_DIR="$tmp/cache" \
      "$ROOT/bin/kai" build stage2/main.kai -o "$tmp/kaic2-gcc" 2> "$tmp/self.err" \
    && "$tmp/kaic2-gcc" --version 2>&1 | grep -q "self-hosted"; then
   echo "musttail-gcc: PASS the compiler's modular C builds under $GCC"
