@@ -11475,6 +11475,14 @@ test-user-cache: $(TARGET)
 	  sh "$$f" || { echo "user-cache FAIL: $$f"; exit 1; }; \
 	done; \
 	echo "user-cache OK (Phase B invalidation + typed interface-hash fixtures passed)"
+
+# The compiler's own source built with the per-module typed cache, cold and
+# warm, matches the plain build in C and KIR. It rides the shard that already
+# self-compiles, not `test-user-cache`, so it is not repeated on every job
+# that runs the cache fixtures.
+.PHONY: test-selfcompile-cache-identity
+test-selfcompile-cache-identity: $(TARGET)
+	@sh ../examples/cache/selfcc_cold_warm_identical.sh
 # Issue #825 — core (auto-loaded stdlib) post-parse cache invalidation
 # gate. Runs the positive cold==warm==oracle differential plus three
 # negatives (edit a core file / version bump / corrupt blob). Serving a
