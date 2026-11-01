@@ -522,10 +522,17 @@ size, so a rebuilt or swapped compiler never reads another's entries; the
 driver removes every other toolchain's directory, and turns the cache off
 when the id cannot be read. Both the post-parse and the typed blobs live
 in that directory;
-`KAI_CACHE=0` disables it and `KAI_CACHE=1` forces it on for a loose
-file. The package gate is what makes the typed rebuild cut below pay:
-a loose file partitions into one bucket the cut cannot split, so it
-would pay the publish and never serve a hit.
+`KAI_CACHE=0` disables it. A loose file (no `kai.toml`) keeps its blobs
+in the shared core cache, in `loose/<hash of its absolute source
+directory>`, so no file lands beside the source and two `main.kai` in
+different directories never share a bucket; `KAI_CACHE=1` keeps them in
+`.kai-cache` beside the source instead. A loose file is one root, but
+its imports still partition, so the typed cut serves hits for them.
+Measured on the compiler's own source (a loose file; front end only,
+`KAI_THREADS=1`, leaf edit, n=5): the first build costs +3.4 s (+15 %),
+a body edit is 14 % faster (22.6 s to 19.4 s) and a signature edit 12 %
+faster (22.9 s to 20.2 s). A one-module `hello` builds in 106 ms with the
+cache on or off.
 
 - **The key is the file's own content, materialised as the blob
   filename** (`<content_hex>-<no-dep>.kab`). A parse blob is what the
