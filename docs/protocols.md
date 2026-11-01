@@ -104,14 +104,14 @@ fn main() : Unit / Stdout = {
 ```
 
 Impl ops use the full `fn name(params) : R = body` form. A polymorphic
-impl (`impl[T] ... for Tagged[T]`) is monomorphised per concrete
+impl (`impl[t] ... for Tagged[t]`) is monomorphised per concrete
 instantiation, like any generic function.
 
 ### Polymorphic impls with bounded type parameters
 
 A polymorphic impl whose body dispatches on the type variable —
-`impl[T] Show for Bag[T]` calling `show(x : T)` on an element — needs
-to know `T` itself implements `Show`. An impl-site bound makes that
+`impl[t] Show for Bag[t]` calling `show(x : t)` on an element — needs
+to know `t` itself implements `Show`. An impl-site bound makes that
 requirement explicit:
 
 ```kaikai
@@ -143,10 +143,10 @@ fn main() : Unit / Stdout = Stdout.print(show(Bag { items: [4, 4] }))
 ```
 
 **Where bounds are allowed.** Protocol bounds appear on **impl-site**
-type parameters (`impl[T : Eq] ... for ...`) and on
-**free-fn** type parameters (`fn dedup[T : Eq](xs : [T])`,
-`fn sum[T : Numeric](xs : [T])` — the stdlib aggregates use this).
-They do **not** appear on `type`/record declarations: `type M[T : Add]`
+type parameters (`impl[t : Eq] ... for ...`) and on
+**free-fn** type parameters (`fn dedup[t : Eq](xs : [t])`,
+`fn sum[t : Numeric](xs : [t])` — the stdlib aggregates use this).
+They do **not** appear on `type`/record declarations: `type M[t : Add]`
 is a parse error ("type-parameter kind must be `Type` or `Measure`").
 The line that keeps single-dispatch protocols clear of Haskell
 typeclasses / HKT / constraint propagation (Tier 1 #3) is *how* the
@@ -154,7 +154,7 @@ bound is honoured, not *where* it may be written: dispatch resolves
 per monomorphised instance, never by a constraint that travels with
 the signature. A free-fn bound is checked against every concrete type
 the function is instantiated at, whether or not the body calls the op:
-`count[T : Eq]` applied to a list of a type without `Eq` is rejected,
+`count[t : Eq]` applied to a list of a type without `Eq` is rejected,
 even when the call reaches it through an unbounded generic caller.
 
 **How dispatch resolves.** The monomorphiser specialises the impl
@@ -218,7 +218,7 @@ pointing at the missing impl — no silent fallback to bytes or
 Point` appears in the same compilation unit, the resolver emits a
 duplicate-impl error.
 
-**Orphan rule** (Rust-style): an `impl P[A1, ..] for T` is allowed
+**Orphan rule** (Rust-style): an `impl P[a1, ..] for T` is allowed
 only when the current module declares **P**, the head of **T**, or
 the head of some protocol argument **Ai**. `impl Add[Complex] for Real`
 in the module declaring `Complex` is legal (see *Heterogeneous
@@ -227,7 +227,7 @@ argument's head is `List`. "Declares" means the declaration's home
 module, never a same-spelled name. This prevents two foreign packages
 defining conflicting impls on a type they both import.
 
-Blanket impls (`impl[T] P[T] for X`) would additionally need Rust's
+Blanket impls (`impl[t] P[t] for X`) would additionally need Rust's
 condition that no uncovered type parameter appears before the first
 local type.
 
@@ -242,8 +242,8 @@ imported. No global registry.
 ### What protocols cannot do (deliberately)
 
 - **No constraint propagation**: a bound on a generic function
-  (`fn sort[T : Ord](xs: [T]) : [T]`, as core declares it) is checked
-  against each concrete `T` the function is instantiated at, and the
+  (`fn sort[t : Ord](xs: [t]) : [t]`, as core declares it) is checked
+  against each concrete `t` the function is instantiated at, and the
   op resolves to a direct call in that instance. No dictionary is
   passed and no constraint is inferred into a caller's signature;
   a caller that wants another order passes a comparator:
@@ -267,7 +267,7 @@ imported. No global registry.
   Type parameters of protocols are first-order (`protocol P[a]`,
   lowercase per kaikai's tparam convention), and the only way `Self`
   is parametric is when the impl target is parametric (`impl[T] Show for
-  Bag[T]`). `protocol P[a]` declares a single-dispatch parametrized
+  Bag[t]`). `protocol P[a]` declares a single-dispatch parametrized
   protocol — the impl table key remains `(P, Self)`, so adding `[a]`
   does NOT introduce multi-method dispatch (see §*Single-dispatch
   parametrized protocols* below).
@@ -276,7 +276,7 @@ imported. No global registry.
   first-position type). For two-arg dispatch (e.g. `convert(from:
   T, to: U)`), the user writes a free function and dispatches manually
   via match. **However**, single-dispatch *parametrized* protocols
-  (`protocol P[A] { ... }`) cover the most common multi-type use
+  (`protocol P[a] { ... }`) cover the most common multi-type use
   cases without violating single-dispatch — see §*Multi-method
   dispatch — analysis* below.
 
@@ -325,7 +325,7 @@ function call.
 | `Add[a]` `Sub[a]` `Mul[a]` `Div[a]` `Rem[a]` `Neg` | `add` … `neg` | operator overloading (see below) |
 
 The primitives carry the impls that make sense for them; the
-parametric containers (`[T]`, `Option[T]`, `Result[T, E]`, pairs,
+parametric containers (`[t]`, `Option[t]`, `Result[t, e]`, pairs,
 triples, quads) carry `Show` / `Eq` / `Ord` / `Hash` under the matching
 bound. User types `impl` or `#[derive(...)]` themselves. A builtin
 never makes an impl local under the orphan rule (see *Coherence
@@ -349,8 +349,8 @@ fn main() : Unit = ()
 ```
 
 Canonical defaults: numeric zero, false, empty string, empty list,
-absent option. `Result[T, E]` is intentionally absent — neither
-`Ok(default()) : Result[T, _]` nor `Err(default()) : Result[_, E]`
+absent option. `Result[t, e]` is intentionally absent — neither
+`Ok(default()) : Result[t, _]` nor `Err(default()) : Result[_, e]`
 is a privileged choice, so callers construct results explicitly.
 
 `default() : Self` has Self only in the return position, so
@@ -598,8 +598,8 @@ proposal rather than re-derive the catalog.
    today. A type whose serialisation reads `Time.now()` for a
    timestamp, or `Random.uuid()` for an ID, must compute those
    effects beforehand and pass values in.
-3. **Iterators backed by I/O.** `protocol Iterator[T] { next(self:
-   Self) : Option[T] / Io }` — a stream over a file or socket would
+3. **Iterators backed by I/O.** `protocol Iterator[t] { next(self:
+   Self) : Option[t] / Io }` — a stream over a file or socket would
    want this. Today these are written as effects directly, no
    protocol.
 4. **Validation with external lookups.** `protocol Validate {
@@ -665,7 +665,7 @@ impl Logable for Transaction { to_log_event(t) : LogEvent / Log }
 
 At monomorphic call sites (the typer knows `T = Account`), the row
 is instantiated from the resolved impl. Polymorphic call sites
-(`fn debug[T : Logable](x: T)`) carry a row hole that must be closed
+(`fn debug[t : Logable](x: t)`) carry a row hole that must be closed
 at the next monomorph step or rejected.
 
 - **Pros**: covers cases 2–4 cleanly when call sites are monomorphic
@@ -886,7 +886,7 @@ table grows with the cross-product of type pairs.
 Rejected form; `TypeOf` does not exist:
 
 ```text
-fn convert[A, B](x: A, target: TypeOf[B]) : B = match (x, target) {
+fn convert[a, b](x: a, target: TypeOf[b]) : b = match (x, target) {
   ...
 }
 ```
@@ -921,7 +921,7 @@ ergonomic gap.
 
 The genuinely irreducible case where C wins over B is **dispatch by
 runtime value (not type) extensible post-hoc** — and that is
-expressible in kaikai with `Map[K, V]` + first-class functions
+expressible in kaikai with `Map[k, v]` + first-class functions
 (`Map.from([(Compact, ser_compact), ...])`), not a language
 feature.
 
@@ -939,7 +939,7 @@ avoids:
    T1, T2, ... is local" — and that breaks the cleanest version
    of the rule (any of the participants gives ownership). Two
    third-party libraries can both legitimately claim ownership of
-   `Convert[A, B]` if they own `A` and `B` respectively.
+   `Convert[a, b]` if they own `a` and `b` respectively.
 3. **Resolution with parametrized types becomes ambiguous.** `impl
    Convert[Money[USD], Money[EUR]]` and `impl Convert[Money[u],
    Money[v]]` both apply to a call `convert(usd_amount, eur_amount)`.
@@ -958,7 +958,7 @@ or downstream-framework use case shows that B + sum types + pattern
 matching is genuinely insufficient. Specifically:
 
 - A documented fintech (or other domain) operation that has no
-  clean expression as `protocol P[A]` with `A` resolved by
+  clean expression as `protocol P[a]` with `a` resolved by
   bidirectional inference.
 - A documented case where dispatch must depend on two or more
   *open-world* type sets simultaneously (third-party library
@@ -976,7 +976,7 @@ the *value-arithmetic* level (`Real<USD> + Real<USD>` vs
 ## Risks
 
 1. **Slope to "we need a bit more"**. The first user request will be
-   `protocol Functor[F[_]]` or `protocol Convert[A, B]`. Mitigation:
+   `protocol Functor[F[_]]` or `protocol Convert[a, b]`. Mitigation:
    the design doc (this file) lists what is out of scope as
    "explicitly not supported". Re-opening means a separate proposal
    with explicit cost analysis, not extension of this one.
@@ -1006,16 +1006,16 @@ implicit `Self`) bound at impl-site — `From[a]` above is one.
 Surface contract:
 
 - **Tparam names**: lowercase (`a`, `other`, `ctx`, …). Uppercase
-  forms (`A`, `Other`) are valid syntax but are rejected later by
+  forms (`a`, `Other`) are valid syntax but are rejected later by
   the implicit-tparam classifier — keep to lowercase.
 - **Impl-site arguments are concrete**. Polymorphism in `a`
-  (`impl[T] From[T] for X`) is not supported.
+  (`impl[t] From[t] for X`) is not supported.
 - **Default-Self backwards compat**. Legacy `impl P for X` parses
-  unchanged and is treated as `impl P[X] for X` (the homogeneous
+  unchanged and is treated as `impl P[x] for X` (the homogeneous
   case). Existing primitive impls do NOT need migration.
 - **Dispatch table key stays `(P, Self)`**. The proto-arg list lives
   inside the impl's mangled C name (`__pimpl_<P>_<T>_<op>__a_<arg>`)
-  so multiple `impl P[A] for T` instances with different `A` coexist
+  so multiple `impl P[a] for T` instances with different `a` coexist
   in the same compilation unit.
 
 ### Bidirectional inference
@@ -1082,7 +1082,7 @@ operand order: `2.0 + z` is a `Complex`, like `z + 2.0`.
 
 ### Out of scope
 
-- Polymorphic impl in `a` (`impl[T] From[T] for X`).
+- Polymorphic impl in `a` (`impl[t] From[t] for X`).
 - Multi-method dispatch (`(P, T1, T2, ...) -> fn`) — Tier 1 #3 commit.
 - `#[derive(...)]` synthesis for parametrised protocols.
 
@@ -1133,7 +1133,7 @@ strictly worse than convention:
 
 | Rule | Why pipes can't ride a protocol |
 |---|---|
-| **No HKT** (Tier 1 #3, "Fast compilation") | `map`'s shape is `F[A] -> (A -> B) -> F[B]` — the type constructor `F` is bound, not a concrete type. Single-dispatch protocols require a concrete `Self` in first position; they cannot abstract over the head constructor. |
+| **No HKT** (Tier 1 #3, "Fast compilation") | `map`'s shape is `F[a] -> (a -> b) -> F[b]` — the type constructor `F` is bound, not a concrete type. Single-dispatch protocols require a concrete `Self` in first position; they cannot abstract over the head constructor. |
 | **No effect rows in protocol ops** (§"With effects" rule above) | The function arg to `map` carries an effect row, and the row must propagate to `map`'s own row. Protocol op signatures are pinned to closed rows; the protocol ban on effect rows in op signatures rules out the canonical `map` shape. |
 | **Annotation surface vs convention** | A `#[pipe_dispatch]` annotation costs a parser change, a new visible concept for ~5 stdlib + future package decls, and a test surface. Convention is free at the parser, costs ~70 LOC inside the typer, and mirrors how qualified-name resolution already works for `EModCall`-driven calls. |
 
@@ -1143,17 +1143,17 @@ post-`expand_imports` decl stream + module table. Any `pub type T`
 exported by a module whose `pub fn map / flat_map / filter / each`
 follow the canonical signatures participates in `|`, `||`, `|?`, `|!`
 automatically — no annotation, no compiler change. ahu's future
-`Source[T, e]`, henua's `EventBus[E]`, manutara stream/sink types
+`Source[t, e]`, henua's `EventBus[e]`, manutara stream/sink types
 opt in by declaring `pub type` + the canonical fns.
 
 The canonical signatures (LHS receiver first, function/predicate
 second, return wraps the same head type):
 
 ```text
-pub fn map[A, B, e](xs: T[A], f: (A) -> B / e) : T[B] / e
-pub fn flat_map[A, B, e](xs: T[A], f: (A) -> T[B] / e) : T[B] / e
-pub fn filter[A, e](xs: T[A], p: (A) -> Bool / e) : T[A] / e
-pub fn each[A, e](xs: T[A], f: (A) -> Unit / e) : Unit / e
+pub fn map[a, b, e](xs: T[a], f: (a) -> b / e) : T[b] / e
+pub fn flat_map[a, b, e](xs: T[a], f: (a) -> T[b] / e) : T[b] / e
+pub fn filter[a, e](xs: T[a], p: (a) -> Bool / e) : T[a] / e
+pub fn each[a, e](xs: T[a], f: (a) -> Unit / e) : Unit / e
 ```
 
 `|!` checks its stage's return against `Unit` at the pipe and types the
@@ -1162,12 +1162,12 @@ pipe as `Unit`, whatever the export declares.
 A head carrying an `(element, row)` parameter list — a streaming
 carrier like `Stream[t, e]` (or ahu's `Source[t, e]`) whose effect
 row is itself a type parameter — rides the pipes the same way. The
-canonical shape becomes `map[A, B, e](xs: T[A, e], f: (A) -> B / e) :
-T[B, e]`: the element unifies against the first slot, the row threads
+canonical shape becomes `map[a, b, e](xs: T[a, e], f: (a) -> b / e) :
+T[b, e]`: the element unifies against the first slot, the row threads
 through the trailing row-kind slot. Dispatch is by head *name* and is
 arity-agnostic, so no extra opt-in is needed; the row slot threads via
 a row carrier (`row_arg_carrier`), keeping the effect visible in the
-type (the carrier is the fix for #773). The single-parameter `T[A]`
+type (the carrier is the fix for #773). The single-parameter `T[a]`
 form is the special case where `T` is pure.
 
 Diagnostic shape when conventions are violated (anchored at the

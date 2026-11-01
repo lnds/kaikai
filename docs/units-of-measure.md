@@ -543,7 +543,7 @@ to be re-validated with UoM active.
    use them does not suffer them. Tier 2 #6 (few visible
    concepts, layered) allows this.
 
-4. **Generics interaction**. `Real[T]` (generic) vs `Real<u>`
+4. **Generics interaction**. `Real[t]` (generic) vs `Real<u>`
    (unit) could confuse. Mitigation: the syntax distinguishes
    (`[]` vs `<>`) and the kinds are separate (`Type` vs `Measure`).
    Explicit doc.

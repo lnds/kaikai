@@ -48,7 +48,7 @@ idiomatic   how to write kaikai well, with the wrong reaches to avoid
 llm         this page
 effects     algebraic effects and handlers
 fibers      structured concurrency, Spawn/await/cancel
-actors      send/receive/self over Actor[Msg]
+actors      send/receive/self over Actor[msg]
 match       pattern matching, exhaustiveness
 contracts   requires / ensures + refinement-type predicates
 pipes       the five pipe operators and their intent

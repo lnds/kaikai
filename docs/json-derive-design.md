@@ -121,7 +121,7 @@ fixed by an external spec; see *Field overrides* below.
 
 ### 2. Null and missing — `Option` accepts both, everything else is required
 
-An `Option[T]` field accepts an explicit JSON `null` **and** a missing
+An `Option[t]` field accepts an explicit JSON `null` **and** a missing
 key, both decoding to `None`. Any other field is required: a missing key
 is a deserialization error, not a zero value. This is the serde/Go
 model — `Option` is genuinely optional and everything else is not, so
@@ -131,9 +131,9 @@ carry.
 A field whose key is present but carries the wrong shape is an error
 even under `Option`: `null` means absent, `7` does not mean absent.
 
-### 3. Failure shape — `Result[T, JsonError]`, located
+### 3. Failure shape — `Result[t, JsonError]`, located
 
-Decoding returns `Result[T, JsonError]`, where `JsonError` carries the
+Decoding returns `Result[t, JsonError]`, where `JsonError` carries the
 JSON path to the offending node:
 
 ```kaikai-fragment
@@ -248,7 +248,7 @@ distinction is what keeps `Json` out of the kind system.
 
 - **In:** `#[derive(Json)]` over records and sum types, generating
   `to_json` and `of_json`; fields/payloads of type `String`, `Int`,
-  `Real`, `Bool`, `[T]`, `Option[T]`, and nested records/sums that
+  `Real`, `Bool`, `[t]`, `Option[t]`, and nested records/sums that
   themselves derive `Json`; the `#[json(rename/default/skip)]` field
   overrides; the adjacently-tagged sum envelope.
 - **Out:** per-type selectable tagging (the envelope is fixed);
@@ -260,7 +260,7 @@ A field or variant payload with no JSON denotation is reported at the
 derive site naming the field/variant, rather than surfacing later as a
 missing `to_json` at the first call site:
 
-- `Option[Option[T]]` — one JSON `null` cannot denote two absences;
+- `Option[Option[t]]` — one JSON `null` cannot denote two absences;
 - a generic head (`Result[Int, String]`) — the emitted decode calls a
   monomorphic shim a parameterised type has none of;
 - any other type with no denotation in the DOM.

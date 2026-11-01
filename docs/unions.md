@@ -68,8 +68,8 @@ type Color = Red | Green | Blue
 # Color = Red | Green | Blue.
 
 type Tree[a] = Leaf | Node(a, Tree[a], Tree[a])
-# Declares Leaf (auto-declared unit) and Node[A] (auto-declared
-# record { 0: A, 1: Tree[A], 2: Tree[A] }) and Tree.
+# Declares Leaf (auto-declared unit) and Node[a] (auto-declared
+# record { 0: a, 1: Tree[a], 2: Tree[a] }) and Tree.
 
 type Meters = Int    # single component: a transparent alias
 
@@ -266,8 +266,8 @@ variant of the named component.
 ## `!` propagation across union boundaries
 
 `!` works transparently across the implicit upcast. A function
-returning `Result[T, U]` may freely propagate inner results whose
-error type is a component of `U` — `query_balance` in the first
+returning `Result[t, u]` may freely propagate inner results whose
+error type is a component of `u` — `query_balance` in the first
 example above propagates both an `IdentityError` and an `AuthError`
 into `QueryBalanceErr` without `map_err`.
 
@@ -303,8 +303,8 @@ footgun the unified model set out to remove.
 
 - **Components are names.** A component is a bare name, `Name(T1,
   T2)`, or a qualified `pkg.Name`; an applied type such as
-  `Option[T]` or `Box[Int]` is not a component, so
-  `type F[T] = Option[T] | Result[String, T]` does not parse.
+  `Option[t]` or `Box[Int]` is not a component, so
+  `type F[t] = Option[t] | Result[String, t]` does not parse.
 - **Protocols dispatch on the component.** `impl P for U` on a union
   is a compile error: implement `P` for each component. A call on a
   `U`-typed value runs the impl of the component the value carries,

@@ -134,7 +134,7 @@ can be parallelised across short lanes.
 | **Region-brand full machinery** ⚠ partial 2026-05-02 | ~3–5d | Pid symmetric with Fiber in the shallow check (2026-04-30); sum-type-payload escape closed via `SumInfo` registry + `ty_expr_find_handle` walker (2026-05-02 commit `c18cd4b`, issue #71 option (a)). Full `TyBranded(Ty, BrandId)` propagation with sibling-nursery brand mismatch is option (b), gated on m7b #4 cap-binding form not yet landing — see §*Residual m8.x items* |
 | ~~**LLVM op-dispatch `in_dispatch_node`**~~ ✅ shipped 2026-04-30 | ~0.5–1d | Wave A follow-up; same bug #12 shape but in the LLVM backend — three runtime helpers (`kaix_evidence_lookup_node` / `kaix_in_dispatch_enter` / `kaix_in_dispatch_leave`) keep the KaiFiber struct out of the IR |
 | ~~**Trap-exit semantics**~~ ✅ shipped 2026-04-29 | ~1d | `Spawn.set_trap_exit(Bool)` opts current fiber in; DONE → "Normal" / CANCELLED → "Crashed" pushed to mailbox instead of cancel_requested |
-| ~~**Per-op generics in Spawn API**~~ ✅ shipped 2026-05-02 | ~0.5d | TYPE generics retrofitted 2026-04-30 on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk closed in issue #72 — `Spawn.spawn[T, e](f: () -> T / e)` is the canonical entry point, wrappers in `stdlib/spawn.kai` reduced to one-line aliases |
+| ~~**Per-op generics in Spawn API**~~ ✅ shipped 2026-05-02 | ~0.5d | TYPE generics retrofitted 2026-04-30 on `spawn` / `await` / `select` / `cancel`; ROW generics on the spawned thunk closed in issue #72 — `Spawn.spawn[t, e](f: () -> t / e)` is the canonical entry point, wrappers in `stdlib/spawn.kai` reduced to one-line aliases |
 | ~~**Reactor — Phase R1 (file + sleep + process)**~~ ✅ shipped 2026-05-15 | ~1d | Issue #611. Sorted timer wheel + SIGCHLD self-pipe + 4-worker file pool, woken via a single `poll()` on the scheduler thread. `Clock.sleep_ns`, `File.read_file` / `write_file`, `Process.wait` no longer freeze the scheduler; sockets (`NetTcp`) queue for R2 in Orongo |
 | ~~**Reactor — Phase R3 (stdin)**~~ ✅ shipped 2026-05-15 | ~0.1d | Issue #620. Singleton `kai_reactor_stdin_waiter` slot reuses the existing `poll()` set; fd 0 is flipped to `O_NONBLOCK` once per process with an `atexit`-restored cleanup. `Stdin.read_line` and `Stdin.read_bytes` park on EAGAIN; multiple concurrent readers panic. |
 | ~~**Reactor — Phase R2 (TCP sockets)**~~ ✅ shipped 2026-05-16 | ~0.2d | Issue #630. Per-direction socket waiter lists (`socket_read_waiters` + `socket_write_waiters`) join the existing `poll()` set; every socket fd is `O_NONBLOCK` from creation; `connect` handles `EINPROGRESS` + `SO_ERROR`, `send` loops on partial writes, `accept` / `recv` park on read-readiness. `demos/tcp_concurrent` proves three concurrent handshakes interleave. |
@@ -189,8 +189,8 @@ registry collected during `infer_program` and threaded through
 `infer_all_loop` → `infer_decl` → `check_no_fiber_escape`. The
 `ty_expr_find_handle` predicate substitutes the sum's tparams
 into each variant's payload TypeExpr and recurses, with a
-`visited` set guarding recursive sums (`type Tree[T] = Leaf(T) |
-Node(Tree[T], Tree[T])`). When the breach goes through a sum
+`visited` set guarding recursive sums (`type Tree[t] = Leaf(t) |
+Node(Tree[t], Tree[t])`). When the breach goes through a sum
 payload the diagnostic adds a note citing the constructor +
 sum type. Coverage: `examples/effects/m8x_7_fiber_in_sum.kai`,
 `m8x_7_pid_in_sum.kai`, `m8x_7_recursive_sum_no_breach.kai`. The
@@ -232,7 +232,7 @@ of issue #71 are now closed:
 
 - **Brand propagation through helper calls.** Each top-level fn
   is summarised as *brand-transparent at parameter `i`* when its
-  body is syntactically that parameter (`fn id[T](x: T) : T = x`,
+  body is syntactically that parameter (`fn id[t](x: t) : t = x`,
   including a block body whose tail is the parameter and whose
   statements do not rebind it), and *opaque* otherwise. The
   mismatch checker follows a brand across a transparent call, so
@@ -257,7 +257,7 @@ soundness rather than size:
 
 - A brand is a *scope-instance* property, not a type property.
   A constant `BrandId` inside `Ty` has no way to unify: given
-  `fn pick[T](a: T, b: T) : T` applied to two different brands,
+  `fn pick[t](a: t, b: t) : t` applied to two different brands,
   the unifier must either reject a legal program, or join to
   "unbranded" — which silently launders the brand and detects
   nothing. Doing it soundly requires brands to be a fourth

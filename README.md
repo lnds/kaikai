@@ -307,7 +307,7 @@ by topic:
   `a[i]`).
 - [`docs/structured-concurrency.md`](docs/structured-concurrency.md) —
   fibers, nurseries, `Spawn` / `Cancel`.
-- [`docs/actors.md`](docs/actors.md) — `Actor[Msg]` effect,
+- [`docs/actors.md`](docs/actors.md) — `Actor[msg]` effect,
   mailboxes, link/monitor supervision.
 
 **Other**

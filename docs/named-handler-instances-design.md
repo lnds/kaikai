@@ -104,7 +104,7 @@ fn main() : Int / Stdout = {
 }
 ```
 
-Why the capability type and not a `Handler[E]` wrapper: a wrapper is a
+Why the capability type and not a `Handler[e]` wrapper: a wrapper is a
 type constructor *over an effect*, i.e. effect-kinded generics / HKT —
 **Tier 1.3 forbids HKT.** With the capability type, one uniform rule
 covers everything already in the language:
@@ -193,22 +193,22 @@ kaikai does not carry that weight on its effects, because the cases that
 *need* a value to outlive its creating scope already have first-class,
 primitive carriers:
 
-- **A reference that must escape its scope** → `Ref[T]` under `Mutable`
+- **A reference that must escape its scope** → `Ref[t]` under `Mutable`
   (`ref_make` / `ref_get` / `ref_set`, `docs/effects-stdlib.md`:1479).
-  `Ref[T]` is a first-class, storable value — `stdlib/collections/hashmap.kai`
+  `Ref[t]` is a first-class, storable value — `stdlib/collections/hashmap.kai`
   keeps `buckets : Ref[Array[..]]`, `count : Ref[Int]`, `cap : Ref[Int]`
   in a record that outlives every method, and swaps the whole bucket
   array through the `Ref` on resize. That is exactly Koka's
   `dynamic-ref`, done with a data type instead of a named effect.
 - **A dynamic, addressable population of stateful entities** → actors
-  (`Actor[Msg]`, a first-class storable `Pid`) or fibers (`Spawn`).
+  (`Actor[msg]`, a first-class storable `Pid`) or fibers (`Spawn`).
   "Many independent things with private state, created at runtime,
   addressed individually" is a *process* shape in kaikai, not a handler
   shape.
 
 So the no-escape rule does not remove an expressible program; it only
 declines to make *handler instances* a second mechanism for something
-`Ref[T]` and actors already cover. Named instances is then a genuinely
+`Ref[t]` and actors already cover. Named instances is then a genuinely
 lexical feature — N static instances of one effect passed *down* into a
 function (`samples/handlers/named/ask.kk`, the Effekt `named` example) —
 and forbidding escape removes nothing from that shape, because anything
@@ -237,14 +237,14 @@ that needed to escape would be a `Ref`, not a capability.
 
 To keep the feature inside the tiers, the following are explicitly out:
 
-- **No `Handler[E]` type, no effect-kinded generics, no HKT** (Tier 1.3).
+- **No `Handler[e]` type, no effect-kinded generics, no HKT** (Tier 1.3).
 - **No escape analysis / region types / borrow checker** (Tier 1).
 - **No multi-shot.** A captured capability is still one-shot; naming an
   instance does not let you resume it twice.
 - **No first-class storage of capabilities.** §5's positional rule
   forbids stashing a capability in a long-lived value — that would
   require escape analysis to make sound. This is not a gap: a value that
-  must outlive its scope uses `Ref[T]` (`Mutable`); a dynamic population
+  must outlive its scope uses `Ref[t]` (`Mutable`); a dynamic population
   of stateful entities uses actors/`Spawn` (§5 *"Why the no-escape
   restriction costs nothing"*). Capabilities stay lexical on purpose.
 
@@ -263,7 +263,7 @@ To keep the feature inside the tiers, the following are explicitly out:
 ## 9. Open questions
 
 1. **Parameterised instances in signatures.** `fn f(c: State[Int])`
-   names the cell's payload type. Is `fn f(c: State[T])` (row-poly over
+   names the cell's payload type. Is `fn f(c: State[t])` (row-poly over
    the payload) allowed, or only monomorphic instances? Leaning
    monomorphic for v1 — matches "one `handle … with State[Int]` is
    monomorphic per instance" (`docs/effects.md`:262).

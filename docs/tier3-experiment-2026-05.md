@@ -318,7 +318,7 @@ bugs:
   does not implement it.
 - **R10** — parameterised handler outer + self-delegating handler
   inner crashes runtime on second op invocation. SIGSEGV with
-  `State[T]`, SIGBUS with `Reader[T]`, blank-line corruption with
+  `State[t]`, SIGBUS with `Reader[t]`, blank-line corruption with
   three Trace ops. Likely the m8 #12 `in_dispatch_node`
   save/restore needs to handle parameterised resume entries.
 - **R11** — single-read of a stateful handler clause's `state`

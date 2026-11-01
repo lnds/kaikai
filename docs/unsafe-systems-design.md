@@ -12,8 +12,8 @@ landed beyond the arena runtime primitive noted below (#120 P0).
    motivating use cases (buffers, reinterpreting bytes, framebuffers).
 3. **The raw layer (`region` + raw memory + `Unsafe`)** — the rest of the doc.
    Reduced to genuinely raw cases after layers 1–2 absorb the common ones. The
-   `Ptr[T]` framing it originally carried was found wrong in design review (see
-   "Why `Ptr[T]` is the wrong shape") and is superseded by opaque block access.
+   `Ptr[t]` framing it originally carried was found wrong in design review (see
+   "Why `Ptr[t]` is the wrong shape") and is superseded by opaque block access.
 
 ## What Rust gives in systems that kaikai does not
 
@@ -34,7 +34,7 @@ cover most of what people *use* Rust's shared mutable aliasing to achieve:
 
 - **in-place mutation** → `Mutable` effect + Perceus reuse (exclusivity is
   inferred from refcount, not proven),
-- **shared identity** → `Ref[T]`, a runtime-counted cell,
+- **shared identity** → `Ref[t]`, a runtime-counted cell,
 - **race-free concurrency** → fiber isolation (the problem disappears — no shared
   memory to prove safe — rather than being proven safe).
 
@@ -52,7 +52,7 @@ debt or unbuilt surface, not renunciation:
 |---|---|---|
 | Flat layout, no per-element RC (`Vec<Point>`) | `Copy`/`repr(C)`, 16B inline | **#1053** — connect the dead typed-slot path (bug, not limit) |
 | Type layout control (`repr(C)`, packed, align) | attributes | new `#[repr(...)]`-style attribute; same mold as `#[derive]`/`extern type` |
-| Raw memory with indexed access | `unsafe` + pointers | `Array[T]` in a `region` + bounds-check + the four nets |
+| Raw memory with indexed access | `unsafe` + pointers | `Array[t]` in a `region` + bounds-check + the four nets |
 | Binary parsing | `unsafe` transmute / `nom` / `zerocopy` | **safe binary pattern matching** (below) — *safer* than Rust here |
 
 And a genuine grey zone — present in Rust, absent in kaikai today, reachable in
@@ -122,7 +122,7 @@ type Header = {
 The binary "pattern" then needs no special form at all — it is ordinary record
 destructuring of a type whose fields carry layout, using the `{ len, port }`
 pattern that **already exists**. Proposed form, not implemented (there is no
-`decode[T]`):
+`decode[t]`):
 
 ```text
 fn parse_header(packet: Array[U8]) : Option[Header] = decode[Header](packet)
@@ -147,10 +147,10 @@ type Packet = {
 ```
 
 1. **Endianness is declared** (`<be>`/`<le>`), so decoding is correct regardless of
-   host architecture. `reinterpret[T]` assumed host memory layout — a portability
+   host architecture. `reinterpret[t]` assumed host memory layout — a portability
    bug waiting to happen.
 2. **Data-dependent size** (a `payload` field as long as a prior `length` field
-   said) is *impossible* with `reinterpret[T]`, whose `T` has a fixed compile-time
+   said) is *impossible* with `reinterpret[t]`, whose `t` has a fixed compile-time
    size. Tag-length-value is the shape of every real binary format. This is also
    the one case the pure `Layout`-on-fields form does not cover — a length that is
    a *runtime value* is not a `Layout`. It needs either a value-dependent decode
@@ -220,7 +220,7 @@ proposal deliberately does not.
 The motivating benchmark is case 6 of `lnds/kaikai-vs-rust` (`flat-layout-no-rc`,
 the one clean Rust win). Its measurements split the problem in two:
 
-1. **Contiguous layout** — *already solved*. `Array[T]` is a single allocation
+1. **Contiguous layout** — *already solved*. `Array[t]` is a single allocation
    (`alloc_total ~15` for 1M elements). Layout is not the gap.
 2. **Per-element / per-field boxing** — the real cost. This is already tracked
    as **#1053 (open, labels `perceus`/`compiler`/`unboxing`)**, whose diagnosis
@@ -237,7 +237,7 @@ the one clean Rust win). Its measurements split the problem in two:
 
 So the request "I want a byte ring buffer with controlled layout" decomposes:
 
-| What you want | What is actually needed | Needs `Ptr[T]` + `Unsafe`? |
+| What you want | What is actually needed | Needs `Ptr[t]` + `Unsafe`? |
 |---|---|---|
 | Byte ring buffer | `Array[U8]` storing flat bytes | **No** — `Array` unboxing |
 | `Vec[Point]` flat, no RC | POD value-types stored inline in `Array` | **No** — flat-layout analysis |
@@ -251,37 +251,37 @@ Everything else — the ring buffer, flat `Vec[Point]`, and *binary parsing itse
 touch to Perceus. Binary parsing moved out of the `Unsafe` column in review: it is
 a pattern-match, not a reinterpret.
 
-## Why `Ptr[T]` is the wrong shape (superseded)
+## Why `Ptr[t]` is the wrong shape (superseded)
 
-The original proposal exposed a raw handle as `Ptr[T]`. Design review rejected the
+The original proposal exposed a raw handle as `Ptr[t]`. Design review rejected the
 shape, in stages, each rejection sharper than the last:
 
-- **`Ptr[T:POD]` breaks Tier 1 #3.** A bound on a *type constructor* is constraint
+- **`Ptr[t:POD]` breaks Tier 1 #3.** A bound on a *type constructor* is constraint
   propagation — the exact thing "no HKT, no constraint propagation, no type
-  families" forbids. A `fn f[T](p: Ptr[T])` would have to thread `T:POD` to every
+  families" forbids. A `fn f[t](p: Ptr[t])` would have to thread `T:POD` to every
   caller. Not allowed.
 - **`#[pod]` + a formation rule fixes soundness but not the smell.** Marking types
-  POD (an assertion the typer verifies, `#[derive]`-style) and making `Ptr[T]`
-  well-formed only for POD `T` avoids the bound. But it patches a deeper problem
+  POD (an assertion the typer verifies, `#[derive]`-style) and making `Ptr[t]`
+  well-formed only for POD `t` avoids the bound. But it patches a deeper problem
   rather than removing it.
-- **The deeper problem: `Ptr[T]` wears the shape of a generic without being one.**
-  `Ref[T]` earns `[T]` — it is parametric, uniform over every `T`, because RC
-  counts anything. `Ptr[T]` is *not* uniform: only POD, because the absence of
-  counting is only safe for plain-data. The `[T]` form lies. Contrast: `Ref[T]` is
-  a *counted* indirection (Perceus tracks it, any `T`, safe by the count);
-  `Ptr[T]` would be an *uncounted* raw address (Perceus-invisible, POD-only, unsafe
+- **The deeper problem: `Ptr[t]` wears the shape of a generic without being one.**
+  `Ref[t]` earns `[t]` — it is parametric, uniform over every `t`, because RC
+  counts anything. `Ptr[t]` is *not* uniform: only POD, because the absence of
+  counting is only safe for plain-data. The `[t]` form lies. Contrast: `Ref[t]` is
+  a *counted* indirection (Perceus tracks it, any `t`, safe by the count);
+  `Ptr[t]` would be an *uncounted* raw address (Perceus-invisible, POD-only, unsafe
   by the absence of the count). They are opposites, and `Ptr` borrows `Ref`'s
   notation without earning it.
-- **The `T` was never in the pointer.** A pointer is an address; bytes have no
-  type. The `T` is a promise about *how to read*, and that lives at the read site,
-  not in a persistent type. So the handle is opaque — **`Ptr`, no `[T]`** — and
+- **The `t` was never in the pointer.** A pointer is an address; bytes have no
+  type. The `t` is a promise about *how to read*, and that lives at the read site,
+  not in a persistent type. So the handle is opaque — **`Ptr`, no `[t]`** — and
   the type appears only in the typed operations over it.
 
-**Resolved shape:** raw memory is `Array[U8]`/`Array[T]` inside a `region`; the
+**Resolved shape:** raw memory is `Array[U8]`/`Array[t]` inside a `region`; the
 handle, if one is even exposed, is an opaque `Ptr` (a region-owned address with
 known extent), Zig-style, never a C `*mut T` with free arithmetic. Types live in
 the *operations* — bounds-checked `get`/`set` (safe, no `Unsafe`), and
-`reinterpret[T]` (`/Unsafe`, POD-restricted) — not in the handle. `Ptr[T]` as a
+`reinterpret[t]` (`/Unsafe`, POD-restricted) — not in the handle. `Ptr[t]` as a
 type does not exist in the resolved design.
 
 ## Where the analogy to Rust's `unsafe` holds and breaks
@@ -292,7 +292,7 @@ effect row does. So `unsafe` *is* capturable as an effect, and `unsafe { }` is
 the handler that discharges the row.
 
 Where it breaks: in Rust `unsafe` **disables the borrow checker** — that is its
-job. kaikai has no borrow checker to disable. What a raw `Ptr[T]` would break
+job. kaikai has no borrow checker to disable. What a raw `Ptr[t]` would break
 instead is the pair of invariants that give kaikai safety *without* a checker:
 
 - **(a) Perceus discipline** — exposing a raw pointer to the interior of an
@@ -305,7 +305,7 @@ instead is the pair of invariants that give kaikai safety *without* a checker:
 crack in the two invariants that replace the checker. The design's job is to keep
 that crack closed by construction.
 
-## The model: `region` owns, `Ptr[T]` handles, `Unsafe` audits
+## The model: `region` owns, `Ptr[t]` handles, `Unsafe` audits
 
 Raw memory lives **inside a `region { }` block** (the bump-arena from #120: `rc =
 INT32_MAX`, Perceus-invisible, bulk-freed at block close). That region is the
@@ -320,7 +320,7 @@ region {
 }                                     # buf dies here, in bulk, no per-value walk
 ```
 
-The decision that makes a safety net possible: **`Ptr[T]` always originates from
+The decision that makes a safety net possible: **`Ptr[t]` always originates from
 a region/allocator the runtime knows** (Zig-style), never an arbitrary address
 (`*mut T`, C-style). A bounds-check is only possible when the runtime knows the
 block's extent. Arbitrary-address pointers make every net impossible, which would
@@ -330,9 +330,9 @@ checker we rejected).
 This choice yields three invariants for free:
 
 1. **Perceus intact.** The region is already `INT32_MAX`; Perceus counts nothing
-   inside it. `Ptr[T]` points at raw bytes in that region, not at the interior of
+   inside it. `Ptr[t]` points at raw bytes in that region, not at the interior of
    a live RC value. Zero crack in the count — *conditional on the POD rule below*.
-2. **Fiber-safe by construction.** A `Ptr[T]` cannot cross a `spawn`; the typer
+2. **Fiber-safe by construction.** A `Ptr[t]` cannot cross a `spawn`; the typer
    rejects it, reusing the cell-escape mechanism from #997 (cells are fiber-local,
    compile-rejected on escape). No shared raw memory between fibers; BEAM model
    preserved. Compile-time, zero runtime cost.
@@ -350,7 +350,7 @@ This choice yields three invariants for free:
 | `set(p, i, v)` bounds-checked | `Unit / Mutable` | `Mutable` | check + mutation visible in row |
 | `get_unchecked(p, i)` | `U8 / Unsafe` | **`Unsafe`** | none — hot path, you promise |
 | `offset(p, n)` pointer arith | `Ptr[U8] / Unsafe` | **`Unsafe`** | none |
-| `reinterpret[T](p)` cast | `Ptr[T] / Unsafe` | **`Unsafe`** | none |
+| `reinterpret[t](p)` cast | `Ptr[t] / Unsafe` | **`Unsafe`** | none |
 
 The fine point that makes this tolerable: **~90% of a systems structure uses the
 safe, bounds-checked `get`/`set`** (no `/Unsafe`). You drop to `get_unchecked`
@@ -376,7 +376,7 @@ Two things Zig does not have, gained for free by coming from the effects side:
    it. Also strictly finer than Rust: Rust's `unsafe` block wraps a whole region
    and loses per-op granularity; here each raw op is individually typed.
 
-2. **Raw memory cannot race.** By the fiber-escape check, a `Ptr[T]` never crosses
+2. **Raw memory cannot race.** By the fiber-escape check, a `Ptr[t]` never crosses
    a `spawn`. Zig has no isolation — a pointer shared across threads is your
    problem. In kaikai it is a compile error. The BEAM model gives data-race-freedom
    over raw memory, which neither Zig nor C has and Rust achieves only with the
@@ -385,24 +385,24 @@ Two things Zig does not have, gained for free by coming from the effects side:
 
 ## The three edges that still bite (honesty)
 
-**Edge 1 — the POD restriction is the load-bearing beam.** If `T` in `Ptr[T]` /
-`reinterpret[T]` were a type containing a `KaiValue*` (a record with a `String`
+**Edge 1 — the POD restriction is the load-bearing beam.** If `t` in `Ptr[t]` /
+`reinterpret[t]` were a type containing a `KaiValue*` (a record with a `String`
 field), a `set` would write a pointer-to-RC-value into raw memory and Perceus
-would stop counting correctly. The net here is a **type restriction**: `Ptr[T]`
-and `reinterpret[T]` accept **only POD `T`** — `U8..U128`, `F32/F64`, `I8..I128`,
+would stop counting correctly. The net here is a **type restriction**: `Ptr[t]`
+and `reinterpret[t]` accept **only POD `t`** — `U8..U128`, `F32/F64`, `I8..I128`,
 and structs whose fields are all POD. The typer rejects `Ptr[Record-with-String]`.
 This single rule is what keeps invariant (a) intact. Without it, all the safety
 collapses. Compile-time checkable, zero runtime cost. It is also the same
 "what is POD" analysis the case-6 unboxing needs — see sequencing.
 
-**Edge 2 — use-after-region-close.** If a `Ptr[T]` escapes its region (stored in
+**Edge 2 — use-after-region-close.** If a `Ptr[t]` escapes its region (stored in
 something outliving the block), it dangles. #120's policy is deep-copy-out at the
 border, but a raw pointer cannot be deep-copied meaningfully, so here it must be a
-**hard escape error**: the typer rejects a `Ptr[T]` crossing its region's close,
+**hard escape error**: the typer rejects a `Ptr[t]` crossing its region's close,
 via the same side-table flow analysis as #120 P2a. Without it, silent UAF.
 
 **Edge 3 — the strategic cost.** This adds surface to Tier 1 (the `Unsafe`
-effect, `Ptr[T]`, POD-analysis, pointer escape-check) for a benefit that has **no
+effect, `Ptr[t]`, POD-analysis, pointer escape-check) for a benefit that has **no
 measured use case in the repo today**. Case 6 — the only net Rust win — is closed
 by the field-unboxing work already tracked in #1053 (+ family #440/#383/#861),
 NOT by this. Building the general power *before* the structure
@@ -418,7 +418,7 @@ demanding structure (a binary parser, an allocator) exists.
 | Arena runtime | bump-alloc, `INT32_MAX`, bulk-free, Perceus-invisible | **exists** (#120 P0, `kai_arena_alloc`/`kai_arena_free` in `runtime.h`) |
 | `region { }` surface | lexical block, same mold as `nursery` | missing (P2a deferred, benchmark-gated) |
 | Escape-check side-table | `Ptr`/region does not cross block close or a `spawn` | missing (#997 pattern reusable) |
-| `Ptr[T]` with `T:POD` | handle to offset; typer rejects `T` containing `KaiValue*` | new |
+| `Ptr[t]` with `T:POD` | handle to offset; typer rejects `t` containing `KaiValue*` | new |
 | `Unsafe` marker effect | twin of `Ffi` (`effect Unsafe {}`) | new, trivial |
 | safe `get`/`set` layer | bounds-checked, no `/Unsafe`, `set` via `Mutable` | new stdlib |
 
@@ -440,7 +440,7 @@ the `Unsafe` effect:
    closes the *native-vs-C* gap; any residual *C-vs-Rust* per-access RC cost on
    `Array[Point]` is a separate, finer question to re-measure only after #1053.
 2. **`region { }` surface + lowering to arena** (unblocks #120, useful alone).
-3. **`Ptr[T:POD]` + `alloc_bytes` + safe `get`/`set`** inside a region. The byte
+3. **`Ptr[t:POD]` + `alloc_bytes` + safe `get`/`set`** inside a region. The byte
    ring buffer and ~80% of systems programming land here, **without touching
    `Unsafe`**.
 4. **`Unsafe` + `get_unchecked`/`offset`/`reinterpret`** — only when a real

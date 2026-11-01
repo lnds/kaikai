@@ -17,7 +17,7 @@ fn main() : Unit = ()
 ```
 
 `Small(5)` is positional because a variant *is* a named constructor-function
-(`Some : (T) -> Option[T]`, generated). A record generates none — the only way in
+(`Some : (t) -> Option[t]`, generated). A record generates none — the only way in
 is the literal `Rational { num: 1n, den: 4n }`. The stdlib already pays for this by
 hand: `complex.mk(re, im)`, `rational.make(num, den)` are hand-written positional
 constructors that exist *only* because the language does not generate them (with

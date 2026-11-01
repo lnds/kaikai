@@ -59,8 +59,8 @@ Worked examples of the rule in action:
 | supervised port program            | `ahu`    | composes `Process` + `supervisor` restart policy                     |
 | `nursery` (scoped `Spawn` + cancel-on-fail) | stdlib | safe default scope over `Spawn` — policy in its own spec    |
 | `supervisor` (restart strategies)  | `ahu`    | configurable policy, supervision tree shape                          |
-| `Actor[Msg]` — mailbox + send/receive | stdlib | primitive concurrency communication, same tier as `Spawn`           |
-| `GenServer`-analog (state + callbacks) | `ahu`| OTP pattern on top of `Actor[Msg]`                                   |
+| `Actor[msg]` — mailbox + send/receive | stdlib | primitive concurrency communication, same tier as `Spawn`           |
+| `GenServer`-analog (state + callbacks) | `ahu`| OTP pattern on top of `Actor[msg]`                                   |
 
 If it requires `Cancel` + `Clock` (timeouts, deadlines) to be usable,
 that is already stdlib (both are stdlib effects). It is only `ahu`
@@ -277,10 +277,10 @@ stdlib/
   gen.kai        effect Yield[t]: pull generators on a kept continuation
   seq.kai        lazy sequences over a memoised runtime cell
   stream.kai     lazy streams as generators over the Emit[t] effect
-  reader.kai     with_reader for Reader[T]
-  writer.kai     with_writer for Writer[W]
-  ffi.kai        Userdata[T]: a kaikai value parked behind a void * for C callbacks (under Ffi)
-  array.kai      [T] / Array[T] bridge, plus `each` for `|!`
+  reader.kai     with_reader for Reader[t]
+  writer.kai     with_writer for Writer[w]
+  ffi.kai        Userdata[t]: a kaikai value parked behind a void * for C callbacks (under Ffi)
+  array.kai      [t] / Array[t] bridge, plus `each` for `|!`
   string_builder.kai  amortised text accumulator; `append` rides Mutable, `build` is pure
   text.kai       Unicode text measurement (terminal-column width)
   text/
@@ -305,7 +305,7 @@ stdlib/
   log.kai        effect Log
   trace.kai      effect Trace: ad-hoc structured logging
   spawn.kai      wrappers over the Spawn ops, including `nursery`
-  actor.kai      typed wrappers and helpers for Actor[Msg] (`with_mailbox`)
+  actor.kai      typed wrappers and helpers for Actor[msg] (`with_mailbox`)
   net/           effects NetTcp, NetUdp, NetDns, NetUnix
     tcp.kai      (fiber-parking on the reactor)
     udp.kai      (datagram UDP, IPv4)
@@ -345,7 +345,7 @@ land in each module's own spec when implemented.
 
 ### core (pure, stage 1)
 
-- `core.list` — map, filter, foldl, foldr, foreach, length, reverse, nth, take, drop, zip, unzip, concat, any, all, find, index_of, sum, product; surface expansion (#340 — shipped): `last`, `init`, `partition`, `split_at`, `span`, `chunk`, `windows`, `intersperse`, `enumerate`, `zip3`, `scan`, `group_by`, `find_map`. The aggregates are protocol-bounded generics (#891, on the #890 free-fn bound feature): `sum`/`product` are `[T : Numeric + Add]` / `[T : Numeric + Mul]` (folding `add`/`mul` from `zero()`/`one()`), `max`/`min`/`sort` are `[T : Ord]` (via `cmp`), `uniq` is `[T : Eq]` (via `eq`). `max`/`min` keep the `Option[T]` wrapper so the empty list stays a total `None`. `group_by` uses Erlang/Elixir consecutive-key semantics (NOT Haskell's all-equal-regardless-of-position) — the consecutive variant stays linear without an `Eq` map; its key type is still `Int` for v1 (it carries no `: Eq` bound), unlike `uniq` which now does. `map_foldl` (#1134) folds `combine` over `stage(x)` in one pass — the fusion rewrite emits it for a pure `xs | stage |> foldl(...)`, materialising no mapped list. `map_sum` / `map_product` (#1143) are the ring-terminal analogues (`[b : Numeric + Add]` / `+ Mul`, pure stage), emitted for `xs | stage |> sum` / `|> product`; the range-headed targets live in `protocols` (`range_map_foldl` / `range_map_sum` / `range_map_product` + `range_step_*` variants, and `range_length` / `range_step_length` for the `length` terminal, which drops the pure stages entirely).
+- `core.list` — map, filter, foldl, foldr, foreach, length, reverse, nth, take, drop, zip, unzip, concat, any, all, find, index_of, sum, product; surface expansion (#340 — shipped): `last`, `init`, `partition`, `split_at`, `span`, `chunk`, `windows`, `intersperse`, `enumerate`, `zip3`, `scan`, `group_by`, `find_map`. The aggregates are protocol-bounded generics (#891, on the #890 free-fn bound feature): `sum`/`product` are `[t : Numeric + Add]` / `[t : Numeric + Mul]` (folding `add`/`mul` from `zero()`/`one()`), `max`/`min`/`sort` are `[t : Ord]` (via `cmp`), `uniq` is `[t : Eq]` (via `eq`). `max`/`min` keep the `Option[t]` wrapper so the empty list stays a total `None`. `group_by` uses Erlang/Elixir consecutive-key semantics (NOT Haskell's all-equal-regardless-of-position) — the consecutive variant stays linear without an `Eq` map; its key type is still `Int` for v1 (it carries no `: Eq` bound), unlike `uniq` which now does. `map_foldl` (#1134) folds `combine` over `stage(x)` in one pass — the fusion rewrite emits it for a pure `xs | stage |> foldl(...)`, materialising no mapped list. `map_sum` / `map_product` (#1143) are the ring-terminal analogues (`[b : Numeric + Add]` / `+ Mul`, pure stage), emitted for `xs | stage |> sum` / `|> product`; the range-headed targets live in `protocols` (`range_map_foldl` / `range_map_sum` / `range_map_product` + `range_step_*` variants, and `range_length` / `range_step_length` for the `length` terminal, which drops the pure stages entirely).
 - `core.string` — length, slice, to_int, concat, starts_with, ends_with, trim, repeat, join *(originals)*; split, replace, pad_left, pad_right, lines, is_blank *(shipped via #338)*; **index_of, to_upper, to_lower, is_empty, reverse** *(shipped via #396 — the remainder of #338's proposed surface)*; drop_prefix, drop_suffix *(shipped via #632)*; **bytes, chars, char_count, byte_length, char_indices + `CharIndex` record** *(shipped via #744 — the codepoint model)*; **trim_left, trim_right, from_chars** *(shipped — closes #1589: one-sided trim + the `chars` inverse)*; **from_bytes + `bytes` retyped to `[Byte]`** *(shipped — closes #1978: the byte view wears the byte type)*; **`slice` re-based on codepoints + byte_slice, is_char_boundary, floor_char_boundary, ceil_char_boundary, char_index_of** *(shipped — closes #1982: the index unit is chosen, not implicit)*; **string_find** *(shipped — closes #2125: a builtin core declares with `extern "kai"`, the byte offset or -1 that `index_of` wraps in `Option`)*. **to_int_radix, int_to_string_radix** *(shipped — refs #2823: integers in radix 2..36; `to_int` stays base 10)*. **contains, count, last_index_of, char_last_index_of, split_once** *(shipped — search family: `contains` is `string_contains`; `count` is non-overlapping and `count(s, "")` is `char_count(s) + 1`; `last_index_of` returns a byte offset (pairs with `slice` / `byte_slice`, overlaps allowed, `""` gives `Some(length(s))`) and `char_last_index_of` a codepoint index (pairs with `char_slice`); `split_once` cuts at the first separator, `split_once(s, "")` is `Some(("", s))`)*. `text.format_spec` *(shipped)* — `fixed(x, digits)`, `pad_center`, `pad_zero`, behind the `#{x:.2}` / `#{s:^10}` / `#{n:05}` interpolation format specs; `fixed` is the exact printf-style `%.*f` behind `#{x:.2}`; `math.real.to_fixed` delegates to it. `length`/`byte_length` count bytes; `char_count` counts Unicode codepoints; `bytes()` is the byte-level `[Byte]`, `chars()` the codepoint-level `[Char]` (UTF-8 decode) — distinct element types, so `from_chars(bytes(s))` is a type error instead of a silent double-encode; `from_bytes` is the `bytes` inverse, `from_chars` the `chars` one. Two index units, split by name: the `char_`-prefixed `char_slice` / `char_index_of` / `char_last_index_of` / `char_count` address codepoints; `slice` / `char_at` / `index_of` / `length` / `byte_length` and the `byte_`-prefixed names address bytes. `slice(s, from, len)` takes byte offsets and clamps out of range, so an offset from `index_of` always slices correctly; it panics when an end falls inside a multibyte sequence. `char_slice(s, from, len)` is the codepoint-indexed cut and never splits a character. `byte_slice(s, from, len) : Option[String]` is the total byte-indexed cut, `None` when either end falls inside a multibyte sequence or outside the buffer. `is_char_boundary` / `floor_char_boundary` / `ceil_char_boundary` classify and snap an arbitrary byte offset (Rust 1.91's truncate-to-N-bytes primitives). The search pair stays coherent by shipping both halves: `index_of` keeps its byte offset and pairs with `slice` / `byte_slice`; `char_index_of` returns a codepoint index and pairs with `char_slice`. `reverse`/`to_upper`/`to_lower` operate by codepoint. `split(s, "")` panics; `lines("")` returns `[]` (Python/Rust convention). `drop_prefix` / `drop_suffix` return `Option[String]` (`Some(rest)` on match, `None` otherwise) — same shape as `to_int`, `log2`, `div_mod`, mirroring Rust's `str::strip_prefix`. The #396 five share bare names with core exports (`list.is_empty`, `char.to_upper`, …); first-arg-type narrowing (#235) routes the `String` receiver. (A bare call inline in a comparison still mis-narrows cross-module — issue #758 — so the intrinsic tests bind with `let` before asserting.)
 - `core.option` — is_some, is_none, map, flat_map, each, filter, and_then, unwrap_or, or_else *(shipped: `map` / `flat_map` / `filter` / `each` make `Option` ride `|`, `||`, `|?`, `|!`)*
 - `core.result` — is_ok, is_err, map, flat_map, each, map_err, and_then, unwrap_or *(shipped: `map` / `flat_map` / `each` make `Result` ride `|`, `||`, `|!`; no `filter`)*
@@ -389,8 +389,8 @@ land in each module's own spec when implemented.
 
 ### array (pure, stage 2 — shipped via #366)
 
-Top-level module bridging the linked-list `[T]` carrier to the
-contiguous `Array[T]` carrier. The runtime ships `array_make`,
+Top-level module bridging the linked-list `[t]` carrier to the
+contiguous `Array[t]` carrier. The runtime ships `array_make`,
 `array_get`, `array_set`, `array_length`, `array_grow` plus the
 indexing sugars (`a[i]`, `a[i] := v`); this module fills the
 gap between the two carriers so consumers don't roll their own
@@ -582,11 +582,11 @@ security-sensitive code paths.
 - `random` — `int_range`, `float`, `bytes`, plus pure helpers
   (`shuffle`, `choice`, `sample`) built on top; the default
   handler is seedable for tests. `shuffle` runs in-place
-  Fisher-Yates over a locally-built `Array[T]` (O(n), one Array
+  Fisher-Yates over a locally-built `Array[t]` (O(n), one Array
   allocation beyond the input/output lists) — the previous
   selection-sampling implementation cost O(n²) and was retired in
   PR #366. The masking discipline keeps `shuffle`'s observable row
-  at `[T] -> [T] / Random`.
+  at `[t] -> [t] / Random`.
 - `random_secure` — `int`, `bytes`, cryptographic-grade primitives;
   not seedable
 
@@ -619,7 +619,7 @@ manutara's first design pass exercises them.
 ### encoding (pure, stage 2)
 
 - `encoding.json` — `json_encode`, `json_decode`, `json_decode_report`; drilling `get`, `at` (`Option[JsonValue]`: `None` for a missing key, out-of-range index or wrong shape; a present `null` is `Some(JNull)`) and `as_string`/`as_int`/`as_real`/`as_bool` *(shipped — `json_decode_report` returns `Result[JsonValue, JsonParseError]`, where `JsonParseError` is `{ line, column, offset, reason }`: `offset` is the 0-based byte offset, `line` is 1-based, `column` is 1-based and counts characters; named `JsonParseError` because `json_bind` already exports `JsonError`; — Real number parsing via #361 adds `JReal(Real)` alongside `JNum(Int)`; surrogate-pair `\uD8xx\uDCxx` decode + UTF-8 emit via #362; strict RFC 8259 decode, where leading zeros and raw control characters yield `None`, and a `JReal` always encodes with a fraction so it decodes back as `JReal`, via #3148)*
-- `#[derive(Json)]` — typed struct binding over the same DOM *(shipped: `to_json` / `<lower(T)>_of_json` for records and sum types; field names verbatim, `Option` accepts null-or-missing, unknown keys ignored, failures are `Result[T, JsonError]` carrying the JSON path. Sum types encode under a fixed adjacently-tagged envelope `{"tag", "value"}` (nullary → `null`, single → the value, multi → a JSON array); decode routes on `tag`, an unknown tag is a located error. Per-field `#[json(rename/default/skip)]` overrides layer on top: `rename` sets the wire name, `default` supplies an absent key's value, `skip` drops a field (requiring a `default` or `Option`). `protocol Json` in `stdlib/protocols.kai`; `JsonValue` / `JsonError` / runtime in `stdlib/encoding/json_bind.kai`, kept out of the core so `JNull` does not offset every binary's RC baseline. See `docs/json-derive-design.md`.)*
+- `#[derive(Json)]` — typed struct binding over the same DOM *(shipped: `to_json` / `<lower(t)>_of_json` for records and sum types; field names verbatim, `Option` accepts null-or-missing, unknown keys ignored, failures are `Result[t, JsonError]` carrying the JSON path. Sum types encode under a fixed adjacently-tagged envelope `{"tag", "value"}` (nullary → `null`, single → the value, multi → a JSON array); decode routes on `tag`, an unknown tag is a located error. Per-field `#[json(rename/default/skip)]` overrides layer on top: `rename` sets the wire name, `default` supplies an absent key's value, `skip` drops a field (requiring a `default` or `Option`). `protocol Json` in `stdlib/protocols.kai`; `JsonValue` / `JsonError` / runtime in `stdlib/encoding/json_bind.kai`, kept out of the core so `JNull` does not offset every binary's RC baseline. See `docs/json-derive-design.md`.)*
 - `encoding.toml` — `decode`, `decode_report`, `encode`, `round_trip`, `error_message` *(shipped subset for the package manager (#405): top-level scalars, `[name]` and `[[name]]` headers — dotted with bare or quoted segments (`[native.sqlite]`, `[native."db.pg"]`) and nesting since #2772, a table or key defined twice rejected — basic strings, ints/bools, array values (#1742, the `[native]` table), inline tables, comments. Floats via #2056 — `TReal(Real)`, optional `-`/`+` sign, fractional (`0.8`) and/or exponent (`5e+22`) parts, a digit required on each side of the `.` and after the exponent marker; the encoder appends `.0` so an integral float does not re-decode as an integer. `inf` / `nan` and `_` digit separators stay out of the subset. `decode_report` (#2056) returns `Result[TomlValue, TomlError]` naming the 1-based line and bare key the parse stopped on, so a caller can point at the offending entry instead of calling the whole file malformed; `error_message` renders it. Encoder emits a canonical form so `kai.lock` round-trips byte-identical. Datetimes / dotted keys left of `=` / multi-line strings deferred until a user-facing TOML need lands.)*
 - `encoding.base64` — `encode`, `decode` (standard + URL-safe) *(shipped)*
 - `encoding.hex` — `encode`, `decode` *(shipped)*; byte lists only — an integer in hex goes through core `to_int_radix(s, 16)` / `int_to_string_radix(n, 16)`
@@ -671,12 +671,12 @@ tokens.
 
 ### concurrent (`/ Spawn`, `/ Cancel`)
 
-The `Actor[Msg]` effect is deferred to `docs/actors.md`; once that
+The `Actor[msg]` effect is deferred to `docs/actors.md`; once that
 spec lands, it is added to this header.
 
 > **Physical layout note.** No `stdlib/concurrent/` directory exists. The catalog uses the `concurrent.*` namespace as the **target** shape; the actual `pub fn` lives at the top level today.
 
-- `concurrent.nursery` — scoped `spawn` / `await` / `select` with cancel-on-failure *(shipped — `pub fn nursery[T, e]` lives at `stdlib/spawn.kai:95`, not at `stdlib/concurrent/nursery.kai`)*. Policy detailed in its own spec; restart policies live in `ahu.supervisor`.
+- `concurrent.nursery` — scoped `spawn` / `await` / `select` with cancel-on-failure *(shipped — `pub fn nursery[t, e]` lives at `stdlib/spawn.kai:95`, not at `stdlib/concurrent/nursery.kai`)*. Policy detailed in its own spec; restart policies live in `ahu.supervisor`.
 - `concurrent.actor` — mailbox primitive: `send`, `receive`, `self` *(shipped — `stdlib/actor.kai`, not `stdlib/concurrent/actor.kai`)*; spawn surface `spawn_actor` (unbounded default) + `spawn_actor_policy` (explicit `MailboxPolicy` — shipped, closes #763) and current-fiber installers `with_mailbox` / `with_mailbox_policy`. Spec detail lives in `docs/actors.md`.
 
 ### testing

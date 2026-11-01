@@ -42,7 +42,7 @@ sit in the literature, plus a hybrid worth naming explicitly:
 
 1. *Fibers (m8) become a corollary, not new runtime.* A
    reified-continuation representation is already needed for
-   `Spawn`, `Cancel`, and `Actor[Msg]`. Régime B gives us this for
+   `Spawn`, `Cancel`, and `Actor[msg]`. Régime B gives us this for
    free; régime A would require a parallel segmented-stack
    subsystem before m8 can start.
 2. *Perceus has a published co-design with evidence passing.*
@@ -186,7 +186,7 @@ Rows are normalised before storage:
 2. Deduplicate **syntactically**: labels that compare equal in
    both `eff` and `ty_args` collapse (`{Io, Fail, Io}` → `{Fail,
    Io}`). Labels that share the same effect symbol but differ in
-   payload — `State[Int]` vs `State[?T]`, where `?T` is an
+   payload — `State[Int]` vs `State[?t]`, where `?T` is an
    unresolved type variable — are *not* merged at normalisation
    time. They may unify later via `unify_row`'s recursive payload
    step. Cost: a row may carry one extra entry per unresolved
@@ -244,7 +244,7 @@ struct EvIo {
   (§*`resume` representation*).
 - A clause that resumes in tail position returns the op's value;
   one that does not resume returns a value of the handle's type
-  `S` (Doc A §*`resume`: one-shot, explicit*), which becomes the
+  `s` (Doc A §*`resume`: one-shot, explicit*), which becomes the
   handle's result. The op site tells the two apart by the status.
 - `handler_id` is a unique integer identifying the handler
   instance, used only for diagnostics that need to name the
@@ -277,12 +277,12 @@ generates a generic evidence type with one extra field per
 declared `with`-clause parameter — the *handler state*:
 
 ```
-struct EvState[T] {
+struct EvState[t] {
   handler_id : HandlerId
   env        : *Frame
-  state      : T                                       ; per-handler state
-  get        : fn(*Self,        k: Cont[T])    -> Answer
-  set        : fn(*Self, v: T,  k: Cont[Unit]) -> Answer
+  state      : t                                       ; per-handler state
+  get        : fn(*Self,        k: Cont[t])    -> Answer
+  set        : fn(*Self, v: t,  k: Cont[Unit]) -> Answer
 }
 ```
 
@@ -313,7 +313,7 @@ runtime never receives "the second argument of resume" as a
 distinct concept.
 
 Effects with multiple state parameters (none in the v1 stdlib;
-hypothetical `effect Reader2[A, B]`) gain one field per
+hypothetical `effect Reader2[a, b]`) gain one field per
 parameter, in declaration order, read positionally.
 
 ### Calling a capability
@@ -439,10 +439,10 @@ capture locals through a boxed env.
 
 > **v1 status (2026-10-08):** a `resume` is the stack-allocated
 > `KaiCont` of §*One-shot case* unless its handle runs on a segment,
-> where it is a `Cont[T, S, e]` closure over the segment's box
+> where it is a `Cont[t, s, e]` closure over the segment's box
 > (§*Handles on a segment*). Multi-shot is not implemented.
 
-`resume` is a value of type `(T) -> S / ρ`. Doc A §*`resume`:
+`resume` is a value of type `(t) -> s / ρ`. Doc A §*`resume`:
 one-shot, explicit* pinned its surface semantics; this section
 pins its runtime shape.
 
@@ -600,9 +600,9 @@ The inner handle's clauses are tail-resuming forwarders, so it takes
 the direct path and lives on the segment: the handler is deep by
 construction. The typer types the thunk first; the arguments and
 result of each `$seg_request(i, …)` give clause `i` its parameter
-types and its continuation `Cont[answer, S, e]`, where `S` is the
+types and its continuation `Cont[answer, s, e]`, where `s` is the
 handle's type and `e` the thunk's row, the body's effects besides `E`.
-`Cont[T, S]` written in a type is `Cont[T, S, e]` with `e` empty.
+`Cont[t, s]` written in a type is `Cont[t, s, e]` with `e` empty.
 A `Cont` is called like a function, and `k(v)` adds `e` to the
 caller's row; at run time it is a closure over the segment's box and
 the handler.
@@ -650,12 +650,12 @@ clause "for uniformity". The representation honours both:
 
 - The op's signature is generated normally — `fail` has a
   `Cont[Nothing]` parameter just like every other op has a
-  `Cont[Ret]`. The `resume` binding is in scope.
+  `Cont[ret]`. The `resume` binding is in scope.
 - `Cont[Nothing]` is uninhabited (no value of type `Nothing`
   exists), so `resume(v)` cannot be type-checked: there is no
   value `v` to pass.
 - The clause's code path therefore returns directly with an
-  `Answer` of the handle's `S`, never invoking `resume`. No
+  `Answer` of the handle's `s`, never invoking `resume`. No
   runtime check is needed because no path can reach the call.
 
 The uniformity is purely syntactic: every clause binds `resume`,
@@ -691,7 +691,7 @@ _hr = kai_resume_frames_run(&_node, _hr);   // only when a clause defers
 ### Early return / discard path
 
 A clause that does not resume returns a value of the handle's
-type `S` — the typer checks every clause body against `S`. The op
+type `s` — the typer checks every clause body against `s`. The op
 site sees the status still UNRESUMED, stores the value in the
 discard slot, unwinds to the node and longjmps. The rest of the
 body is dropped and the `return` clause does not run.
@@ -791,7 +791,7 @@ floor, that would be a compiler bug, not a user error.
 ## Interaction with monomorphisation
 
 Generic functions are monomorphised by `(type_args, row)` instead
-of just `type_args`. `map[A, B, e]` instantiated at
+of just `type_args`. `map[a, b, e]` instantiated at
 
 ```kaikai-fragment
 map([1,2,3], (x) => x + 1)                          # e = {}
@@ -826,10 +826,10 @@ contribute to dedup; both block emission when no caller exists.
 
 ### Interaction with per-op type generics
 
-A per-op generic like `Mutable.array_make[T](n: Int, init: T)`
+A per-op generic like `Mutable.array_make[t](n: Int, init: t)`
 does *not* monomorphise the op itself — the op stays type-erased
 in the evidence struct. The *caller* is monomorphised: each
-distinct `T` at a call site emits a specialised caller that
+distinct `t` at a call site emits a specialised caller that
 packages the arguments and calls through to the erased op. The
 exact ABI of that erased call (raw-byte layout + element size or
 a runtime witness) is pinned in §*Per-op type generics*.
@@ -871,7 +871,7 @@ drops it (§*Non-tail `resume`*).
 All clauses of the same `handle` share the single `EvE` struct
 allocated by the prologue: free variables of the enclosing scope
 are reached through `EvE.env: *Frame`, and per-handler state
-(`State[T]`'s `state: T`, for example) lives as an additional
+(`State[t]`'s `state: t`, for example) lives as an additional
 field of the same struct. Perceus treats `EvE` like any
 stack-allocated struct: heap-allocated payloads inside `env` or
 `state` are RC-tracked by their own type's drop sequence; the
@@ -895,7 +895,7 @@ on this: an `EvE` value never escapes its lexical `handle` scope,
 so its drop is guaranteed to run at the epilogue.
 
 The continuation is a separate matter: a kept continuation
-(`Cont[T, S, e]`) can escape the clause. But the continuation
+(`Cont[t, s, e]`) can escape the clause. But the continuation
 captures values from the *perform site* (locals of the function
 that called `Eff.op`), not the `handle`'s frame and not the `EvE`,
 so no cycle between `EvE` and continuation arises.
@@ -934,7 +934,7 @@ up like any other identifier:
 - *Trailing lambdas* → ordinary application with the last
   argument as a lambda expression.
 - *Local mutable cell* — `var x := init; body` →
-  `handle { body } with State[?T](init)` with canonical
+  `handle { body } with State[?t](init)` with canonical
   `get`/`set`/`return` clauses. `?T` is a fresh type variable;
   HM inference later unifies it with the type of `init` (or of
   the cell's uses). The variable specialisation pass
@@ -963,7 +963,7 @@ transformations are hard-coded and tested.
 ### Why split
 
 Pre-resolve sugars produce stdlib names (`Mutable.array_get`,
-`State[T]` for `var`'s implicit handler) that resolve must look
+`State[t]` for `var`'s implicit handler) that resolve must look
 up uniformly with hand-written calls — so they have to run
 *before* resolve. Capability sugars are the opposite: a naked
 read `cap` cannot rewrite without knowing whether `cap` denotes
@@ -974,7 +974,7 @@ information it needs.
 
 ## Variable specialisation
 
-Doc B §`State[T]` *Performance* promised that `var x := 0;
+Doc B §`State[t]` *Performance* promised that `var x := 0;
 x := x + 1` compiles to a native mutable int, not a chain of
 handler invocations. The mechanism:
 
@@ -982,7 +982,7 @@ handler invocations. The mechanism:
 
 All three must hold:
 
-1. The `var` binding desugars to a canonical `State[T]` handler
+1. The `var` binding desugars to a canonical `State[t]` handler
    (the one the desugar pass emits — user-written handlers do
    not trigger specialisation).
 2. The captured `state` does not escape into a closure that
@@ -995,18 +995,18 @@ syntactic check.
 
 ### The specialisation
 
-A canonical `State[T]` handler that meets the triggers is
+A canonical `State[t]` handler that meets the triggers is
 replaced by:
 
-- An `alloca` for a slot of type `T`, initialised from the
+- An `alloca` for a slot of type `t`, initialised from the
   `init` expression.
 - `x` (= `State.get()`) → `load` from the slot.
 - `x := v` (= `State.set(v)`) → `store` to the slot.
 - `return(x) -> expr` → `expr` evaluated after the body,
   dropping the slot at the enclosing frame's end.
 
-No evidence struct for this particular `State[T]`. The
-surrounding body's row still carries `State[T]` until the
+No evidence struct for this particular `State[t]`. The
+surrounding body's row still carries `State[t]` until the
 canonical handler is replaced, once the handler's shape is known.
 
 ### Why the conditions
@@ -1022,7 +1022,7 @@ the canonical handler runs normally.
 
 ### Known follow-ups after m7b #5b
 
-The desugar is faithful to Doc B §`State[T]` *Syntax note*; three
+The desugar is faithful to Doc B §`State[t]` *Syntax note*; three
 gaps remain between the lowered code and what Doc B implies should
 "just work":
 
@@ -1045,7 +1045,7 @@ gaps remain between the lowered code and what Doc B implies should
    still pending.** The desugar emits the canonical heap-handler
    form unconditionally; until specialisation lands, every
    `var n := 0; n.set(n + 1)` pays a full op-call (evidence
-   lookup + identity continuation) per access. Doc B §`State[T]`
+   lookup + identity continuation) per access. Doc B §`State[t]`
    *Performance* promised this lowers to a stack slot when the
    four trigger conditions hold — the trigger check + slot
    replacement is the missing pass.
@@ -1092,10 +1092,10 @@ struct EvMutable {
 }
 ```
 
-Each op's signature uses *raw byte payloads* in place of `T`:
-`array_make`'s `init: T` becomes `init: *void` carrying a pointer
+Each op's signature uses *raw byte payloads* in place of `t`:
+`array_make`'s `init: t` becomes `init: *void` carrying a pointer
 to the value, and `array_make` returns `*void` for the resulting
-`Array[T]`. The size of `T` is passed alongside as an implicit
+`Array[t]`. The size of `t` is passed alongside as an implicit
 runtime argument (§*At the call site*).
 
 ### At the call site
@@ -1107,20 +1107,20 @@ A call `Mutable.array_make[Int](10, 0)` compiles to:
    concrete layout for `T = Int` and calls through the erased
    function pointer.
 
-The op implementation must itself handle all `T`s. For stdlib
+The op implementation must itself handle all `t`s. For stdlib
 `Mutable`, the op body is a `Ffi` wrapper whose C counterpart
 operates on raw bytes + an element-size parameter — the compiler
 passes the element size as an implicit arg after monomorphisation.
 
 Per-op generics do *not* compose with row polymorphism at the op
-call site: the op is generic over `T`, not over a row. Doc A
+call site: the op is generic over `t`, not over a row. Doc A
 §*Out of scope* item 3's row-polymorphic clause stays
 out of scope.
 
 ### Evidence-layout stability
 
 The evidence struct's layout is fixed at effect declaration time
-and does not depend on the concrete `T` of any call. This is what
+and does not depend on the concrete `t` of any call. This is what
 lets the op be type-erased. The cost is that the caller pays one
 extra argument (element size, or a runtime type witness) for each
 generic op — negligible compared to the op's own body.
@@ -1144,16 +1144,16 @@ distinction is purely surface; pinned in `docs/effects-stdlib.md`
 §`Mutable` §*Migration plan*.
 
 **Spawn API cleanup landed 2026-05-02 (issue #72).** The four
-Fiber-shaped Spawn ops now carry per-op `[T, e]` directly:
-`spawn[T](thunk: () -> T / e) : Fiber[T]` is the canonical entry
+Fiber-shaped Spawn ops now carry per-op `[t, e]` directly:
+`spawn[t](thunk: () -> t / e) : Fiber[t]` is the canonical entry
 point. Implementation: `add_effect_op_sigs_loop` collects op-level
 row-variable names from `ROpen` tails inside parameter and return
 types (mirroring `collect_decl_rvars` for fns) and quantifies the
 op's scheme over them via `mk_rvbinds_from` — the row-bind analog
 of `mk_tpbinds_from`. `builtin_spawn_decl`'s thunk parameter
-became the proper `() -> T / e` shape; the wrappers in
+became the proper `() -> t / e` shape; the wrappers in
 `stdlib/spawn.kai` reduce to one-line aliases retained for
-in-tree compatibility (`fiber_spawn[T, e](f) = Spawn.spawn(f)`).
+in-tree compatibility (`fiber_spawn[t, e](f) = Spawn.spawn(f)`).
 Coverage: `examples/effects/m8_spawn_per_op_row_generics.kai`
 (positive end-to-end) and `examples/effects/m8_spawn_row_mismatch.kai`
 (negative — non-thunk argument is rejected with the per-op row
@@ -1164,8 +1164,8 @@ preserved below for posterity.
 
 #### State at the start of m7b #2
 
-- `effect Foo { op[T](...) : T }` — `parse_effect_ops`
-  (`stage2/compiler.kai:3168`) does **not** accept `[T]` after the
+- `effect Foo { op[t](...) : t }` — `parse_effect_ops`
+  (`stage2/compiler.kai:3168`) does **not** accept `[t]` after the
   op name. The parser rejects it as malformed.
 - `EffectOp = EOp(name, params, ret, line, col)` — no slot for
   per-op tparams. ~10 pattern-match sites across the file.
@@ -1177,10 +1177,10 @@ preserved below for posterity.
   `Mutable` row.
 - `Mutable` is **not** declared and **not** builtin-injected. No
   default handler exists.
-- m7b #11 (parametric *effects*, `effect Foo[T] { … }`) is
+- m7b #11 (parametric *effects*, `effect Foo[t] { … }`) is
   orthogonal: it parameterises the effect, not the op. A
-  `State[Int]` handler serves only `Int`; per-op `[T]` lets one
-  handler instance serve every `T` at every call. Both kinds
+  `State[Int]` handler serves only `Int`; per-op `[t]` lets one
+  handler instance serve every `t` at every call. Both kinds
   coexist.
 
 #### Partition
@@ -1210,27 +1210,27 @@ Touches:
 3. **Resolver** — push the op's tparams onto the resolution
    environment when checking the op's signature, popped after.
    Distinct scope from the effect-level tparams (m7b #11): a
-   `State[T]` op can also have its own `op[U]`, with `T` bound at
-   the effect level and `U` per-op.
+   `State[t]` op can also have its own `op[u]`, with `t` bound at
+   the effect level and `u` per-op.
 4. **Inferencer** — at each call site `Eff.op(args)`, instantiate
    fresh tvars for the op's tparams (the same machinery that
-   handles `forall T. …` for top-level functions, applied to the
+   handles `forall t. …` for top-level functions, applied to the
    op's signature).
 5. **Codegen** — pass an implicit element-size hint per op tparam
    as an extra `i64` argument, before user args. The default
    handler ignores it; FFI handlers consume it. This is the
    simplest evidence-layout-stable encoding (Doc C §*Evidence-
    layout stability*); a richer runtime witness can come later.
-6. **Diagnostics** — render `Foo.op[T]` faithfully in error
+6. **Diagnostics** — render `Foo.op[t]` faithfully in error
    messages where the op signature is shown.
 
 Test fixtures (new, under `examples/effects/m7b_2a_*.kai`):
 
-- `m7b_2a_op_id_basic` — `effect Box { id[T](x: T) : T }` with a
+- `m7b_2a_op_id_basic` — `effect Box { id[t](x: t) : t }` with a
   trivial `id(x, resume) -> resume(x)` clause; one call with
   `T = Int`, one with `T = String`, in the same handler scope.
 - `m7b_2a_op_distinct_types` — same handler, two ops, distinct
-  per-op tparams (`get[T] : T` returning state-of-T).
+  per-op tparams (`get[t] : t` returning state-of-T).
 - `m7b_2a_negative_arity` — wrong number of tparams in op signature
   vs declaration (mirroring #11j arity check).
 - `m7b_2a_negative_undeclared_tparam` — op body mentions a tparam
@@ -1248,9 +1248,9 @@ top-level row.
 Touches:
 
 1. **Builtin decl** — add `builtin_mutable_decl()` mirroring Doc B
-   §`Mutable` §*Declaration*: `array_make[T]`, `array_length[T]`,
-   `array_get[T]`, `array_set[T]`, `array_grow[T]`,
-   `ref_make[T]`, `ref_get[T]`, `ref_set[T]`. All use per-op `[T]`
+   §`Mutable` §*Declaration*: `array_make[t]`, `array_length[t]`,
+   `array_get[t]`, `array_set[t]`, `array_grow[t]`,
+   `ref_make[t]`, `ref_get[t]`, `ref_set[t]`. All use per-op `[t]`
    (this is the first real consumer of #2a).
 2. **Injection** — `inject_builtin_effects` injects `Mutable` per
    `inject_one` (gated on main's row mentioning it) — **not** per
@@ -1325,7 +1325,7 @@ After #2b stabilises:
 - A richer runtime type witness beyond the implicit element-size
   hint. The hint suffices for `Mutable`'s FFI shape; richer
   witnesses can land if a future op needs them.
-- Migration of `Spawn` or `Actor[Msg]` to per-op generics. Doc B
+- Migration of `Spawn` or `Actor[msg]` to per-op generics. Doc B
   flags both as candidates but neither is in m7b's scope.
 
 ## Diagnostic quality
@@ -1431,7 +1431,7 @@ scheduler.
 Brief sketch (full spec in `docs/fibers-impl.md`, TBD):
 
 - `Spawn.spawn(body)` clause: allocate `Fiber`, copy parent's
-  evidence pointer, enqueue on scheduler, return a `Fiber[T]`
+  evidence pointer, enqueue on scheduler, return a `Fiber[t]`
   handle.
 - `Cancel.cancel(fib)` clause: mark the target fiber cancelled;
   the next `perform` on that fiber sees the `Cancel` op
@@ -1476,7 +1476,7 @@ allocation; effects within a fiber behave as specified above.
    *Tentative:* stay on cons; revisit after m7 lands and
    profiling is possible.
 
-2. **Tail-call optimisation inside `State[T]`-recursive
+2. **Tail-call optimisation inside `State[t]`-recursive
    functions.** When a recursive function reads and writes state
    on every call, the variable-specialisation pass must ensure
    the `load`/`store` do not defeat tail calls. Straightforward
@@ -1545,17 +1545,17 @@ allocation; effects within a fiber behave as specified above.
      régime decision (régime C, surface Effekt over Koka-style
      evidence-passing runtime) is revisited per §*Fallback*.
 
-7. **Per-op generics for non-trivially-copyable `T`.** §*Per-op
+7. **Per-op generics for non-trivially-copyable `t`.** §*Per-op
    type generics* describes the erased ABI as "raw bytes +
    element size". This works for `Int`, `Bool`, primitive-sized
    types. For `T = Option[Int]` or any sum/record type, the
    ABI needs the *layout*, not only the size — drop sequences,
-   alignment, tag positions all depend on `T`'s shape. The
-   monomorphic caller already knows `T`'s layout; what crosses
+   alignment, tag positions all depend on `t`'s shape. The
+   monomorphic caller already knows `t`'s layout; what crosses
    the erased boundary needs to be enough information for the
    op body to operate without re-deriving it.
    *Open.* Resolve during m7b implementation, before
-   `array_make[T]` ships for non-primitive `T`.
+   `array_make[t]` ships for non-primitive `t`.
 
 8. **Balance invariant under non-lexical fiber boundaries.**
    §*Per-fiber isolation* fixes the invariant `evidence_top ==
@@ -1576,7 +1576,7 @@ allocation; effects within a fiber behave as specified above.
    bodies. A hole inside a handler clause body should also
    surface the *effect context*: which clause it appears in,
    which op signature constrains its result, what the surrounding
-   `handle`'s `S` type is. None of that is reported today; the
+   `handle`'s `s` type is. None of that is reported today; the
    stub at m7a #4e treats clause bodies like ordinary
    expressions. Without it, the LLM-authorability bet (Tier 3,
    `CLAUDE.md`) loses precision exactly where effect-typed
@@ -1643,18 +1643,18 @@ page the way they are written.
      original plan in one important way: the core `array_*`
      calls inside `stage2/compiler.kai` itself are NOT migrated to
      `Mutable.array_*`. Reason: Doc B specifies
-     `array_set : (Array[T], Int, T) -> Unit`, but stage 2's
-     core returns `Array[T]` so internal
+     `array_set : (Array[t], Int, t) -> Unit`, but stage 2's
+     core returns `Array[t]` so internal
      `xs = array_set(xs, i, v)` chains type-check. Migrating the
      compiler's call sites would require either rewriting every
      such chain (~hundreds of sites) or matching the core shape
      in the Mutable signature (which then diverges from Doc B at
      the user surface). The Mutable op signatures here mirror the
-     core (Array[T] return) so the compiler sources stay
+     core (Array[t] return) so the compiler sources stay
      untouched and stage 2 keeps no `Mutable` in its row.
      Verified by `m7b_2b_mutable_default` (runtime default) and
      `m7b_2b_mutable_intercept` (user handler). `ref_*` ops
-     deferred — kaikai has no surface `Ref[T]` type today.
+     deferred — kaikai has no surface `Ref[t]` type today.
    - **#2c — Mutable internal migration audit**. **Landed as
      "no migration" decision.** Doc B §`Mutable` *Migration plan*
      anticipated migrating every core `array_*` call inside
@@ -1687,7 +1687,7 @@ page the way they are written.
      compiler can migrate to `Mutable.array_*` uniformly.
 
      Other audit findings:
-     - `Ref[T]` ops in Doc B remain deferred (no surface `Ref[T]`
+     - `Ref[t]` ops in Doc B remain deferred (no surface `Ref[t]`
        type yet).
      - The Doc B `array_set : … -> Unit` shape divergence
        documented in #2b stands; revisit when the bootstrap split
@@ -1712,7 +1712,7 @@ page the way they are written.
    `set` on effect Reader" diagnostic. **Landed.**
 5. **`var x := init`** — lowering after the resolver + variable
    specialisation (§*Variable specialisation*). **Landed.** Doc B
-   §3 mandates lowering to `handle { rest } with State[T](init) as
+   §3 mandates lowering to `handle { rest } with State[t](init) as
    name { ... }` with the canonical `get`/`set`/`return` clauses;
    `lower_vars_decls` (`stage2/compiler/desugar_var.kai`) walks every
    block, wraps the rest-of-block from each `SVar` onward in that
@@ -1720,7 +1720,7 @@ page the way they are written.
    innermost first. The resolver has already turned each read and
    write of the cell into a node naming its binder, and a literal
    `while`/`until`/`repeat` call of the core into a loop
-   intrinsic. The annotated form `var x: T := init` passes `[T]` as the
+   intrinsic. The annotated form `var x: t := init` passes `[t]` as the
    handler's syntactic type args; the unannotated form leaves the
    list empty and synth_handle fills `[type_of_init]` from the
    `init`'s inferred type. A pre-resolve alias rewrite (sibling
@@ -1735,18 +1735,18 @@ page the way they are written.
    guarantee, no Mutable-row contamination).
 6. **`a[i]` and `a[i] := v`** — pre-resolve desugar pass.
    **Landed.**
-7. **`Reader[T]` / `Writer[W]`** — new stdlib effects (Doc B
+7. **`Reader[t]` / `Writer[w]`** — new stdlib effects (Doc B
    §*Open questions* #2 resolved in their favour). The effect
    declarations are builtin-injected by `inject_builtin_effects`
    (since #11); `stdlib/reader.kai` and `stdlib/writer.kai` ship
-   the `with_reader[T, S]` / `with_writer[W]` helpers Doc B
+   the `with_reader[t, s]` / `with_writer[w]` helpers Doc B
    mandates so users do not have to inline
-   `handle ... with Reader[T] { ... }` at every call site.
+   `handle ... with Reader[t] { ... }` at every call site.
    Initially blocked on #13 + #14 (surfaced by the 2026-04-25
    attempt — polymorphic helpers need fn-level type parameters
    AND lambda bodies that carry their own row); both landed,
-   then this finished. `with_writer` returns just `[W]` rather
-   than the Doc B `(S, [W])` shape because kaikai does not yet
+   then this finished. `with_writer` returns just `[w]` rather
+   than the Doc B `(s, [w])` shape because kaikai does not yet
    have a tuple type at the surface — harvest the body's value
    via `var` or a closure if needed; tuple form is a follow-up.
    Test wired into `test-reader` and `test-writer` (Makefile);
@@ -1772,25 +1772,25 @@ page the way they are written.
 10. *Reserved.*
 11. **Parametric effects** — the umbrella sub-milestone that
     unblocks #4, #5 (desugar half), and #7. Scope:
-    - parser: `effect Foo[T] { ops }` accepts type parameters;
+    - parser: `effect Foo[t] { ops }` accepts type parameters;
     - AST: `DEffect` carries `[String]` tparams; `RowExpr`
       carries per-label type args (e.g. `Reader[Int]` distinct
       from `Reader[String]` in the row); `EHandle` carries an
-      `Option[Expr]` init for `with Eff[T](init)`;
+      `Option[Expr]` init for `with Eff[t](init)`;
     - resolver: per-instance substitution of op signatures
       (`Reader[Int].ask : Int` vs `Reader[String].ask : String`);
     - inferencer: type-arg unification per row label;
     - codegen: per-instantiation handler-struct emission, op
       dispatch parameterised by the type instantiation;
     - diagnostics: render `Reader[Int]`, not `Reader`.
-    First end-to-end user: `State[T]`. Once that lands,
-    `Reader[T]` and `Writer[W]` become the trivial stdlib pair
+    First end-to-end user: `State[t]`. Once that lands,
+    `Reader[t]` and `Writer[w]` become the trivial stdlib pair
     of #7. Comparable in scope to m7a #6 + #7 + #8 combined.
-    **Landed.** Sub-steps a/b (parser + AST), c-h (`State[T]`,
-    `Reader[T]`, `Writer[W]` end-to-end), i (per-instance
+    **Landed.** Sub-steps a/b (parser + AST), c-h (`State[t]`,
+    `Reader[t]`, `Writer[w]` end-to-end), i (per-instance
     `row.ty_args` propagation), j (arity check), k (diagnostics
     render type args), l (type-check `state` / `log` / `resume`),
-    m (followup tests). Promotion of `Reader[T]` / `Writer[W]`
+    m (followup tests). Promotion of `Reader[t]` / `Writer[w]`
     from test fixtures into `stdlib/` remains as #7.
 12. **Open row variables in user-written signatures** —
     `pub fn while(pred: () -> Bool / e, body: () -> Unit / e) :
@@ -1804,11 +1804,11 @@ page the way they are written.
     function's type parameters. Independent of #11; the two
     can land in either order. Blocker of `stdlib/loop.kai` as
     specified in `docs/stdlib-layout.md` §`loop`. **Landed.**
-13. **Polymorphic user-function signatures** — `fn name[T, S](...)`
+13. **Polymorphic user-function signatures** — `fn name[t, s](...)`
     declares per-function type parameters that generalise across
-    call sites the same way op-level `[T]` does for #2. Required
+    call sites the same way op-level `[t]` does for #2. Required
     for any polymorphic higher-order helper (Doc B's
-    `with_reader[T, S]`, `with_writer[W, S]`, future `map`, `fold`,
+    `with_reader[t, s]`, `with_writer[w, s]`, future `map`, `fold`,
     etc.). Surfaced by the 2026-04-25 attempt at #7. Implementation:
     `DFn` extended with a `[String]` tparam slot; `parse_fn_decl`
     accepts an optional `[T1, T2, …]` after the function name;
@@ -1827,7 +1827,7 @@ page the way they are written.
     external caller with a concrete element type exposed the
     mismatch. `fn_scheme_of_decl` and `infer_decl` now also
     auto-collect lowercase identifiers from the signature and
-    promote them to *implicit* tparams. The explicit `[T]` bracket
+    promote them to *implicit* tparams. The explicit `[t]` bracket
     form keeps working unchanged; users no longer have to write it
     when the lowercase identifier already appears in the signature.
     The negative fixture `m7b_13_lowercase_undeclared` is removed
@@ -1847,8 +1847,8 @@ page the way they are written.
     independent of the lambda type. `eff_uses` (per-label first-use
     diagnostics) intentionally stays unscoped so error spans still
     point at the right call. Combined with #13 this enables Doc B's
-    polymorphic helper shapes (`with_state[T, S]`,
-    `with_reader[T, S]`, `with_writer[W]`) applied to inline lambda
+    polymorphic helper shapes (`with_state[t, s]`,
+    `with_reader[t, s]`, `with_writer[w]`) applied to inline lambda
     bodies. Verified end-to-end with `m7b_14_state_helper.kai`,
     `m7b_14_reader_helper.kai`, `m7b_14_writer_helper.kai`.
     **Landed.**
@@ -1886,7 +1886,7 @@ page the way they are written.
     function argument — `body_escapes` walks the body checking;
     `init` is a normal expression — `init_is_safe` allows
     literals, EVar, core arithmetic, and non-effect calls)
-    the desugar swaps the `with State[T] as name { ... }`
+    the desugar swaps the `with State[t] as name { ... }`
     handler for `let name__slot = array_make(1, init); body'`
     where `body'` rewrites every `name.get()` to
     `array_get(name__slot, 0)` and every `name.set(v)` to
@@ -1925,7 +1925,7 @@ page the way they are written.
     enclosing `EBlock`'s trailing expression; `fv_arms` extends
     `own` with the pattern's bound names; `fv_hclauses` and
     `fv_hreturn` always include `state` and `log` so a `with
-    State[T]` desugared inside a lambda (the `var` body case)
+    State[t]` desugared inside a lambda (the `var` body case)
     does not lift those magic bindings into the capture array.
     Pre-existing — surfaced while landing #14. **Landed.**
 
@@ -1937,7 +1937,7 @@ then specialisation (m7b #5) piggybacks on top. m7b #11 and
 both have landed. m7b #13 and #14 are the post-#11 gaps surfaced
 by attempting #7 — neither was on the original m7b list, but
 together they unblock #7 and any future polymorphic higher-order
-helper. m7b #5b (`var` → `State[T]` desugar) landed; #15, #16,
+helper. m7b #5b (`var` → `State[t]` desugar) landed; #15, #16,
 and #17 are the three known gaps it left behind, promoted from
 the §*Known follow-ups after m7b #5b* subsection. m7b #13, #14,
 and #7 all landed in sequence after #5b. m7b #18 (lambda free-var
@@ -2045,7 +2045,7 @@ inside a closure. The proper fix needs:
      closure; the closure must read the outer cell, not the
      inner.
    - `m7b_15_explicit_handler_per_instance` — same shape, but
-     using user-written `with State[T] as a { with State[T] as
+     using user-written `with State[t] as a { with State[t] as
      b { ... } }` instead of the var sugar.
 
 **Trigger to schedule**: when a real-world program hits the

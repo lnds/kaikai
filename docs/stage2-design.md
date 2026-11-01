@@ -96,12 +96,12 @@ shape.
 - **Stdlib effect catalog** (Doc B): `Console`, `Stdin`, `Env`,
   `File` (granularised from a coarse `Io`, with `type Io =
   Console + Stdin + Env + File` as a closed alias);
-  `State[T]`, `Reader[T]`, `Writer[W]`, `Mutable`, `Cancel`,
-  `Spawn`, `Ffi`. Mailboxes (`Actor[Msg]`) live in
+  `State[t]`, `Reader[t]`, `Writer[w]`, `Mutable`, `Cancel`,
+  `Spawn`, `Ffi`. Mailboxes (`Actor[msg]`) live in
   `docs/actors.md`. The runtime installs default handlers for
   `Console`/`Stdin`/`Env`/`File`/`Mutable`/`Cancel`/`Spawn`/`Ffi`
-  when `main`'s row contains them; `State[T]`/`Reader[T]`/
-  `Writer[W]` always require an explicit handler.
+  when `main`'s row contains them; `State[t]`/`Reader[t]`/
+  `Writer[w]` always require an explicit handler.
 
 ### 4. Fibers + scheduler
 
@@ -116,8 +116,8 @@ shape.
   not interrupted until it reaches one — `Spawn.yield()` is the
   canonical pinning point. See `docs/structured-concurrency.md`
   §*Non-goals* for the rule.
-- `Fiber[T]` is a region-branded **handle** tagged with the
-  brand of the enclosing nursery (same machinery as `Pid[Msg]`
+- `Fiber[t]` is a region-branded **handle** tagged with the
+  brand of the enclosing nursery (same machinery as `Pid[msg]`
   in `docs/actors.md`); it cannot escape its scope.
 
 ### 5. Structured concurrency
@@ -129,8 +129,8 @@ Stage 2 is where it lands (m8).
   `docs/syntax-sugars.md` §1) to a stdlib helper that installs
   the `Spawn` effect handler.
 - `Spawn` and `Cancel` effects defined in the stdlib.
-- Region-branding of `Fiber[T]` lives in the type checker; the
-  same brand machinery is shared with `Pid[Msg]` from
+- Region-branding of `Fiber[t]` lives in the type checker; the
+  same brand machinery is shared with `Pid[msg]` from
   `docs/actors.md`.
 
 ### 5b. Actors
@@ -138,7 +138,7 @@ Stage 2 is where it lands (m8).
 Design pinned in `docs/actors.md`. Lands in m8 alongside the
 scheduler and `Spawn`.
 
-- `Actor[Msg]` parameterised effect with `self`, `send`,
+- `Actor[msg]` parameterised effect with `self`, `send`,
   `receive` ops; `send` and `receive` carry `Cancel` because
   blocking on a full mailbox or empty receive is a yield point.
 - Mailbox policies: `Unbounded`, `Bounded(capacity, on_full)`
@@ -147,7 +147,7 @@ scheduler and `Spawn`.
 - Stdlib helpers: `spawn_actor` (explicit policy),
   `spawn_actor_default` (`Bounded(1024, BlockSender)`),
   `with_mailbox` (mailbox in the current fiber), all passing
-  the capability as `m: ActorCap[Msg]` to the body.
+  the capability as `m: ActorCap[msg]` to the body.
 - Supervision: `Link` (bidirectional, auto-cancels peer) and
   `Monitor` (unidirectional, sends `MonitorDown` to observer).
 
@@ -380,7 +380,7 @@ in.
      generics (Doc A amendment), trailing lambdas, naked cell
      read / `cap := v` capability sugar, local mutable cells
      (`var x := init`), array indexing (`a[i]` / `a[i] := v`),
-     `Reader[T]` / `Writer[W]` as their own effects.
+     `Reader[t]` / `Writer[w]` as their own effects.
    - **m7c — LLVM effects port**: replicate the m7a/m7b
      effects codegen in the LLVM backend. Today
      `llvm_emit_expr` falls through to "unsupported expression
@@ -398,7 +398,7 @@ in.
      is statically visible.
    - **m7d — ergonomic sugars**: five parser-only additions
      from `docs/proposed-extensions.md`:
-     - §1 `todo!(msg) : T` — principled unimplemented marker,
+     - §1 `todo!(msg) : t` — principled unimplemented marker,
        grep-able replacement for `// TODO`, reuses the typed
        holes runtime.
      - §10 record punning `{ x, y }` — drops the
@@ -418,7 +418,7 @@ in.
      - §13 `!` postfix — `expr!` propagates `Option` /
        `Result` errors to the caller.
        Syntax already reserved in `kaikai-minimal.md`.
-     - §11 `variants[T]()` builtin — enumerate sum-type
+     - §11 `variants[t]()` builtin — enumerate sum-type
        constructors at compile time; useful for
        discriminator code and exhaustive testing helpers.
      - §24 `main()` row inference — drop the mandatory row
@@ -455,8 +455,8 @@ in.
 8. **m8 — Fibers + structured concurrency + actors**: CPS
    scheduler, `Spawn` / `Cancel` effects with default
    handlers, `nursery { n -> ... }` helper, region-branded
-   `Fiber[T]`. Same milestone delivers `Actor[Msg]`,
-   `Pid[Msg]`, mailbox policies, link/monitor supervision —
+   `Fiber[t]`. Same milestone delivers `Actor[msg]`,
+   `Pid[msg]`, mailbox policies, link/monitor supervision —
    designs in `docs/structured-concurrency.md` and
    `docs/actors.md`.
 
@@ -618,8 +618,8 @@ in.
     consistent with the rest of the I/O surface. **Status:** the
     consolidation is **deferred** in m14 v1; it is independent
     of the qualified-call work and lands on a separate lane.
-    Lands the collection-design pass on top: `Map[K, V]`,
-    `Vector[T]`, `Range[T]` (see `docs/proposed-extensions.md`
+    Lands the collection-design pass on top: `Map[k, v]`,
+    `Vector[t]`, `Range[t]` (see `docs/proposed-extensions.md`
     §17, §20).
 15. **m15 — `kai fmt`** using the stage 2 parser. Canonical,
     no options (gofmt-style discipline).
@@ -664,13 +664,13 @@ Rationale:
    parser is still warm from m7b. Without m7d the language
    reads as "almost there" to a senior trying v1.
 3.6. **m7e (error propagation polish)** — `!` postfix on
-   `Option`/`Result`, `variants[T]()` builtin. ~1-2 days.
+   `Option`/`Result`, `variants[t]()` builtin. ~1-2 days.
    Lands once `Option` and `Result` are firm in prelude (post
    m7b/m7c). `!` is the highest-value pending sugar after UoM
    and refinements; without it, error handling reads verbose.
    **Update 2026-04-26**: `!` postfix is extracted into its own
    mini-lane (`!`-postfix-only) ahead of m12.8; the rest of m7e
-   (`variants[T]()`, main-row inference, `use Effect`) lands after
+   (`variants[t]()`, main-row inference, `use Effect`) lands after
    m12 selfhost checkpoint. See "Update 2026-04-26 — post-m7b
    reordering" at the end of this section.
 3.7. **m7f (LLM affordances + method refs)** — `kai effects
@@ -747,7 +747,7 @@ Rationale:
      is a follow-up).
    - **m12.6.e** — `ensure(value) where pred` primary expression
      desugars to `{ let self = value; if pred { Some(self) } else
-     { None } }`, returning `Option[T]` for explicit narrowing.
+     { None } }`, returning `Option[t]` for explicit narrowing.
      Recognised only when `ensure(...)` is followed by `where`, so
      user-defined `ensure` functions are unaffected.
 
@@ -1182,7 +1182,7 @@ walker, or a regression fixture.
 What is **not** in Core but is part of Full:
 
 - ~~Remaining m7e items~~: all three landed 2026-04-27 —
-  `variants[T]()` (Full lane 1.3, `docs/proposed-extensions.md`
+  `variants[t]()` (Full lane 1.3, `docs/proposed-extensions.md`
   §11), `use Effect` (Full lane 1.4, §25), and `main()` row
   inference (Full lane 1.5, §24, commit `7e36027`).
 - ~~m7f LLM affordances~~ (landed 2026-04-27 as Full lane 2.3 —
@@ -1229,7 +1229,7 @@ Core lane itself.
   Each walker keeps explicit cases only for kinds it actually
   transforms or that need scope-aware bookkeeping; everything
   else falls through to the visitor. Adding a new `ExprKind`
-  variant (m7e `variants[T]()`, m12.6 refinement carriers, future
+  variant (m7e `variants[t]()`, m12.6 refinement carriers, future
   actor primitives) now breaks the compiler at the visitor's
   match site instead of silently degrading ten walkers.
   Net: −1031 / +236 lines in `stage2/compiler.kai`, 12 commits

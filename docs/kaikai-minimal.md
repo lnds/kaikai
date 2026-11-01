@@ -19,7 +19,7 @@ To make the scope explicit:
 
 - No full effects system — only an implicit `Io` is available via a handful of built-in functions.
 - No type inference beyond local propagation (the type of a `let` comes from its RHS; nothing else is inferred).
-- No generics beyond a fixed set (`Option[T]`, `Result[T, E]`, `List[T]` — that's it).
+- No generics beyond a fixed set (`Option[t]`, `Result[t, e]`, `List[t]` — that's it).
 - No fibers, no actors, no concurrency.
 - No `|` pipe (map). Stage 0 only supports `|>` (apply).
 - No `with` record update. Stage 0 builds records only via full-literal construction.

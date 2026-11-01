@@ -34,7 +34,7 @@ unification discipline that decides how its habitants unify:
 
 | Kind      | Theory | Engine | Introducer | Inhabits |
 |-----------|--------|--------|------------|----------|
-| `Type`    | `HindleyMilner` | builtin (the compiler's HM unifier) | `type` | ordinary types: `Int`, `String`, `[T]`, `Option[T]`, user records and variants |
+| `Type`    | `HindleyMilner` | builtin (the compiler's HM unifier) | `type` | ordinary types: `Int`, `String`, `[t]`, `Option[t]`, user records and variants |
 | `Effect`  | `EffectRow` | builtin (the compiler's row-unification) | `effect` | effect labels: `Stdout`, `State`, `Spawn` |
 | `Measure` | `AbelianGroup` | hand-written abelian unifier | `unit` | units of measure: `m`, `kg`, `m/s`, `m^2` |
 | `Currency` | `Module` | nominal atom equality + formation guard | `currency` | currencies: `USD`, `EUR` (habitants ship in `stdlib/money.kai`) |
@@ -72,7 +72,7 @@ product, no inverse, no sum — a habitant stands only for itself.
 
 `Shape` was once grouped under a shared `Structural` label with
 `Region`. It is not: shape unification binds a constructor
-witness by decomposing `s[A]`, which region identity never does.
+witness by decomposing `s[a]`, which region identity never does.
 `Shape` carries its own theory, `ConstructorApp`.
 
 A region habitant is never declared at item scope the way

@@ -10,16 +10,16 @@ their shape, precedence, and desugaring.
 
 The five sugars:
 
-1. **Trailing lambdas** — the last `() -> T` argument of any
+1. **Trailing lambdas** — the last `() -> t` argument of any
    call can be written as a block outside the parens. The
    block-form `{ x -> body }` is also legal as a standalone
    lambda expression in non-trailing positions (operand of
    `|` / `|>`, RHS of `let`, etc.).
 2. **Capability read/write** — a naked read `cap` and
-   `cap := v` as short forms for capability ops on `State[T]`
-   and `Reader[T]`.
+   `cap := v` as short forms for capability ops on `State[t]`
+   and `Reader[t]`.
 3. **Local mutable cells** — `var x := init` declares an
-   in-block `State[T]` handler.
+   in-block `State[t]` handler.
 4. **Array indexing** — `a[i]` and `a[i] := v` for
    `Mutable.array_get` / `Mutable.array_set`.
 5. **Double trailing lambdas** — when the last two arguments
@@ -80,7 +80,7 @@ Two filters justify accepting this surface:
    "few forms, each with clear intent" standard.
 2. **None replaces an existing form.** The long forms —
    `counter.get()`, `counter.set(v)`, `Mutable.array_get(a, i)`,
-   `handle { ... } with State[T](init) as name { ... }` —
+   `handle { ... } with State[t](init) as name { ... }` —
    remain legal. Sugar is additive.
 
 The sugars that were **rejected** during Doc B review are also
@@ -273,14 +273,14 @@ on the receiver's type:
 
 | Receiver shape | naked `cap` lowers to | `cap := v` lowers to |
 |---|---|---|
-| `State[T]` (an `as`-bound handler capability) | `cap.get()` (resolves to `State.get`) | `cap.set(v)` |
-| `Reader[T]` (an `as`-bound handler capability) | `cap.get()` (alias-rewritten to `Reader.ask`) | rejected — `Reader` has no `set` op |
-| `Ref[T]` (a value of type `Ref[T]`, e.g. a `let` or fn parameter) | not a read — `@cap` is `Mutable.ref_get(cap)` | `Mutable.ref_set(cap, v)` |
+| `State[t]` (an `as`-bound handler capability) | `cap.get()` (resolves to `State.get`) | `cap.set(v)` |
+| `Reader[t]` (an `as`-bound handler capability) | `cap.get()` (alias-rewritten to `Reader.ask`) | rejected — `Reader` has no `set` op |
+| `Ref[t]` (a value of type `Ref[t]`, e.g. a `let` or fn parameter) | not a read — `@cap` is `Mutable.ref_get(cap)` | `Mutable.ref_set(cap, v)` |
 
 The first two require an `as`-bound name (rule 4 below). The third
-works on any value typed `Ref[T]` regardless of how it was bound,
+works on any value typed `Ref[t]` regardless of how it was bound,
 including a function parameter, mirroring the way `a[i] := v` adds
-`Mutable` to the row for arrays. A `Ref[T]` comes from `&init` and
+`Mutable` to the row for arrays. A `Ref[t]` comes from `&init` and
 crosses function boundaries, which `var` cannot.
 
 ```kaikai
@@ -309,17 +309,17 @@ fn main() : Unit / Stdout + Mutable = {
 
 Four restrictions, lifted verbatim from Doc B:
 
-1. A naked read applies **only to `State[T].get()` and
-   `Reader[T].ask()`**. A `Ref[T]` reads through `@r`.
-2. `cap := v` applies **only to `State[T].set(v)` and
-   `Mutable.ref_set(c, v)` for `c : Ref[T]`**.
+1. A naked read applies **only to `State[t].get()` and
+   `Reader[t].ask()`**. A `Ref[t]` reads through `@r`.
+2. `cap := v` applies **only to `State[t].set(v)` and
+   `Mutable.ref_set(c, v)` for `c : Ref[t]`**.
 3. A naked-read identifier must be **a simple capability
    binding** (`counter`, not `config.section.level`).
-4. The naked read and `:=` on a `State[T]` / `Reader[T]`
+4. The naked read and `:=` on a `State[t]` / `Reader[t]`
    capability require **an `as`-bound capability name**. Using
    the default capability name (`State` itself) keeps the
-   explicit `State.get()` / `State.set(v)` form. (`Ref[T]` has
-   no "default name" — every `Ref[T]` value is bound by an
+   explicit `State.get()` / `State.set(v)` form. (`Ref[t]` has
+   no "default name" — every `Ref[t]` value is bound by an
    ordinary `let` or parameter, so this rule does not apply
    to the `Ref` shape.)
 
@@ -345,18 +345,18 @@ Stmt        ::= ...
 ```
 
 Both are resolved by the checker, which verifies the
-identifier's type. `StateCap[T]` and `ReaderCap[T]` below are
+identifier's type. `StateCap[t]` and `ReaderCap[t]` below are
 the internal types the compiler assigns to `as`-bound
 capabilities of the corresponding effects — they are checker
 implementation details, not names users spell in source code.
 
 - a naked read of `x` lowers to the get/ask op iff
-  `x : StateCap[T]` (for any `T`) or `x : ReaderCap[T]`; otherwise
+  `x : StateCap[t]` (for any `t`) or `x : ReaderCap[t]`; otherwise
   `x` stays an ordinary variable read.
-- `x := v` legal iff `x : StateCap[T]` and `v : T`, or
-  `x : Ref[T]` and `v : T`, **or** the array-indexing form below.
+- `x := v` legal iff `x : StateCap[t]` and `v : t`, or
+  `x : Ref[t]` and `v : t`, **or** the array-indexing form below.
 
-When `x : Ref[T]`, the call site adds `Mutable` to the enclosing
+When `x : Ref[t]`, the call site adds `Mutable` to the enclosing
 function's effect row, mirroring the `a[i] := v` /
 `Mutable.array_set` row injection.
 
@@ -391,7 +391,7 @@ var name := init         # with inference
 desugars, in the same block, to:
 
 ```text
-handle { /* rest of block */ } with State[T](init) as name {
+handle { /* rest of block */ } with State[t](init) as name {
   get(resume)    -> resume(state)
   set(v, resume) -> resume((), v)
   return(x)      -> x
@@ -405,9 +405,9 @@ The `name` of the `var` declaration becomes the `as` binding of
 the synthesised `handle` — there is no separate step. Scope and
 shadowing rules for that binding are in §*Scope* below.
 
-Because the synthesised `handle` opens and closes `State[T]`
+Because the synthesised `handle` opens and closes `State[t]`
 inside the same block, the enclosing function's effect row
-does **not** gain `State[T]` — the cell is purely local. See
+does **not** gain `State[t]` — the cell is purely local. See
 §*Effect-row impact* below for the full statement.
 
 ### Grammar delta
@@ -441,7 +441,7 @@ Rules that follow from the desugar:
 - A `var` declaration may also appear at the top of a
   handler-clause list (before all operation clauses, sibling
   to them inside `handle { ... } with Eff { ... }`). It
-  desugars to a sibling `with State[T](init) as name` wrapping
+  desugars to a sibling `with State[t](init) as name` wrapping
   the handler. Reads inside clause bodies use the same
   naked `name` / `name.get()` forms as anywhere else; `var` and
   `let` must precede every operation clause inside one
@@ -449,12 +449,12 @@ Rules that follow from the desugar:
 
 ### Effect-row impact
 
-Because the implicit `handle` closes `State[T]` in the same
+Because the implicit `handle` closes `State[t]` in the same
 block, the enclosing function's effect row **does not** gain
-`State[T]`. A `var counter := 0` inside a function of signature
+`State[t]`. A `var counter := 0` inside a function of signature
 `: Int / Console` leaves the signature untouched.
 
-`var` encapsulates `State[T]` and nothing else. Any other
+`var` encapsulates `State[t]` and nothing else. Any other
 effect the body uses — `Console.print(counter)`,
 `File.write_file(...)`, `Spawn.yield()` — still appears in the
 enclosing function's row, same as without the `var`. The sugar
@@ -465,7 +465,7 @@ does not hide anything else about what the body does.
 
 The compiler recognises the canonical clauses (the ones
 `var` emits) plus the lack of `resume_multishot` and
-specialises the `handle { ... } with State[T](init) { ... }`
+specialises the `handle { ... } with State[t](init) { ... }`
 into a stack-allocated mutable slot. Koka calls this
 "variable specialization". After LLVM's `mem2reg`, the
 generated code is identical to what a C-style mutable `int`
@@ -490,7 +490,7 @@ a[i]         ≡   Mutable.array_get(a, i)      # read
 a[i] := v    ≡   Mutable.array_set(a, i, v)   # write
 ```
 
-Both require `a : Array[T]` (for some `T` inferred at the call
+Both require `a : Array[t]` (for some `t` inferred at the call
 site) and `Mutable` in the effect row. The checker enforces
 both; a missing `Mutable` produces the standard
 "`Mutable` not handled" error with a hint about wrapping in
@@ -498,7 +498,7 @@ both; a missing `Mutable` produces the standard
 
 Out-of-bounds access (`i < 0` or `i >= Mutable.array_length(a)`)
 panics via the runtime's audited escape (`kai_core_panic`);
-`Mutable` ops do not return `Option[T]` for out-of-bounds. Same
+`Mutable` ops do not return `Option[t]` for out-of-bounds. Same
 semantics in the sugar as in the underlying ops — see Doc B
 §`Mutable` for the full statement.
 
@@ -530,12 +530,12 @@ followed by `[...]` is an array write.
 
 ### Map dispatch
 
-When `e1 : Map[K, V]`, the same `e1[e2]` postfix lowers instead
-to `map.get(e1, e2) : Option[V]`. The typer picks the lowering
+When `e1 : Map[k, v]`, the same `e1[e2]` postfix lowers instead
+to `map.get(e1, e2) : Option[v]`. The typer picks the lowering
 by inspecting the inferred type of `e1` at the index site;
-`Array[T]` keeps the `array_get` semantics above unchanged, and
-unresolved type variables default to `Array[T]` so the existing
-"expected `Array[T]`" diagnostic still fires when an unannotated
+`Array[t]` keeps the `array_get` semantics above unchanged, and
+unresolved type variables default to `Array[t]` so the existing
+"expected `Array[t]`" diagnostic still fires when an unannotated
 local is indexed without a constructor hint.
 
 ```kaikai
@@ -555,12 +555,12 @@ fn main() : Unit / Stdout + Mutable = {
 ```
 
 A `Map` is immutable, so the write-side sugar `m[k] := v` is a
-compile error on `Map[K, V]`: use `map.put(m, k, v)` and rebind, or a
+compile error on `Map[k, v]`: use `map.put(m, k, v)` and rebind, or a
 `HashMap` to mutate in place.
 
 ### Related forms
 
-- **`Ref[T]`** has its own sugar: `&init`, `r := v`, `@r`
+- **`Ref[t]`** has its own sugar: `&init`, `r := v`, `@r`
   (§2, `docs/ref-sugar-design.md`).
 - **Slicing** — `xs[a..b]` slices a `Vec` by range (`kai info vec`).
 
@@ -678,9 +678,9 @@ stdlib record types — no new TyCtor, zero typer/RC cost.
 (a, b, c, d)          ≡  Quad  { fst: a, snd: b, trd: c, frt: d }
 
 # Type
-(A, B)                ≡  Pair[A, B]
-(A, B, C)             ≡  Triple[A, B, C]
-(A, B, C, D)          ≡  Quad[A, B, C, D]
+(a, b)                ≡  Pair[a, b]
+(a, b, c)             ≡  Triple[a, b, c]
+(a, b, c, d)          ≡  Quad[a, b, c, d]
 
 # Pattern (let-destructure or match arm)
 let (a, b) = pair     ≡  let Pair { fst: a, snd: b } = pair
@@ -1463,7 +1463,7 @@ Parsing this unambiguously walks:
 - `counter < max` — `counter` is an ordinary `Ident` the checker
   rewrites to a cap read, binary `<`.
 - `buffer[e.id] := e.payload` — indexed write. `buffer` must
-  be `Array[T]`; the checker picks `T` from `e.payload`.
+  be `Array[t]`; the checker picks `t` from `e.payload`.
 - `counter := counter + 1` — capability write + capability
   read.
 - `Stdout.print("processed #{counter}")` — interpolation
@@ -1479,8 +1479,8 @@ lookahead. No extra peek beyond that is required.
 Candidates discussed during Doc B review and rejected, with
 reasons:
 
-- **A naked read for `Ref[T]`.** A bare `r` does not read a
-  `Ref[T]`; `@r` does. A `Ref` is a value, not a capability
+- **A naked read for `Ref[t]`.** A bare `r` does not read a
+  `Ref[t]`; `@r` does. A `Ref` is a value, not a capability
   binding, so reading through it is marked.
 
 - **`counter <- v` (Haskell-style) instead of `counter := v`.**
@@ -1538,12 +1538,12 @@ reasons:
    *Decided:* error at top level. The broader rule: kaikai has
    **no mutable state at module scope** — modules are for
    definitions (types, effects, functions, constants), and any
-   mutable cell (`State[T]`, `Mutable` ref/array) lives inside
+   mutable cell (`State[t]`, `Mutable` ref/array) lives inside
    a function. `var` at file top level emits a `handle` with
    nowhere to close; the checker rejects it with a message
    pointing at the `var` keyword and suggesting to put the cell
    inside `main` or whichever entry point needs it. The same
-   rule forbids file-level `handle ... with State[T](init)
+   rule forbids file-level `handle ... with State[t](init)
    { ... }` sites — there is no enclosing function body to
    be the handler's `body`.
 

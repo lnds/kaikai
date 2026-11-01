@@ -37,8 +37,8 @@ on.
 |--------------------------------------------|----------|-------------------------|
 | Sum types with constant attributes         | proposed | parser + resolution     |
 | `?.` optional chaining                     | proposed | parser + type checker   |
-| Slice syntax `a[i..j]`                     | landed on `Vec[T]` (`kai info vec`) | `Vector[T]` landing     |
-| `Range[T]` as a first-class iterable       | proposed | collection design       |
+| Slice syntax `a[i..j]`                     | landed on `Vec[t]` (`kai info vec`) | `Vector[t]` landing     |
+| `Range[t]` as a first-class iterable       | proposed | collection design       |
 | Binary pattern matching `<<...>>`          | proposed | parser + match exhaustiveness |
 
 ## 1. `kai type <pos> --json` — queryable type-at-position
@@ -230,10 +230,10 @@ nullability in kaikai).
 
 ### Semantics
 
-- `x?.field` where `x : Option[T]` and `T` has a field `field : F`:
+- `x?.field` where `x : Option[t]` and `t` has a field `field : F`:
   - `None -> None`
   - `Some(v) -> Some(v.field)` if `F` is not `Option[...]`
-  - `Some(v) -> v.field`        if `F` is already `Option[U]`
+  - `Some(v) -> v.field`        if `F` is already `Option[u]`
     (flattens — same as Swift)
 - Chainable: `x?.a?.b?.c` short-circuits at the first `None`.
 - Does **not** short-circuit the enclosing function. `!` does that;
@@ -242,7 +242,7 @@ nullability in kaikai).
 ### What it buys
 
 - Linear, readable navigation through optional fields.
-- Complements `!`: `?.` builds an `Option[T]` at the current
+- Complements `!`: `?.` builds an `Option[t]` at the current
   expression; `!` propagates the `None` out. Both are needed for
   different patterns.
 
@@ -252,11 +252,11 @@ nullability in kaikai).
 - Parser must distinguish `?.` from separate `?` and `.` tokens.
   Easy with LL(1) + lookahead.
 - Type checker needs one rule per invocation site. The flattening
-  case (`Option[Option[T]]` → `Option[T]`) mirrors `opt_and_then`.
+  case (`Option[Option[t]]` → `Option[t]`) mirrors `opt_and_then`.
 
 ### Constraints
 
-- Works on `Option[T]` only — not on `Result`, not on user-defined
+- Works on `Option[t]` only — not on `Result`, not on user-defined
   sum types. Same reasoning as `!`: generalising would require
   typeclasses.
 - No `?[i]` for optional list indexing in the first pass —
@@ -275,7 +275,7 @@ pass (to nested `opt_and_then`).
 
 ## 6. Slice syntax `a[i..j]`
 
-Proposed form; kaikai today slices a `Vec[T]` with an inclusive
+Proposed form; kaikai today slices a `Vec[t]` with an inclusive
 `v[a..b]` view (`kai info vec`), and lists and arrays have no slice
 syntax:
 
@@ -307,28 +307,28 @@ Swift.
   large arrays.
 - Interaction with `Mutable`: a view into a mutable array is
   itself mutable, which pushes into region-type territory
-  (same brand mechanism as `Fiber[T]` and `Pid[Msg]`).
+  (same brand mechanism as `Fiber[t]` and `Pid[msg]`).
 
 ### Decision posture
 
-Slice syntax makes most sense alongside `Vector[T]` (post-MVP,
-see Doc B §*Out of scope for v1*). `Vector[T]` is persistent
+Slice syntax makes most sense alongside `Vector[t]` (post-MVP,
+see Doc B §*Out of scope for v1*). `Vector[t]` is persistent
 and has no mutation concerns, so "slice = view" is cheap and
-unambiguous. For `Array[T]`, a slice either copies (simplest)
+unambiguous. For `Array[t]`, a slice either copies (simplest)
 or carries the same lifetime brand the region machinery already
 supports.
 
-The recommended order is: (i) land `Vector[T]` with copying
-slice semantics for `Array[T]` as a first approximation, (ii)
+The recommended order is: (i) land `Vector[t]` with copying
+slice semantics for `Array[t]` as a first approximation, (ii)
 revisit view-style slices once region types have proven
 themselves elsewhere.
 
 **Cost**: low for a copying implementation; medium for
 view-based slices with region tracking.
-**Depends on**: `Vector[T]` landing; range-literal `..`
+**Depends on**: `Vector[t]` landing; range-literal `..`
 confirmed in the grammar.
 
-## 7. `Range[T]` as a first-class iterable
+## 7. `Range[t]` as a first-class iterable
 
 Proposed form (not implemented; kaikai has `[1..n]` lists and lazy
 `lazy [1..]` sequences, `kai info seq`):
@@ -337,14 +337,14 @@ Proposed form (not implemented; kaikai has `[1..n]` lists and lazy
 # Today (only as list literal):
 each([1..4]) { i -> ... }
 
-# With Range[T] as a value:
+# With Range[t] as a value:
 each(1..4) { i -> ... }
 for i in 1..n { ... }                # if `for` lands too
 ```
 
 Today kaikai-minimal allows `[1..n]` as syntax for *constructing
 a list* with a range fill. `1..n` on its own — without the
-brackets — is not a value. Adding `Range[T]` as a first-class
+brackets — is not a value. Adding `Range[t]` as a first-class
 type would let `1..4` evaluate to a value that `each`, `map`,
 `filter`, etc., can iterate over directly, without an
 intermediate list allocation.
@@ -361,14 +361,14 @@ intermediate list allocation.
 
 ### What it costs
 
-- A new built-in parametric type `Range[T]` (probably
+- A new built-in parametric type `Range[t]` (probably
   `Range[Int]` and `Range[Char]` to start; full polymorphism
   needs a `Stepable` capability or similar).
 - Higher-order helpers (`each`, `map`, `filter`, etc.) need to
-  accept either `[T]` or `Range[T]` — easiest with a common
-  `Iterable[T]` abstraction, which kaikai does not have today.
-  Without it, each helper grows two overloads (or `Range[T]` is
-  silently coerced to `[T]`, which loses the laziness benefit).
+  accept either `[t]` or `Range[t]` — easiest with a common
+  `Iterable[t]` abstraction, which kaikai does not have today.
+  Without it, each helper grows two overloads (or `Range[t]` is
+  silently coerced to `[t]`, which loses the laziness benefit).
 - Parser distinction between `[1..n]` (list literal) and `1..n`
   (range value). Both should remain legal; `[1..n]` keeps
   meaning "list with these contents", `1..n` keeps meaning "the
@@ -377,14 +377,14 @@ intermediate list allocation.
 ### Decision posture
 
 Wanted alongside the collection-design pass that closes Doc B's
-`Vector[T]` Known gap (§*Out of scope for v1*). The trio
-`Vector[T]` + `Map[K, V]` + `Range[T]` is the natural set to
+`Vector[t]` Known gap (§*Out of scope for v1*). The trio
+`Vector[t]` + `Map[k, v]` + `Range[t]` is the natural set to
 design together — they share the question "what is the kaikai
 notion of an iterable?".
 
 **Cost**: medium. New built-in type, helper overloads,
 parser. Coupled with the iterable-abstraction question.
-**Depends on**: collection design (`Vector[T]`, `Map[K, V]`).
+**Depends on**: collection design (`Vector[t]`, `Map[k, v]`).
 
 ## 8. Binary pattern matching `<<...>>`
 
@@ -507,7 +507,7 @@ rejected elsewhere in the design:
   direct-style effects do not need a bind operator. Adding `<-`
   would be a second mechanism for the same flow. The flat-map pipe
   `||` is **not** the same proposal: `||` is a binary pipe over
-  containers in the `Sequence` family (`[T]`, future `Stream[T]`),
+  containers in the `Sequence` family (`[t]`, future `Stream[t]`),
   with `Option` / `Result` explicitly outside the dispatch table.
   Different problems, different surface.
 - **`$` low-precedence apply (Haskell-style)**: `|>` and `|` already
@@ -549,12 +549,12 @@ of that one conversation — not drip-fed.
   been used enough to confirm the two do not overlap in practice.
   `?.` is local; `!` propagates. If the code base mostly wants
   propagation, `?.` may not be worth the complexity.
-- **Slice syntax `a[i..j]`**: lands *after* `Vector[T]` ships.
-  Copying semantics over `Array[T]` is the first-approximation
+- **Slice syntax `a[i..j]`**: lands *after* `Vector[t]` ships.
+  Copying semantics over `Array[t]` is the first-approximation
   implementation; view-based slices with region tracking wait
   for region types to prove themselves elsewhere.
-- **`Range[T]` as a first-class iterable**: lands together
-  with the collection design pass (`Vector[T]`, `Map[K, V]`).
+- **`Range[t]` as a first-class iterable**: lands together
+  with the collection design pass (`Vector[t]`, `Map[k, v]`).
   Designing iterability across these three types in one go
   avoids retrofitting helpers later.
 - **Binary pattern matching `<<...>>`**: a milestone in its own

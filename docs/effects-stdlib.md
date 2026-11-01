@@ -35,16 +35,16 @@ and used by the stdlib sparingly.
 | `Process`       | OS-level process spawn, wait, exit            | yes (runtime, if in `main`'s row) |
 | `Signal`        | trap POSIX signals on the running process     | yes (runtime, if in `main`'s row) — POSIX only |
 | `Log`           | leveled diagnostic logging                    | yes (runtime, if in `main`'s row) — writes to stderr |
-| `State[T]`      | value-threaded mutable state                  | no (user supplies)    |
-| `Reader[T]`     | read-only ambient value                       | no (user supplies)    |
-| `Writer[W]`     | accumulating log / output                     | no (user supplies)    |
+| `State[t]`      | value-threaded mutable state                  | no (user supplies)    |
+| `Reader[t]`     | read-only ambient value                       | no (user supplies)    |
+| `Writer[w]`     | accumulating log / output                     | no (user supplies)    |
 | `Mutable`       | heap cells and arrays (the `Array` escape)    | yes (runtime-trivial, invisible in user code) |
 | `Cancel`        | cooperative cancellation                      | yes (scheduler-wired) |
 | `Spawn`         | fibers and nurseries                          | yes (root nursery) — cross-ref `docs/structured-concurrency.md` |
 | `Ffi`           | crossings to C via `extern "C"` declarations  | yes (compiler-synthesised) |
 | `Js`            | crossings to JavaScript via `extern "js"` declarations | no (refused at `main` on a host build; runs on `wasm32-browser`) |
 
-Mailboxes and message passing (`Actor[Msg]`, with `Link` and
+Mailboxes and message passing (`Actor[msg]`, with `Link` and
 `Monitor`) are specified in `docs/actors.md`, because the mailbox
 model (bounded vs unbounded, supervision, links/monitors) is its own
 design surface; it does not fit inside a single table row.
@@ -97,8 +97,8 @@ exists only when one of these three applies; none is arbitrary.
 
 1. **Value-transportable** (`Stdout`, `Stderr`, `Stdin`, `Env`,
    `File`, `Clock`, `Random`, `SecureRandom`, the network effects,
-   `Process`, `Signal`, `Mutable`, and the user-defined `State[T]`,
-   `Reader[T]`, `Writer[W]`). Their evidence is a value that travels
+   `Process`, `Signal`, `Mutable`, and the user-defined `State[t]`,
+   `Reader[t]`, `Writer[w]`). Their evidence is a value that travels
    as an injected hidden parameter; the `default { }` property decides
    only which supplier fills the slot. These are uniform with
    user-declared effects — a builtin here has no privilege a user
@@ -198,7 +198,7 @@ fn main() : Unit / Stdout = {
   # Paren form — always legal.
   twice(() => Stdout.print("paren"))
 
-  # Trailing-lambda form — sugar: the final `() -> T` argument may
+  # Trailing-lambda form — sugar: the final `() -> t` argument may
   # be written as a block outside the parens.
   twice { Stdout.print("trailing") }
 }
@@ -233,11 +233,11 @@ reads one.
 Both are strictly limited — each sugar only applies to one
 specific op shape on one specific effect:
 
-1. **A naked read only lowers `State[T].get()` and
-   `Reader[T].ask()`.** Other zero-argument operations (like a
+1. **A naked read only lowers `State[t].get()` and
+   `Reader[t].ask()`.** Other zero-argument operations (like a
    hypothetical `Clock.now()`) still need `Clock.now()` spelled
    out. The bare identifier reads the capability's current value.
-2. **`:=` applies only to `State[T].set(v)`.** Any other
+2. **`:=` applies only to `State[t].set(v)`.** Any other
    `set`-shaped op on some other effect keeps `.set(v)`.
 3. **A capability read must be a simple binding** (`counter`,
    not `config.section.level`).
@@ -272,10 +272,10 @@ fn main() : Unit / Stdout = {
 
 ## Syntax note: local mutable cells with `var`
 
-The commonest use of `State[T]` is not a long-lived threaded
+The commonest use of `State[t]` is not a long-lived threaded
 state but a local mutable variable — a counter in a loop, an
 accumulator in a builder function. Writing a full
-`handle { ... } with State[T](init) as name { clauses }`
+`handle { ... } with State[t](init) as name { clauses }`
 block for something Koka spells as `var x := 0` is friction Doc
 B would rather not ship.
 
@@ -311,7 +311,7 @@ return(x)      -> x
 Consequences:
 
 - **The cell does not escape the block's effect row.** Because
-  the implicit `handle` closes `State[T]` in the same scope, the
+  the implicit `handle` closes `State[t]` in the same scope, the
   enclosing function's signature is unchanged. `sum_costs`
   above is `/ Stdout`, not `/ Stdout + State[Int]`.
 - **Scope is the innermost block.** The cell is live from its
@@ -323,7 +323,7 @@ Consequences:
 - **Explicit annotation is optional.** `var total := 0` infers
   `Int`; `var total: Int := 0` is the annotated form.
 - **Sibling to `let`, not replacement.** `let` is immutable
-  binding; `var` is a local `State[T]` cell. Both survive,
+  binding; `var` is a local `State[t]` cell. Both survive,
   each with its own intent.
 
 A `var` declaration at function-top level is the usual case;
@@ -353,9 +353,9 @@ writing the op name out would stand out:
 - `a[i]`       ≡ `Mutable.array_get(a, i)`  — read
 - `a[i] := v`  ≡ `Mutable.array_set(a, i, v)` — write
 
-Both require `a : Array[T]`; a write needs `Mutable` in the effect
+Both require `a : Array[t]`; a write needs `Mutable` in the effect
 row when the caller can observe it (§`Mutable` *Observable-effects
-discipline*). `Ref[T]` has sigils of its own: prefix `&` makes a
+discipline*). `Ref[t]` has sigils of its own: prefix `&` makes a
 cell, prefix `@` reads it, and `r := v` writes it (`kai info syntax`
 §*Capability sugar*).
 
@@ -436,7 +436,7 @@ See §*Error model* below for the rule.
 
 ### Error model
 
-`Option[T]` is the shape for ops where the caller wants to stop on
+`Option[t]` is the shape for ops where the caller wants to stop on
 absence but never to inspect a fault message in detail.
 `read_line` fits because "no more input" is structural and every
 real fault reduces to "the terminal is broken, bail". `File` uses
@@ -1401,7 +1401,7 @@ where its skip policy is domain knowledge.
 
 What to use instead:
 
-- **Inspectable failure** — `Result[T, E]` with postfix `!`. This is
+- **Inspectable failure** — `Result[t, e]` with postfix `!`. This is
   what the stdlib does, and what `Fail` could express nothing beyond.
 - **A failure whose policy the consumer chooses** — declare a domain
   effect whose op returns `Unit`, so a handler can resume and skip.
@@ -1415,7 +1415,7 @@ several fixtures declare it locally for exactly that. A locally declared
 compile error (`effect not handled: Fail`) rather than a runtime abort.
 See `docs/editions.md` for the migration note.
 
-## `State[T]`
+## `State[t]`
 
 ### Declaration
 
@@ -1427,7 +1427,7 @@ effect State[t] {
 ```
 
 Declared in `stdlib/effects/concurrent.kai`. A handler for
-`State[T]` takes an initial value via `with State[T](v0)` and threads
+`State[t]` takes an initial value via `with State[t](v0)` and threads
 `state` through `resume`'s optional second argument. See Doc A
 §*State: a handler with its own state* for the worked example.
 
@@ -1460,21 +1460,21 @@ so calls look like `State.get()` / `State.set(v)` (the naked read /
 `:=` sugar needs an `as`-bound name, per §*Syntax note: capability
 read/write sugar* rule 4).
 
-### When to reach for `State[T]` vs `Mutable`
+### When to reach for `State[t]` vs `Mutable`
 
-`State[T]` is **value-semantics under the hood**: each `set`
-replaces a pure value. Two fibers sharing `State[T]` is not
+`State[t]` is **value-semantics under the hood**: each `set`
+replaces a pure value. Two fibers sharing `State[t]` is not
 sharing mutation — each fiber gets its own handler instance. Use
 `Mutable` when you need *location* semantics (shared mutable
 memory, imperative arrays).
 
-## `Reader[T]` and `Writer[W]`
+## `Reader[t]` and `Writer[w]`
 
 Two standalone effects for two specialised patterns of `State`-
 like state: read-only ambient values (`Reader`) and
 write-only accumulation (`Writer`). Each is its own effect
-declaration — not sugar over `State[T]` — so diagnostics say
-`Reader` / `Writer` by name rather than `State[[W]]` and so
+declaration — not sugar over `State[t]` — so diagnostics say
+`Reader` / `Writer` by name rather than `State[[w]]` and so
 handlers can be specialised independently.
 
 ```kaikai-fragment
@@ -1513,7 +1513,7 @@ fn main() : Unit / Stdout = {
 }
 ```
 
-`with Writer[W]([])` parallels `with State[T](init)` — it
+`with Writer[w]([])` parallels `with State[t](init)` — it
 declares that the handler carries its own state, initialised
 here to `[]`, threaded through `resume`'s second argument and
 referred to as `log` inside the clauses. `with_writer` returns the
@@ -1546,9 +1546,9 @@ required to avoid ambiguity.
 The three `State`-like effects cover three different shapes of
 "non-pure value through a computation":
 
-- **`State[T]`** — the body reads and writes a current value.
+- **`State[t]`** — the body reads and writes a current value.
   `set` replaces the previous value.
-- **`Reader[T]`** — the body only reads, via `ask`; the
+- **`Reader[t]`** — the body only reads, via `ask`; the
   handler decides what value to serve each time. The body has
   no way to change what the next `ask` will return. *Reader is
   not a guarantee that repeated `ask`s return the same value*:
@@ -1556,19 +1556,19 @@ The three `State`-like effects cover three different shapes of
   one that serves the current system clock). What Reader rules
   out is the body expressing writes — the write capability is
   simply not in the effect declaration.
-- **`Writer[W]`** — the body only writes, via `tell`; the
-  handler accumulates in an internal state (typically `[W]`)
+- **`Writer[w]`** — the body only writes, via `tell`; the
+  handler accumulates in an internal state (typically `[w]`)
   that is harvested at the handler's close via `return`. The
   body cannot read back what it has written mid-stream. If
-  reading back matters, reach for `State[[W]]` instead.
+  reading back matters, reach for `State[[w]]` instead.
 
 The read/write sugar follows the shape:
 
 | Effect      | naked read | `cap := v` (write) |
 |-------------|:----------:|:------------------:|
-| `State[T]`  | ✓          | ✓                  |
-| `Reader[T]` | ✓          | —                  |
-| `Writer[W]` | —          | —                  |
+| `State[t]`  | ✓          | ✓                  |
+| `Reader[t]` | ✓          | —                  |
+| `Writer[w]` | —          | —                  |
 
 A naked read applies where the effect exposes a single read op;
 `cap := v` applies where the effect exposes a value-replacing
@@ -1577,7 +1577,7 @@ pattern).
 
 ## `Mutable`
 
-The provisional `Array[T]` escape from CLAUDE.md — mutation that
+The provisional `Array[t]` escape from CLAUDE.md — mutation that
 is not visible in the value's type — migrates to sit behind the
 `Mutable` effect. Writing a row with `Mutable` is the source of
 truth that a function mutates memory; calling `Mutable`'s
@@ -1599,17 +1599,17 @@ effect Mutable {
 }
 ```
 
-`Mutable` uses a per-operation type generic: `[T]` in each op
+`Mutable` uses a per-operation type generic: `[t]` in each op
 signature quantifies independently at the call site, so a
 single handler instance serves `Ref[Int]`, `Ref[String]`, and
-every `Array[T]` instantiation in the program. Parameterising
-the effect itself (à la `State[T]`) would lock one handler to
+every `Array[t]` instantiation in the program. Parameterising
+the effect itself (à la `State[t]`) would lock one handler to
 one type, which is useless here.
 
-This form — operations with their own `forall T. …` quantifier
+This form — operations with their own `forall t. …` quantifier
 — is the amended version of Doc A §*Out of scope* item
 3. The type checker treats `Mutable.array_get` as having type
-`forall T. (Array[T], Int) -> T / Mutable` and reuses the
+`forall t. (Array[t], Int) -> t / Mutable` and reuses the
 existing Hindley–Milner generalisation machinery at each call
 site. Row polymorphism at the call site remains out of scope.
 
@@ -1617,7 +1617,7 @@ site. Row polymorphism at the call site remains out of scope.
 
 `array_get`, `array_set`, and `array_grow` panic via the
 runtime's audited escape (`kai_core_panic`) when `i < 0` or
-`i >= array_length(a)`. None of the ops returns `Option[T]` or
+`i >= array_length(a)`. None of the ops returns `Option[t]` or
 otherwise signals the condition as a value — the contract is
 "the caller is responsible for staying in bounds". This is the
 same discipline as C / Rust's unchecked indexing, with the
@@ -1661,7 +1661,7 @@ or short-circuit.
 
 `Mutable` follows the *observable-effects* school (Koka, Eff):
 the row captures what the *caller* observes during the call, not
-what the function does internally. For `Array[T]`, this gives
+what the function does internally. For `Array[t]`, this gives
 two precise rules:
 
 1. **`array_set` requires `Mutable` IF AND ONLY IF the mutation
@@ -1692,7 +1692,7 @@ two precise rules:
    `bytes_get_string` never require `Mutable`.
 
 4. **A value shares the caller's cells wherever a cell sits in its
-   type.** `[Array[T]]`, `Option[Array[T]]`, a record or sum storing an
+   type.** `[Array[t]]`, `Option[Array[t]]`, a record or sum storing an
    `Array`/`Ref`, and a closure whose row carries `Mutable` all reach
    the caller's state, so handing one to a `/ Mutable` callee is
    observable exactly like handing it the Array itself.
@@ -1704,7 +1704,7 @@ two precise rules:
    function stay transparent: the first two are checked with the
    function body, the last captures nothing. A generic parameter never
    hides a cell on its own — a callee can reach a value it only knows
-   as `T` only through such a closure.
+   as `t` only through such a closure.
 
 The typer enforces this by collecting Mutable demand at every
 `array_set` / `array_grow` call site, then walking the typed
@@ -1712,7 +1712,7 @@ function body once to classify each demand as local (the target
 Array was constructed in this function and never escapes, per the
 *Escape rule*) or external (anything else). A function
 whose every demand is local has `Mutable` *masked* from its
-inferred row — the same way `var x := init` masks `State[T]` at
+inferred row — the same way `var x := init` masks `State[t]` at
 the surrounding block boundary. A function with even one
 external demand keeps `Mutable` and must declare it.
 
@@ -1842,9 +1842,9 @@ and shows its line.
   observable effect — the caller's mental model is intact.
   Mutation through a parameter / capture / global is observable
   and therefore in the row.
-- **`var` precedent**: kaikai already masks `State[T]` for
+- **`var` precedent**: kaikai already masks `State[t]` for
   `var x := init` because the State doesn't escape the block. The
-  same logic applies to `Array[T]` whose lifetime is bounded by
+  same logic applies to `Array[t]` whose lifetime is bounded by
   the function body.
 
 ### Idiomatic usage
@@ -1883,7 +1883,7 @@ fn main() : Unit / Stdout + Mutable = {
 }
 ```
 
-`Ref[T]` has the explicit op form and the sigils `&` (make), `@`
+`Ref[t]` has the explicit op form and the sigils `&` (make), `@`
 (read) and `:=` (write):
 
 ```kaikai
@@ -1896,11 +1896,11 @@ fn main() : Unit / Stdout + Mutable = {
 }
 ```
 
-In practice `Ref[T]` is rare in application code — `var` plus
-`State[T]` covers almost every cell-valued use case, and
-`Ref[T]` is reserved for cases where the cell has to outlive a
+In practice `Ref[t]` is rare in application code — `var` plus
+`State[t]` covers almost every cell-valued use case, and
+`Ref[t]` is reserved for cases where the cell has to outlive a
 block and be passed across functions without being threaded
-through `State[T]`'s handler.
+through `State[t]`'s handler.
 
 ### Bare array builtins
 
@@ -2075,7 +2075,7 @@ link and nursery machinery; user code reaches fibers through
 `Spawn` uses per-op generics (the amended Doc A §*Out of scope*
 item 3, see §`Mutable`) plus a row variable on `spawn`'s
 argument. The row variable reuses the existing row polymorphism
-from Doc A; the per-op `T` is the type-generic piece shared with
+from Doc A; the per-op `t` is the type-generic piece shared with
 `Mutable`.
 
 ### `Spawn.cancel` vs the `Cancel` effect
@@ -2154,7 +2154,7 @@ Direct `Ffi` use is an **audited escape** (CLAUDE.md Tier 1). It
 appears in the `runtime/` directory and in the default handlers
 for `Stdout`, `Stderr`, `Stdin`, `Env`, `File`, `Mutable`, and `Spawn` —
 every effect whose behaviour ultimately touches the OS. Pure
-effects (`State[T]`, `Reader[T]`, `Writer[W]`) and
+effects (`State[t]`, `Reader[t]`, `Writer[w]`) and
 `Cancel` do not use `Ffi`. Userland almost never writes
 `extern "C"` directly, because the stdlib exposes `Stdout` /
 `File` / `Mutable` etc. for the common cases.
@@ -2205,8 +2205,8 @@ fn main() : Unit / Io + Mutable + Spawn               # ... plus fibers
 Prefer the granular effects when only one or two apply (they
 document the program's actual surface); reach for `/ Io` when
 the program does essentially all of `Console + Env + File`. Any
-effect without a runtime-installed default handler (`State[T]`,
-`Reader[T]`, `Writer[W]`, or a user-declared effect with no
+effect without a runtime-installed default handler (`State[t]`,
+`Reader[t]`, `Writer[w]`, or a user-declared effect with no
 `default { }` block) in `main`'s row is rejected by the compiler —
 here a user-declared `effect Fail { fail(msg: String) : Nothing }`:
 
@@ -2280,23 +2280,23 @@ Ffi                                   (always innermost, compiler-synthesised)
 ## Open questions
 
 1. **Per-operation type generics.** `Mutable`, `Spawn`, and
-   possibly others need operations with their own `[T]`
+   possibly others need operations with their own `[t]`
    quantifier; Doc A §*Out of scope* item 3 currently
    forbids this.
    *Decided:* allow per-op HM generalisation of *type*
    parameters (row parameters stay out of scope). The type
    checker treats `Mutable.array_get` as having type
-   `forall T. (Array[T], Int) -> T / Mutable` and each call
-   site picks `T` independently. Doc A §*Out of scope*
+   `forall t. (Array[t], Int) -> t / Mutable` and each call
+   site picks `t` independently. Doc A §*Out of scope*
    item 3 is amended accordingly.
 
-2. **`Writer[W]` as primitive or sugar.** Is `Writer[W]` its own
-   effect declaration, or stdlib sugar over `State[[W]]`?
+2. **`Writer[w]` as primitive or sugar.** Is `Writer[w]` its own
+   effect declaration, or stdlib sugar over `State[[w]]`?
    *Decided:* its own effect declaration.
    Diagnostics say `Writer` instead of `State[[String]]`, and
-   the handler can keep a one-line body using `with Writer[W]([])`
+   the handler can keep a one-line body using `with Writer[w]([])`
    plus the canonical `tell` / `return` clauses — symmetric with
-   `State[T](init)`.
+   `State[t](init)`.
 
 3. **Short form for IO ops.** Is `print(s)` callable, or must
    every call name the effect (`Stdout.print(s)`)?
@@ -2332,7 +2332,7 @@ Ffi                                   (always innermost, compiler-synthesised)
 - **Doc C** — `docs/effects-impl.md`: op dispatch in the stage-2
   pipeline, the handler-stack runtime representation, per-op type
   generics, interaction with monomorphisation and fibers.
-- **`docs/actors.md`** — `Actor[Msg]`, `Pid`, mailbox policies,
+- **`docs/actors.md`** — `Actor[msg]`, `Pid`, mailbox policies,
   supervision, links/monitors.
 - **`docs/syntax-sugars.md`** — the call-site sugars introduced
   here (trailing lambdas, naked cell read / `cap := v`,

@@ -181,9 +181,9 @@ Conclusion: Front A is GO. The lever is real and large. Proceed to the
 coordinated refactor (hot st_* mutate-and-return-same), with the
 snapshot-reader audit (errs/holes stay functional) as the safety contract.
 
-### Cell representation: `Array[T]`, NOT `Ref[T]` (decided)
+### Cell representation: `Array[t]`, NOT `Ref[t]` (decided)
 
-Use `Array[T]` (1-element, the Subst pattern), not `Mutable.ref_*`:
+Use `Array[t]` (1-element, the Subst pattern), not `Mutable.ref_*`:
 - **Performance (the whole point):** `array_set`/`array_get` are direct
   builtins (`EP("array_set", "kai_prelude_array_set", 3)`, emit_c:847) — no
   effect dispatch. `Ref` goes through the qualified op-call path with runtime

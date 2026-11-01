@@ -389,7 +389,7 @@ missing variants. With unions, the report identifies the
 component-of-origin: `"missing variant InsufficientBalance from
 AuthError in QueryBalanceErr"`.
 
-### With `Result[T, E]` + `!` propagation
+### With `Result[t, e]` + `!` propagation
 
 Proposed form; kaikai today propagates with postfix `!`, not `?`:
 
@@ -463,7 +463,7 @@ flattening nested unions) requires care. Edge cases:
   + flattening of singleton.
 - `union E = A | A | A`: normalizes to `A`, but should this trigger
   a warning? Decision: yes, warn but accept.
-- Unions of generic types: `union F[T] = Option[T] | Result[String, T]`
+- Unions of generic types: `union F[t] = Option[t] | Result[String, t]`
   — does this work? Decision: out of scope for v1. Unions in v1
   compose **only monomorphic types**.
 
@@ -527,7 +527,7 @@ and know exactly what upcasts are possible.
 
 Unions interact with:
 
-- **`protocol P[A]` (#180)**: unions could be `A`. Decision: out of
+- **`protocol P[a]` (#180)**: unions could be `a`. Decision: out of
   scope for v1; revisit when #180 lands.
 - **Polymorphic-impl runtime panic (#174)**: unions might exacerbate
   the panic if a union is passed where dispatch on its variants is
@@ -623,7 +623,7 @@ tested subset.
 
 - **stdlib protocol impls migrated to unions**: deferred. Existing
   impls work; user code can adopt.
-- **Generic unions**: `union F[T] = Option[T] | Result[String, T]` —
+- **Generic unions**: `union F[t] = Option[t] | Result[String, t]` —
   out of scope. Monomorphic only in v1.
 - **Union with HKT** (when #180 lands): re-evaluate.
 - **`impl P for U` where U is union**: forbidden in v1, may revisit.
@@ -642,7 +642,7 @@ tested subset.
 
 Comparable in scale to m12.8 (single-dispatch protocols) which
 landed in similar effort. Significantly larger than #180 (`protocol
-P[A]`) which is ~345 lines.
+P[a]`) which is ~345 lines.
 
 ## Decision posture
 
@@ -673,7 +673,7 @@ companion milestone issue.
   on `union` keyword + Model C semantics.
 - **Issue #182**: `Result` / `Option` API expansion. Independent
   but complementary — `map_err` is useful with or without unions.
-- **Issue #180**: `protocol P[A]` parametrized. May interact with
+- **Issue #180**: `protocol P[a]` parametrized. May interact with
   unions when future generic unions land.
 - **Issue #174**: polymorphic-impl runtime panic. Affects any
   feature that dispatches at runtime, including future

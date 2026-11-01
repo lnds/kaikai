@@ -247,7 +247,7 @@ A.x lane from using Serialize today:
    not cursor-based.** A list of records can't be parsed by calling
    `from_string` on a prefix and getting `(Self, rest)` back; the
    protocol consumes the full string or fails. AST serialisation
-   needs a cursor (`from_bytes : ([Byte], Int) → Result[(Self, Int), E]`
+   needs a cursor (`from_bytes : ([Byte], Int) → Result[(Self, Int), e]`
    or similar).
 
 Both gaps are pre-blockers for the A.0 lane. The cache lane that
@@ -497,7 +497,7 @@ are gates for every sub-phase.
 - **Pre-blocker landed (#471):** the kaikai-native `BinSerialize`
   protocol with cursor semantics (`from_bytes(buf, pos)`) plus
   `#derive(BinSerialize)` for records and sums (including
-  `[T]` / `Option[T]` collection payloads). Annotating the AST
+  `[t]` / `Option[t]` collection payloads). Annotating the AST
   variants (Decl / Expr / ExprKind / Pattern / PatKind / TypeExpr /
   TyKind / RowExpr / Stmt / Param / Variant / FieldDecl /
   TypeBody / ImportKind / HClause / HReturn / UnitExprT plus

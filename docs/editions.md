@@ -146,7 +146,7 @@ assembled from one list rather than reconstructed from git.
 
 - **`Fail` removed from the stdlib** (issue #1535). `pub effect Fail`
   and its runtime default handler are gone from `stdlib/effects.kai`.
-  Migration: a `/ Fail` row becomes `Result[T, String]` propagated
+  Migration: a `/ Fail` row becomes `Result[t, String]` propagated
   with postfix `!`; a failure whose policy the consumer must choose
   becomes a domain effect whose op returns `Unit` (so a handler can
   resume and skip); a deep non-local exit uses `Cancel.raise()`. Code
@@ -377,7 +377,7 @@ the migration leaves diagnostics that explain what to fix.
 - the two type arguments of every `Result[_, _]` annotation are
   swapped, only when the source edition is `tongariki`, whose `Result`
   is Err-first. Hanga Roa's `Result` is already Ok-first
-  (`Result[T, E]`), so a `hanga-roa` source keeps its annotations;
+  (`Result[t, e]`), so a `hanga-roa` source keeps its annotations;
 - `array.from` / `array.copy` with a `default` argument → reported as
   `manual:`.
 

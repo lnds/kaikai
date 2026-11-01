@@ -298,7 +298,7 @@ fn main() : Int / Stdout = {
 (`Cell`, `State[Int]`) — no `Handler[e]` wrapper. So a capability
 appears in two positions, one uniform rule:
 
-- in a row (`fn f() : T / Cell`) — *demanded*, satisfied by a handle;
+- in a row (`fn f() : t / Cell`) — *demanded*, satisfied by a handle;
 - as a parameter (`fn f(c: Cell)`) — *provided* by the caller, NOT in
   the row.
 
@@ -352,7 +352,7 @@ fn main() : Int = 0
 The same holds when a function passed as an argument performs two instances
 and the parameter's row names one of them, as `spawn_actor`'s
 `Actor[msg]` does. The choice waits for the first thing that pins `msg`: an
-annotated result (`let srv: Pid[Req] = spawn_actor(body)`), or a later use of
+annotated result (`let srv: Pid[req] = spawn_actor(body)`), or a later use of
 the result (`Actor.send(srv, Ask(..))`). It is never taken from the order of
 the row, and a call nothing pins is rejected as an `ambiguous effect
 instance`. The instance a spawned actor does not take reaches the child fiber
@@ -542,7 +542,7 @@ producer may perform other effects too: they are the `e` of `Gen[t, e]`.
 
 Stdin, Stdout, Stderr, File, Env, Clock (`import time`), Random,
 SecureRandom, NetTcp, NetUdp, NetUnix, NetDns (`kai info net`),
-Process, Spawn, Cancel, Actor[Msg], Signal, Mutable, State, Reader,
+Process, Spawn, Cancel, Actor[msg], Signal, Mutable, State, Reader,
 Writer, Log, Link, Monitor, Ffi. Two row aliases name common sums:
 `Console` is `Stdout + Stderr + Stdin`, and `Io` is
 `Console + Env + File`.

@@ -30,7 +30,7 @@ The design breaks if any of these is compromised.
 
 1. **Safe at compile time**
    - Memory safety by default (see memory model below).
-   - No null; `Option[T]` is the canonical absence type.
+   - No null; `Option[t]` is the canonical absence type.
    - Effects are visible in types: IO, errors, cancellation, spawn
      appear as rows on the function's signature. A function cannot
      be called from a context that does not handle its effects.
@@ -190,13 +190,13 @@ arguments:
 - **Backend**: LLVM directly.
 - **Concurrency**: subsumed under effects. Fibers and actors are not separate primitives — both ride on top of the effect system.
   - `spawn` / `await` / `select` / `cancel` are operations of the **`Spawn`** effect; `nursery { n -> ... }` installs the handler that scopes them. See `docs/structured-concurrency.md`.
-  - `send` / `receive` / `self` are operations of the parameterised **`Actor[Msg]`** effect; `spawn_actor`, `spawn_actor_default`, and `with_mailbox` install the handler with a typed mailbox. See `docs/actors.md`.
+  - `send` / `receive` / `self` are operations of the parameterised **`Actor[msg]`** effect; `spawn_actor`, `spawn_actor_default`, and `with_mailbox` install the handler with a typed mailbox. See `docs/actors.md`.
   - `Cancel` is its own effect, delivered cooperatively at yield points.
 - **Memory model**: hybrid.
   - **Perceus** (compile-time optimized reference counting, Koka-style) within each fiber.
   - **Isolated fibers** BEAM-style in discipline: fibers share no mutable state. Allocation comes from per-thread slabs and pools, which the fibers running on one scheduler thread share; a value that crosses threads — a message, a spawned thunk, an awaited result — is deep-copied when more than one scheduler thread runs (with one thread, a send passes the reference).
   - Goal: compile-time memory-lifetime decisions without a visible borrow checker and without a tracing GC.
-  - **Opaque mutable `Array[T]` behind `Mutable`** (issue #251 + #252, 2026-05). `array_make / length / get / set / grow` are builtins; the typer routes writes (`array_set`, `array_grow`, the `a[i] := v` sugar) through the `Mutable` effect on the **observable-effects** discipline (Koka-style): a write requires `Mutable` if and only if the target Array escapes the function (parameter, capture, global, record field). Writes to a locally-constructed Array that never crosses a function-call boundary are *masked* — the row stays clean from the caller's POV. Reads (`array_get`, `array_length`) never raise `Mutable` regardless of provenance. This collapses the prior "audited escape" debt into the standard row discipline: every observable mutation is in the row, every truly-local one is invisible. See `docs/effects-stdlib.md` §`Mutable` for the full spec, four worked examples, and the escape rule for locals passed to helpers.
+  - **Opaque mutable `Array[t]` behind `Mutable`** (issue #251 + #252, 2026-05). `array_make / length / get / set / grow` are builtins; the typer routes writes (`array_set`, `array_grow`, the `a[i] := v` sugar) through the `Mutable` effect on the **observable-effects** discipline (Koka-style): a write requires `Mutable` if and only if the target Array escapes the function (parameter, capture, global, record field). Writes to a locally-constructed Array that never crosses a function-call boundary are *masked* — the row stays clean from the caller's POV. Reads (`array_get`, `array_length`) never raise `Mutable` regardless of provenance. This collapses the prior "audited escape" debt into the standard row discipline: every observable mutation is in the row, every truly-local one is invisible. See `docs/effects-stdlib.md` §`Mutable` for the full spec, four worked examples, and the escape rule for locals passed to helpers.
 - **Formal effects model**: capability-passing **Effekt + inference**.
   - Effects as an explicit set of capabilities, passed implicitly by the compiler.
   - **Effect inference in local bodies**: lambdas and local bindings get their rows inferred.
@@ -209,7 +209,7 @@ arguments:
   - **Out of scope (permanently)**: `kai repl`. Removed from v1.0 per #406 and not planned for v1.x or v2. See `docs/decisions/repl-removal-2026-05-09.md` for the rationale. The `kai run` + `kai watch` workflow replaces the REPL use case.
   - Motivation: LLM-friendly (predictable commands, LSP provides immediate feedback), zero ecosystem fragmentation, trivial install.
 - **FFI / Interop**: crossing to C is expressed as the **`Ffi` effect capability**.
-  - Declarations use `extern "C" fn name(args) : T`.
+  - Declarations use `extern "C" fn name(args) : t`.
   - Calling a C function is an operation of the `Ffi` effect (appears in the type of every function that uses it).
   - Incoming FFI (kaikai as a C library): minimal subset in MVP — exportable pure functions, initializable runtime.
   - Binding generator: not implemented.
@@ -228,7 +228,7 @@ arguments:
   - Also shipped: property checks (`check "..." with a: Int { }`, run by `kai check`) and benchmarks (`bench "..." { }`, run by `kai bench`); see `kai info testing`. Snapshots, fuzzing and doctests are not implemented.
   - Motivation: single canonical form, integration with `kai test`, LLM-friendly (LLMs write tests without picking frameworks).
 - **Typed holes** (stage 2): `?` and `?name` are first-class expressions/patterns. At check time the compiler reports the expected type, bindings in scope, and synthesis candidates, both as human-readable text and as JSON (`kai build --holes-json`). Unfilled holes don't break the build — they become a runtime panic — so partial programs run. Designed as the integration point for LLM-assisted editing. Full rationale and syntax in `docs/typed-holes.md`.
-- **Structured concurrency** (stage 2): every fiber lives inside a lexical scope (`nursery`) that waits for its children and propagates cancellation. `spawn` / `await` / `select` are operations of a `Spawn` effect, not built-in primitives; the nursery is literally a handler for that effect. `Fiber[T]` is a region-branded handle (same brand machinery as `Pid[Msg]` from actors) that cannot escape its scope. Cancellation is an effect (`Cancel`) that fibers can handle for cleanup. Full rationale, syntax, and patterns in `docs/structured-concurrency.md`; the actor surface (mailbox, supervision, `Pid[Msg]`) lives in `docs/actors.md`.
+- **Structured concurrency** (stage 2): every fiber lives inside a lexical scope (`nursery`) that waits for its children and propagates cancellation. `spawn` / `await` / `select` are operations of a `Spawn` effect, not built-in primitives; the nursery is literally a handler for that effect. `Fiber[t]` is a region-branded handle (same brand machinery as `Pid[msg]` from actors) that cannot escape its scope. Cancellation is an effect (`Cancel`) that fibers can handle for cleanup. Full rationale, syntax, and patterns in `docs/structured-concurrency.md`; the actor surface (mailbox, supervision, `Pid[msg]`) lives in `docs/actors.md`.
 - **Kind system**: closed at two kinds — `Type` (default, classifies normal types) and `Measure` (classifies units of measure used in `Real<u>` and friends). Most code never names a kind; the annotation only appears when a tparam ranges over units (`fn area[u: Measure](w: Real<u>, h: Real<u>) : Real<u^2>`). The `Measure` kind, the `Unit` void-return type, and the `unit` declaration keyword are three distinct things that share no semantics — see `docs/kinds.md` for the full reference and disambiguation table.
 - **Name resolution**: a bare name reaches the nearest binding of it, and the resolver decides which one, once; every later pass reads the identity it stamped and never looks the name up again by spelling. The ladder, nearest first:
   1. a local binder (`let`, a parameter, a pattern binder);
@@ -240,7 +240,7 @@ arguments:
   7. any other module that exports the name.
 
   A **call** carries its arity — the piped value counts (`x |> f(a)` calls `f` with two arguments) — and a rung whose binding has another arity is passed over, never chosen: beside a user `fn min(xs)`, `min(1, 2)` reaches `Ord.min`, while `min([3])` reaches the user's function. Passing over a binding the user wrote (a local, the own file, an import) earns a warning that names both; the core's own homonyms of different arity (`list.max/1` beside `Ord.max/2`) coexist silently. Two declarations of one name and arity on the same rung are contested: a call lets its argument types settle the contest (`length("ab")` is `string.length`), a function value cannot (`let f = length` is an error; qualify it). When no rung fits the arity, the call reports its arity error against the nearest binding. **Escape hatch**: qualify the name (`list.max(xs)`, `m.f(x)`).
-- **Pipe operators**: kaikai ships five pipes, each with a clear intent — `|>` (apply pipe: `x |> f(args)` ≡ `f(x, args)`, no dispatch), `|` (map pipe), `||` (flat-map pipe), `|?` (filter pipe), and `|!` (each pipe: runs a stage for its effect, returns `Unit`). The four latter operators **dispatch by convention** against the LHS's head type (#594): any package that declares `pub type T` and exports `pub fn map / flat_map / filter / each` with the canonical signatures (`(T[A], (A) -> B / e) -> T[B] / e` and friends) participates automatically — no annotation, no protocol, no compiler change required. Dispatch resolution uses a per-compile head-owner cache built once from the post-`expand_imports` decl stream + module table; lookup at each call site is `O(1)` over the small cache list. Diagnostic surface and rationale (why protocols cannot express HKT/effect-row ops) live in `docs/protocols.md` §"Pipe operators are convention-based".
+- **Pipe operators**: kaikai ships five pipes, each with a clear intent — `|>` (apply pipe: `x |> f(args)` ≡ `f(x, args)`, no dispatch), `|` (map pipe), `||` (flat-map pipe), `|?` (filter pipe), and `|!` (each pipe: runs a stage for its effect, returns `Unit`). The four latter operators **dispatch by convention** against the LHS's head type (#594): any package that declares `pub type T` and exports `pub fn map / flat_map / filter / each` with the canonical signatures (`(T[a], (a) -> b / e) -> T[b] / e` and friends) participates automatically — no annotation, no protocol, no compiler change required. Dispatch resolution uses a per-compile head-owner cache built once from the post-`expand_imports` decl stream + module table; lookup at each call site is `O(1)` over the small cache list. Diagnostic surface and rationale (why protocols cannot express HKT/effect-row ops) live in `docs/protocols.md` §"Pipe operators are convention-based".
 
 ## MVP scope
 
@@ -266,7 +266,7 @@ cc stage0/*.c -o kaic0
 - Tagged sum types (for AST representation): `type Expr = Lit(Int) | Add(Expr, Expr)`.
 - Basic records.
 - Minimal file IO (`file.read`, `file.write`, `print`).
-- `Result[T, E]` and `Option[T]` for error handling.
+- `Result[t, e]` and `Option[t]` for error handling.
 - Pattern matching over sum types and lists.
 - Mandatory type annotations (no inference yet).
 - Simple RC (no full Perceus).
@@ -322,13 +322,13 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
   - `switch` / `cond` / `match` — **resolved**: `match` is the only form. Neither `switch` nor `cond` exist in kaikai-minimal (`kaikai-minimal.md` §`match`). No redundancy to remove.
   - `|` vs `|>` — **resolved**: both retained with distinct intent. `|>` is apply-pipe (first-arg threading); `|` is map-pipe over a list (m7b #9, see `docs/syntax-sugars.md`). Each form signals a different operation.
   - collections `[]` / `()` / `{}` — **resolved**: `[]` for ordered lists, `{}` for records (named fields), `()` for grouping. The "should `()` gain a tuples meaning" sub-decision was closed on 2026-04-27 (m8.5 gate): **tuples-as-a-type are REJECTED** — records cover anonymous products at the same or smaller signature length once `Pair[a, b]` exists in stdlib, so a second product form earns no slot (the gate failed both its line-count and signature-length thresholds; metrics in the commit history). What *did* ship (issue #154) is **parser-only n-tuple sugar**: `(a, b)` / `(a, b, c)` / `(a, b, c, d)` desugar to `Pair` / `Triple` / `Quad` record literals in expression, type, and pattern position (arity 2..4; field access stays nominal `.fst`/`.snd`/`.trd`/`.frt`). Zero typer or runtime cost — the inferred type is still `Pair[..]`, only the literal/pattern shape is shorter. Transient multi-return shapes also use the multi-arg match sugar (shipped). See `stdlib/core/tuple.kai` and `docs/syntax-sugars.md` § "n-tuples".
-  - atoms / structs / maps — **resolved**: kaikai has no atoms (no Erlang-style standalone symbols). Records carry nominal identity; `Map[K, V]` is a lookup table landing with the collection-design pass (m14). Distinct concepts, no overlap.
+  - atoms / structs / maps — **resolved**: kaikai has no atoms (no Erlang-style standalone symbols). Records carry nominal identity; `Map[k, v]` is a lookup table landing with the collection-design pass (m14). Distinct concepts, no overlap.
 
   Net status: every sub-decision in this list is now closed.
 
 - **Extensions catalogue** (`docs/proposed-extensions.md`): two families of proposed additions; status tracked per-item in that document.
   - *LLM-friendly diagnostics* — typed-holes-adjacent features (principled `todo!`, type-query JSON, exhaustiveness counterexamples, `axiom`, effect holes, import holes, canonical-form lints). Share the typed-holes output contract (human text + stable JSON). Most depend on m11 (diagnostics quality pass); `todo!` scheduled for m7d, `axiom` for m12.7.
-  - *Language-surface features* — record punning `{ x, y }`, `variants[T]()`, sum types with constant attributes, `!` postfix (Option/Result propagation), `@` as-patterns, `?.` optional chaining, deferred bitwise operators, `Map[K, V]` with hash-map indexing, slice syntax `a[i..j]`, method references as values (`obj.method`), `Range[T]` as a first-class iterable, pipeline placeholder `_`, binary pattern matching `<<...>>`. Tuples `(T1, T2)` were rejected at m8.5 (2026-04-27); see §9. Six items now scheduled (m7d/m7e); the rest split between collection-design (m14), demand-driven (#12, #15, #16), and standalone candidates (#19, #22).
+  - *Language-surface features* — record punning `{ x, y }`, `variants[t]()`, sum types with constant attributes, `!` postfix (Option/Result propagation), `@` as-patterns, `?.` optional chaining, deferred bitwise operators, `Map[k, v]` with hash-map indexing, slice syntax `a[i..j]`, method references as values (`obj.method`), `Range[t]` as a first-class iterable, pipeline placeholder `_`, binary pattern matching `<<...>>`. Tuples `(T1, T2)` were rejected at m8.5 (2026-04-27); see §9. Six items now scheduled (m7d/m7e); the rest split between collection-design (m14), demand-driven (#12, #15, #16), and standalone candidates (#19, #22).
 
 ## Roadmap
 
@@ -362,7 +362,7 @@ It does not need to compile 100% of full kaikai — what matters is that it comp
 2. `kai build`, `kai run`, `kai test` working against stage 1.
 3. Demos rewritten under the new design, running.
 
-`Map[K, V]` and full effects-aware stdlib (`Mutable`, `State[T]`, `Reader[T]`, `Writer[W]`, `Cancel`, `Spawn`, `Ffi`) land in stage 2 — m7a (mechanics) and m7b (sugars). The actor surface (`Actor[Msg]`, `Pid[Msg]`, mailbox policies, link/monitor) lands in m8 alongside the fiber scheduler. See the post-MVP list below for the deliverables.
+`Map[k, v]` and full effects-aware stdlib (`Mutable`, `State[t]`, `Reader[t]`, `Writer[w]`, `Cancel`, `Spawn`, `Ffi`) land in stage 2 — m7a (mechanics) and m7b (sugars). The actor surface (`Actor[msg]`, `Pid[msg]`, mailbox policies, link/monitor) lands in m8 alongside the fiber scheduler. See the post-MVP list below for the deliverables.
 
 **Post-MVP** (out of immediate scope at the time this section
 was first pinned; many items below have since shipped — see
@@ -370,12 +370,12 @@ was first pinned; many items below have since shipped — see
 - Stage 2 with LLVM backend directly, full Perceus, effect inference, fibers, BEAM-style scheduler.
 - **Effects system** — three pinned design docs:
   - `docs/effects.md` (Doc A): rows, unification, syntax, `handle` / `resume`, inference. The mental model.
-  - `docs/effects-stdlib.md` (Doc B): catalog of stdlib effects (`Console`, `Stdin`, `Env`, `File`, `State[T]`, `Reader[T]`, `Writer[W]`, `Mutable`, `Cancel`, `Spawn`, `Ffi`), their default handlers, the `Io` alias, and the m7a/m7b sub-milestones.
+  - `docs/effects-stdlib.md` (Doc B): catalog of stdlib effects (`Console`, `Stdin`, `Env`, `File`, `State[t]`, `Reader[t]`, `Writer[w]`, `Mutable`, `Cancel`, `Spawn`, `Ffi`), their default handlers, the `Io` alias, and the m7a/m7b sub-milestones.
   - `docs/effects-impl.md` (Doc C, in progress): CPS transform, handler-stack runtime, codemod for migrating bare builtins.
 - **Syntax sugars** (`docs/syntax-sugars.md`): trailing lambdas, naked cell read / `cap := v`, local `var x := init` cells, array indexing `a[i]` / `a[i] := v`. m7b ships these alongside the effects mechanics.
 - **Typed holes** (`docs/typed-holes.md`): `?` / `?name` in expressions and patterns, structured reports (expected type, in-scope bindings, candidates) in text and JSON. First-class integration point for LLM-assisted editing. *Landed in stage 2 m10.*
-- **Structured concurrency** (`docs/structured-concurrency.md`): nursery-scoped fibers, `Spawn` / `Cancel` as effects, region-branded `Fiber[T]` that cannot escape its scope. Built on top of the effects + handlers machinery; lands in m8.
-- **Actors** (`docs/actors.md`): `Actor[Msg]` effect with typed mailboxes, link/monitor supervision, `Pid[Msg]` as a region-branded handle. Lands in m8 alongside the scheduler.
+- **Structured concurrency** (`docs/structured-concurrency.md`): nursery-scoped fibers, `Spawn` / `Cancel` as effects, region-branded `Fiber[t]` that cannot escape its scope. Built on top of the effects + handlers machinery; lands in m8.
+- **Actors** (`docs/actors.md`): `Actor[msg]` effect with typed mailboxes, link/monitor supervision, `Pid[msg]` as a region-branded handle. Lands in m8 alongside the scheduler.
 - Elm/Rust-level error messages as an explicit design investment (not a "feature" — a quality bar for every diagnostic).
 - `kai fmt` (shipped v0.24.0), `kai lsp` (shipped v0.75.0 → v0.79.0, issue #447). `kai repl` removed permanently per #406 / `docs/decisions/repl-removal-2026-05-09.md`.
 - Property testing (`check`), benchmarks (`bench`), snapshots.

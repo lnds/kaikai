@@ -85,7 +85,7 @@ Why A and not the alternatives (recorded from the review):
   handle exclusion, `docs/lane-experience-kir-native-fix.md`).
 - **Injection point:** after row inference, before monomorphisation.
   Monomorphisation then specialises functions *per call-shape* exactly
-  as it does for types — a row-polymorphic `fn f() : T / e` receives the
+  as it does for types — a row-polymorphic `fn f() : t / e` receives the
   caller's evidence tuple for `e`. Effects already monomorphise (rows
   are resolved statically per instantiation); this rides that machinery.
 - **Who supplies it, per call site:**
@@ -186,10 +186,10 @@ review's corrections.
 ### 6.1 Surface (corrected)
 
 `with Eff as a` binds `a` as a first-class **capability value** whose
-type is the capability itself (`Cell`, `State[Int]`) — no `Handler[E]`
+type is the capability itself (`Cell`, `State[Int]`) — no `Handler[e]`
 wrapper (HKT stays banned). Uniform rule:
 
-- capability **in a row** (`fn f() : T / Cell`) — *demanded*; satisfied
+- capability **in a row** (`fn f() : t / Cell`) — *demanded*; satisfied
   by a `handle` or a default;
 - capability **as a parameter** (`fn f(c: Cell) : T`) — *provided* by
   the caller; not in the row. (**Not** `/ {}` — an empty row literal
@@ -227,15 +227,15 @@ The four escape vectors from the review, and their disposition:
 | 4 | crossing `spawn` into a fiber | rejected explicitly; the evidence clone no longer exists to make it accidentally "work" |
 
 What must escape was never a handler's job: a value that outlives its
-scope is a `Ref[T]` under `Mutable`; a dynamic population of stateful
+scope is a `Ref[t]` under `Mutable`; a dynamic population of stateful
 entities is actors/`Spawn`. (The lineage doc's §5 argument survives
 verbatim and is incorporated by reference.)
 
 ### 6.3 Out of scope, unchanged
 
-No `Handler[E]`/HKT; no multi-shot; no escape analysis or regions; no
+No `Handler[e]`/HKT; no multi-shot; no escape analysis or regions; no
 first-class capability storage; instances monomorphic in v1
-(`f(c: State[Int])`, not `f(c: State[T])`); `mask` deferred until
+(`f(c: State[Int])`, not `f(c: State[t])`); `mask` deferred until
 named reach proves insufficient.
 
 ## 7. Migration shape (input to the asu lane plan — not the plan)
@@ -284,7 +284,7 @@ record of what it deferred.
    before choosing between individual params and an evidence tuple.
    (Lane plan §A.3: measure first, binary threshold; individual params
    the expected winner.)
-4. **Actor ops:** `send/receive/self` ride `Actor[Msg]` — confirm the
+4. **Actor ops:** `send/receive/self` ride `Actor[msg]` — confirm the
    actor runtime's dispatch sites tolerate the same injection or need
    their own step in the spine. (Lane plan §A.4: same injection, no
    separate lane, one actor tripwire fixture in L3.)

@@ -25,7 +25,7 @@ Tier 1 §3 amendment (§7) is an edition-level decision.
 **Packaging (resolved):** `Shape` is a **catalog kind** — `kind Shape : ConstructorApp`,
 surfaced by `kai info kinds` — not a hidden typer sort. An earlier draft hid it as a
 sort; §1 records why that was walked back. The one new mechanism (the `Shape-App`
-formation rule, `s[A] :: Type`) and the atomicity discipline (arity-1, no composition,
+formation rule, `s[a] :: Type`) and the atomicity discipline (arity-1, no composition,
 no type-lambdas) are identical under either packaging; only the packaging changed.
 
 **Thesis:** kaikai's kind/theory machinery already has everything needed to give
@@ -39,7 +39,7 @@ fusion is decoupled from `stdlib/list`: **closed law set, open models.**
 
 This proposal **revises the rejection** of option (B) `Foldable`/`Mappable` made in
 the #1134 session. That rejection was correct *for the formulation then on the
-table* (`map(self: Self[A]) : Self[B]` with `Self` HKT + GHC-RULES-style synthesis).
+table* (`map(self: Self[a]) : Self[b]` with `Self` HKT + GHC-RULES-style synthesis).
 The `Shape` formulation is not that one: it never applies `Self` to two distinct type
 arguments (no type-lambda), and the synthesis of the fused target is not a RULES
 machine but inlining + collapse driven by a closed-catalog equational law — which is
@@ -54,7 +54,7 @@ exactly the option (C) that #1134 said it "converges on". The real novelty here:
 > **REVISED (challenge from lnds).** An earlier draft packaged `Shape` as a hidden
 > *sort* of the typer, deliberately kept out of the kind catalog. That was a category
 > error, walked back here. `Shape` is a **catalog kind** — `kind Shape : ConstructorApp`
-> — surfaced by `kai info kinds` like every other. The application rule `s[A] :: Type`
+> — surfaced by `kai info kinds` like every other. The application rule `s[a] :: Type`
 > (§1.3) is the one genuinely new typer mechanism and is independent of the packaging;
 > atomicity (§1.2) is identical either way. See the closing note of this section for
 > the full rationale.
@@ -72,7 +72,7 @@ kind Shape : ConstructorApp
 **The theory is `ConstructorApp` — Shape's own engine.** Habitant equality is symbol
 identity: `List ~ List` succeeds, `List ~ Vec` fails. No product, no inverse, no sum —
 a shape "stands only for itself". The *application* rule (§1.3) is what makes this an
-engine rather than plain equality: it decomposes `s[A]` into head and argument and
+engine rather than plain equality: it decomposes `s[a]` into head and argument and
 binds the constructor witness.
 
 > An earlier draft shared one `Structural` label between `Shape` and `Region` on the
@@ -141,14 +141,14 @@ Formation discipline inherited verbatim from the catalog (`Composition` rejects
 | `Map` (arity 2) | **rejected at formation** | arity != 1 (§1.4) |
 | `Int`, `String` (arity 0) | no | arity 0 — it is a `Type` habitant, not a `Shape` habitant |
 | `List[Int]` (applied) | no as Shape (yes as Type) | already saturated — a `Type` habitant |
-| `s . t`, `Compose[F,G]` | **rejected at formation** | shape composition — forbidden (§1.4) |
+| `s . t`, `Compose[f,g]` | **rejected at formation** | shape composition — forbidden (§1.4) |
 | `\a. List[a]` type-lambda | **does not parse** | type-lambda — HKT poison #1, never a `Shape` habitant |
 
 The three prohibitions (arity!=1, composition, type-lambda) are the definition of
 "atomic" and are **what buys decidability**. A `Shape` habitant "stands only for
 itself" — exactly like a `Region` habitant.
 
-### 1.3 Well-formedness of `s[A]` — the one new formation rule
+### 1.3 Well-formedness of `s[a]` — the one new formation rule
 
 Habitant *equality* is symbol identity (§1.1). What the assembled theories cannot give
 is **application**: the property menu speaks only of combination *within* one kind
@@ -163,10 +163,10 @@ The formation judgment classifies each type by which kind it belongs to; write `
 ```
 Γ ⊢ s : Shape        Γ ⊢ A : Type
 ──────────────────────────────────────  (Shape-App)
-        Γ ⊢ s[A] : Type
+        Γ ⊢ s[a] : Type
 ```
 
-`s[A]` is a `Type` habitant formed by applying a `Shape` to a `Type`. **There is only
+`s[a]` is a `Type` habitant formed by applying a `Shape` to a `Type`. **There is only
 one shape-application rule**, and its argument kind is `Type`, not `Shape`: that is
 what forbids `s[t]` with `t : Shape` (composition). Saturation is total and in one
 step: a `Shape` applied to its single `Type` produces a finished `Type`, never a
@@ -180,48 +180,48 @@ parallel "sort" level.)*
 
 **The three cases to resolve:**
 
-**(a) `s[A] ~ Int` → FAILS.** `s[A]` has sort `Type` and form "shape application";
+**(a) `s[a] ~ Int` → FAILS.** `s[a]` has sort `Type` and form "shape application";
 `Int` has sort `Type` and form "nullary constant". First-order unification fails
-because the head constructors differ in arity: `s[A]` is `App(s, A)`, `Int` is
+because the head constructors differ in arity: `s[a]` is `App(s, a)`, `Int` is
 `App(Int, ∅)` with `Int` of arity 0. No unifier. **Clear, early error**, not a hang.
 (This is exactly what `List[Int] ~ Int` does today.)
 
-**(b) `s[A] ~ Map[K,V]` → FAILS, and this is the arity decision.**
+**(b) `s[a] ~ Map[k,v]` → FAILS, and this is the arity decision.**
 
-> **Decision — strict arity 1. `Map[K,V]` does not inhabit `Shape`; `s[A] ~ Map[K,V]`
+> **Decision — strict arity 1. `Map[k,v]` does not inhabit `Shape`; `s[a] ~ Map[k,v]`
 > is a unification error, not a coercion.** `Map` is arity 2. The `Shape-App` rule
-> only produces `s[A]` (one argument). An `s := Map` would require `Map` to be
+> only produces `s[a]` (one argument). An `s := Map` would require `Map` to be
 > arity 1, false. The error is "`Map` has arity 2, cannot unify with a `Shape`
 > (arity-1 constructor)".
 
 Rationale (against the temptation of arity-N from day 1): arity-N is *precisely*
-where undecidable higher order reappears, because `s[A] ~ Map[K,V]` with `s` an
-arity-N variable admits two unifiers (`s := Map` with two args, or `s := \x.Map[K,x]`
+where undecidable higher order reappears, because `s[a] ~ Map[k,v]` with `s` an
+arity-N variable admits two unifiers (`s := Map` with two args, or `s := \x.Map[k,x]`
 by currying) — and the second is a type-lambda, poison #1. Strict arity-1 leaves only
 `s := Constructor` with no currying possible: **syntactic** first-order unification,
 one unifier or none, trivial principality. The precedent is Rust: `Iterator` was not
 HKT, and GATs (which give variable arity to associated types) arrived **years later**
-with a much more expensive resolution engine. `Map[K,V]` participating in a
+with a much more expensive resolution engine. `Map[k,v]` participating in a
 `Sequence` is post-Orongo, exactly as GATs were post-1.0 in Rust — and when it lands it
-will be via explicit user currying (`impl Sequence for Map[K]` fixing `K`), never via
+will be via explicit user currying (`impl Sequence for Map[k]` fixing `k`), never via
 higher-order unification. Register this as a known limit, not a bug.
 
-**(c) nested shapes `s[t[A]]` → FORBIDDEN at formation.**
+**(c) nested shapes `s[t[a]]` → FORBIDDEN at formation.**
 
-> **Decision — `s[t[A]]` with `s, t` both `Shape` variables is NOT a well-formed
-> type.** The `Shape-App` rule requires `s`'s argument to be sort `Type`. `t[A]` is
-> sort `Type` **only if `t` is resolved to a concrete constructor** (then `t[A]` is
-> saturated and is `Type`). With `t` an unresolved shape variable, `t[A]` is
+> **Decision — `s[t[a]]` with `s, t` both `Shape` variables is NOT a well-formed
+> type.** The `Shape-App` rule requires `s`'s argument to be sort `Type`. `t[a]` is
+> sort `Type` **only if `t` is resolved to a concrete constructor** (then `t[a]` is
+> saturated and is `Type`). With `t` an unresolved shape variable, `t[a]` is
 > syntactically `Type`, but the interesting position — two distinct shape variables
 > stacked — is exactly functor-compose (`Compose F G`), the case Haskell needs
 > `newtype Compose` for because the kind system does not give it free. Forbid it at
-> the surface: a protocol op **may not** mention `s[t[A]]` with two environment shape
-> variables. `List[Option[A]]` (one shape variable `s[Option[A]]`, `Option` concrete)
-> IS legal — it is `s` applied to a `Type` that happened to be `Option[A]`. The line:
+> the surface: a protocol op **may not** mention `s[t[a]]` with two environment shape
+> variables. `List[Option[a]]` (one shape variable `s[Option[a]]`, `Option` concrete)
+> IS legal — it is `s` applied to a `Type` that happened to be `Option[a]`. The line:
 > **at most one free `Shape` variable per type position.**
 
 This is not an accidental expressiveness limit — it is what keeps unification
-first-order. With two shape variables stacked, `s[t[A]] ~ List[Option[Int]]` has
+first-order. With two shape variables stacked, `s[t[a]] ~ List[Option[Int]]` has
 multiple unifiers (`s := List, t := Option` vs `s := \x.List[Option[x]], t :=
 identity`), reintroducing currying. Forbidding it eliminates the whole class.
 
@@ -235,9 +235,9 @@ Multi-sorted unification adds two rules and **zero new engine** (same argument a
 #1108: "zero new engine", the solver consumes opaque keys):
 
 ```
-unify(s[A], D[B])   where s : Shape variable, D : Shape constant
+unify(s[a], D[b])   where s : Shape variable, D : Shape constant
 ──────────────────────────────────────────────────────────────────
-  s := D,  then unify(A, B)          -- first-order decomposition
+  s := D,  then unify(a, b)          -- first-order decomposition
 
 unify(s, D)  where s : Shape variable, D : Shape constant or variable
 ──────────────────────────────────────────────────────────────────
@@ -276,7 +276,7 @@ attacks section verifies rows and Measure-under-shape do not break this.)
 ### 2.3 Interaction with effect rows
 
 Effect rows live in a distinct sort (`Effect`) and a distinct syntactic position
-(after `/`), not under `[·]`. An op `map(xs: s[A], f: (A)->B / e) : s[B] / e` has:
+(after `/`), not under `[·]`. An op `map(xs: s[a], f: (a)->B / e) : s[b] / e` has:
 
 - `s : Shape` — unifies by §2.1
 - `A, B : Type` — unify by standard HM
@@ -288,7 +288,7 @@ is why the "pipes convention-based" §of the protocols doc says pipes *cannot* r
 operator-style protocol: `+`-style operators have closed rows). Here it is different:
 **the `Sequence` protocol declares its op with an explicit row-variable `e`**, not a
 closed row. That is row-polymorphism in the op signature — which kaikai *already*
-supports for free functions (`fn map[A,B,e](xs, f: (A)->B/e) : /e`). The protocol
+supports for free functions (`fn map[a,b,e](xs, f: (a)->B/e) : /e`). The protocol
 inherits that capability because its op is, at bottom, a free function also
 parametrised by `s`.
 
@@ -329,8 +329,8 @@ a protocol op takes no effect row today (`/ e` is a parse error there):
 
 ```text
 protocol Sequence[s: Shape] : Functorial {
-  map(xs: s[A], f: (A) -> B / e) : s[B] / e
-  foldl(xs: s[A], init: Acc, combine: (Acc, A) -> Acc / e) : Acc / e
+  map(xs: s[a], f: (a) -> b / e) : s[b] / e
+  foldl(xs: s[a], init: Acc, combine: (Acc, a) -> Acc / e) : Acc / e
 }
 ```
 
@@ -420,15 +420,15 @@ decidable construction.**
 
 ### 4.1 How the shape flows through the pipeline
 
-Call-site `xs |> map(f)` with `xs : s[A]`:
+Call-site `xs |> map(f)` with `xs : s[a]`:
 
 1. **Inference.** `map` resolves as an op of protocol `Sequence`. The typer infers
-   `type-of(xs) = s[A]`. Since `s` is a `Shape` variable, dispatch **is not resolved
+   `type-of(xs) = s[a]`. Since `s` is a `Shape` variable, dispatch **is not resolved
    yet** — it is left as a pending protocol-op, exactly as an op over generic `Self`
    waits for monomorphisation today (protocols.md §How dispatch resolves).
 2. **Monomorphisation.** When the call-site specialises, `s` binds to a concrete
    constructor (`s := List`, `s := Tree`, ...) by the live substitution. Now
-   `type-of(xs) = List[A']` with everything concrete.
+   `type-of(xs) = List[a']` with everything concrete.
 3. **Impl-table.** The post-specialisation rewrite looks up `(Sequence, List)` in the
    impl table (key `(P, Shape-constant)`, `O(1)` hash) and redirects to
    `__pimpl_Sequence_List_map`. **Direct call, zero indirection, zero instance
@@ -590,9 +590,9 @@ refuses to use that impl for fusion** (or fails the test, decision §6.3).
 
 **The generators.** Here is the subtlety to resolve:
 
-> **Decision — `s[A]` values are generated via the `impl` itself, specifically via a
+> **Decision — `s[a]` values are generated via the `impl` itself, specifically via a
 > generator derived from the `type` structure (not via the `map`/`foldl` under
-> test).** For arbitrary `A`, instantiate `A := Int` (the canonical witness type, with
+> test).** For arbitrary `a`, instantiate `A := Int` (the canonical witness type, with
 > a standard `Int` generator) — property-based over `Int` suffices for parametric
 > functions (parametricity: a function `∀a. s[a] -> ...` that works for `Int` works
 > for every `a`, a Wadler-style free theorem). To generate a `Tree[Int]`, the
@@ -662,7 +662,7 @@ The current letter (CLAUDE.md Tier 1 §3): *"no Haskell-style type-class resolut
 > unification), no instance search / constraint propagation, no functional
 > dependencies, no type families, no overlapping instances.** Single-dispatch
 > protocols may quantify over a `Shape` (arity-1 type constructor, atomic — no
-> composition, no partial application, no type-lambda), so `s[A] ~ List[Int]` unifies
+> composition, no partial application, no type-lambda), so `s[a] ~ List[Int]` unifies
 > by **first-order applicative** unification (decidable; the mgu is `s := List, A :=
 > Int` or fails). A protocol may declare **equational laws from the closed theory
 > catalog** (`Functorial = { identity, fusion }`) that the optimizer exploits for
@@ -686,7 +686,7 @@ What the amendment **opens** (bounded):
 
 The rhetorical key: the amendment does **not** say "now HKT is allowed". It says "no
 type-lambdas, no instance search" — which are the concrete mechanisms that made HKT
-dangerous. `F[A] ~ List[Int]` was never the undecidable part; the undecidable part was
+dangerous. `F[a] ~ List[Int]` was never the undecidable part; the undecidable part was
 `F` = type-lambda + searching for `Functor F`. Forbidding those two by name, and
 allowing applicative shapes, is a *more precise* line, not a laxer one.
 
@@ -699,10 +699,10 @@ allowing applicative shapes, is a *more precise* line, not a laxer one.
 | Cost | Magnitude | Position |
 |---|---|---|
 | **New kind + application rule in the typer** | The `Kind` enum is today `KType \| KUnit` (2 variants); adding `KShape` is mechanical (precedent #1108: ~29 sites, 3 files). Habitant equality reuses `ConstructorApp` (zero engine). The one real new mechanism is the `Shape-App` formation/unification rule — pure first-order, cheaper than the abelian engine (no linear-equation solving). | Low. `ConstructorApp` is free; the application rule is the cheapest new formation in the family (less than `Composition`, far less than `AbelianGroup`). |
-| **Error quality** | A `s[A] ~ Map[K,V]` must say "arity mismatch: `Map` takes 2 type args, `Shape` requires 1", not a generic mgu-fail. A forbidden `s[t[A]]` must explain "at most one Shape variable per position". | **Real risk, budgetable.** It is the classic "half expressiveness" trap: the user writes something that *looks* reasonable (`Map` in a `Sequence`) and the rejection must be intelligible, not a unification vomit. Budget specific diagnostics per formation prohibition (§1.2), with an LLM-friendly hint ("use `impl Sequence for Map[K]` fixing K"). |
+| **Error quality** | A `s[a] ~ Map[k,v]` must say "arity mismatch: `Map` takes 2 type args, `Shape` requires 1", not a generic mgu-fail. A forbidden `s[t[a]]` must explain "at most one Shape variable per position". | **Real risk, budgetable.** It is the classic "half expressiveness" trap: the user writes something that *looks* reasonable (`Map` in a `Sequence`) and the rejection must be intelligible, not a unification vomit. Budget specific diagnostics per formation prohibition (§1.2), with an LLM-friendly hint ("use `impl Sequence for Map[k]` fixing K"). |
 | **Compile time** | Two new engines: Shape unification (cheap) + Functorial rewriting in KIR (fires only in pipelines with `map`). The autogenerated check runs in `kai test`, not `build`. | Low in `build` (the rewriting is local to call-sites with a pipe). Measurable: gate on selfhost byte-id + time. |
 | **Synthesis vs hand-written on native** | The synthesised fusion (inline+collapse) may not match the hand-written `list.map_sum` on the native backend, where RC and layout matter. | **The material risk of the proposal.** If the generic synthesis lands 20-30% behind the hand-written on native, the decoupling is a perf regression for the `list` case (the most common). **Mitigation (already in the design): the hand-written stay as the `list` model's fast-path** — synthesis only runs for user models. So the common case does not regress, and the user gains fusion they did not have before. Gate: native rb-tree/list bench, synthesis-vs-hand-written, synthesis must be within ~1.15× of hand-written or the fast-path stays and synthesis is marked "best-effort". |
-| **Future pressure: `Compose[F,G]`, arity-N** | Users will ask for functor-compose and `Map[K,V]` as `Sequence`. | Register as explicit out-of-scope (as #180 registered multi-method). `Compose` is genuine HKT (two stacked shape variables) — stays forbidden. Arity-N is post-Orongo (Rust GATs precedent). The doc lists this as "explicitly not supported", like protocols.md §"What protocols cannot do". |
+| **Future pressure: `Compose[f,g]`, arity-N** | Users will ask for functor-compose and `Map[k,v]` as `Sequence`. | Register as explicit out-of-scope (as #180 registered multi-method). `Compose` is genuine HKT (two stacked shape variables) — stays forbidden. Arity-N is post-Orongo (Rust GATs precedent). The doc lists this as "explicitly not supported", like protocols.md §"What protocols cannot do". |
 
 ### 8.2 The four attacks
 
@@ -746,10 +746,10 @@ propagation does).
 
 Yes — three cases, and they are **the half-expressiveness trap**, the proposal's
 cultural risk:
-1. `protocol P[m: Shape] { op(x: Map[K, m[V]]) }` — `Map` arity-2 rejected, and the
+1. `protocol P[m: Shape] { op(x: Map[k, m[v]]) }` — `Map` arity-2 rejected, and the
    user may not understand why `Map` is not "a container like the others".
    **Mitigation:** a diagnostic saying "`Map` has arity 2; `Shape` is arity-1. To use
-   `Map` as a Sequence, `impl Sequence for Map[K]` fixing the key type" — turns the
+   `Map` as a Sequence, `impl Sequence for Map[k]` fixing the key type" — turns the
    rejection into a recipe.
 2. `impl Sequence for Compose[List, Option]` — functor-compose, rejected. The user
    coming from Haskell expects it. **Mitigation:** a diagnostic "functor composition

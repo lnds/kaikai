@@ -126,7 +126,7 @@ type Type
   | TRecord(String, [(String, Type)])
   | TSum(String, [Variant])
   | TGen(String)                  (* generic parameter name *)
-  | TApp(Type, [Type])            (* Option[T], Result[T,E], etc. *)
+  | TApp(Type, [Type])            (* Option[t], Result[t,e], etc. *)
 ```
 
 The plan had the check pass resolve every `TGen` at a call site by unifying against the argument types.

@@ -28,7 +28,7 @@ cannot do. The four wins, in order of leverage:
 3. **Derived encode from the same Layout** — one type declares the representation
    once; `decode`/`encode` both derive from it, *impossible to desync*. Elixir
    writes parser and serializer separately.
-4. **Effects in the decode signature** — `decode[T] : T / Read + Abort` puts
+4. **Effects in the decode signature** — `decode[t] : t / Read + Abort` puts
    streaming and failure in the signature, composable with the rest of the effect
    system. Elixir has no typed effects.
 
@@ -48,7 +48,7 @@ re-implemented by hand, unsafely (an off-by-one in the cursor reads adjacent
 memory) and illegibly.
 
 The alternative that was considered and **rejected** is a raw-memory
-`reinterpret[T]` (`docs/unsafe-systems-design.md`). It cannot express two things
+`reinterpret[t]` (`docs/unsafe-systems-design.md`). It cannot express two things
 every real format needs — declared endianness (it assumes host layout) and
 data-dependent size — and it is `/Unsafe`. The declarative alternative is to make
 *layout a property of the type*, verified at compile time, with a safe

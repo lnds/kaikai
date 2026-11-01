@@ -425,7 +425,7 @@ default_block ::= 'default' '{' (handle_clause | return_clause)* '}'
 
 Operations are declared without `fn`, without a body; "paying the
 effect" is implicit at the call site. Each op may carry its own
-type parameters (`next[T]() : Option[T]`) in addition to the
+type parameters (`next[t]() : Option[t]`) in addition to the
 effect-level ones. Issue #533: an optional `default { … }` block at
 the tail of the body supplies handler clauses that run when no user
 handler is in scope — the clause shapes (`op(params, resume) -> body`
@@ -438,8 +438,8 @@ protocol_decl ::= 'protocol' IDENT type_params? '{' protocol_op+ '}'
 protocol_op   ::= IDENT type_params? '(' params? ')' return_spec
 ```
 
-`Self` is implicit. `protocol P[A]` introduces a single type
-parameter `A` for parametrised single-dispatch protocols. Op
+`Self` is implicit. `protocol P[a]` introduces a single type
+parameter `a` for parametrised single-dispatch protocols. Op
 declarations OMIT the `fn` keyword (parser rejects `fn name(...)`
 inside `protocol { ... }`) and have no body — default-impl bodies
 are not parsed today.
@@ -454,7 +454,7 @@ impl_type_param  ::= IDENT (':' kind_or_bound)?
 impl_member ::= fn_decl
 ```
 
-Bounded impl-site type parameters (`impl[T : Show + Eq] Show for [T]`)
+Bounded impl-site type parameters (`impl[t : Show + Eq] Show for [t]`)
 are the only place protocol bounds appear in the syntax. Ordinary
 `fn` / `type` declarations call `parse_optional_kind_annotation`
 which accepts only `: Type` or `: Measure` — the bound branch is
@@ -682,7 +682,7 @@ interpolation or triple-quoted forms.
 internals like `$extern_handler("c_symbol")`. Pinned 2026-05-13 to
 keep the `$`-prefixed namespace from leaking to user code.
 
-`variants[T]()` enumerates every constructor of the union type `T`
+`variants[t]()` enumerates every constructor of the union type `t`
 at compile time; the result is a list of the constructor values.
 
 `ensure(expr) where pred` narrows `expr` against a refinement
@@ -809,7 +809,7 @@ handle_alias ::= 'as' IDENT
 handle_member ::= effect_clause
               | return_clause
               | var_stmt                               (* lifts to wrapping
-                                                        State[T] handler
+                                                        State[t] handler
                                                         (issue #148 / m7b
                                                         #5b extension) *)
               | let_stmt                               (* lifts as above *)
@@ -820,14 +820,14 @@ clause_params ::= (IDENT (',' IDENT)*)? ',' 'resume'   (* resume always last *)
               | (* empty — handler op takes no args *)
 ```
 
-`with EffName[T1, T2](init) as alias` exercises every option: type
+`with EffName[t1, t2](init) as alias` exercises every option: type
 arguments for parametric effects (`Reader[Int]`), an initial value
 for stateful handlers (`State[Int](0)`), and a rebinding alias when
 two handlers of the same effect nest. All three slots are
 independently optional.
 
 `var` and `let` declarations at the top of the clause block lift
-into wrapping `State[T]` handlers via `desugar_var_block` (m7b #5b
+into wrapping `State[t]` handlers via `desugar_var_block` (m7b #5b
 extension, issue #148). The lifted handlers wrap the original body
 before the user-supplied clauses run, giving the inner block access
 to a State capability that survives the outer effect's handler.
@@ -979,9 +979,9 @@ delta and the desugar target.
 (a, b, c)           ≡  Triple { fst: a, snd: b, trd: c }
 (a, b, c, d)        ≡  Quad { fst: a, snd: b, trd: c, frt: d }
 
-(A, B)              ≡  Pair[A, B]                       (* type *)
-(A, B, C)           ≡  Triple[A, B, C]
-(A, B, C, D)        ≡  Quad[A, B, C, D]
+(a, b)              ≡  Pair[a, b]                       (* type *)
+(a, b, c)           ≡  Triple[a, b, c]
+(a, b, c, d)        ≡  Quad[a, b, c, d]
 
 let (a, b) = pair   ≡  let Pair { fst: a, snd: b } = pair  (* pattern *)
 ```
@@ -1065,13 +1065,13 @@ cap                     ≡  Cap.get()                   (* naked cell read *)
 cap := v                ≡  Cap.set(v)
 a[i] := v               ≡  Mutable.array_set(a, i, v)  (* indexed write *)
 a[i]                    ≡  Mutable.array_get(a, i)     (* indexed read *)
-var x := init           ≡  handle { ... } with State[T](init) { ... }
+var x := init           ≡  handle { ... } with State[t](init) { ... }
 ```
 
 `:=` is the single mark of mutability: `var x := init` declares the
 cell, `x := v` writes it, and a bare `x` reads it. `@` is no longer a
 read prefix — its only role is the as-pattern (`name @ subpattern`).
-`Ref[T]` uses ordinary `r.get()` / `r.set(v)`.
+`Ref[t]` uses ordinary `r.get()` / `r.set(v)`.
 
 ### 4.10 `unit` keyword
 
@@ -1108,7 +1108,7 @@ expr!                  ≡  match expr {
 
 The dispatch (Option vs Result) is by the type the typer assigns to
 `expr`. Used in any expression position; the enclosing function's
-return type must be `Option[U]` or `Result[U, E]` accordingly.
+return type must be `Option[u]` or `Result[u, e]` accordingly.
 
 ### 4.13 As-pattern — `name @ pattern`
 

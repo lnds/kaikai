@@ -307,7 +307,7 @@ loose runtime's tolerance).
   prologue.
 - The two-arg `resume(v, ns)` branch in `emit_call_expr`
   (`stage2/compiler.kai:8037-8043`) — this writes `self->state =
-  ns` for `State[T]::set(v, resume) -> resume((), new_state)`.
+  ns` for `State[t]::set(v, resume) -> resume((), new_state)`.
   Untouched. The new state is owned by `self->state` after the
   write, so it follows the same alias pattern — a subsequent
   `state` read inside another clause will need (and get) a

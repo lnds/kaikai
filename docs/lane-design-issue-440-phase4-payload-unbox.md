@@ -260,7 +260,7 @@ ship in three sub-PRs**:
 - Switch construction + pat-test + pat-bind sites to the new helpers
   for variants with the new layout.
 - Selfhost byte-identical (no stdlib variant in stage1 has primitive
-  fields — verify this empirically: `Result[T,E]`, `Option[T]`,
+  fields — verify this empirically: `Result[t,e]`, `Option[t]`,
   `LamInfo`, `EFn`, `Var`, `TypeBody` etc. are all-pointer payloads;
   if anything has a primitive field the bootstrap chain needs care).
 - ~4–5 days.
@@ -288,7 +288,7 @@ descriptor in Strategy 2, or by keeping `KAI_VARIANT` as the legacy
 tag in Strategy 1), bootstrap is safe. Strategy 3 fails this without
 extra runtime work.
 
-stdlib variants (`Result[T,E]`, `Option[T]`, `Map[K,V]`, etc.) are
+stdlib variants (`Result[t,e]`, `Option[t]`, `Map[k,v]`, etc.) are
 parametric over type variables — type-variable slots are POINTER per
 the layout rule — so they keep emitting all-pointer payloads. **The
 new layout fires only on monomorphised variants whose ground types

@@ -81,10 +81,10 @@ when discussing Orongo readiness):
   disclaimer sweep). The chain that opened Hanga Roa de facto:
   - **Hanga Roa precondition work (landed early)**: #246 / #245
     (operator overloading via protocols + Complex stdlib),
-    #266 (positional record construction), #257 (Ref[T] in
+    #266 (positional record construction), #257 (Ref[t] in
     Mutable effect), #260 / #261 (extern "C" fn syntax + name
     override), #275 (`@` / `:=` Ref sugar), #267 phase 1
-    (Complex `i` literal), #180 (`protocol P[A]` single-dispatch
+    (Complex `i` literal), #180 (`protocol P[a]` single-dispatch
     parametrised), #267 phase 2 (heterogeneous Complex
     arithmetic), #174 (polymorphic impl bounded constraints),
     #175 (stdlib polymorphic impls Show/Eq/Ord/Hash for
@@ -290,11 +290,11 @@ ad-hoc evaluation workflow.
 
 - Operator overloading via protocols + Complex stdlib (#246, #245).
 - Positional record construction `T { v1, v2 }` (#266).
-- `Ref[T]` in `Mutable` effect (#257).
+- `Ref[t]` in `Mutable` effect (#257).
 - `extern "C" fn` syntax + name override (#260, #261).
 - `@` / `:=` Ref sugar (#275).
 - Complex literal `i` suffix — phase 1 (#267).
-- `protocol P[A]` single-dispatch parametrised + heterogeneous
+- `protocol P[a]` single-dispatch parametrised + heterogeneous
   arithmetic — phase 2 (#180, #267 phase 2).
 - Polymorphic impl bounded constraints (#174).
 - Stdlib polymorphic impls Show/Eq/Ord/Hash for
@@ -303,7 +303,7 @@ ad-hoc evaluation workflow.
 
 These unblock the rest of the scope below: m11 needs the
 diagnostic surface stabilised, LSP needs the protocol resolver,
-and `check` v2 (`Arbitrary`) needs `protocol P[A]` plus the
+and `check` v2 (`Arbitrary`) needs `protocol P[a]` plus the
 polymorphic-impl machinery.
 
 **Scope — closure status (refreshed 2026-06-29, HEAD v0.94.0)**:
@@ -476,7 +476,7 @@ mirrors it. The two Orongo pillars the edition was re-scoped around
   surface decisions are explicitly deferred to this moment, to be
   taken with measurements in hand: the list-literal default
   (`[1,2,3]`: cons today; the flip — literal AND type together,
-  cons becoming nominal `List[T]`, no sigil — per the 2026-07-09
+  cons becoming nominal `List[t]`, no sigil — per the 2026-07-09
   design consult) and the final `kai info syntax` freeze.
 - **`kai migrate` rule set** — machinery shipped (#1047); the rule
   set grows with the surface pin (the list flip, if taken, is its
@@ -485,7 +485,7 @@ mirrors it. The two Orongo pillars the edition was re-scoped around
   user programs compile one unit per module on both backends (#963).
 - **Near-C performance on structural workloads** — the measured
   ladder, in order: pipe fusion (#1140/#1145, shipped: fused
-  chains, range generator heads), `Vec[T]` (#1142/#1147, shipped:
+  chains, range generator heads), `Vec[t]` (#1142/#1147, shipped:
   flat unboxed storage, uniqueness in-place, raw element paths —
   case-6 memory at Rust parity), sized-exact variant
   representation (#1136, shipped — the rb-tree wall closer),

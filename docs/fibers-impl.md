@@ -393,7 +393,7 @@ queued for post-MVP.
 
 **Phase 6 v1 caveats**: the shallow check in
 `is_fiber_producer_helper` + `ty_expr_contains_fiber` rejects
-`Fiber[T]` in any user-fn return-type position the walker reaches
+`Fiber[t]` in any user-fn return-type position the walker reaches
 (direct, `[Fiber[_]]`, function-type return, `Result[_, Fiber[_]]`,
 etc.). It does NOT track:
 
@@ -401,7 +401,7 @@ etc.). It does NOT track:
   record fields whose types don't lexically mention `Fiber` (e.g.
   `type Boxed = Wrapper(Fiber[Int])` — the return type `Boxed`
   hides Fiber from the walker).
-- `Pid[Msg]` escape (the same brand machinery would apply per
+- `Pid[msg]` escape (the same brand machinery would apply per
   `docs/structured-concurrency.md` §*Type system*; v1 only checks
   Fiber).
 

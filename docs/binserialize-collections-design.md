@@ -12,9 +12,9 @@ machinery for records and sums. The protocol covers `Int`, `Bool`,
 that recursively rely on those primitives.
 
 The catch: the AST types we want to serialise for the cache layer
-(`Decl`, `Expr`, `Pattern`, `TypeExpr`, …) carry `[T]` lists,
-`Option[T]` fields, and `Char` payloads everywhere. None of those
-three have a `BinSerialize` impl today, and one of them (`[T]`)
+(`Decl`, `Expr`, `Pattern`, `TypeExpr`, …) carry `[t]` lists,
+`Option[t]` fields, and `Char` payloads everywhere. None of those
+three have a `BinSerialize` impl today, and one of them (`[t]`)
 cannot have a useful single-dispatch impl at all. This lane closes
 the gap so the cache lane can apply `#[derive(BinSerialize)]` to the
 AST.
@@ -40,7 +40,7 @@ global `impl BinSerialize for List` would have to:
 - co-exist with the buffer's own list-of-Byte head, which the same
   dispatch table is already trafficking for arithmetic on `pos`.
 
-`Option[T]` has the same shape — one global impl cannot carry the
+`Option[t]` has the same shape — one global impl cannot carry the
 element type. `Char` is simpler (no parameter), but adding it would
 expand the protocol's whitelist and force a runtime `kai_op_*` entry
 that mostly delegates to `Int`. The current cluster of primitive impls
@@ -52,7 +52,7 @@ table small.
 
 `derive_binserialize_impl` generates the `to_bytes` / `from_bytes`
 bodies *at compile time*, with full access to each field's
-`TypeExpr`. When the field is a `[T]` or `Option[T]` or `Char`, the
+`TypeExpr`. When the field is a `[t]` or `Option[t]` or `Char`, the
 derive emits a call to a free combinator function instead of a
 protocol dispatch. The element type's encoder/decoder is supplied
 inline as a lambda — its mangled name is computable from the
@@ -61,15 +61,15 @@ element's head type, exactly as the record-field chain does today.
 Surface:
 
 ```text
-fn bin_list_to_bytes[T, e](xs: [T], enc: (T) -> Array[Byte] / e) : Array[Byte] / Mutable + e
-fn bin_list_from_bytes[T](buf: Array[Byte], pos: Int,
-                          dec: (Array[Byte], Int) -> Result[BinCursor[T], String])
-                        : Result[BinCursor[[T]], String]
+fn bin_list_to_bytes[t, e](xs: [t], enc: (t) -> Array[Byte] / e) : Array[Byte] / Mutable + e
+fn bin_list_from_bytes[t](buf: Array[Byte], pos: Int,
+                          dec: (Array[Byte], Int) -> Result[BinCursor[t], String])
+                        : Result[BinCursor[[t]], String]
 
-fn bin_option_to_bytes[T, e](o: Option[T], enc: (T) -> Array[Byte] / e) : Array[Byte] / e
-fn bin_option_from_bytes[T](buf: Array[Byte], pos: Int,
-                            dec: (Array[Byte], Int) -> Result[BinCursor[T], String])
-                          : Result[BinCursor[Option[T]], String]
+fn bin_option_to_bytes[t, e](o: Option[t], enc: (t) -> Array[Byte] / e) : Array[Byte] / e
+fn bin_option_from_bytes[t](buf: Array[Byte], pos: Int,
+                            dec: (Array[Byte], Int) -> Result[BinCursor[t], String])
+                          : Result[BinCursor[Option[t]], String]
 
 fn bin_char_to_bytes(c: Char) : Array[Byte]
 fn bin_char_from_bytes(buf: Array[Byte], pos: Int) : Result[BinCursor[Char], String]
@@ -163,13 +163,13 @@ then dispatch at decode time on that tag. Rejected because:
 
 ### Alt B: newtype `ByteVec` wrapping `[Byte]`
 
-Disambiguates the buffer from a `[T]` payload by wrapping the buffer
+Disambiguates the buffer from a `[t]` payload by wrapping the buffer
 in `ByteVec`. Rejected because it forces every existing call site
 (`bin_byte_at`, `bin_have`, the protocol surface itself) to switch
 from `[Byte]` to `ByteVec`. That is the kind of cascade #471 already
 absorbed once during the `u8 → Byte` rename (#476); doing it again
 for `ByteVec` adds churn without solving the parametric-element
-problem for `Option[T]`.
+problem for `Option[t]`.
 
 ### Alt C: redesign the protocol with explicit element decoder
 
@@ -210,7 +210,7 @@ fall-through is harmless.
   not the cache itself. The cache (`.kab` files, atomic writes,
   driver wiring, header validation, wall-time bench) ships in the
   next lane (#452).
-- Other parametric protocols (`Show[T]`, `Hash[T]`). They have the
+- Other parametric protocols (`Show[t]`, `Hash[t]`). They have the
   same dispatch shape but no immediate caller — re-revisit when the
   next consumer surfaces.
 - Adding `Char` as a first-class `BinSerialize` impl in the
@@ -226,7 +226,7 @@ fall-through is harmless.
   remain byte-identical (`make selfhost` is the gate).
 - New positive fixtures cover: `[Int]`, `[String]`, `[[Int]]`,
   `Option[Int]`, `Option[String]`, `Char`, sum variants with
-  `[T]` and `Option[T]` payloads.
+  `[t]` and `Option[t]` payloads.
 - New negative fixture: `[FooNoImpl]` reports the inner type as
   missing, not the outer `List`.
 - `make tier0` + `make tier1` green.

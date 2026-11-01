@@ -70,7 +70,7 @@ body (`handle { ... } with MyEff { ... }`).
 
 The same move keeps a test from performing an effect it would rather
 not: install your own handler over the code under test. An actor's
-mailbox is the main case — a scripted `Actor[Msg]` handler feeds
+mailbox is the main case — a scripted `Actor[msg]` handler feeds
 messages and expires deadlines without waiting (`kai info actors`
 §*Testing: the mailbox is a handler*). A handler clause must return,
 so a fake cannot emulate *blocking*: a mailbox can be replaced because

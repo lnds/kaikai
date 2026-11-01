@@ -138,7 +138,7 @@ fn main() : Unit / Ffi + Stdout = {
 
 Three things are happening:
 
-1. `extern "C" fn name(args) : T / Ffi` declares an external
+1. `extern "C" fn name(args) : t / Ffi` declares an external
    symbol. The compiler emits a forward declaration over the C ABI
    types the boundary uses (`extern <ret> name(<params>);`) on both
    backends, and the linker resolves `name` at link time. The
@@ -150,7 +150,7 @@ Three things are happening:
    exact kaikai mapping — `size_t`, a struct return — must be wrapped
    in a small `.c` whose signature uses a width kaikai can express
    (see *The C shim pattern*).
-2. `extern "C"("symbol") pub fn name(args) : T / Ffi` overrides
+2. `extern "C"("symbol") pub fn name(args) : t / Ffi` overrides
    the C symbol when the kaikai-side identifier doesn't match
    (e.g. binding `puts` as `c_puts`, or avoiding a kaikai
    keyword).

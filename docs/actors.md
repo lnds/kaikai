@@ -1,7 +1,7 @@
 # actors
 
 kaikai subsumes actors under the effect system. An actor is a
-**fiber with a mailbox**, implemented as an `Actor[Msg]` effect
+**fiber with a mailbox**, implemented as an `Actor[msg]` effect
 handler on top of the `Spawn` effect. There is no separate
 "actor runtime" — the scheduler, supervision, and cancellation
 machinery already specified for fibers in
@@ -12,14 +12,14 @@ thread — private heap, messages copied across fibers,
 one-shot `resume` as tail call. Full spec in
 `docs/structured-concurrency.md`.)
 
-This document specifies the `Actor[Msg]` effect: operations,
+This document specifies the `Actor[msg]` effect: operations,
 mailbox policies, supervision, interaction with `Cancel`, and
 the out-of-scope list. It refers back to `docs/effects.md` for
 the row-and-handler semantics, `docs/effects-stdlib.md` for the
-catalog slot reserving `Actor[Msg]`, and
+catalog slot reserving `Actor[msg]`, and
 `docs/structured-concurrency.md` for fiber lifetime rules.
 
-Scope of v1: a single effect `Actor[Msg]`, three canonical
+Scope of v1: a single effect `Actor[msg]`, three canonical
 mailbox policies, link and monitor supervision primitives, and
 clear semantics for `Cancel` mid-receive. Several extensions
 are deferred — see §*Out of scope for v1* below.
@@ -28,7 +28,7 @@ are deferred — see §*Out of scope for v1* below.
 
 The design commits in `docs/design.md` place actors under
 effects ("concurrency subsumed under effects. Actors = effect
-capability, not a separate primitive"). Doc B lists `Actor[Msg]`
+capability, not a separate primitive"). Doc B lists `Actor[msg]`
 in its out-of-scope section and points here; this doc fills it
 in.
 
@@ -37,12 +37,12 @@ Prior art. BEAM actors (Erlang / Elixir) define the surface —
 the mailbox untyped. Pony goes the opposite way: each actor
 declares one specific message type, and the compiler rejects
 sends that do not match. kaikai takes BEAM's surface and
-applies Pony's typing: `Pid[Msg]` is a typed handle, an actor
-handles exactly one `Msg` type, and the checker enforces it.
+applies Pony's typing: `Pid[msg]` is a typed handle, an actor
+handles exactly one `msg` type, and the checker enforces it.
 Links and monitors come from Erlang — the semantics is
 load-tested and composes with fibers.
 
-## The `Actor[Msg]` effect
+## The `Actor[msg]` effect
 
 ### Declaration
 
@@ -56,13 +56,13 @@ effect Actor[msg] {
 ```
 
 - `self()` — the pid of the current actor. Always available
-  under an `Actor[Msg]` handler.
+  under an `Actor[msg]` handler.
 - `send(pid, msg)` — enqueue `msg` in `pid`'s mailbox. Its
-  message type `T` is the destination's, chosen per call and
-  unrelated to the sender's own `Msg`: an actor whose mailbox is
+  message type `t` is the destination's, chosen per call and
+  unrelated to the sender's own `msg`: an actor whose mailbox is
   `Actor[Reply]` sends a `Request` to a `Pid[Request]`, as
   Erlang's `!` sends to any pid. A handler's `send` clause sees
-  `T` as rigid, so it may count, drop or forward the message but
+  `t` as rigid, so it may count, drop or forward the message but
   not inspect it; the content is inspected on the receiving side.
   May block, drop a message, or complete immediately depending on
   the receiving mailbox's overflow policy (see §*Mailbox
@@ -84,14 +84,14 @@ effect Actor[msg] {
   parks on the mailbox and the reactor timer wheel at once,
   woken by whichever fires first — no busy-poll. The deadline
   is serviced by the runtime reactor, which is always present
-  under the fiber scheduler, so the op's row stays `Actor[Msg]`
+  under the fiber scheduler, so the op's row stays `Actor[msg]`
   with no `Clock` capability. The `Duration`-typed
   `receive_timeout(d)` wrapper in `stdlib/actor.kai` is the
   surface callers use; it converts to nanoseconds and invokes
   this op.
 
-`Msg` is the concrete message type of the actor's own mailbox:
-what `self` names and `receive` returns. One `Actor[Msg]`
+`msg` is the concrete message type of the actor's own mailbox:
+what `self` names and `receive` returns. One `Actor[msg]`
 instance corresponds to one mailbox for one message type. Two
 mailboxes with different message types are two different
 effects (`Actor[Request]` vs `Actor[Event]`); sending to either
@@ -111,15 +111,15 @@ type ServerMsg =
 fn main() : Int = 0
 ```
 
-### `Pid[Msg]` — typed handle
+### `Pid[msg]` — typed handle
 
-`Pid[Msg]` is opaque: user code cannot build one. It is returned
+`Pid[msg]` is opaque: user code cannot build one. It is returned
 by `spawn_actor` and `Actor.self()`, and consumed by
 `Actor.send(pid, msg)` and the supervision ops.
 
-A function cannot return a `Pid[Msg]`, directly or inside a
+A function cannot return a `Pid[msg]`, directly or inside a
 record or sum it returns — the same check that keeps a
-`Fiber[T]` inside its nursery (`docs/structured-concurrency.md`
+`Fiber[t]` inside its nursery (`docs/structured-concurrency.md`
 §*Type system*). The check covers return types only. A pid can
 still outlive its mailbox's scope — for instance captured by a
 `spawn_actor` child that outlives the parent's `with_mailbox` —
@@ -136,21 +136,21 @@ monitoring, and message routing need it.
 <!-- coverage: skip --> spawn_actor + Monitor shipped in Fibers Tier 2 (2026-04-30, v0.5.0+); coverage via m8x_4_recv_blocking + m8_monitor.kai + m8_trap_exit.kai + demos/ping_pong/
 
 An actor is spawned through `Spawn` just like any other fiber,
-with an `Actor[Msg]` handler wrapped around the body so
+with an `Actor[msg]` handler wrapped around the body so
 `send` / `receive` / `self` are in scope. The body reaches them
 through its row (`Actor.receive()`, `Actor.send(pid, msg)`,
 `Actor.self()`). A handler written by hand can also bind the
-capability as a named instance, `with Actor[Msg](...) as m`, and
-pass `m` down to a function taking `m: Actor[Msg]`, which then
+capability as a named instance, `with Actor[msg](...) as m`, and
+pass `m` down to a function taking `m: Actor[msg]`, which then
 calls `m.receive()`, `m.send(pid, msg)`, `m.self()`.
 
 ### `spawn_actor` — a fiber with its own mailbox
 
 ```text
-pub fn spawn_actor[Msg, e](body: () -> Unit / Actor[Msg] + e) : Pid[Msg] / Spawn
+pub fn spawn_actor[msg, e](body: () -> Unit / Actor[msg] + e) : Pid[msg] / Spawn
 
-pub fn spawn_actor_policy[Msg, e](policy: MailboxPolicy,
-                                   body: () -> Unit / Actor[Msg] + e) : Pid[Msg] / Spawn
+pub fn spawn_actor_policy[msg, e](policy: MailboxPolicy,
+                                   body: () -> Unit / Actor[msg] + e) : Pid[msg] / Spawn
 ```
 
 `spawn_actor` runs `body` on a new fiber under a fresh
@@ -161,13 +161,13 @@ child's first action. `spawn_actor_policy` takes the mailbox's
 ### `with_mailbox` — mailbox for the current fiber
 
 ```text
-pub fn with_mailbox[Msg, R, e](body: () -> R / Actor[Msg] + e) : R / e
+pub fn with_mailbox[msg, r, e](body: () -> r / Actor[msg] + e) : r / e
 
-pub fn with_mailbox_policy[Msg, R, e](policy: MailboxPolicy,
-                                       body: () -> R / Actor[Msg] + e) : R / e
+pub fn with_mailbox_policy[msg, r, e](policy: MailboxPolicy,
+                                       body: () -> r / Actor[msg] + e) : r / e
 ```
 
-Installs an `Actor[Msg]` handler in the current fiber without
+Installs an `Actor[msg]` handler in the current fiber without
 spawning a new one. Useful when `main` (or any existing fiber)
 needs to receive replies — `with_mailbox` gives it its own
 mailbox:
@@ -192,7 +192,7 @@ fn main() : Int / Spawn = {
 ### Longhand
 
 `spawn_actor` is a thin wrapper over a fiber spawn plus a
-`handle { ... } with Actor[Msg](mailbox)` installation whose
+`handle { ... } with Actor[msg](mailbox)` installation whose
 state is the mailbox's pid:
 
 ```kaikai-fragment
@@ -622,7 +622,7 @@ fn main() : Int / Spawn + Stdout = {
 }
 ```
 
-`ask` needs only the caller's own `Reply` mailbox: the request
+`ask` needs only the caller's own `reply` mailbox: the request
 goes out through the server's `Pid[Request]`. The caller must
 already be inside an `Actor[Reply]` scope, typically by being an
 actor itself, or by wrapping the call in
@@ -707,7 +707,7 @@ fn main() : Int / Spawn + Stdout = {
 The dispatcher is an ordinary actor body that receives a `Task`,
 forwards it to the next worker, and rotates the list. The pool
 is built inline rather than by a `pool(size) : Pid[Task]` helper
-because a function cannot return a pid (§*`Pid[Msg]` — typed
+because a function cannot return a pid (§*`Pid[msg]` — typed
 handle*); a helper would take a continuation that receives the
 pid instead.
 
@@ -766,11 +766,11 @@ pid instead.
    which accepts a pid of any message type. Supervision only
    needs the pid's identity, never its mailbox type.
 
-4. **`Actor[Msg]` generic over `Msg`.**
+4. **`Actor[msg]` generic over `msg`.**
    A function may be generic over the mailbox type it runs
-   in: `receive_matching[Msg]` in §*Selective receive and future
+   in: `receive_matching[msg]` in §*Selective receive and future
    extension* has
-   row `Actor[Msg]` with `Msg` a type parameter, instantiated
+   row `Actor[msg]` with `msg` a type parameter, instantiated
    at each call site.
 
 ## Next steps

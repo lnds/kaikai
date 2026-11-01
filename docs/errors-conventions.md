@@ -9,8 +9,8 @@ applies and how they compose.
 
 | Mechanism | When to use | Inspectable? | Recovers? |
 |---|---|---|---|
-| `Option[T]` | "no value" is routine, no motive worth keeping | no | yes |
-| `Result[T, E]` | failure has a motive callers branch on | yes (typed `E`) | yes |
+| `Option[t]` | "no value" is routine, no motive worth keeping | no | yes |
+| `Result[t, e]` | failure has a motive callers branch on | yes (typed `e`) | yes |
 | abort effect (user-declared, op returns `Nothing`) | abort with message; caller cannot recover meaningfully | string only | no, unhandled = compile error |
 | `panic` | programming error, contract violation, unreachable | string only | no, terminates the process |
 | `!` postfix | propagate `Option[None]` or `Result[Err]` to the caller | — | yes (lifts to caller) |
@@ -19,10 +19,10 @@ applies and how they compose.
 LLM / authoring affordance, not an error-handling mechanism. They
 panic at runtime if reached unfilled.)
 
-## Rule 1 — `Option[T]` vs `Result[T, E]`
+## Rule 1 — `Option[t]` vs `Result[t, e]`
 
-> Use `Option[T]` when "absent" is the only thing the caller needs
-> to know. Use `Result[T, E]` when the caller branches on the
+> Use `Option[t]` when "absent" is the only thing the caller needs
+> to know. Use `Result[t, e]` when the caller branches on the
 > *motive*.
 
 Examples in stdlib:
@@ -40,7 +40,7 @@ on the error case of a `Result`, you should have used `Option`.
 Conversely, if you write `match opt { None -> Err("missing") }`,
 you should have used `Result` from the start.
 
-## Rule 2 — `Result[T, E]` vs an abort effect
+## Rule 2 — `Result[t, e]` vs an abort effect
 
 > Use `Result` when the caller can recover. Use an abort effect when
 > there is nothing reasonable for the caller to do.
@@ -50,7 +50,7 @@ every caller until a handler catches it. The handler converts the
 failure into something else (a default value, a logged event, a
 process exit). Callers in between do **not** branch on the message.
 
-`Result[T, E]` is for failures the caller wants to inspect and
+`Result[t, e]` is for failures the caller wants to inspect and
 *continue*: retry the operation, fall back to a default, surface
 the error to a user, log structured detail to an audit trail.
 
@@ -75,14 +75,14 @@ message is too lossy.
 
 - Failed I/O (`File`, the network effects, `Stdin`) — use the `Result` / `Option`
   shape declared by the effect.
-- Bad user input — surface it through `Result[T, InputError]`.
+- Bad user input — surface it through `Result[t, InputError]`.
 - Validation failures — same as above.
 
 **In fintech / regulated production code, `panic` should be
 exceptional.** A reachable `panic` in production is a bug in the
 contract design, not in the input.
 
-## Rule 4 — `Result[T, E]` order: `T` first, `E` second (Ok-first)
+## Rule 4 — `Result[t, e]` order: `t` first, `e` second (Ok-first)
 
 ```kaikai
 type ParseError = Empty | NotANumber(String)
@@ -103,8 +103,8 @@ comes first, the error type second — the same order as Rust's
 `Result<T, E>`, and the order of the declaration in
 `stdlib/core/result.kai`.
 
-> **Reading the type aloud**: `Result[T, E]` is "a result that
-> carries `T` or errors with `E`". Because `Ok`/`Err` are named
+> **Reading the type aloud**: `Result[t, e]` is "a result that
+> carries `t` or errors with `e`". Because `Ok`/`Err` are named
 > constructors, `Ok(value)` / `Err(motive)` are unambiguous
 > regardless of the type-argument order — and the annotation itself
 > reads left-to-right success-then-error, matching Rust.
@@ -237,7 +237,7 @@ across three bounded contexts.
 | The same component error participates in many app-level unions | **Pattern C** (no name mangling needed) |
 | You need a single-tag runtime layout (FFI, serialisation pinned to a tag enum) | Pattern A |
 | The wrapper is purely for type identity with no extra payload | **Pattern C** wins (less boilerplate) |
-| Generic over the error type (`F[T] = Option[T] | Result[T, String]`) | Neither — unions are not generic |
+| Generic over the error type (`F[t] = Option[t] | Result[t, String]`) | Neither — unions are not generic |
 
 Default to Pattern C for new code. Migrate Pattern A code only
 when the wrapper carries no extra structure and the migration is
@@ -259,7 +259,7 @@ in the natural path of other work (do not chase a clean-up).
 
 ## Rule 6 — Validation and accumulating errors
 
-`Result[T, E]` short-circuits at the first `Err`. For validations
+`Result[t, e]` short-circuits at the first `Err`. For validations
 that should report **all** failures (every rule that fired) — the
 typical fintech use case for transfer / order / portfolio
 validation — kaikai today requires manual accumulation:
@@ -293,14 +293,14 @@ fn main() : Unit / Stdout =
   }
 ```
 
-This pattern works but is verbose. A `Validation[E, T]`-style type
+This pattern works but is verbose. A `Validation[e, t]`-style type
 that accumulates over `<*>`-like composition (the Scala cats /
 Haskell `Validation` model) is **not** in the stdlib.
 
 The current guidance: when validation rules are independent (the
-typical case), build a `[E]` list manually and return
-`Result[T, [E]]`. When they cascade (later rules depend on earlier
-results), use `Result[T, E]` and `!` so the first failure
+typical case), build a `[e]` list manually and return
+`Result[t, [e]]`. When they cascade (later rules depend on earlier
+results), use `Result[t, e]` and `!` so the first failure
 short-circuits cleanly.
 
 ## Rule 7 — an abort effect is for the unhandleable
@@ -329,8 +329,8 @@ user-declared, no default handler exists — an unhandled abort is a
 compile error (`effect not handled`), not a runtime banner.
 
 **Such an effect should carry a `String` only.** If the error needs
-to be inspected, structured, branched on, it is a `Result[T, E]`
-with `E` a sum type.
+to be inspected, structured, branched on, it is a `Result[t, e]`
+with `e` a sum type.
 
 The stdlib itself declares no such effect: every fallible API
 returns `Result`, and the one failure-shaped effect it does declare
@@ -346,9 +346,9 @@ For deep non-local exit that the scheduler already models, use
 
 ```
 Is the failure value worth keeping for the caller?
-├── No, "absent" is enough → Option[T]
+├── No, "absent" is enough → Option[t]
 └── Yes, motive matters
-    ├── Caller can recover meaningfully → Result[T, E]
+    ├── Caller can recover meaningfully → Result[t, e]
     │   └── Multiple subsystems' errors compose? → union (Pattern C)
     │       (Pattern A — wrapper sum + map_err — when the wrapper
     │        carries extra structure.)

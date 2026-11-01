@@ -118,13 +118,13 @@ whose engine *is* the HM core, honestly.
 `Dim` classifies static shape indices: its habitants are `Int` values (`<3>`), `with`
 form (b). `<3>` unifies with `<3>`, never with `<4>` — **first-order value
 equality**. `Vec`/`Matrix`/`Tensor` are *types over* `Dim`, not kinds
-(`type Matrix[T]<m: Dim, n: Dim>`), carrying one or more `Dim` habitants in `<>`,
+(`type Matrix[t]<m: Dim, n: Dim>`), carrying one or more `Dim` habitants in `<>`,
 exactly as `Money` is a type over `Currency`.
 
 `Dim`'s engine is **not** the shape engine and **not** the abelian one:
 
 - Not shape: `shape_bind` binds a constructor *metavariable* by decomposing a type
-  application `D[A]` into head + argument (`shape_witness_of` yields an unapplied
+  application `D[a]` into head + argument (`shape_witness_of` yields an unapplied
   constructor, `shape_reapply` re-applies it). `<3>` has no head, no argument, no
   variable to bind — it is a closed value. Forcing a fake witness (`witness_of(<3>) =
   TyCon("3",[])`) would be the forbidden makeup.
@@ -504,7 +504,7 @@ The full declaration form:
 
 ```
 kind Name : Theory [over SecondDomain] with <habitant-form>
-type  M[T]<Kind> = { ... }
+type  M[t]<Kind> = { ... }
 # use:  M[Carrier]<habitant>      e.g.  Money[Real]<USD>,  Matrix[Real]<3,4>
 ```
 
@@ -514,11 +514,11 @@ Four pieces, each with one job.
 
 A user type over a kind has **two** parameters of different natures, in different brackets:
 
-- **`[Carrier]`** — an ordinary **type** parameter (`[]`, exactly like `Option[T]`). The `[]`
+- **`[Carrier]`** — an ordinary **type** parameter (`[]`, exactly like `Option[t]`). The `[]`
   list holds ONLY `Type` params (the carrier), with **no protocol bound** (see next). Its
   *name* is a plain convention — but a meaningful convention: name it for what the theory
-  expects, not a bare `T`. Money's carrier is a number, so name it `Num`
-  (`type Money[Num]<Currency>`); a bare `T` reads as "anything" and hides the intent. The name
+  expects, not a bare `t`. Money's carrier is a number, so name it `Num`
+  (`type Money[Num]<Currency>`); a bare `t` reads as "anything" and hides the intent. The name
   is documentation, not a bound — the compiler enforces the numeric requirement through the
   theory (below), the name just makes it legible. It is the type the value is built from:
   `Money[Decimal]`, `Money[BigInt]`, `Matrix[Real]`.
@@ -533,7 +533,7 @@ machinery being wired to native heads — the number enters as an ordinary carri
 only the wrapper type (`Money`, `Matrix`) carries the `<>`.
 
 The proposed declaration put the habitant slot on a record body; it has no surface
-(`type M[T]<Kind> = { ... }` does not parse):
+(`type M[t]<Kind> = { ... }` does not parse):
 
 ```text
 type Money[Num]<Currency> = { amount: Num }
@@ -575,8 +575,8 @@ non-numeric carrier where the concrete instance is known.
 The sharp line vs Haskell: this validation is **local and non-propagating**. It is an
 `impl`-table check at the concrete construction site — the same `concrete ⇒ check locally /
 variable ⇒ wait for the instance` discipline as literal minting. No constraint travels with a
-signature; a generic `fn combine[C](a: Money[C], b: Money[C])` still waits for the concrete `C`
-(and the theory's carrier check fires when `C` is pinned), rather than propagating a `C: Numeric`
+signature; a generic `fn combine[c](a: Money[c], b: Money[c])` still waits for the concrete `c`
+(and the theory's carrier check fires when `c` is pinned), rather than propagating a `c: Numeric`
 up the call graph. So the theory gives what a bound would — `Money[String]` is impossible — without
 the constraint resolution Tier 1 #3 rejects.
 
@@ -598,12 +598,12 @@ the operation crosses. Present exactly when the theory has two domains, absent o
   marks the second domain, and (like the carrier) carries no protocol bound — monomorphisation
   checks the scalar's ops per concrete instance.
 
-  > **Why not `kind Currency[T: Numeric] : Module over T`?** A module mathematically
+  > **Why not `kind Currency[t: Numeric] : Module over t`?** A module mathematically
   > *requires* its scalar to be a ring, so it is tempting to spell that as a bound on the
   > kind. Don't: that predicate belongs to the **theory**, not the kind declaration. `Module`
   > *is* "additive group + scalar-from-a-ring" by construction — the `scale` property has no
   > meaning without a ring to draw scalars from, so the ring requirement is baked into the
-  > theory. A `[T: Numeric]` on the kind would (a) be redundant with what `Module` already
+  > theory. A `[t: Numeric]` on the kind would (a) be redundant with what `Module` already
   > guarantees and (b) reintroduce exactly the constraint-propagation the carrier rule forbids
   > — a bound that travels with the signature, the Haskell line Tier 1 #3 rejects. The scalar's
   > ring-ness is enforced the same way the carrier's summability is: monomorphisation at the
@@ -629,7 +629,7 @@ behaves (opaque vs measure-carrying, open vs closed — the per-theory propertie
   written directly (`<3>`, `<"tag">`), not declared; the type restricts validity
   (`Matrix[Real]<3,4>` ok, `<USD,4>` error). The one kind here is `kind Dim with Int`
   — a habitant is a single `Int`. `Vec`, `Matrix`, `Tensor` are **types over `Dim`**, not kinds:
-  `type Vec[T]<n: Dim>`, `type Matrix[T]<m: Dim, n: Dim>` — they carry one or more `Dim`
+  `type Vec[t]<n: Dim>`, `type Matrix[t]<m: Dim, n: Dim>` — they carry one or more `Dim`
   habitants in `<>`, exactly as `Money` is a type over `Currency` and `Real` a type over
   `Measure`. `Dim` alone owns habitants (`Int` values); `Matrix` owns none, it consumes `Dim`'s.
   `Dim`'s engine is the **HM core** (first-order value equality), not a catalog theory — see

@@ -378,7 +378,7 @@ when the value is a literal, at runtime otherwise.
 
 **Inside a generic type there is no implicit narrowing.** A
 `[Int]` does not become a `[Pos]`, nor an `Option[Int]` an
-`Option[Pos]` or a `Result[Int, E]` a `Result[Pos, E]`: no runtime
+`Option[Pos]` or a `Result[Int, e]` a `Result[Pos, e]`: no runtime
 check stands behind the elements, so the conversion is a compile
 error. The explicit path maps the value through a function that
 checks it and returns the refined type. A literal is the exception,
@@ -680,7 +680,7 @@ predicate):
 ```text
 fn is_finite(x: Real) : Bool [<refinement_pure>]
 fn is_nan(x: Real) : Bool    [<refinement_pure>]
-fn length[T](xs: [T]) : Int  [<refinement_pure>]
+fn length[t](xs: [t]) : Int  [<refinement_pure>]
 fn is_some[T](o: Option<T>) : Bool [<refinement_pure>]
 fn is_none[T](o: Option<T>) : Bool [<refinement_pure>]
 fn matches(s: String, r: Regex) : Bool [<refinement_pure>]
@@ -802,7 +802,7 @@ short:
 
 - **Syntax**: `BaseT where Pred` (with the unary `where >= 0`
   elision), `requires` / `ensures` clauses with `result` bound in
-  `ensures`, `ensure(value) where pred` returning `Option[T]`, and
+  `ensures`, `ensure(value) where pred` returning `Option[t]`, and
   the `~r/.../` regex sigil with `matches` from `regexp`.
 - **Checking**: a refinement is a subtype of its base, so widening is
   free. A value flowing into a refined position is checked: annotated

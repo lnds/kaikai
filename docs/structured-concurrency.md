@@ -107,13 +107,13 @@ fn main() : Int / Spawn = {
 - `nursery { n -> ... }` opens a scope. `n` is the `Spawn`
   capability binding (the trailing-lambda + `as`-style cap form
   pinned in `docs/syntax-sugars.md`).
-- `n.spawn(f: () -> T / e) : Fiber[T] / Spawn + Cancel`
+- `n.spawn(f: () -> t / e) : Fiber[t] / Spawn + Cancel`
   creates a child fiber.
-- `n.await(f: Fiber[T]) : T / Spawn + Cancel` suspends until
+- `n.await(f: Fiber[t]) : t / Spawn + Cancel` suspends until
   the child finishes, returns its value.
-- `n.select(fs: [Fiber[T]]) : T / Spawn + Cancel` returns when
+- `n.select(fs: [Fiber[t]]) : t / Spawn + Cancel` returns when
   **any** listed child finishes; the others are cancelled.
-- `n.cancel(f: Fiber[T]) : Unit / Spawn` requests cancellation
+- `n.cancel(f: Fiber[t]) : Unit / Spawn` requests cancellation
   of one specific child. The child receives `Cancel.raise()`
   at its next yield point.
 - Leaving the nursery block **waits for all pending children** —
@@ -163,11 +163,11 @@ the scheduler.
 
 ## Type system
 
-- `Fiber[T]` and `Pid[Msg]` are scope-bound handles, not
+- `Fiber[t]` and `Pid[msg]` are scope-bound handles, not
   first-class movable values. The typer rejects any non-stdlib
   function that mentions either handle in its return type — at
   any depth in the TypeExpr (`Result[_, Fiber[Int]]`,
-  `Option[Pid[Msg]]`, `[Fiber[T]]`, …) **and** transitively
+  `Option[Pid[msg]]`, `[Fiber[t]]`, …) **and** transitively
   through user-defined sum-type constructor payloads
   (`type Boxed = Wrap(Fiber[Int])`). A narrow allow-list
   (`fiber_spawn`, `mailbox_alloc`, `spawn_actor`, …) admits the
@@ -179,7 +179,7 @@ the scheduler.
   `m8x_7_fiber_in_sum.kai`, `m8x_7_pid_in_sum.kai`
   (sum-payload), `m8x_7_recursive_sum_no_breach.kai` (recursive
   sums traverse + terminate without false positive).
-- `spawn(f: () -> T / e)` makes the **effect set `e`** part of the
+- `spawn(f: () -> t / e)` makes the **effect set `e`** part of the
   nursery's own row. A nursery that spawns only pure tasks has no
   additional effect; a nursery that spawns `Io` tasks has `Io`.
 - Cancellation is an effect, `Cancel`. A task can `handle` it to
@@ -493,8 +493,8 @@ Requires:
 
 - The effects + handlers machinery from m7a (row unification,
   direct-style op dispatch, handler-stack runtime).
-- `Fiber[T]` as a scope-bound handle (§*Type system*): the
-  return-type escape check it shares with `Pid[Msg]`, plus the
+- `Fiber[t]` as a scope-bound handle (§*Type system*): the
+  return-type escape check it shares with `Pid[msg]`, plus the
   per-nursery brand check.
 - A scheduler in the runtime: per-fiber stacks (segmented or
   heap-allocated), a cooperative scheduler loop, and a

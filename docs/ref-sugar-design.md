@@ -1,14 +1,14 @@
-# `Ref[T]` surface sugar — `&` make, `:=` set, `@` deref
+# `Ref[t]` surface sugar — `&` make, `:=` set, `@` deref
 
 **Status:** shipped. Motivated by #1113 (`:=` rejects a `Ref` record field) and by
-`Ref[T]` surfacing in everyday user code (graph nodes with rewritable edges —
+`Ref[t]` surfacing in everyday user code (graph nodes with rewritable edges —
 `kaikai-vs-rust` cases 1 & 6), which refutes the original rationale for leaving `Ref`
 verbose. The trio `&` / `:=` / `@` is live: `&x` opens a ref, `r := v` and
 `record.field := v` write, `@r` and `@r.field` read.
 
 ## The problem
 
-`Ref[T]` — the transportable mutable cell (unlike a local `var`, a `Ref` is a
+`Ref[t]` — the transportable mutable cell (unlike a local `var`, a `Ref` is a
 first-class value you can put in a record, pass, and return) — has no surface sugar.
 Every use spelled the effect and the op by hand (still accepted):
 
@@ -35,16 +35,16 @@ Three problems:
 
 ### Why the original "keep it verbose" rationale no longer holds
 
-`docs/effects-stdlib.md:287` deliberately withheld sugar from `Ref[T]`:
+`docs/effects-stdlib.md:287` deliberately withheld sugar from `Ref[t]`:
 
-> The same sugar is **not** extended to `Ref[T]` … Rationale: `Array[T]` shows up in
-> everyday user code, `Ref[T]` is a low-level tool used mostly by the stdlib and FFI
+> The same sugar is **not** extended to `Ref[t]` … Rationale: `Array[t]` shows up in
+> everyday user code, `Ref[t]` is a low-level tool used mostly by the stdlib and FFI
 > adapters where explicit ops double as documentation.
 
 That premise is refuted by practice. A graph node `{ id: Int, next: Ref[Slot] }` is
 user modelling, not stdlib plumbing (#1113 came from a two-node cyclic graph). Users
 model mutable-pointer-in-a-record with `Ref`, and are forced into `Mutable.ref_set(...)`
-or, worse, a one-cell `Array[T]` purely to reach the `[0]`-indexed form `:=` accepts.
+or, worse, a one-cell `Array[t]` purely to reach the `[0]`-indexed form `:=` accepts.
 Both are workarounds for a missing sugar, not a modelling choice.
 
 ## The surface — `&` / `:=` / `@`
@@ -146,7 +146,7 @@ write.
 
 ## Closing #1113 falls out of this
 
-#1113 (`:=` rejects `n.field := v` where `field : Ref[T]`) is subsumed: extending the
+#1113 (`:=` rejects `n.field := v` where `field : Ref[t]`) is subsumed: extending the
 `:=` LHS grammar (`parse.kai:3256`) so a `Ref`-typed `record.field` desugars to
 `Mutable.ref_set(record.field, v)` is exactly the `r := v` rule applied to a field
 target. The bare-`Ref` `:=` case and the `Ref`-field case are the same sugar; shipping

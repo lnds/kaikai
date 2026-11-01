@@ -1,13 +1,13 @@
 # actors
 
-Message-passing concurrency built on fibers — `Actor[Msg]` effect
+Message-passing concurrency built on fibers — `Actor[msg]` effect
 with `send` / `receive` / `self` ops.
 
 ## Description
 
 Actors are fibers with a private mailbox parameterised by message
-type. `Actor[Msg]` is an effect; its ops are reached via the plain
-`Actor.` prefix (the `[Msg]` parameter lives in the handler binding,
+type. `Actor[msg]` is an effect; its ops are reached via the plain
+`Actor.` prefix (the `[msg]` parameter lives in the handler binding,
 not in the op call site).
 
 Each actor has a private heap (BEAM-style isolation). A message
@@ -21,7 +21,7 @@ mailbox (backpressure). `receive()` takes the oldest message; there
 is no selective receive.
 
 `send` takes its message type from the destination, not from the
-sender's `Msg`: `send[t](pid: Pid[t], msg: t)`. An actor with an
+sender's `msg`: `send[t](pid: Pid[t], msg: t)`. An actor with an
 `Actor[Reply]` mailbox sends a `Request` to a `Pid[Request]` without a
 `Request` mailbox of its own.
 
@@ -53,14 +53,14 @@ fn main() : Int / Spawn + Stdout = with_mailbox {
 }
 ```
 
-`with_mailbox` is the stdlib helper that installs an `Actor[Msg]`
+`with_mailbox` is the stdlib helper that installs an `Actor[msg]`
 handler over the current fiber (see `stdlib/actor.kai`). The full
 spawn/install surface:
 
 - `with_mailbox(body)` / `with_mailbox_policy(policy, body)` —
   mailbox for the *current* fiber.
 - `spawn_actor(body)` / `spawn_actor_policy(policy, body)` — spawn
-  a fresh actor fiber (returns its `Pid[Msg]`); the `_policy` form
+  a fresh actor fiber (returns its `Pid[msg]`); the `_policy` form
   sets an explicit `MailboxPolicy` on the spawned mailbox, e.g.
   `spawn_actor_policy(Bounded(1, BlockSender), () => consumer())`
   for sender-side backpressure.
@@ -74,7 +74,7 @@ ties two fibers both ways. See `docs/actors.md` for the full surface.
 
 ## Testing: the mailbox is a handler
 
-`Actor[Msg]` is an effect and `with_mailbox` is an ordinary handler,
+`Actor[msg]` is an effect and `with_mailbox` is an ordinary handler,
 so a test can install its own and answer every receive from a
 script — including letting a deadline expire with no time passing.
 The test below runs instantly against a 5-second `receive_timeout`:
@@ -119,7 +119,7 @@ the code under test never calls. `receive`, `receive_timeout` and
 `send` can be scripted; a `send` clause serves every message type, so
 it may count, drop or forward the message but not inspect it. `self`
 cannot — user code has no way to build
-a `Pid[Msg]`, and `Actor.self()` inside the clause has no handler to
+a `Pid[msg]`, and `Actor.self()` inside the clause has no handler to
 reach. Code that calls `Actor.self()` cannot be driven by a scripted
 mailbox.
 
@@ -143,7 +143,7 @@ observes shared mutation.
   crash on either side cancels the other, unless it traps exits), but
   a link cannot be removed. A `Monitor` can (`Monitor.demonitor`).
 - Process registry / named actors as primitive. Use a stdlib
-  helper that wraps `Actor[Msg]` handles.
+  helper that wraps `Actor[msg]` handles.
 - Distributed actors. Single-node only.
 - `receive_match { ... }` selective receive.
 

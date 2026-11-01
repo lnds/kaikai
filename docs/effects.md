@@ -82,7 +82,7 @@ Row unification is standard Rémy-style. To solve
    as the tail of the row it is being bound to — same discipline
    as ordinary type-variable binding in HM.
 4. Recursively unify any label payloads (if labels carry type
-   arguments — rare, see `State[T]` below).
+   arguments — rare, see `State[t]` below).
 
 The algorithm is decidable, linear in the row size, and runs
 inside the existing HM inference loop. No fancy lattice, no
@@ -276,9 +276,9 @@ This applies uniformly:
 | Form                                         | Inference                |
 |----------------------------------------------|--------------------------|
 | `fn f(x: Int) = body`                        | return inferred, no row (private: row inferred) |
-| `fn f(x: Int) : T = body`                    | return explicit, no row (private: row inferred) |
+| `fn f(x: Int) : t = body`                    | return explicit, no row (private: row inferred) |
 | `fn f(x: Int) / E = body`                    | return inferred, row explicit |
-| `fn f(x: Int) : T / E = body`                | both explicit            |
+| `fn f(x: Int) : t / e = body`                | both explicit            |
 
 `Unit`-returning functions written as `fn f(x) / E = body` are
 the canonical short form for procedural helpers in stdlib and
@@ -312,7 +312,7 @@ the call site.
 constructed). An operation returning `Nothing` cannot resume —
 this is how `Fail` encodes abort at the type level.
 
-Effects can be parameterised (`State[T]`). The parameter is
+Effects can be parameterised (`State[t]`). The parameter is
 monomorphic per handler instance: one `handle ... with State[Int]`
 installs an `Int`-valued state cell.
 
@@ -387,7 +387,7 @@ handle { body } with Effect {
   return path. If absent, the return value of `handle` is the
   return value of `body` — identity is the documented default,
   not an oversight (`docs/decisions/handler-return-clause-optional-2026-05-12.md`).
-  Handlers that transform the body result (e.g. `State[S]` returning
+  Handlers that transform the body result (e.g. `State[s]` returning
   `(x, state)`) must write the clause explicitly.
 - `initially { }` runs once when the handler is installed, before
   `body`. Its value is the handler state, readable as `state` in the
@@ -544,17 +544,17 @@ call that has no clause to run, so the typer rejects it instead.
 
 ### `resume`: one-shot, explicit
 
-`resume` is a value of type `(T) -> S / ρ` where:
+`resume` is a value of type `(t) -> s / ρ` where:
 
-- `T` is the operation's declared return type.
-- `S` is the type of the `handle` expression (the type `body`
+- `t` is the operation's declared return type.
+- `s` is the type of the `handle` expression (the type `body`
   returns, possibly transformed by `return`).
 - `ρ` is the effect row of `body` **without** this handler's
   effect (plus whatever the handler's own body causes).
 
 In a parameterised handler (see *State: a handler with its own
 state* below), `resume` has the extended signature
-`(T, H) -> S / ρ`, where `H` is the handler's state type: the
+`(t, h) -> s / ρ`, where `h` is the handler's state type: the
 second argument replaces the current state. The plain `resume(v)`
 form is shorthand for `resume(v, state)` — state unchanged.
 
@@ -569,9 +569,9 @@ A clause may keep its continuation beyond a call in the clause
 itself: call it inside a `handle` nested in the clause, a loop body,
 a match guard, a string interpolation or a lambda, read a clause
 `var` after it, or store and return it. `resume` is then a value of
-type `Cont[T, S, e]` — `T` the op's result, `S` the handle's type, `e`
-the body's row without the handled effect — and `k(v) : S / e` resumes
-the body. `Cont[T, S]` is `Cont[T, S, e]` with `e` empty: the
+type `Cont[t, s, e]` — `t` the op's result, `s` the handle's type, `e`
+the body's row without the handled effect — and `k(v) : s / e` resumes
+the body. `Cont[t, s]` is `Cont[t, s, e]` with `e` empty: the
 continuation of a pure body. The handle runs its body on a stack
 segment.
 
@@ -593,7 +593,7 @@ A continuation stays on its fiber: a thunk handed to `spawn`, a
 fiber's result, or an actor message holding one is a compile error.
 
 A stateful handle keeps its continuation the same way. The state
-travels with it: the continuation is a `Cont[(T, H), S, e]`, with `H`
+travels with it: the continuation is a `Cont[(t, h), s, e]`, with `h`
 the handler's state type, and `k(v, s)` resumes the body with `v` and
 the next state `s`, as `resume(v, s)` does; in the clause, `resume(v)`
 is still `resume(v, state)`. The body's handle holds the state between
@@ -611,7 +611,7 @@ value the clause evaluates to becomes the value of the entire
 `handle`; the rest of `body` is abandoned, and the `return`
 clause (if any) is bypassed — `return` only runs on `body`'s
 normal completion path. The clause's value therefore already has the
-handle's type `S`; a clause of any other type is a type error.
+handle's type `s`; a clause of any other type is a type error.
 
 This is how `Fail` works:
 
@@ -675,7 +675,7 @@ worth noting so the syntax is not mystery:
   lambda that references a capability bound outside it (an op call,
   returning it, copying it, passing it on) carries that capability's
   effect in its own row, exactly as an alias does. The closure is then
-  `(…) -> T / Eff`, so it can only be called where `Eff` is handled,
+  `(…) -> t / Eff`, so it can only be called where `Eff` is handled,
   and a return type or field that does not declare `Eff` rejects it.
   The scope that owns the parameter does not demand the effect itself.
 - A tail `resume` returns into the op site at no cost; a non-tail
@@ -721,7 +721,7 @@ out transparently.
 
 ### State: a handler with its own state
 
-Not every handler is stateless. `State[T]` threads a value through
+Not every handler is stateless. `State[t]` threads a value through
 the body without exposing mutation to the user. Declaration
 repeated here for convenience:
 
@@ -734,7 +734,7 @@ effect State[t] {
 fn main() : Int = 0
 ```
 
-A handler for `State[T]` takes an initial value and binds a
+A handler for `State[t]` takes an initial value and binds a
 `state` identifier inside its clauses. `resume` gains an optional
 second argument: `resume(value, new_state)` resumes the body with
 `value` *and* updates the handler's state. Plain `resume(value)`
@@ -768,13 +768,13 @@ fn main() : Unit / Stdout = Stdout.print("#{sum([1, 2, 3])}")   # 6
   final state.
 
 This is the standard "parameterised handler" shape from the
-algebraic-effects literature. It generalises to `Reader[T]`,
-`Writer[W]`, exception handlers that collect context, etc. —
+algebraic-effects literature. It generalises to `Reader[t]`,
+`Writer[w]`, exception handlers that collect context, etc. —
 covered effect-by-effect in `docs/effects-stdlib.md`.
 
-The same *masking-at-scope-boundary* idea extends from `State[T]`
+The same *masking-at-scope-boundary* idea extends from `State[t]`
 (masked at the `var x := init` block) to `Mutable` (masked at the
-function boundary when the `Array[T]` is constructed locally and
+function boundary when the `Array[t]` is constructed locally and
 never escapes — see `docs/effects-stdlib.md` §`Mutable`
 *Observable-effects discipline*). In both cases the row tracks
 what the *caller* observes, not what the function does
@@ -837,8 +837,8 @@ remaining row (paid by the final `print`).
   with whatever the body produced.
 - Row variables in scope are generalised over at declaration
   boundaries, not inside expressions — same rule as ordinary
-  type generalisation. Example: `fn map[A, B, e](...)` is
-  generalised as `forall A, B, e. ...`, with `e` a row variable.
+  type generalisation. Example: `fn map[a, b, e](...)` is
+  generalised as `forall a, b, e. ...`, with `e` a row variable.
 
 ### Interaction with existing HM
 
@@ -932,7 +932,7 @@ subtyping (see *Out of scope*).
 - **Row polymorphism at the call site of an effect operation.**
   An operation cannot quantify over its own row variable.
   *(Type generics at the call site — an operation with its own
-  `forall T. …` — are allowed, see `docs/effects-stdlib.md`
+  `forall t. …` — are allowed, see `docs/effects-stdlib.md`
   §`Mutable`; this is the narrowed version of what was
   previously "effect operations with generic type arguments at
   the use site". Row-level per-call polymorphism is what stays
@@ -942,7 +942,7 @@ subtyping (see *Out of scope*).
   No default handler is baked into the language itself — the
   stdlib effects declare defaults, installed at `main` when its row
   holds them.
-- **Exceptions as a separate feature.** `Result[T, E]` with postfix
+- **Exceptions as a separate feature.** `Result[t, e]` with postfix
   `!`, or a user-declared `Nothing`-returning effect, subsumes
   try/catch idioms. There is no `try` keyword.
 - **`raise` / `throw` / `catch` keywords.** The only surface
@@ -956,8 +956,8 @@ Two related capabilities are in the language (§6 named instances):
   passed *down* into a function (`fn f(c: Eff)`), where each
   instance performs against its own evidence. It stays second-class
   (no return, no storage, no escaping closure — §6.2), so a value
-  that must outlive its scope is a `Ref[T]` under `Mutable`, not a
-  capability. No `Handler[E]` wrapper, no HKT.
+  that must outlive its scope is a `Ref[t]` under `Mutable`, not a
+  capability. No `Handler[e]` wrapper, no HKT.
 - **Multiple instances of one effect, addressed independently.**
   Three `with Cell as c1/c2/target` instances pass through one
   `add(c1, c2, dst)` call and each performs against its own node,
@@ -1035,7 +1035,7 @@ they first need to be acted on.
 <!-- coverage: skip --> cross-references
 
 - `docs/effects-stdlib.md` — the concrete stdlib effects (`Stdout`,
-  `File`, `State[T]`, `Mutable`, `Cancel`, `Spawn`, …) and their
+  `File`, `State[t]`, `Mutable`, `Cancel`, `Spawn`, …) and their
   default handlers.
 - `docs/effects-impl.md` — op dispatch in the stage-2 pipeline,
   handler-stack runtime representation, interaction with

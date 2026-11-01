@@ -34,10 +34,10 @@ and `stage0/runtime.h`. User variants start at `KAI_USER_VARIANT_TAG_BASE
 
 | Tag | Constructor  | Sum type             | Arity |
 | --- | ------------ | -------------------- | ----- |
-| 0   | `Some`       | `Option[T]`          | 1     |
-| 1   | `None`       | `Option[T]`          | 0     |
-| 2   | `Ok`         | `Result[T, E]`       | 1     |
-| 3   | `Err`        | `Result[T, E]`       | 1     |
+| 0   | `Some`       | `Option[t]`          | 1     |
+| 1   | `None`       | `Option[t]`          | 0     |
+| 2   | `Ok`         | `Result[t, e]`       | 1     |
+| 3   | `Err`        | `Result[t, e]`       | 1     |
 | 4   | `SigInt`     | `Signal`             | 0     |
 | 5   | `SigTerm`    | `Signal`             | 0     |
 | 6   | `SigHup`     | `Signal`             | 0     |
@@ -201,7 +201,7 @@ The runtime helper maps any value to its head tag:
   so a record with a head for `Ord` compares as one without. A reused
   cell is reset to 0 before its site stamps it.
 - **`Eq.eq` reached at run time** — a generic impl called from the
-  structural compare (`impl Eq for Option[T]` on a `Some` inside a
+  structural compare (`impl Eq for Option[t]` on a `Some` inside a
   list) compares what it holds through the `Eq.eq` dispatcher, and that
   dispatcher is the structural compare itself: it calls the impl of a
   value whose head has one and compares any other value member by
