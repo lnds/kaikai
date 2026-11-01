@@ -84,6 +84,23 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.192.0 (2026-11-01)
+
+### BREAKING CHANGE
+
+- a spawned body whose row names an `Actor` instance it does
+not handle is rejected. Delete the vestigial instance from the row (`send`
+goes through the child's own mailbox), or give the child its own
+`with_mailbox`.
+
+### Fixed
+
+- **typer**: match a spawned actor's Pid to its label by variable identity
+- **typer**: cover only the label an unresolved Pid argument names
+- **typer**: reject an Actor instance that crosses a spawn
+- **typer**: compare spawned mailbox instances structurally, classify ops by label
+- **typer**: defer the Actor instance choice and reject an unhandled mailbox at the spawn
+
 ## v0.191.0 (2026-11-01)
 
 ### Added
