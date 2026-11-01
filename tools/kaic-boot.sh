@@ -18,7 +18,10 @@
 #
 # A kaic2-class boot takes two hops: the boot emits <dir>/stage2-a.c, linked
 # into <dir>/kaic2-a, and kaic2-a emits <out.c>, so the C that is linked is
-# this tree's codegen. A kaic1-class boot takes one.
+# this tree's codegen. A kaic1-class boot takes one. KAIC_BOOT_HOPS=1 asks a
+# kaic2-class boot for one hop too: the boot emits <out.c> itself, which is
+# its codegen's C for this tree. The record states the hops taken, so a C
+# is reused only under the KAIC_BOOT_HOPS it was emitted with.
 #
 # KAIC_BOOT_MODULAR=1 makes a kaic2-class boot emit both hops as a
 # `--emit=c-modular` stream, one translation unit per module, which
@@ -42,6 +45,7 @@ export LC_ALL
 
 die() { echo "kaic-boot: error: $*" >&2; exit 2; }
 say() { echo "kaic-boot: $*" >&2; }
+case "${KAIC_BOOT_HOPS:-2}" in 1|2) ;; *) die "KAIC_BOOT_HOPS must be 1 or 2, got '$KAIC_BOOT_HOPS'" ;; esac
 
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi
@@ -269,7 +273,7 @@ run_boot() {
   fi
 }
 
-hops() { if [ "$1" = kaic2 ]; then echo 2; else echo 1; fi; }
+hops() { if [ "$1" = kaic2 ]; then echo "${KAIC_BOOT_HOPS:-2}"; else echo 1; fi; }
 
 # emit_to <out.c>: run BOOT_BIN, replacing <out.c> only on success.
 emit_to() {
@@ -296,7 +300,7 @@ cmd_emit() {
   mkdir -p "$(dirname "$out")"
   rm -f "$out.id"
   key="$(src_key "$BOOT_CLASS")"
-  if [ "$BOOT_CLASS" = kaic2 ]; then hop_a "$out"; else say "boot $BOOT_ID -> $out"; fi
+  if [ "$(hops "$BOOT_CLASS")" = 2 ]; then hop_a "$out"; else say "boot $BOOT_ID -> $out"; fi
   emit_to "$out"
   printf 'boot=%s\nclass=%s\nhops=%s\nsrc=%s\nout=%s\n' \
     "$BOOT_ID" "$BOOT_CLASS" "$(hops "$BOOT_CLASS")" "$key" "$(sha_of "$out")" > "$out.id.tmp"

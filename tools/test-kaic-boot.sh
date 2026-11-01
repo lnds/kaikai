@@ -171,6 +171,17 @@ is_stale release "kaic2-class record of one hop"
 cp "$work/rec" "$out.id"
 ok "a kaic2-class C that did not take two hops is never reused"
 
+(KAIC_BOOT_HOPS=1; export KAIC_BOOT_HOPS; boot release emit "$out" 2>/dev/null) || fail "one-hop release emit failed"
+[ "$(head -n 1 "$out")" = "/* release stdlib=$root/stdlib args=--edition hanga-roa main.kai */" ] \
+  || fail "KAIC_BOOT_HOPS=1 did not take the boot's own C: $(head -n 1 "$out")"
+grep -q '^hops=1$' "$out.id" || fail "a one-hop emit does not record one hop"
+(KAIC_BOOT_HOPS=1; export KAIC_BOOT_HOPS; is_fresh release "one-hop C, one hop asked")
+is_stale release "one-hop C, two hops asked"
+boot release emit "$out" 2>/dev/null
+(KAIC_BOOT_HOPS=1; export KAIC_BOOT_HOPS; is_stale release "two-hop C, one hop asked")
+(KAIC_BOOT_HOPS=3; export KAIC_BOOT_HOPS; boot release emit "$out" 2>/dev/null) && fail "KAIC_BOOT_HOPS=3 was accepted"
+ok "KAIC_BOOT_HOPS=1 takes one hop, records it, and is reused only under the same setting"
+
 echo 'fn o() = 2' > "$root/stdlib/other.kai"
 is_fresh release "non-core stdlib edit"
 echo 'fn x() = 3' > "$root/stdlib/core/x.kai"

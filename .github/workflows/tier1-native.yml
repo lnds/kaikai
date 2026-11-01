@@ -51,8 +51,11 @@ permissions:
 
 # The boot of stage2.c (docs/build-system.md §KAIC_BOOT). Workflow-wide: a
 # job whose mode disagrees with the artifact's stage2.c.id rebuilds stage2.c.
+# The shared artifact takes one hop; the native self-host gate, which measures
+# the compiler as a subject, takes the two-hop artifact of `bootstrap-native`.
 env:
   KAIC_BOOT: release
+  KAIC_BOOT_HOPS: 1
 
 jobs:
   changes:
@@ -208,7 +211,7 @@ jobs:
             stage0/runtime_llvm.bc
             stage0/runtime_llvm.bc.stamp
             stage0/runtime_inline.bc
-          key: kaic2-native-${{ steps.cc-fp.outputs.id }}-${{ steps.boot.outputs.id }}-${{ hashFiles('Makefile', 'EDITION', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/kaic-boot.sh', 'tools/kaic-link.sh', 'tools/assert-runtime-bc.sh', 'tools/gen-runtime-bc.sh') }}
+          key: kaic2-native-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ steps.boot.outputs.id }}-${{ hashFiles('Makefile', 'EDITION', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/kaic-boot.sh', 'tools/kaic-link.sh', 'tools/assert-runtime-bc.sh', 'tools/gen-runtime-bc.sh') }}
       # Both hops are linked from one translation unit per module, compiled on
       # every core (tools/kaic-link.sh). Each object is keyed by everything
       # cc reads for it, so a near-miss restore is sound here: an object whose
@@ -219,9 +222,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: stage2/build/obj-cache
-          key: kaic2-native-obj-${{ steps.cc-fp.outputs.id }}-${{ github.sha }}
+          key: kaic2-native-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ github.sha }}
           restore-keys: |
-            kaic2-native-obj-${{ steps.cc-fp.outputs.id }}-
+            kaic2-native-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-
       # kaic1 is not the boot; it ships because the consumers' chain carries it.
       # The log is shown only on failure, bar the lines that time each hop.
       - name: Build kaic1 and the release-booted native kaic2
@@ -240,7 +243,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: stage2/build/obj-cache
-          key: kaic2-native-obj-${{ steps.cc-fp.outputs.id }}-${{ github.sha }}
+          key: kaic2-native-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ github.sha }}
       - name: Mark cached chain fresh (no rebuild)
         if: steps.bootstrap-cache.outputs.cache-hit == 'true'
         run: |
@@ -270,6 +273,114 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # The two-hop native chain; publishes `kaic2-native-full` as soon as it is
+  # linked. Required through the aggregator: the self-host gate starts from it.
+  bootstrap-native:
+    needs: changes
+    env:
+      KAIC_BOOT_HOPS: 2
+    if: needs.changes.outputs.doc-only != 'true'
+    runs-on: ubuntu-latest
+    # A release boot compiles the whole compiler twice; keep equal to
+    # tier1-mn-corpus's scheduled build-native.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain (clang + libLLVM)
+        run: ./tools/ci-install-toolchain.sh llvm
+      # Exact-match cache of the native bootstrap chain (same discipline as
+      # tier1's build job: no restore-keys — a near-miss chain plus the mtime
+      # touch would present a stale kaic2 as fresh). The key folds the clang
+      # AND libLLVM identities so a runner-image LLVM bump misses cleanly.
+      - name: Fingerprint toolchain for cache key
+        id: cc-fp
+        run: echo "id=$( (clang --version | head -1; "$LLVM_CONFIG" --version) | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
+      # The boot is part of the chain's identity: the key names the release it resolves to.
+      - name: Resolve the release boot
+        id: boot
+        run: |
+          id="$(tools/kaic-boot.sh release-id)"
+          echo "id=$(printf '%s' "$id" | tr -c 'A-Za-z0-9.' '-')" >> "$GITHUB_OUTPUT"
+      - name: Cache native bootstrap chain (exact source match only)
+        id: bootstrap-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            stage0/*.o
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/stage2.c
+            stage2/build/stage2.c.id
+            stage2/build/kaic2.id
+            stage0/runtime_llvm.bc
+            stage0/runtime_llvm.bc.stamp
+            stage0/runtime_inline.bc
+          key: kaic2-native-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ steps.boot.outputs.id }}-${{ hashFiles('Makefile', 'EDITION', 'stage0/**', 'stage1/**', 'stage2/**', 'stdlib/**', 'tools/ci-touch-build.sh', 'tools/kaic-boot.sh', 'tools/kaic-link.sh', 'tools/assert-runtime-bc.sh', 'tools/gen-runtime-bc.sh') }}
+      # Both hops are linked from one translation unit per module, compiled on
+      # every core (tools/kaic-link.sh). Each object is keyed by everything
+      # cc reads for it, so a near-miss restore is sound here: an object whose
+      # inputs changed is not found, and is compiled. Saved from main only: a
+      # PR restores main's objects and compiles the modules it touches.
+      - name: Restore boot objects
+        if: steps.bootstrap-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: stage2/build/obj-cache
+          key: kaic2-native-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ github.sha }}
+          restore-keys: |
+            kaic2-native-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-
+      # kaic1 is not the boot; it ships because the consumers' chain carries it.
+      # The log is shown only on failure, bar the lines that time each hop.
+      - name: Build kaic1 and the release-booted native kaic2
+        if: steps.bootstrap-cache.outputs.cache-hit != 'true'
+        env:
+          KAIC_BOOT_MODULAR: 1
+        run: |
+          set -o pipefail
+          rm -f stage2/kaic2
+          make kaic1
+          make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" kaic2 2>&1 \
+            | tee "$RUNNER_TEMP/kaic2.log" | grep --line-buffered -E '^(kaic-boot|kaic-link|building stage2):' \
+            || { tail -n 40 "$RUNNER_TEMP/kaic2.log"; exit 1; }
+      - name: Save boot objects
+        if: steps.bootstrap-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: stage2/build/obj-cache
+          key: kaic2-native-obj-h${{ env.KAIC_BOOT_HOPS }}-${{ steps.cc-fp.outputs.id }}-${{ github.sha }}
+      - name: Mark cached chain fresh (no rebuild)
+        if: steps.bootstrap-cache.outputs.cache-hit == 'true'
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: Assert P2 bitcode
+        run: tools/assert-runtime-bc.sh
+      - name: Build bin/kai (shipped in the artifact so no consumer rebuilds it)
+        run: make -s CC=clang -C tools/kai kai
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaic2-native-full
+          path: |
+            bin/kai
+            stage0/*.o
+            stage0/kaic0
+            stage1/kaic1
+            stage1/build/stage1.c
+            stage2/kaic2
+            stage2/build/stage2.c
+            stage2/build/stage2.c.id
+            stage2/build/kaic2.id
+            stage0/runtime_llvm.bc
+            stage0/runtime_llvm.bc.stamp
+            stage0/runtime_inline.bc
+          retention-days: 1
+          if-no-files-found: error
+
   # Native self-host gate: compile the compiler itself with the native
   # backend and ratchet the `unbound register` subset-gap count against
   # tools/native-selfhost-baseline.txt — green at baseline, red only on
@@ -281,9 +392,11 @@ jobs:
   # linked it against libLLVM — and probes that binary for the native
   # backend before self-compiling.
   native-selfhost-gate:
-    needs: [changes, build-native]
+    needs: [changes, bootstrap-native]
     if: needs.changes.outputs.doc-only != 'true'
     runs-on: ubuntu-latest
+    env:
+      KAIC_BOOT_HOPS: 2
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -293,7 +406,7 @@ jobs:
         run: ./tools/ci-install-toolchain.sh llvm
       - uses: actions/download-artifact@v4
         with:
-          name: kaic2-native
+          name: kaic2-native-full
       - name: Restore artifact mtimes (no rebuild)
         run: |
           chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
@@ -767,7 +880,7 @@ jobs:
   # shards, the self-host gate, the native RC leak ledger and, when the diff
   # reaches its paths, the RC detector pass.
   tier1-native:
-    needs: [changes, native-parity, native-shard-1, native-shard-1b, native-shard-2, native-selfhost-gate, native-rc-leak-gate, rc-detector]
+    needs: [changes, bootstrap-native, native-parity, native-shard-1, native-shard-1b, native-shard-2, native-selfhost-gate, native-rc-leak-gate, rc-detector]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -778,6 +891,7 @@ jobs:
             echo "tier1-native OK — doc-only PR, shards skipped"; exit 0
           fi
           rp='${{ needs.native-parity.result }}'
+          rb='${{ needs.bootstrap-native.result }}'
           r1='${{ needs.native-shard-1.result }}'
           r1b='${{ needs.native-shard-1b.result }}'
           r2='${{ needs.native-shard-2.result }}'
@@ -785,11 +899,11 @@ jobs:
           r4='${{ needs.native-rc-leak-gate.result }}'
           r5='${{ needs.rc-detector.result }}'
           rcdet='${{ needs.changes.outputs.rcdet }}'
-          echo "native results: parity=$rp shard1=$r1 shard1b=$r1b shard2=$r2 selfhost-gate=$r3 rc-leak-gate=$r4 rc-detector=$r5 (in scope: $rcdet)"
-          if [ "$rp" = "success" ] && [ "$r1" = "success" ] && [ "$r1b" = "success" ] && [ "$r2" = "success" ] && [ "$r3" = "success" ] && [ "$r4" = "success" ]; then
+          echo "native results: bootstrap=$rb parity=$rp shard1=$r1 shard1b=$r1b shard2=$r2 selfhost-gate=$r3 rc-leak-gate=$r4 rc-detector=$r5 (in scope: $rcdet)"
+          if [ "$rb" = "success" ] && [ "$rp" = "success" ] && [ "$r1" = "success" ] && [ "$r1b" = "success" ] && [ "$r2" = "success" ] && [ "$r3" = "success" ] && [ "$r4" = "success" ]; then
             :
           else
-            echo "::error::tier1-native FAIL — a shard, the parity ratchet, the self-host gate or the native RC leak ledger did not succeed"; exit 1
+            echo "::error::tier1-native FAIL — the two-hop bootstrap, a shard, the parity ratchet, the self-host gate or the native RC leak ledger did not succeed"; exit 1
           fi
           if [ "$rcdet" = "true" ] && [ "$r5" != "success" ]; then
             echo "::error::tier1-native FAIL — the RC detector did not succeed"; exit 1
