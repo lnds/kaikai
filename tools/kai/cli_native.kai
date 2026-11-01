@@ -321,26 +321,51 @@ fn hold_dir(tmp: String) : String / Env + File + Ffi {
   if dir == "" { tmp } else { dir }
 }
 
-# A hold dir is removed once the link is done; the scratch dir goes with the job.
-fn release_hold(dir: String, tmp: String) : Unit / Ffi =
+# Pinned descriptors close and a hold dir is removed once the link is done; the
+# scratch dir goes with the job.
+fn release_hold(dir: String, tmp: String) : Unit / Ffi {
+  cli_sys.unpin_all()
   if dir != tmp {
     let _ = cli_sys.remove_tree(dir)
   }
+}
 
-# The listed objects, each one outside the build's scratch dir hard-linked into
-# `dir` (copied when the link fails) so the trim cannot take it before the
-# link, and marked used so the trim keeps hot entries; none when one is gone.
-fn hold_objects(dir: String, tmp: String, objs: [String], i: Int) : Option[[String]] / Ffi =
+# A debug map records the object paths, so a debug build links paths that outlive the link.
+fn pin_objects() : Bool / Env =
+  cli_caches.env_or("KAI_BUILD_MODE", "default") != "debug"
+
+# The name an object is held under: an open descriptor (no per-object file
+# work), else a hard link into `dir`, else a copy; none when the object is gone.
+fn hold_one(o: String, mine: String, pin: Bool) : Option[String] / Ffi {
+  let fd = if pin { cli_sys.pin(o) } else { -1 }
+  if fd >= 0 {
+    Some("/dev/fd/#{fd}")
+  } else if cli_sys.link_file(o, mine) or cli_sys.copy_file(o, mine) {
+    let _ = cli_gc.refresh(o)
+    Some(mine)
+  } else {
+    None
+  }
+}
+
+# The listed objects, each one outside the build's scratch dir held so the
+# trim cannot take it before the link and marked used so the trim keeps hot
+# entries; none when one is gone.
+fn hold_objects(dir: String, tmp: String, objs: [String], i: Int) : Option[[String]] / Env + Ffi =
+  hold_each(dir, tmp, objs, i, pin_objects())
+
+fn hold_each(dir: String, tmp: String, objs: [String], i: Int, pin: Bool) : Option[[String]] / Ffi =
   match objs {
     [] -> Some([])
     [o, ...rest] -> {
-      let mine = "#{dir}/held-#{i}-#{cli_fs.basename(o)}"
-      let own = string.starts_with(o, "#{tmp}/")
-      if own or cli_sys.link_file(o, mine) or cli_sys.copy_file(o, mine) {
-        let _ = own or cli_gc.refresh(o)
-        hold_objects(dir, tmp, rest, i + 1) |> option.map(r => [if own { o } else { mine }, ...r])
+      let held = if string.starts_with(o, "#{tmp}/") {
+        Some(o)
       } else {
-        None
+        hold_one(o, "#{dir}/held-#{i}-#{cli_fs.basename(o)}", pin)
+      }
+      match held {
+        Some(h) -> hold_each(dir, tmp, rest, i + 1, pin) |> option.map(r => [h, ...r])
+        None -> None
       }
     }
   }

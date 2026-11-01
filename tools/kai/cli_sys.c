@@ -17,6 +17,33 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Pinned files: an open descriptor keeps the inode readable after its name is
+   unlinked, and /dev/fd/N names it. The descriptor is inherited by every
+   child, and on macOS opening /dev/fd/N shares the file offset, so each
+   child starts from a rewound one. */
+#define KAICLI_MAX_PINS 512
+#define PIN_REFRESH_AFTER 3600
+static int pins[KAICLI_MAX_PINS];
+static int npins;
+
+int64_t kaicli_pin(const char *path) {
+    if (npins >= KAICLI_MAX_PINS) return -1;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && time(NULL) - st.st_mtime >= PIN_REFRESH_AFTER) futimens(fd, NULL);
+    pins[npins++] = fd;
+    return fd;
+}
+
+void kaicli_unpin_all(void) {
+    while (npins > 0) close(pins[--npins]);
+}
+
+static void rewind_pins(void) {
+    for (int i = 0; i < npins; i++) lseek(pins[i], 0, SEEK_SET);
+}
+
 int64_t kaicli_mtime(const char *path) {
     struct stat st;
     return stat(path, &st) == 0 ? (int64_t) st.st_mtime : -1;
@@ -236,6 +263,7 @@ static void run_child(const char *dir, const char *out, const char *err) {
         int f = open(child_fd3, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (f < 0 || (f != 3 && (dup2(f, 3) < 0 || close(f) != 0))) _exit(126);
     }
+    rewind_pins();
     execvp(exec_argv.items[0], exec_argv.items);
     dprintf(2, "kai: %s: %s\n", exec_argv.items[0], strerror(errno));
     _exit(127);
