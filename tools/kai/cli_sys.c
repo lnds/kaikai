@@ -18,16 +18,26 @@
 #include <unistd.h>
 
 /* Pinned files: an open descriptor keeps the inode readable after its name is
-   unlinked, and /dev/fd/N names it. The descriptor is inherited by every
-   child, and on macOS opening /dev/fd/N shares the file offset, so each
+   unlinked, and /dev/fd/N names it. Opened without O_CLOEXEC on purpose: every
+   child, down to the linker run by the cc driver, inherits it, and on macOS opening /dev/fd/N shares the file offset, so each
    child starts from a rewound one. */
 #define KAICLI_MAX_PINS 512
 #define PIN_REFRESH_AFTER 3600
 static int pins[KAICLI_MAX_PINS];
 static int npins;
 
+/* At most half the descriptor limit, so the build's own pipes and files
+   always have room; past it the caller falls back to another hold. */
+static int pin_capacity(void) {
+    struct rlimit rl;
+    int cap = KAICLI_MAX_PINS;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur / 2 < (rlim_t) cap)
+        cap = (int) (rl.rlim_cur / 2);
+    return cap;
+}
+
 int64_t kaicli_pin(const char *path) {
-    if (npins >= KAICLI_MAX_PINS) return -1;
+    if (npins >= pin_capacity()) return -1;
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
     struct stat st;
