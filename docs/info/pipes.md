@@ -18,15 +18,15 @@ owner exports no such function is an error; there is no fallback.
 ## Canonical signatures
 
 ```text
-pub fn map      (xs: T[A], f: (A) -> B / e)        : T[B] / e
-pub fn flat_map (xs: T[A], f: (A) -> T[B] / e)     : T[B] / e
-pub fn filter   (xs: T[A], p: (A) -> Bool / e)     : T[A] / e
-pub fn each     (xs: T[A], f: (A) -> Unit / e)     : Unit / e
+pub fn map      (xs: T[a], f: (a) -> b / e)        : T[b] / e
+pub fn flat_map (xs: T[a], f: (a) -> T[b] / e)     : T[b] / e
+pub fn filter   (xs: T[a], p: (a) -> Bool / e)     : T[a] / e
+pub fn each     (xs: T[a], f: (a) -> Unit / e)     : Unit / e
 ```
 
 `each` runs `f` for its effect on every element, in the order `map`
-visits them, and is what `|!` calls. Every type below exports it (`[T]`
-through the core `each`, `Array[T]` through `array.each`, which is the only pipe function `Array` has: `|`, `||` and `|?` over an Array are errors, so pipe over `array.to_list(a)`); the mutable `HashMap` / `HashSet` carry
+visits them, and is what `|!` calls. Every type below exports it (`[t]`
+through the core `each`, `Array[t]` through `array.each`, which is the only pipe function `Array` has: `|`, `||` and `|?` over an Array are errors, so pipe over `array.to_list(a)`); the mutable `HashMap` / `HashSet` carry
 `/ Mutable`.
 
 ## `|!` — for each element, for its effect
@@ -139,7 +139,7 @@ These stdlib types export the canonical `map` / `flat_map` / `filter`
 / `each`, so they dispatch through `|` / `||` / `|?` / `|!`:
 
 ```text
-[T]                  element a            (core/list)
+[t]                  element a            (core/list)
 Option[a]            the Some payload     (core/option)
 Result[a, e]         the Ok payload       (core/result)
 Stream[t, e]         element t            (stream)

@@ -105,7 +105,7 @@ type ColorErr = Color | Shade                  # union of PRE-DECLARED sums
                                                #   (not new ctors; narrow
                                                #   with `n : T ->` arms)
 type Web = Stdout + Mutable                    # effect alias (row)
-type Ids = List[Int]                           # `List[T]` is `[T]`: one type
+type Ids = List[Int]                           # `List[t]` is `[t]`: one type
 
 effect Logger {                                # effect declaration
   log(s: String) : Unit
@@ -216,7 +216,7 @@ A `fn` signature takes optional `requires` / `ensures` clauses before
 either body form (`ensures` binds `result`). A type alias takes a
 `where` refinement predicate over `self` — with a unary elision
 (`Int where >= 0` means `self >= 0`). `ensure(v) where <pred>`
-checks a value at runtime, yielding `Option[T]`. Full treatment:
+checks a value at runtime, yielding `Option[t]`. Full treatment:
 `kai info contracts`.
 
 ```kaikai
@@ -1413,7 +1413,7 @@ fn main() : Unit / Stdout = {
 
 `==` on two arrays compares their contents, like every other container; `array.same(a, b)` tests identity.
 
-`Ref[T]` cells — prefix `&` makes one, prefix `@` dereferences
+`Ref[t]` cells — prefix `&` makes one, prefix `@` dereferences
 (`@x.f.g` walks a field path), `r := v` writes, and a record field
 holding a `Ref` writes through `rec.field := v`. Observable `Ref`
 traffic rides the `Mutable` effect:
@@ -1553,7 +1553,7 @@ fn main() : Int = x + y where { let x = 1; let y = 2 }  # Haskell where
 
 ```kaikai-neg
 type Foo<T> = T                                # angle generics
-                                               # (use [T] / Foo[T])
+                                               # (use [t] / Foo[t])
 ```
 
 ```kaikai-neg
@@ -1616,9 +1616,9 @@ Use instead:
 - `[x*2 for x in xs]` → `xs | (x => x * 2)`
 - `do { ... }` → block body
 - `where x = ...` → `let` inside block
-- angle generics `Foo<T>` → bracket generics `Foo[T]` (angles are reserved for `Real<m>`)
+- angle generics `Foo<T>` → bracket generics `Foo[t]` (angles are reserved for `Real<m>`)
 - `/// doc` / `//! doc` / `#: doc` → `#[doc("...")]` above the declaration
-- `null` / `undefined` / `nil` → `Option[T]`
+- `null` / `undefined` / `nil` → `Option[t]`
 - `throw` / `try-catch` → `Result[a, e]` (with `expr!`) or an effect op returning `Nothing`
 - `async` / `await` → `Spawn` effect (see `kai info fibers`)
 - `interface I { ... }` → `protocol P { ... }`

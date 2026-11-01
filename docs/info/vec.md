@@ -1,11 +1,11 @@
 # vec
 
-`Vec[T]` — the pure value vector: flat contiguous storage with
+`Vec[t]` — the pure value vector: flat contiguous storage with
 functional semantics.
 
 ## Description
 
-A `Vec[T]` is an immutable *value* over one flat growable buffer.
+A `Vec[t]` is an immutable *value* over one flat growable buffer.
 Every operation is pure — nothing carries an effect, in particular no
 `Mutable`. `set` and `push` return the resulting vector; aliasing two
 bindings to one `Vec` is never observable.
@@ -28,7 +28,7 @@ anything else (String, variants, nested records, closures)
     boxed fallback — still value semantics via copy-on-write
 ```
 
-Contrast with `Array[T]`, which stays: Array is the mutable
+Contrast with `Array[t]`, which stays: Array is the mutable
 *reference* — aliased writes are observable and every write demands
 `/ Mutable`. Reach for `Vec` when you want a collection that behaves
 like a value.
@@ -37,7 +37,7 @@ like a value.
 
 A list literal in a `Vec`-typed position builds the vec directly —
 one pre-sized buffer, no cons list. The annotation, the argument
-position and a declared return type (`fn f() : Vec[T] = [...]`, or a
+position and a declared return type (`fn f() : Vec[t] = [...]`, or a
 block's tail) mint, at any depth under them: a record field, a tuple
 component, a constructor argument, an `if` branch, a lambda body; a BARE `[1, 2, 3]` still denotes the cons list.
 

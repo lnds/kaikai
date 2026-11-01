@@ -29,8 +29,8 @@ stdlib ones for your types is the common case.
 
 ## Orphan rule
 
-An `impl P[A] for T` must live in the module that declares `P`, the
-head of `T`, or the head of a protocol argument `A`. Anywhere else it
+An `impl P[a] for T` must live in the module that declares `P`, the
+head of `T`, or the head of a protocol argument `a`. Anywhere else it
 is a compile error: write the impl beside the type. Builtins (`Int`,
 `[a]`, `Option[a]`, ...) belong to no module, so implement a CORE
 protocol for one by wrapping it in a type of your own.
@@ -74,7 +74,7 @@ an impl and the receiver must be the only `Self`-typed parameter.
 ## Equality and order without an impl
 
 A record or sum type is `Eq` when every field is, with no `impl` or
-`#[derive(Eq)]`: `fn same[T: Eq](a: T, b: T)` accepts it, and `==` and
+`#[derive(Eq)]`: `fn same[t: Eq](a: t, b: t)` accepts it, and `==` and
 `!=` compare it field by field. A hand-written `impl Eq` overrides that
 for its type. A function is never `Eq`, so neither is a type that holds
 one: `f == f` and `same(rec_with_fn, rec_with_fn)` are compile errors
@@ -123,7 +123,7 @@ deriving it is an error.
 
 `#[derive(Json)]` binds a record to the JSON DOM: it generates
 `to_json(self) : JsonValue` and a `<lower(T)>_of_json(v, path) :
-Result[T, JsonError]` entry point. The DOM and the readers the derived
+Result[t, JsonError]` entry point. The DOM and the readers the derived
 code calls live in `encoding.json_bind`, which the deriving file imports.
 
 ```kaikai
@@ -147,7 +147,7 @@ fn main() : Unit / Stdout = {
 ```
 
 Field names go to the wire verbatim — no case conversion. An
-`Option[T]` field accepts an explicit `null` and a missing key alike,
+`Option[t]` field accepts an explicit `null` and a missing key alike,
 both decoding to `None`; every other field is required. Keys the record
 does not declare are ignored. A failure carries the JSON path to the
 offending node (`address.boxes[2].zip: expected String, got Number`).

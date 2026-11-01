@@ -358,7 +358,7 @@ fn fib(n: Int) : Int = fib(n - 1)               #   multi-clause head
 
 ## Option over a sentinel
 
-Absence is `Option[T]`, not a magic value like `-1`, an empty string,
+Absence is `Option[t]`, not a magic value like `-1`, an empty string,
 or null (kaikai has no null). Return `None`; the caller `match`es or
 propagates with postfix `!`.
 
@@ -515,9 +515,9 @@ authoritative list is the NOT-IN-KAIKAI section of `kai info syntax`.
 - `do { ... }` (Haskell) → a `{ }` block body; the row type carries
   the effect discipline
 - `x where y = ...` (Haskell) → a `let` inside a block
-- `Foo<T>` angle generics → `Foo[T]` (angles are reserved for units,
+- `Foo<T>` angle generics → `Foo[t]` (angles are reserved for units,
   `Real<m>`)
-- `null` / `nil` / `undefined` → `Option[T]`
+- `null` / `nil` / `undefined` → `Option[t]`
 - `throw` / `try` / `catch` → `Result[a, e]` with postfix `!`, or an
   effect whose op returns `Nothing`
 - `async` / `await` → the `Spawn` effect (see `kai info fibers`)

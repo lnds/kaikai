@@ -215,7 +215,7 @@ body never unwinds through C frames: the process prints
 
 **Context as a value.** A C API with a `void *userdata` carries a kaikai
 value through `ffi.retain_userdata`, which parks a private copy of it behind a
-`Userdata[T]` handle (an `extern "C" opaque`, so it crosses as `void *`; `T` is
+`Userdata[t]` handle (an `extern "C" opaque`, so it crosses as `void *`; `t` is
 the parked value's type). The exported function receives the handle and reads
 the value back with `ffi.take_userdata`; `ffi.release_userdata` frees the
 parked copy. All three need `Ffi`, so an exported callback that takes the value
@@ -235,7 +235,7 @@ extern "C" fn on_event(ud: Userdata[Pid[Msg]], n: Int) : Unit / Ffi = {
 fn main() : Int = 0
 ```
 
-The handle's `T` is checked at every take, so a take cannot read another type.
+The handle's `t` is checked at every take, so a take cannot read another type.
 A handle names a slot and its generation, not a pointer: a take or release of
 a released handle (or of a value C forged) traps with `released or invalid`,
 also after the slot is reused by a later `retain_userdata`.

@@ -22,7 +22,7 @@ Every entry is verified against the compiler; when in doubt,
 - Lambdas are `(x) => x + 1`. Not `\x -> ...`, not `fn x -> ...`,
   not `|x| ...`.
 - No `return` — the last expression of a block is the value.
-- No `null` / `nil` / `undefined` — `Option[T]` (`Some(x)` / `None`).
+- No `null` / `nil` / `undefined` — `Option[t]` (`Some(x)` / `None`).
 - Option default is the infix `o ?? d` (Swift/JS `??`, Rust `unwrap_or` /
   `unwrap_or_else`): lazy, `Option` only. A `Result` needs `ok(r) ?? d`.
 - No `throw` / `try` / `catch` — use `Result[a, e]` with the `expr!`
@@ -37,7 +37,7 @@ Every entry is verified against the compiler; when in doubt,
   `lazy [0..]`; a bare `[0..]` is an error.
 - No list comprehensions: `[x*2 for x in xs]` → `xs | (x => x * 2)`.
 - The cons pattern is `[h, ...t]` — not `x:xs`, not `[h|t]`.
-- Generics use brackets — `Foo[T]`, `[Int]` — never `Foo<T>`. Angle
+- Generics use brackets — `Foo[t]`, `[Int]` — never `Foo<T>`. Angle
   brackets belong to units of measure (`Real<m>`).
 - `|` between values is the MAP pipe, not bitwise-or. There are no
   bitwise operators on `Int`; `import math.bits` gives `bit_and`,

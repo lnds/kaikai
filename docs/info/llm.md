@@ -53,7 +53,7 @@ match       pattern matching, exhaustiveness
 contracts   requires / ensures + refinement-type predicates
 pipes       the five pipe operators and their intent
 seq         Seq[t], the lazy sequence written `lazy [...]`
-vec         Vec[T], the pure contiguous vector
+vec         Vec[t], the pure contiguous vector
 units       units of measure on Real
 kinds       kinds over types: the closed property menu
 protocols   single-dispatch protocols

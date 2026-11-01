@@ -38,7 +38,7 @@ Every kind is declared in `stdlib/core/kinds.kai` over a theory:
 
 | Kind | Theory | Habitants |
 |---|---|---|
-| `Type` | `HindleyMilner` | ordinary types (`Int`, `[T]`, records, sums) |
+| `Type` | `HindleyMilner` | ordinary types (`Int`, `[t]`, records, sums) |
 | `Effect` | `EffectRow` | effect labels (`Stdout`, `State`, `Spawn`) |
 | `Measure` | `AbelianGroup` | units of measure (`m`, `kg`, `m/s`) |
 | `Currency` | `Module` | currencies (`USD`, `EUR`) |
@@ -266,9 +266,9 @@ and `<3^2>` do not exist). Type-level arithmetic (`concat` as `n+k`,
 `with` introducer. `ConstructorApp` binds constructor witnesses — two
 shapes unify iff they are the same constructor.
 
-A `[s: Shape]` type parameter is applied as `s[A]`, letting a protocol
+A `[s: Shape]` type parameter is applied as `s[a]`, letting a protocol
 quantify over the container itself — the expressiveness a functor
-gives, without HKT's cost. `s[A] ~ List[Int]` unifies first-order
+gives, without HKT's cost. `s[a] ~ List[Int]` unifies first-order
 (`s := List, A := Int`); after monomorphisation the dispatch is an
 `O(1)` static call, no runtime indirection:
 

@@ -238,10 +238,10 @@ error: `main` performs effect `NetTcp`, which the `wasm32-wasi` target cannot ru
 
 ## Handler state — `state` and `log`
 
-A stateful handler (`with State[T](init)`, `with Writer[W]([])`, any
+A stateful handler (`with State[t](init)`, `with Writer[w]([])`, any
 `with Eff(init)`) binds its state slot in every clause under two
 spellings: `state` and `log`. They name the same slot — `state` reads
-naturally for `State[T]`, `log` for accumulator-shaped handlers. The
+naturally for `State[t]`, `log` for accumulator-shaped handlers. The
 `return` clause sees them too.
 
 ```kaikai
@@ -295,7 +295,7 @@ fn main() : Int / Stdout = {
 ## Named instances — a capability as a first-class value
 
 `with Eff as a` binds `a` as a value whose type IS the effect
-(`Cell`, `State[Int]`) — no `Handler[E]` wrapper. So a capability
+(`Cell`, `State[Int]`) — no `Handler[e]` wrapper. So a capability
 appears in two positions, one uniform rule:
 
 - in a row (`fn f() : T / Cell`) — *demanded*, satisfied by a handle;
@@ -319,11 +319,11 @@ argument or an op receiver. It cannot be returned from its `handle`,
 stored in a value, or captured by a closure that outlives the block
 (a lambda that references a capability carries its effect in its own
 row, so it only runs where that effect is handled) —
-a value that must outlive its scope is a `Ref[T]` under `Mutable`
+a value that must outlive its scope is a `Ref[t]` under `Mutable`
 (within one fiber — a `Ref` does not cross a spawn, see
 `kai info fibers`), a dynamic population of stateful entities is
 actors/`Spawn`. Instances
-are monomorphic (`f(c: State[Int])`, not `f(c: State[T])`); `mask` is
+are monomorphic (`f(c: State[Int])`, not `f(c: State[t])`); `mask` is
 not provided — name the outer instance instead.
 
 ## Two instances of one effect in a row
@@ -349,12 +349,12 @@ fn pair() : String / Box[Int] + Box[String] = {
 fn main() : Int = 0
 ```
 
-## Keeping the continuation — `Cont[T, S, e]`
+## Keeping the continuation — `Cont[t, s, e]`
 
 A clause may store `resume`, return it, or call it from a lambda or a
-loop. It is then a value of type `Cont[T, S, e]`: `T` is what the op
-returns, `S` the handle's type, `e` what the body performs besides the
-handled effect, and `k(v) : S / e` resumes the body. `Cont[T, S]` is
+loop. It is then a value of type `Cont[t, s, e]`: `t` is what the op
+returns, `s` the handle's type, `e` what the body performs besides the
+handled effect, and `k(v) : s / e` resumes the body. `Cont[t, s]` is
 the continuation of a pure body (`e` empty). Such a handle runs its
 body on a stack segment; `kai build --explain` notes each one and why.
 A dropped continuation discontinues its body: every `finally` on it
@@ -413,7 +413,7 @@ fn main() : Unit / Stdout =
   handlers some other way stops the program if resumed or dropped there.
 
 A stateful handle (`with Eff(init)`) keeps its continuation too. It is
-then a `Cont[(T, H), S, e]`, with `H` the state type, and `k(v, s)`
+then a `Cont[(t, h), s, e]`, with `h` the state type, and `k(v, s)`
 resumes the body with `v` and the next state `s`, as `resume(v, s)`
 does. Inside the clause, `resume(v)` still means `resume(v, state)`.
 

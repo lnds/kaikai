@@ -21,7 +21,7 @@ mailbox (backpressure). `receive()` takes the oldest message; there
 is no selective receive.
 
 `send` takes its message type from the destination, not from the
-sender's `Msg`: `send[T](pid: Pid[T], msg: T)`. An actor with an
+sender's `Msg`: `send[t](pid: Pid[t], msg: t)`. An actor with an
 `Actor[Reply]` mailbox sends a `Request` to a `Pid[Request]` without a
 `Request` mailbox of its own.
 
