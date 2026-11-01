@@ -14,7 +14,7 @@ name: tier1-native
 # Structure (docs/ci-time-analysis.md §7): a single `build-native` job
 # builds the libLLVM kaic2 + P2 bitcode ONCE and publishes them; the corpus
 # ratchet (~620 fixtures, the dominant cost) is sharded across three runners
-# via $BACKEND_PARITY_DIRS (disjoint subsets whose union is the full corpus),
+# by file via $BACKEND_PARITY_SHARD (disjoint parts whose union is the corpus),
 # and the native self-host gate runs as a fourth parallel consumer of the same
 # artifact — nothing downstream depends on its output, so keeping it inside
 # build-native would only delay the artifact upload (~13 min off the critical
@@ -231,11 +231,14 @@ jobs:
           ./tools/ci-touch-build.sh
       - name: Assert P2 bitcode
         run: tools/assert-runtime-bc.sh
+      - name: Build bin/kai (shipped in the artifact so no consumer rebuilds it)
+        run: make -s CC=clang -C tools/kai kai
       - name: Upload native artifact
         uses: actions/upload-artifact@v4
         with:
           name: kaic2-native
           path: |
+            bin/kai
             stage0/*.o
             stage0/kaic0
             stage1/kaic1
@@ -280,14 +283,6 @@ jobs:
           ./tools/ci-touch-build.sh
       - name: "Native self-host gate (ratchet — fails only on regression)"
         run: CC=clang LLVM_CONFIG="$LLVM_CONFIG" tools/test-native-selfhost-gate.sh
-      # The second half of the native leak ledger; native-rc-leak-gate runs
-      # the first. Both halves run wherever this workflow runs.
-      - name: "Perceus RC leak ledger, native column, second half (tools/baselines/rc-leak/)"
-        run: |
-          set -o pipefail
-          command -v "$LLVM_CONFIG" >/dev/null || { echo "::error::LLVM_CONFIG does not resolve; the native leak gate would skip"; exit 1; }
-          KAI_LEAK_SHARD=2/2 ./tools/ci-bounded-step.sh 1800 "rc-leak-gate (native)" make -C stage2 CC=clang KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" rc-leak-gate-native 2>&1 | tee "$RUNNER_TEMP/rc-leak-native.log"
-          grep -q '^rc-leak-gate: PASS — [1-9]' "$RUNNER_TEMP/rc-leak-native.log" || { echo "::error::the native leak gate reported no PASS; nothing was measured"; exit 1; }
       # A job killed for memory keeps no log, so the sample series the gate
       # writes is the only record of how the self-compile died.
       - name: "tier1-native #1341 user + core cache fixtures engage on the native driver paths (KAI_CACHE=1 writes blobs)"
@@ -308,9 +303,48 @@ jobs:
             echo "::error::working tree dirty after native-selfhost-gate"; git status; exit 1
           fi
 
-  # Shard 1 — effects corpus subset and the targets that drive bin/kai with
+  # The native-vs-C parity ratchet over the whole corpus, sharded by file
+  # (BACKEND_PARITY_SHARD=I/3): disjoint parts whose union is the corpus.
+  native-parity:
+    needs: [changes, build-native]
+    if: needs.changes.outputs.doc-only != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    name: native-parity (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    env:
+      KAI_NATIVE_OPT: "0"
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install toolchain (clang + libLLVM)
+        run: ./tools/ci-install-toolchain.sh llvm
+      - uses: actions/download-artifact@v4
+        with:
+          name: kaic2-native
+      - name: Restore artifact mtimes (no rebuild)
+        run: |
+          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
+          ./tools/ci-touch-build.sh
+      - name: "Ratchet part ${{ matrix.shard }}/3 (native vs C-direct)"
+        run: |
+          CC=clang LLVM_CONFIG="$LLVM_CONFIG" \
+            TARGET_BACKEND=native ORACLE_BACKEND=c NATIVE_PARITY_RATCHET=1 \
+            BACKEND_PARITY_SHARD="${{ matrix.shard }}/3" \
+            tools/test-backend-parity.sh
+      - name: Working tree clean check
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree dirty after native-parity"; git status; exit 1
+          fi
+
+  # Shard 1 — M:N soundness and the targets that drive bin/kai with
   # KAI_BACKEND=native. Its single-fixture gates ride shard 1b and the cache
-  # fixtures ride the self-host gate, which had the room.
+  # fixtures ride the self-host gate.
   native-shard-1:
     needs: [changes, build-native]
     if: needs.changes.outputs.doc-only != 'true'
@@ -331,12 +365,6 @@ jobs:
         run: |
           chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
           ./tools/ci-touch-build.sh
-      - name: "Ratchet shard 1 (effects vs C-direct)"
-        run: |
-          CC=clang LLVM_CONFIG="$LLVM_CONFIG" \
-            TARGET_BACKEND=native ORACLE_BACKEND=c NATIVE_PARITY_RATCHET=1 \
-            BACKEND_PARITY_DIRS="examples/effects examples/segments" \
-            tools/test-backend-parity.sh
       - name: "tier1-native #1234 M:N work-steal soundness (native cross-thread stress, KAI_THREADS=4/8, zero crashes)"
         run: make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" test-mn-native-soundness
       - name: "tier1-native #1238 M:N C-backend soundness under clang (kai single-TU + modular + ownerless -O2 cross-thread stress, KAI_THREADS=4/8, zero crashes)"
@@ -350,10 +378,10 @@ jobs:
             echo "::error::working tree dirty after native-shard-1"; git status; exit 1
           fi
 
-  # Shard 1b — the rest of the former shard-1 subset, split out so the
-  # two ratchets run in parallel (~230 vs ~216 fixtures), plus the native
-  # and neg-native axes of the namespace-collision corpus (fanned out over
-  # the runner's cores). The native-modular axis rides native-rc-leak-gate.
+  # Shard 1b — the single-fixture native gates, the second half of the native
+  # leak ledger, and the native and neg-native axes of the namespace-collision
+  # corpus (fanned out over the runner's cores). The native-modular axis rides
+  # native-rc-leak-gate.
   native-shard-1b:
     needs: [changes, build-native]
     if: needs.changes.outputs.doc-only != 'true'
@@ -374,18 +402,20 @@ jobs:
         run: |
           chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
           ./tools/ci-touch-build.sh
-      - name: "Ratchet shard 1b (perceus/refinements/actors/llvm vs C-direct)"
-        run: |
-          CC=clang LLVM_CONFIG="$LLVM_CONFIG" \
-            TARGET_BACKEND=native ORACLE_BACKEND=c NATIVE_PARITY_RATCHET=1 \
-            BACKEND_PARITY_DIRS="examples/perceus examples/refinements examples/actors examples/llvm" \
-            tools/test-backend-parity.sh
       - name: "tier1-native namespace-collision corpus, native axis (ratchet: tools/baselines/nscol/)"
         if: needs.changes.outputs.nscol == 'true'
         run: make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" test-namespace-collisions-native
       - name: "tier1-native namespace-collision corpus, neg-native axis (ratchet: tools/baselines/nscol/)"
         if: ${{ !cancelled() && needs.changes.outputs.nscol == 'true' }}
         run: make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" test-namespace-collisions-neg-native
+      # The second half of the native leak ledger; native-rc-leak-gate runs
+      # the first. Both halves run wherever this workflow runs.
+      - name: "Perceus RC leak ledger, native column, second half (tools/baselines/rc-leak/)"
+        run: |
+          set -o pipefail
+          command -v "$LLVM_CONFIG" >/dev/null || { echo "::error::LLVM_CONFIG does not resolve; the native leak gate would skip"; exit 1; }
+          KAI_LEAK_SHARD=2/2 ./tools/ci-bounded-step.sh 1800 "rc-leak-gate (native)" make -C stage2 CC=clang KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" rc-leak-gate-native 2>&1 | tee "$RUNNER_TEMP/rc-leak-native.log"
+          grep -q '^rc-leak-gate: PASS — [1-9]' "$RUNNER_TEMP/rc-leak-native.log" || { echo "::error::the native leak gate reported no PASS; nothing was measured"; exit 1; }
       - name: "Single-fixture native gates (the native-gates-1 rows of stage2/test-registry.txt, under make -j)"
         if: ${{ !cancelled() }}
         run: make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" test-native-gates-1
@@ -395,8 +425,8 @@ jobs:
             echo "::error::working tree dirty after native-shard-1b"; git status; exit 1
           fi
 
-  # Shard 2 — remaining corpus subset and the single-fixture native gates
-  # (one `make -j` over the native-gates-2 rows of stage2/test-registry.txt).
+  # Shard 2 — the single-fixture native gates (one `make -j` over the
+  # native-gates-2 rows of stage2/test-registry.txt) and the ASAN fixtures.
   native-shard-2:
     needs: [changes, build-native]
     if: needs.changes.outputs.doc-only != 'true'
@@ -431,12 +461,6 @@ jobs:
         run: tests/native_cache_hold.sh
       - name: "A broken imported module fails the build on every build path"
         run: tests/broken_import_paths.sh
-      - name: "Ratchet shard 2 (packages/minimal/quickstart/stdlib/attributes/unstable/demos vs C-direct)"
-        run: |
-          CC=clang LLVM_CONFIG="$LLVM_CONFIG" \
-            TARGET_BACKEND=native ORACLE_BACKEND=c NATIVE_PARITY_RATCHET=1 \
-            BACKEND_PARITY_DIRS="examples/packages examples/minimal examples/quickstart examples/stdlib examples/attributes examples/unstable demos" \
-            tools/test-backend-parity.sh
       - name: "Single-fixture native gates (the native-gates-2 rows of stage2/test-registry.txt, under make -j)"
         run: make -C stage2 KAI_LLVM=1 LLVM_CONFIG="$LLVM_CONFIG" test-native-gates-2
       # These hide the runtime bitcode in stage0/ while they run, so they
@@ -555,7 +579,7 @@ jobs:
   # shards, the self-host gate, the native RC leak ledger and, when the diff
   # reaches its paths, the RC detector pass.
   tier1-native:
-    needs: [changes, native-shard-1, native-shard-1b, native-shard-2, native-selfhost-gate, native-rc-leak-gate, rc-detector]
+    needs: [changes, native-parity, native-shard-1, native-shard-1b, native-shard-2, native-selfhost-gate, native-rc-leak-gate, rc-detector]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -565,6 +589,7 @@ jobs:
           if [ "${{ needs.changes.outputs.doc-only }}" = "true" ]; then
             echo "tier1-native OK — doc-only PR, shards skipped"; exit 0
           fi
+          rp='${{ needs.native-parity.result }}'
           r1='${{ needs.native-shard-1.result }}'
           r1b='${{ needs.native-shard-1b.result }}'
           r2='${{ needs.native-shard-2.result }}'
@@ -572,11 +597,11 @@ jobs:
           r4='${{ needs.native-rc-leak-gate.result }}'
           r5='${{ needs.rc-detector.result }}'
           rcdet='${{ needs.changes.outputs.rcdet }}'
-          echo "native results: shard1=$r1 shard1b=$r1b shard2=$r2 selfhost-gate=$r3 rc-leak-gate=$r4 rc-detector=$r5 (in scope: $rcdet)"
-          if [ "$r1" = "success" ] && [ "$r1b" = "success" ] && [ "$r2" = "success" ] && [ "$r3" = "success" ] && [ "$r4" = "success" ]; then
+          echo "native results: parity=$rp shard1=$r1 shard1b=$r1b shard2=$r2 selfhost-gate=$r3 rc-leak-gate=$r4 rc-detector=$r5 (in scope: $rcdet)"
+          if [ "$rp" = "success" ] && [ "$r1" = "success" ] && [ "$r1b" = "success" ] && [ "$r2" = "success" ] && [ "$r3" = "success" ] && [ "$r4" = "success" ]; then
             :
           else
-            echo "::error::tier1-native FAIL — a shard, the self-host gate or the native RC leak ledger did not succeed"; exit 1
+            echo "::error::tier1-native FAIL — a shard, the parity ratchet, the self-host gate or the native RC leak ledger did not succeed"; exit 1
           fi
           if [ "$rcdet" = "true" ] && [ "$r5" != "success" ]; then
             echo "::error::tier1-native FAIL — the RC detector did not succeed"; exit 1
