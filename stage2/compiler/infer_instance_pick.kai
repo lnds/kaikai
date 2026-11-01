@@ -1,0 +1,306 @@
+#[doc("Choosing among several instances of one effect that a parameter's row leaves open: the choice waits for a use that pins it, and row position never decides it.")]
+
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.home_dup
+import compiler.infer_row_kinds
+import compiler.infer_state
+import compiler.infer_apply
+import compiler.infer_call_labels
+import compiler.infer_expect
+import compiler.infer_unify_rows
+import compiler.diag_type_text
+
+#[doc("A call's argument types after the instance choices they leave open are deferred.")]
+pub(pkg) type PickedCall = { st: InferState, expected: Ty }
+
+type PickedArgs = { st: InferState, args: [Ty] }
+
+type PickedArg = { st: InferState, arg: Ty }
+
+type PickedRow = { st: InferState, row: Row }
+
+#[doc("Rewrite the function-typed arguments of a call so that a parameter label fitting several instances of one effect in the argument's row stands for one instance still to be chosen; the rest of the row stays open until a use pins the choice.")]
+pub(pkg) fn defer_instance_picks(
+  st: InferState,
+  callee_ty: Ty,
+  expected: Ty,
+  line: Int,
+  col: Int
+) : PickedCall / Console + File + Mutable =
+  match (apply_ty_keep_row_labels(st.sub, callee_ty), expected) {
+    (TyFnT(ps, res, _), TyFnT(as_, r, row)) -> {
+      let w = pick_params(st, [res, ...ps], ps, as_, line, col)
+      PickedCall { st: w.st, expected: TyFnT(w.args, r, row) }
+    }
+    _ -> PickedCall { st: st, expected: expected }
+  }
+
+fn pick_params(
+  st: InferState,
+  sig: [Ty],
+  ps: [Ty],
+  as_: [Ty],
+  line: Int,
+  col: Int
+) : PickedArgs / Console + File + Mutable = match (ps, as_) {
+  ([p, ...prest], [a, ...arest]) -> {
+    let one = pick_arg(st, sig, p, a, line, col)
+    let rest = pick_params(one.st, sig, prest, arest, line, col)
+    PickedArgs { st: rest.st, args: [one.arg, ...rest.args] }
+  }
+  _ -> PickedArgs { st: st, args: as_ }
+}
+
+fn pick_arg(
+  st: InferState,
+  sig: [Ty],
+  p: Ty,
+  a: Ty,
+  line: Int,
+  col: Int
+) : PickedArg / Console + File + Mutable =
+  match (apply_ty_keep_row_labels(st.sub, p), apply_ty_keep_row_labels(st.sub, a)) {
+    (TyFnT(_, _, prow), TyFnT(aps, ar, arow)) -> {
+      let pr = apply_row_tail_only(st.sub, prow)
+      let r = pick_labels(st, sig, pr.labels, apply_row_tail_only(st.sub, arow), line, col)
+      if list_length(r.row.labels) == list_length(arow.labels) and r.row.tail == arow.tail {
+        PickedArg { st: r.st, arg: a }
+      } else {
+        PickedArg { st: r.st, arg: TyFnT(aps, ar, r.row) }
+      }
+    }
+    _ -> PickedArg { st: st, arg: a }
+  }
+
+fn pick_labels(
+  st: InferState,
+  sig: [Ty],
+  targets: [Label],
+  arow: Row,
+  line: Int,
+  col: Int
+) : PickedRow / Console + File + Mutable = match targets {
+  [] -> PickedRow { st: st, row: arow }
+  [t, ...rest] -> {
+    let cs = instance_cands(st.sub, t, arow.labels)
+    if list_length(cs) < 2 or (not instance_observed(st.sub, sig, t)) {
+      pick_labels(st, sig, rest, arow, line, col)
+    } else if tail_is_rigid(st.sub, arow.tail) {
+      pick_labels(report_unpinned(st, t, cs, line, col), sig, rest, arow, line, col)
+    } else {
+      let fr = subst_fresh_row(st.sub)
+      let st1 = st_push_deferred_hom(st_set_sub(st, fr.subst), DPick(t, cs, fr.id, line, col))
+      let kept = filter(arow.labels, h => not any(cs, c => same_instance(st.sub, c, h)))
+      pick_labels(
+        st1,
+        sig,
+        rest,
+        Row {
+          labels: list_append(kept, [t]),
+          tail: Some(fr.id),
+          display_alias: arow.display_alias
+        },
+        line,
+        col
+      )
+    }
+  }
+}
+
+# A variable no other part of the signature mentions leaves the instance
+# unobservable: whichever is taken, the rest flow outward to be handled.
+fn instance_observed(s: Subst, sig: [Ty], t: Label) : Bool =
+  any(
+    t.ty_args,
+    a => match apply_ty(s, a) {
+      TyVarT(v) -> occurs_any(v, sig, s)
+      _ -> false
+    }
+  )
+
+fn tail_is_rigid(s: Subst, tail: Option[Int]) : Bool = match tail {
+  Some(v) -> subst_row_is_rigid(s, v)
+  None -> false
+}
+
+fn same_instance(s: Subst, a: Label, b: Label) : Bool =
+  label_same(a, b) and args_equal(s, a.ty_args, b.ty_args)
+
+fn args_equal(s: Subst, a: [Ty], b: [Ty]) : Bool = match (a, b) {
+  ([], []) -> true
+  ([x, ...xr], [y, ...yr]) ->
+    ty_eq_shape_concrete(apply_ty(s, x), apply_ty(s, y)) and args_equal(s, xr, yr)
+  _ -> false
+}
+
+fn args_all_open(s: Subst, args: [Ty]) : Bool =
+  args != [] and all(args, t => ty_is_var(apply_ty(s, t)))
+
+fn ty_is_var(t: Ty) : Bool = match t {
+  TyVarT(_) -> true
+  _ -> false
+}
+
+fn args_all_closed(s: Subst, args: [Ty]) : Bool =
+  args != [] and all(args, t => not ty_is_open(apply_ty(s, t)))
+
+fn dedupe_instances(s: Subst, ls: [Label]) : [Label] = match ls {
+  [] -> []
+  [h, ...rest] -> [h, ...dedupe_instances(s, filter(rest, x => not same_instance(s, h, x)))]
+}
+
+fn instance_cands(s: Subst, t: Label, row: [Label]) : [Label] =
+  if args_all_open(s, t.ty_args) {
+    dedupe_instances(
+      s,
+      filter(
+        row,
+        h => label_same(h, t)
+          and args_all_closed(s, h.ty_args)
+          and labels_args_unify(h.ty_args, t.ty_args, s)
+      )
+    )
+  } else {
+    []
+  }
+
+#[doc("Settle the deferred instance choices whose label a use has since pinned. With `last`, one still open is an ambiguous effect instance.")]
+pub(pkg) fn drain_instance_picks(
+  st: InferState,
+  last: Bool
+) : InferState / Console + File + Mutable =
+  drain_picks(st, st.deferred_homs, last, [])
+
+fn drain_picks(
+  st: InferState,
+  hs: [DeferredHom],
+  last: Bool,
+  kept: [DeferredHom]
+) : InferState / Console + File + Mutable = match hs {
+  [] -> InferState { ...st, deferred_homs: list_reverse(kept) }
+  [h, ...rest] -> match h {
+    DPick(t, cs, x, line, col) -> match chosen_instance(st.sub, t, cs) {
+      Some(c) -> drain_picks(commit_pick(st, c, cs, x, line, col), rest, last, kept)
+      None -> if last {
+        drain_picks(report_pick_open(st, t, cs, line, col), rest, last, kept)
+      } else {
+        drain_picks(st, rest, last, [h, ...kept])
+      }
+    }
+    _ -> drain_picks(st, rest, last, [h, ...kept])
+  }
+}
+
+fn chosen_instance(s: Subst, t: Label, cs: [Label]) : Option[Label] =
+  if args_all_closed(s, t.ty_args) {
+    match filter(cs, c => args_equal(s, c.ty_args, t.ty_args)) {
+      [c] -> Some(c)
+      _ -> None
+    }
+  } else {
+    None
+  }
+
+fn commit_pick(
+  st: InferState,
+  chosen: Label,
+  cs: [Label],
+  x: Int,
+  line: Int,
+  col: Int
+) : InferState / Console + File + Mutable {
+  let others = filter(cs, c => not same_instance(st.sub, c, chosen))
+  let fr = subst_fresh_row(st.sub)
+  let rest = Row { labels: others, tail: Some(fr.id), display_alias: None }
+  let held = Row { labels: [], tail: Some(x), display_alias: None }
+  match unify_row(rest, held, fr.subst) {
+    Some(s2) -> st_set_sub(st, s2)
+    None -> report_no_home(st_set_sub(st, fr.subst), others, line, col)
+  }
+}
+
+fn report_pick_open(
+  st: InferState,
+  t: Label,
+  cs: [Label],
+  line: Int,
+  col: Int
+) : InferState / Console + File + Mutable =
+  if args_all_closed(st.sub, t.ty_args) {
+    report_no_instance(st, t, cs, line, col)
+  } else {
+    report_unpinned(st, t, cs, line, col)
+  }
+
+fn shown_labels(st: InferState, ls: [Label]) : String =
+  join_with(map(ls, l => label_diag_display(st, l)), " and ")
+
+fn report_unpinned(
+  st: InferState,
+  t: Label,
+  cs: [Label],
+  line: Int,
+  col: Int
+) : InferState / Console + File + Mutable {
+  let d = mk_diag(
+    SevError,
+    st.file,
+    line,
+    col,
+    "ambiguous effect instance: `#{label_diag_display(st, t)}`",
+    [
+      ri_note(st.file, line, col, "it fits #{shown_labels(st, cs)}"),
+      ri_help(
+        st.file,
+        line,
+        col,
+        "pin the instance with a type the call's result must have, or annotate the type of the function passed in"
+      )
+    ]
+  )
+  st_bump_err(st_push_diag(st, d))
+}
+
+fn report_no_instance(
+  st: InferState,
+  t: Label,
+  cs: [Label],
+  line: Int,
+  col: Int
+) : InferState / Console + File + Mutable {
+  let d = mk_diag(
+    SevError,
+    st.file,
+    line,
+    col,
+    "no effect instance fits `#{label_diag_display(st, t)}`",
+    [ri_note(st.file, line, col, "the function passed in performs #{shown_labels(st, cs)}")]
+  )
+  st_bump_err(st_push_diag(st, d))
+}
+
+fn report_no_home(
+  st: InferState,
+  others: [Label],
+  line: Int,
+  col: Int
+) : InferState / Console + File + Mutable {
+  let d = mk_diag(
+    SevError,
+    st.file,
+    line,
+    col,
+    "effect instance not covered: `#{shown_labels(st, others)}`",
+    [
+      ri_note(
+        st.file,
+        line,
+        col,
+        "the instance the call leaves over has to be handled or declared where the call is"
+      )
+    ]
+  )
+  st_bump_err(st_push_diag(st, d))
+}
