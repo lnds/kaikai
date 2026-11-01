@@ -10,7 +10,7 @@
 # kaic2-a linked from the boot's own C.
 
 set -eu
-unset KAIC_BOOT_MODULAR
+unset KAIC_BOOT_MODULAR KAIC_BOOT_HOPS
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOOT_SH="$SCRIPT_DIR/kaic-boot.sh"
