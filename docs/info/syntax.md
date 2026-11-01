@@ -370,9 +370,10 @@ block, not only in test bodies.
 
 ## Attributes
 
-Five declaration-level `#[...]` meta-instructions exist —
-`#[derive(...)]`, `#[unstable]`, `#[doc("...")]`, `#[constructor]`, and
-`#[native_stack]` (before an `extern "C" fn`, see `kai info ffi`) —
+Six declaration-level `#[...]` meta-instructions exist —
+`#[derive(...)]`, `#[unstable]`, `#[doc("...")]`, `#[constructor]`,
+`#[must_use]` and `#[native_stack]` (before an `extern "C" fn`, see
+`kai info ffi`) —
 plus the field-level `#[json(...)]` family.
 Attributes come BEFORE `pub`. An unrecognised attribute parses and is
 silently discarded — `#[deprecated]` does nothing.
@@ -398,6 +399,25 @@ pub fn wallet(owner: String) : Wallet          #   call syntax on the
   = Wallet { owner: owner, pin: 0 }            #   TYPE name
 
 fn main() : Int = addone(double(20)) + experimental() + Wallet("ana").pin
+```
+
+`#[must_use]` / `#[must_use("message")]` goes on a `type` declaration.
+The compiler warns (`rule: must_use_discard`, message appended) when a
+statement discards a value of that type; `Result` and `Stream` carry it.
+Close the value with `|> ignore` or `let _ =`, bind it, match on it, or
+make it the block's result:
+
+```kaikai
+#[must_use("the fault is lost unless it is checked")]
+type Checked = Checked(Int)
+
+fn check(n: Int) : Checked = Checked(n)
+
+fn main() : Unit {
+  check(1) |> ignore
+  let _ = check(2)
+  Stdout.print("ok")
+}
 ```
 
 On a record field, `#[json(rename = "wire")]` / `#[json(default =

@@ -121,8 +121,9 @@ type.
 ## `|> ignore` to drop a value on purpose
 
 A value that is not `Unit` and is not the block's result is a discard,
-and `kai lint` flags it (`discard_pure_value`). When the value is not
-wanted, say so: close the expression with `|> ignore`, or bind it to
+and `kai lint` flags it (`discard_pure_value`); a discarded `Result` or
+`Stream` is the compiler's own warning instead (`#[must_use]`). When the
+value is not wanted, say so: close the expression with `|> ignore`, or bind it to
 `_`.
 
 ```kaikai

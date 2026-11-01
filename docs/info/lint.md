@@ -53,22 +53,27 @@ an effect:
 ```kaikai
 fn area(w: Int, h: Int) : Int = w * h
 
-fn parse(s: String) : Result[Int, String] / Stdout = {
+fn parse(s: String) : Option[Int] / Stdout = {
   println(s)
-  Ok(s |> length())
+  Some(s |> length())
 }
 
 fn show(n: Int) : Unit / Stdout = println("#{n}")
 
 fn run() : Unit / Stdout = {
   area(3, 4)        # discard_pure_value: the Int is dropped
-  parse("42")       # discard_pure_value: the Result is dropped
+  parse("42")       # discard_pure_value: the Option is dropped
   [1, 2] | show     # discard_pure_value: the [Unit] is dropped
   println("done")
 }
 
 fn main() : Unit / Stdout = run()
 ```
+
+A value of a `#[must_use]` type (`Result`, `Stream`) is not reported
+here: the compiler itself warns on it (`rule: must_use_discard`, see
+`kai info syntax` §Attributes), so the lint stays silent to avoid a
+second report.
 
 To drop a value on purpose, say so: close it with `|> ignore` (a core
 function) or bind it with `let _ =`. Neither is flagged:
