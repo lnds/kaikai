@@ -11680,7 +11680,7 @@ rc-detector: bin-kai
 # exit-code check would pass on that.
 NSCOL_RATCHET = ../tools/nscol-ratchet.sh
 NSCOL_RUN = NSCOL_KAIC2='$(KAIC2)' NSCOL_CORE_CACHE='$(TEST_CORE_CACHE)' \
-  NSCOL_CC='$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0' NSCOL_LDLIBS='$(LDLIBS_M)' \
+  NSCOL_CC='$(CC) $(LIGHT_CFLAGS) $(CPPFLAGS_CORE) -I ../stage0' NSCOL_LDLIBS='$(LDLIBS_M)' \
   NSCOL_ASAN_CC='$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -DKAI_NO_CELL_POOL -Wno-unused-function -Wno-unused-variable -I ../stage2 -I ../stage0' \
   ../tools/nscol-run.sh
 

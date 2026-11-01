@@ -716,7 +716,7 @@ tier1-shard-1: kaic2
 tier1-shard-2: kaic2
 	$(tier1-shard-start)
 	$(call tier1-light-slice,2)
-	$(MAKE) -C stage2 test-namespace-collisions-c-axes-1
+	$(MAKE) -C stage2 test-namespace-collisions-c-axes-1 LIGHT_OPT=$(TIER1_LIGHT_OPT)
 	$(MAKE) test-namespace-matrix
 	$(MAKE) test-field-types FIELD_TYPES_SHARD=2/8
 	$(call tier1-shard-wall,2)
@@ -789,14 +789,14 @@ tier1-shard-9: kaic2
 
 tier1-shard-10: kaic2
 	$(tier1-shard-start)
-	$(MAKE) -C stage2 test-namespace-collisions-c-axes-2
+	$(MAKE) -C stage2 test-namespace-collisions-c-axes-2 LIGHT_OPT=$(TIER1_LIGHT_OPT)
 	$(call tier1-light-slice,10)
 	$(call tier1-shard-wall,10)
 	@echo "tier1-shard-10 OK — namespace-collision corpus (C axes, second group) + light slice 10/$(TIER1_LIGHT_SLICES)"
 
 tier1-shard-11: kaic2
 	$(tier1-shard-start)
-	$(MAKE) -C stage2 test-namespace-collisions-modular-axes
+	$(MAKE) -C stage2 test-namespace-collisions-modular-axes LIGHT_OPT=$(TIER1_LIGHT_OPT)
 	$(call tier1-light-slice,11)
 	$(call tier1-shard-wall,11)
 	@echo "tier1-shard-11 OK — namespace-collision C-modular axes + light slice 11/$(TIER1_LIGHT_SLICES)"

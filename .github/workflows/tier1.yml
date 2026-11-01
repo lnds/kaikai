@@ -937,14 +937,14 @@ jobs:
   # Not in the tier1 aggregator's `needs`: it informs, never blocks, and runs
   # beside the shards. The base compiler comes from the exact-match bootstrap
   # cache (main's build saved it) and is built here only on a miss.
-  cost-ab:
-    needs: [changes, build]
+  # The base compiler of the cost A/B, built beside `build` so the measuring
+  # job does not wait for it: the base chain comes from the exact-match
+  # bootstrap cache (main's build saved it) and is built here only on a miss.
+  cost-ab-base:
+    needs: changes
     if: github.event_name == 'pull_request' && needs.changes.outputs.compiler-touch == 'true' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 50
-    permissions:
-      contents: read
-      pull-requests: write
     steps:
       # The base sits at the workspace root, like the build job's tree: the
       # cache version is derived from the path list, so a restore finds
@@ -1009,10 +1009,61 @@ jobs:
         env:
           KAIC_BOOT_MODULAR: 1
         run: make CC=clang kaic1 kaic2
+      - name: Upload the base compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: cost-ab-base
+          path: stage2/kaic2
+          retention-days: 1
+          if-no-files-found: error
+
+  cost-ab:
+    needs: [changes, build, cost-ab-base]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.compiler-touch == 'true' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # The base sits at the workspace root, like the build job's tree: the
+      # cache version is derived from the path list, so a restore finds
+      # main's entry only when the paths are spelled identically. The root
+      # checkout goes first: checking out into a non-empty root wipes it.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      # The PR artifact is built from the merge commit, so the base is the
+      # commit it was merged onto: newer main sources may use what the
+      # artifact's compiler lacks.
+      - name: Pick the base commit
+        id: base-sha
+        run: |
+          if git rev-parse --verify -q HEAD^2 >/dev/null; then
+            sha="$(git rev-parse HEAD^1)"
+          else
+            sha="${{ github.event.pull_request.base.sha }}"
+            git fetch --depth=1 origin "$sha"
+          fi
+          git checkout -q --detach "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          path: head
+          fetch-depth: 2
+      - name: Install toolchain
+        working-directory: head
+        run: ./tools/ci-install-toolchain.sh
       - uses: actions/download-artifact@v4
         with:
           name: kaic2-c
           path: pr-artifact
+      - uses: actions/download-artifact@v4
+        with:
+          name: cost-ab-base
+          path: base-artifact
+      - name: Install the base compiler
+        run: cp base-artifact/kaic2 stage2/kaic2
       - name: Measure and post
         env:
           GH_TOKEN: ${{ github.token }}
