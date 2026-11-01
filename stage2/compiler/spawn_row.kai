@@ -36,6 +36,8 @@ import compiler.infer_env_exhaust
 import compiler.infer_index
 import compiler.expr_positions
 import compiler.core_types
+import compiler.infer_handle_walk
+import compiler.core_refs
 
 #[doc("Reject a spawned thunk the child fiber cannot honour: an effect it cannot resolve, or a captured value it would mutate as a copy. Each diagnostic names the file declaring the decl it fires on; `tab` names what it reports; `carriers` are the types whose capture is a mutation the child cannot share; `edges` are the instantiations the typer recorded.")]
 pub fn check_spawn_rows(
@@ -83,8 +85,8 @@ fn check_read(
           read_rows(c, vars),
           [],
           (acc, r) => list_append(
-            acc,
-            check_crossing_labels(site, decls, line, col, r.labels, false)
+            list_append(acc, check_crossing_labels(site, decls, line, col, r.labels, false)),
+            check_uncovered_mailboxes(site, typed, d, line, col, r.labels)
           )
         )
       }
@@ -125,7 +127,8 @@ fn check_spawn_owners(
       decls,
       typed,
       foldl(owners, idx_empty(), (ix, o) => idx_prepend_sym(ix, o, o)),
-      []
+      [],
+      typed
     )
   }
 
@@ -136,34 +139,47 @@ fn check_owner_decls(
   all_decls: [Decl],
   ds: [Decl],
   owners: NameIndex[SymId],
-  acc: [Diagnostic]
+  acc: [Diagnostic],
+  typed_all: [Decl]
 ) : [Diagnostic] / Console + File = match ds {
   [] -> acc
   [d, ...rest] -> match d {
     DFn(_, fid, _, _, _, _, body, _, _, _, _, _) ->
       if list_is_empty(idx_chain_sym(owners, fnid_sym(fid))) {
-        check_owner_decls(df, tab, carriers, all_decls, rest, owners, acc)
+        check_owner_decls(df, tab, carriers, all_decls, rest, owners, acc, typed_all)
       } else {
         let site = SpawnSite { file: decl_diag_file(d, df), tab: tab, owner: d }
         let ds1 = foldl(
           spawn_calls(body, []),
           [],
           (a, e) => match e.kind {
-            ECall(_, args_) -> list_append(a, check_spawned_thunk(site, carriers, all_decls, args_))
+            ECall(_, args_) -> list_append(
+              list_append(a, check_spawned_thunk(site, carriers, all_decls, args_)),
+              check_spawned_mailboxes(site, typed_all, e, args_)
+            )
             _ -> a
           }
         )
-        check_owner_decls(df, tab, carriers, all_decls, rest, owners, list_append(acc, ds1))
+        check_owner_decls(
+          df,
+          tab,
+          carriers,
+          all_decls,
+          rest,
+          owners,
+          list_append(acc, ds1),
+          typed_all
+        )
       }
     DUnstable(inner, _, _) ->
-      check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc)
+      check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc, typed_all)
     DProtoLaws(_, inner, _, _, _) ->
-      check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc)
+      check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc, typed_all)
     DImplAxiom(_, inner, _, _, _) ->
-      check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc)
+      check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc, typed_all)
     DConstructor(inner, _, _) ->
-      check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc)
-    _ -> check_owner_decls(df, tab, carriers, all_decls, rest, owners, acc)
+      check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc, typed_all)
+    _ -> check_owner_decls(df, tab, carriers, all_decls, rest, owners, acc, typed_all)
   }
 }
 
@@ -471,4 +487,192 @@ fn report_spawn_escape(
     note, help
   ])
   d
+}
+
+# A spawned actor's own handler covers one `Actor` instance, the one its
+# `Pid` is typed at; any other the body performs reaches the child with no
+# handler, and one whose mailbox the body reads fails there.
+fn check_spawned_mailboxes(
+  site: SpawnSite,
+  typed: [Decl],
+  call: Expr,
+  args_: [Expr]
+) : [Diagnostic] / Console + File = match (spawn_thunk_arg(args_), call.ty) {
+  (Some(thk), Some(TyCon(_, covered))) -> if (not callee_spawns_actor(call))
+    or any(
+      covered,
+      c => match c {
+        TyVarT(_) -> true
+        _ -> false
+      }
+    ) {
+    []
+  } else {
+    match thk.ty {
+      Some(TyFnT(_, _, row)) -> uncovered_mailboxes(
+        site,
+        typed,
+        thk,
+        thk.line,
+        thk.col,
+        filter(
+          row.labels,
+          l => match l.ty_args {
+            [m] ->
+              not any(covered, c => inf_ty_to_string(site.tab, c) == inf_ty_to_string(site.tab, m))
+            _ -> false
+          }
+        )
+      )
+      _ -> []
+    }
+  }
+  _ -> []
+}
+
+fn callee_spawns_actor(call: Expr) : Bool = match call.kind {
+  ECall(callee, _) -> match callee.kind {
+    ESym(s, _) -> match known_fn_of(s) {
+      Some(KfSpawnActor) -> true
+      Some(KfSpawnActorPolicy) -> true
+      _ -> false
+    }
+    _ -> false
+  }
+  _ -> false
+}
+
+fn check_uncovered_mailboxes(
+  site: SpawnSite,
+  typed: [Decl],
+  owner: Decl,
+  line: Int,
+  col: Int,
+  labels: [Label]
+) : [Diagnostic] / Console + File =
+  match owner {
+    DFn(_, _, _, _, _, _, body, _, _, _, _, _) -> match read_thunk(body, line, col) {
+      None -> []
+      Some(thk) -> uncovered_mailboxes(site, typed, thk, line, col, labels)
+    }
+    _ -> []
+  }
+
+fn uncovered_mailboxes(
+  site: SpawnSite,
+  typed: [Decl],
+  thk: Expr,
+  line: Int,
+  col: Int,
+  labels: [Label]
+) : [Diagnostic] / Console + File =
+  foldl(
+    filter(labels, l => effect_is(l.sym, CeActor)),
+    [],
+    (acc, l) => match l.ty_args {
+      [m] -> if thunk_reads_mailbox(site.tab, typed, thk, m) {
+        list_append(acc, [report_mailbox_uncovered(site, l, m, line, col)])
+      } else {
+        acc
+      }
+      _ -> acc
+    }
+  )
+
+fn read_thunk(e: Expr, line: Int, col: Int) : Option[Expr] {
+  let here = match e.kind {
+    ECall(callee, args_) -> if callee.line == line and callee.col == col {
+      spawn_thunk_arg(args_)
+    } else {
+      None
+    }
+    _ -> None
+  }
+  match here {
+    Some(t) -> Some(t)
+    None -> foldl(
+      spawn_expr_children(e),
+      None,
+      (acc, c) => match acc {
+        Some(t) -> Some(t)
+        None -> read_thunk(c, line, col)
+      }
+    )
+  }
+}
+
+type MailboxScan = { tys: [String], seen: [SymId] }
+
+fn thunk_reads_mailbox(tab: SymTab, typed: [Decl], thunk: Expr, msg: Ty) : Bool {
+  let sc = scan_mailboxes(tab, typed, MailboxScan { tys: [], seen: [] }, thunk)
+  let want = inf_ty_to_string(tab, msg)
+  any(sc.tys, t => t == want)
+}
+
+fn scan_mailboxes(tab: SymTab, typed: [Decl], sc: MailboxScan, e: Expr) : MailboxScan {
+  let here = match e.kind {
+    ECall(callee, args_) -> match callee.kind {
+      ESym(op, _) -> add_mailbox_msg(tab, sc, op, callee.ty, list_length(args_))
+      EOp(r) -> add_mailbox_msg(tab, sc, r.eff, callee.ty, list_length(args_))
+      _ -> sc
+    }
+    ESym(s, _) -> follow_mailboxes(tab, typed, sc, s)
+    _ -> sc
+  }
+  foldl(spawn_expr_children(e), here, (a, c) => scan_mailboxes(tab, typed, a, c))
+}
+
+fn follow_mailboxes(tab: SymTab, typed: [Decl], sc: MailboxScan, s: SymId) : MailboxScan =
+  if any(sc.seen, x => sym_raw(x) == sym_raw(s)) {
+    sc
+  } else {
+    let sc1 = MailboxScan { tys: sc.tys, seen: [s, ...sc.seen] }
+    match find_fn_decl(typed, s) {
+      Some(DFn(_, _, _, _, _, _, body, _, _, _, _, _)) ->
+        scan_mailboxes(tab, typed, sc1, body)
+      _ -> sc1
+    }
+  }
+
+# `send` takes the destination and the message, so it names its mailbox and
+# reads none; `self`, `receive` and `receive_timeout` read the one they are
+# typed at.
+fn add_mailbox_msg(
+  tab: SymTab,
+  sc: MailboxScan,
+  op: SymId,
+  callee_ty: Option[Ty],
+  nargs: Int
+) : MailboxScan = match callee_ty {
+  Some(TyCon(_, [m])) -> if effect_is(op, CeActor) and nargs != 2 {
+    MailboxScan { tys: [inf_ty_to_string(tab, m), ...sc.tys], seen: sc.seen }
+  } else {
+    sc
+  }
+  _ -> sc
+}
+
+fn report_mailbox_uncovered(
+  site: SpawnSite,
+  l: Label,
+  msg: Ty,
+  line: Int,
+  col: Int
+) : Diagnostic / Console + File {
+  let shown = "#{decl_name(site.tab, l.sym)}[#{inf_ty_to_string(site.tab, msg)}]"
+  let note = ri_note(
+    site.file,
+    line,
+    col,
+    "the spawned actor's mailbox belongs to one `Actor` instance; the body also reads the mailbox of this one"
+  )
+  let help = ri_help(
+    site.file,
+    line,
+    col,
+    "spawn the body with the instance it receives on as the actor's message type, or give it its own `with_mailbox`"
+  )
+  mk_diag(SevError, site.file, line, col, "effect not handled in spawned fiber: `#{shown}`", [
+    note, help
+  ])
 }

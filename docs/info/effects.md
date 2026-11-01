@@ -349,6 +349,17 @@ fn pair() : String / Box[Int] + Box[String] = {
 fn main() : Int = 0
 ```
 
+The same holds when a function passed as an argument performs two instances
+and the parameter's row names one of them, as `spawn_actor`'s
+`Actor[msg]` does. The choice waits for the first thing that pins `msg`: an
+annotated result (`let srv: Pid[Req] = spawn_actor(body)`), or a later use of
+the result (`Actor.send(srv, Ask(..))`). It is never taken from the order of
+the row, and a call nothing pins is rejected as an `ambiguous effect
+instance`. The instance a spawned actor does not take reaches the child fiber
+without a handler, so a body that reads its mailbox (`self`, `receive`,
+`receive_timeout`) is rejected at the spawn; `send` names its destination and
+needs none.
+
 ## Keeping the continuation — `Cont[t, s, e]`
 
 A clause may store `resume`, return it, or call it from a lambda or a
