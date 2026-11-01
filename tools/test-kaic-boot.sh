@@ -180,6 +180,10 @@ is_stale release "one-hop C, two hops asked"
 boot release emit "$out" 2>/dev/null
 (KAIC_BOOT_HOPS=1; export KAIC_BOOT_HOPS; is_stale release "two-hop C, one hop asked")
 (KAIC_BOOT_HOPS=3; export KAIC_BOOT_HOPS; boot release emit "$out" 2>/dev/null) && fail "KAIC_BOOT_HOPS=3 was accepted"
+(KAIC_BOOT_HOPS=1; KAIC_BOOT_MODULAR=1; export KAIC_BOOT_HOPS KAIC_BOOT_MODULAR; boot release emit "$out" 2>/dev/null) || fail "one-hop modular release emit failed"
+[ "$(head -n 1 "$out")" = "/* release stdlib=$root/stdlib args=--emit=c-modular --edition hanga-roa main.kai */" ] \
+  || fail "a one-hop modular emit did not run the boot with this tree's stdlib and edition: $(head -n 1 "$out")"
+boot release emit "$out" 2>/dev/null
 ok "KAIC_BOOT_HOPS=1 takes one hop, records it, and is reused only under the same setting"
 
 echo 'fn o() = 2' > "$root/stdlib/other.kai"
