@@ -241,27 +241,28 @@ fn load_source(
   home: String,
   src: String
 ) : ResolveState / Console + File {
-  let tokens = tokenize(src)
-  let lex_errs = report_errors(abs_path, src, tokens)
+  let hit_probe = if cache_dir != "" and (not rs_in.legacy) {
+    uc_lookup(cache_dir, abs_path, home, src, [], search_paths, rs_in.dep_memo)
+  } else {
+    UcLM(UcMiss("", ""), rs_in.dep_memo)
+  }
+  let cached = match hit_probe {
+    UcLM(UcHit(_, _), _) -> true
+    _ -> false
+  }
+  # A cached parse blob is only written for text that lexed clean.
+  let tokens = if cached { [] } else { tokenize(src) }
+  let lex_errs = if cached { 0 } else { report_errors(abs_path, src, tokens) }
   if lex_errs != 0 {
     rs_bump_errs(rs_in)
   } else {
-    # When the user cache is on, look the module up by its
-    # composite (content + transitive-dep)
-    # key. A hit hands back the post-doc-strip decls the
-    # parse+doc_strip path below would produce, so the parse
-    # is skipped; process_imports still runs over the cached
-    # decls (their DImport nodes are preserved) so transitive
-    # loads happen exactly as on a miss.
-    let lm = if cache_dir != "" and (not rs_in.legacy) {
-      uc_lookup(cache_dir, abs_path, home, src, tokens, search_paths, rs_in.dep_memo)
-    } else {
-      UcLM(UcMiss("", ""), rs_in.dep_memo)
-    }
-    let cache_res = match lm {
+    # A hit hands back the post-doc-strip decls the parse would
+    # produce; process_imports still runs over them (their DImport
+    # nodes are preserved), so transitive loads happen as on a miss.
+    let cache_res = match hit_probe {
       UcLM(r, _) -> r
     }
-    let rs_memo = match lm {
+    let rs_memo = match hit_probe {
       UcLM(_, m) -> rs_set_dep_memo(rs_in, m)
     }
     match uc_resolve_decls(cache_res, abs_path, home, src, tokens, cache_dir, rs_in.legacy) {
@@ -333,6 +334,7 @@ fn adopt_module(
   let exports = collect_pub_exports(kept, ftab, [])
   let rs3 = rs_scan_imports(
     rs_note_names(rs_append_decls(rs2b, home, tagged, rows), abs_path, exports, kept),
+    cache_dir,
     abs_path,
     abs_path,
     src,
@@ -473,7 +475,8 @@ pub(pkg) fn expand_imports(
   blocks: BlockPolicy,
   inputs_out: String,
   plan: PkgPlan,
-  legacy: Bool
+  legacy: Bool,
+  stats: Bool
 ) : ExpandedProgram / Console + File {
   let base_dir = dir_of(root_path)
   # Canonicalise root + core paths so the resolver's `visited`
@@ -519,11 +522,27 @@ pub(pkg) fn expand_imports(
     cache_dir,
     process_imports(base_dir, root_decls, search_paths, cores, "", cache_dir, rs0)
   )
-  let rs1 = rs_scan_imports(rs_roots, canon_root, root_path, root_src, root_tokens, root_decls, "")
+  let rs1 = rs_scan_imports(
+    rs_roots,
+    cache_dir,
+    canon_root,
+    root_path,
+    root_src,
+    root_tokens,
+    root_decls,
+    ""
+  )
   if inputs_out != "" {
     let _w = __file_write(inputs_out, string_join(rs_inputs(rs1, search_paths), "\n"))
   }
   # A grouped build's own diagnostics come from each test file built alone.
+  let _sn = if stats and cache_dir != "" {
+    eprint(
+      "kaic2: import-scan-cache: #{rs1.imports.scan_hits} hit, #{rs1.imports.scan_misses} miss"
+    )
+  } else {
+    ()
+  }
   let ledger = if list_is_empty(test_roots) { rs1.imports } else { ledger_new([]) }
   let mods = rs_modules(rs1)
   let cycles = if rs1.looped { import_cycles(rs1, mods) } else { [] }

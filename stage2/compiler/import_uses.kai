@@ -21,6 +21,7 @@ import compiler.module_table
 import compiler.core_types
 import compiler.infer_index
 import compiler.parse_lexical
+import compiler.user_cache
 
 #[doc("One import nothing in its file refers to: `UImp(written_name, origin, line, col)`, `origin` being the path of the module it loads.")]
 pub(pkg) type UnusedImport = UImp(String, String, Int, Int)
@@ -103,8 +104,12 @@ pub type Pending = Pend(String, [String])
 # An import that may turn out unused, with the names that mark it used.
 type ImportCand = ICand(UnusedImport, [String])
 
-#[doc("Scan one file's imports. `bindings` are the file's own import entries; `table` the names of every loaded module, keyed by origin.")]
-pub(pkg) fn file_imports(
+#[doc("How `file_imports_cached` met its scan: not needed (no import to check), read from the cache, or run.")]
+pub(pkg) type ScanKind = ScanSkipped | ScanHit | ScanMiss
+
+#[doc("Scan one file's imports; `bindings` are the file's own import entries and `table` the names of every loaded module, keyed by origin. The token scan is read from `cache_dir` when an earlier build ran it on the same text, names and bindings; an empty `tokens` is lexed from `src` only when the scan runs.")]
+pub(pkg) fn file_imports_cached(
+  cache_dir: String,
   origin: String,
   path: String,
   src: String,
@@ -112,21 +117,111 @@ pub(pkg) fn file_imports(
   decls: [Decl],
   bindings: [ModuleEntry],
   table: ModNamesIndex
-) : FileImports {
+) : Pair[FileImports, ScanKind] / Console + File {
   let cands = iu_cands(decls, bindings, table, [])
   let pending = iu_cand_pending(cands, [])
   let cx = iu_cx(src, iu_import_lines(decls, []), iu_module_names(bindings, []), pending)
-  let unused = iu_unused(cands, iu_scan(cx, tokens, 0, pending), [])
-  FileImports {
-    origin: origin,
-    path: path,
-    src: src,
-    import_lines: cx.import_lines,
-    mods: cx.mods,
-    edges: iu_edges(bindings, unused, []),
-    unused: unused,
-    marks: iu_marks(cands, unused, [])
+  let blob = if cache_dir == "" or list_is_empty(pending) {
+    ""
+  } else {
+    iu_scan_path(cache_dir, cx, pending)
   }
+  let cached = if blob == "" { None } else { iu_scan_read(blob) }
+  let left = match cached {
+    Some(keys) -> filter(
+      pending,
+      p => match p {
+        Pend(k, _) -> list_has(keys, k)
+      }
+    )
+    None -> iu_scan_run(cx, tokens, pending, blob)
+  }
+  let kind = if blob == "" {
+    ScanSkipped
+  } else if is_some(cached) {
+    ScanHit
+  } else {
+    ScanMiss
+  }
+  let unused = iu_unused(cands, left, [])
+  Pair {
+    fst: FileImports {
+      origin: origin,
+      path: path,
+      src: src,
+      import_lines: cx.import_lines,
+      mods: cx.mods,
+      edges: iu_edges(bindings, unused, []),
+      unused: unused,
+      marks: iu_marks(cands, unused, [])
+    },
+    snd: kind
+  }
+}
+
+fn iu_scan_run(
+  cx: IuCx,
+  tokens: [Token],
+  pending: [Pending],
+  blob: String
+) : [Pending] / Console + File {
+  let toks = if list_is_empty(tokens) and (not list_is_empty(pending)) {
+    tokenize(cx.src)
+  } else {
+    tokens
+  }
+  let left = iu_scan(cx, toks, 0, pending)
+  if blob != "" {
+    cache_publish(
+      blob,
+      string_join(
+        [
+          "iscan-v1",
+          ...map(
+            left,
+            p => match p {
+              Pend(k, _) -> k
+            }
+          )
+        ],
+        "\n"
+      )
+    )
+  }
+  left
+}
+
+fn iu_scan_read(blob: String) : Option[[String]] / Console + File = match __file_read(blob) {
+  Err(_) -> None
+  Ok(text) -> match string_split(text, "\n") {
+    ["iscan-v1", ...keys] -> Some(keys)
+    _ -> None
+  }
+}
+
+# The scan reads only the text, the lines of its imports, the module names
+# it qualifies by and the names each import can be mentioned by.
+fn iu_scan_path(cache_dir: String, cx: IuCx, pending: [Pending]) : String {
+  let key = concat_all([
+    int_to_string(string_length(cx.src)),
+    "\n",
+    cx.src,
+    "\n",
+    string_join(map(cx.import_lines, int_to_string), ","),
+    "\n",
+    string_join(cx.mods, ","),
+    "\n",
+    string_join(
+      map(
+        pending,
+        p => match p {
+          Pend(k, ns) -> cat2(k, cat2(":", string_join(ns, ",")))
+        }
+      ),
+      "|"
+    )
+  ])
+  concat_all([cache_dir, "/iscan-", uc_content_hex(key), "-", int_to_string(string_length(key))])
 }
 
 #[doc("`f` once `names` count as mentions in it too: an unused import one of them marks is used. For names no token of the file spells, as a derive's expansion refers to.")]

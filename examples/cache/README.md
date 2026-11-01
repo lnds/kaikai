@@ -30,6 +30,8 @@ Negative — an edit must not serve stale decls:
   re-parses that file and nothing else.
 - `userb_home_and_edition.sh` — whatever else a parse reads is in the
   key or shown not to matter.
+- `userb_import_scan_cache.sh` — the unused-import scan is read back
+  from the cache (counted hit/miss) and follows the file's text.
 - `userb_version_bump.sh` — flip the blob's kaikai-version byte.
 - `userb_corrupt_blob.sh` — truncate the blob past the header.
 
