@@ -102,21 +102,26 @@ def main():
             for s in sides if r % 2 == 0 else sides[::-1]:
                 s["t"].append(build(s, work))
         stat = {s["name"]: (min(s["t"]), statistics.median(s["t"])) for s in sides}
+        spread = sorted(
+            100.0 * (r - b) / b for b, r in zip(sides[0]["t"], sides[1]["t"])
+        )
         (bmin, bmed), (rmin, rmed) = stat["base"], stat["branch"]
         pct = 100.0 * (rmed - bmed) / bmed
         over = a.fail_above is not None and pct > a.fail_above
         verdict = f"up, over the {a.fail_above}% budget" if over else "ok"
         if a.markdown:
-            print(f"| probe | base min / median (s) | branch min / median (s) | delta (%) | verdict |")
-            print("|---|---:|---:|---:|---|")
+            print("| probe | base min / median (s) | branch min / median (s) | delta (%) | per-round delta min / median / max (%) | verdict |")
+            print("|---|---:|---:|---:|---:|---|")
             print(
                 f"| {a.modules}-module package build | {bmin:.3f} / {bmed:.3f} | "
-                f"{rmin:.3f} / {rmed:.3f} | {pct:+.2f} | {verdict} |"
+                f"{rmin:.3f} / {rmed:.3f} | {pct:+.2f} | "
+                f"{spread[0]:+.1f} / {statistics.median(spread):+.1f} / {spread[-1]:+.1f} | {verdict} |"
             )
         else:
             print(
                 f"{a.modules}-module package build: base {bmin:.3f}/{bmed:.3f} s, "
-                f"branch {rmin:.3f}/{rmed:.3f} s, {pct:+.2f}% ({verdict})"
+                f"branch {rmin:.3f}/{rmed:.3f} s, {pct:+.2f}% "
+                f"(per-round {spread[0]:+.1f}/{statistics.median(spread):+.1f}/{spread[-1]:+.1f}%, {verdict})"
             )
         return 1 if over else 0
     finally:
