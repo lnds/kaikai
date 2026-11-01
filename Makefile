@@ -643,7 +643,7 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 #  shard 9  — the kai CLI scripts (`test-kai-cli`).
 #  shard 10 — the second group of C axes of the namespace-collision corpus.
 #  shard 11 — the two C-modular axes of the namespace-collision corpus.
-#  shard 12 — a light slice and nothing else.
+#  shard 12 — the self-compile cache identity gate.
 #
 # The Perceus RC leak ledger is split in two (KAI_LEAK_SHARD): shard 4 runs
 # the first half, shard 1 the second. The demos baseline is a tier0 gate, so
@@ -757,7 +757,6 @@ tier1-shard-6: kaic2
 	$(tier1-shard-start)
 ifneq ($(TIER1_SELFHOSTS),0)
 	$(MAKE) -C stage2 test-perceus-1131-modular-escape
-	$(MAKE) -C stage2 test-selfcompile-cache-identity
 endif
 	$(MAKE) test-fmt-property FMT_PROPERTY_SHARD=2/3
 	$(call tier1-light-slice,6)
@@ -804,9 +803,12 @@ tier1-shard-11: kaic2
 
 tier1-shard-12: kaic2
 	$(tier1-shard-start)
+ifneq ($(TIER1_SELFHOSTS),0)
+	$(MAKE) -C stage2 test-selfcompile-cache-identity
+endif
 	$(call tier1-light-slice,12)
 	$(call tier1-shard-wall,12)
-	@echo "tier1-shard-12 OK — light slice 12/$(TIER1_LIGHT_SLICES)"
+	@echo "tier1-shard-12 OK — self-compile cache identity (TIER1_SELFHOSTS=$(TIER1_SELFHOSTS)) + light slice 12/$(TIER1_LIGHT_SLICES)"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
