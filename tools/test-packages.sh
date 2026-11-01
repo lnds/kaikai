@@ -247,6 +247,9 @@ run_check_script "library_test_discovery" "library_test_discovery/check.sh"
 # however many test files import it.
 run_check_script "module_tests_once" "module_tests_once/check.sh"
 
+# Under a `src/` layout the entry's imports resolve from src/, and an impl is not a test block.
+run_check_script "src_layout_imports" "src_layout_imports/check.sh"
+
 # The law checks of an impl in a non-root module read that module's names.
 run_check_script "module_law_checks" "module_law_checks/check.sh"
 
