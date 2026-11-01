@@ -25,8 +25,11 @@ observed() {
     b=$(basename "$f")
     [ "$b" = "diag.kai" ] && continue
     awk -v b="$b" -v pat="$PAT" '
+      function opens(line,   t) { t = line; gsub(/"([^"\\]|\\.)*"/, "\"\"", t); return gsub(/[(]/, "(", t) - gsub(/[)]/, ")", t) }
       /^(pub(\([a-z]+\))? )?fn [A-Za-z0-9_]+/ { s=$0; sub(/^(pub(\([a-z]+\))? )?fn /, "", s); sub(/[^A-Za-z0-9_].*/, "", s); fn=s }
       /^[ \t]*#/ { next }
+      depth > 0 { buf = buf " " $0; depth += opens($0); if (depth <= 0) { if (buf ~ pat) print b "__" fn; depth = 0 } next }
+      /eprint[(]/ && $0 !~ pat { buf = $0; depth = opens($0); if (depth <= 0) depth = 0; next }
       $0 ~ pat { print b "__" fn }' "$f"
   done | sort -u
 }
