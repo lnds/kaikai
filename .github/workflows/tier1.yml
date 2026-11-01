@@ -51,8 +51,8 @@ env:
 # A single `build` job bootstraps the C-only kaic2 ONCE and publishes it as
 # an artifact; tier0, the tier1 shards, tier1-asan and tier1-tsan consume it
 # (download + a dependency-ordered mtime touch so `make` rebuilds nothing).
-# `fast-gates` needs no compiler and runs beside `build`, so the source-only
-# audits fail within minutes. Artifacts do not cross workflows, which is why
+# The source-only audits (`make fast-gates`) ride `selfhost-fixed-point`, which
+# nothing waits for. Artifacts do not cross workflows, which is why
 # the sanitizer gates live here. The `tier1` aggregator job gates on every
 # shard; `tier1-tsan` is a separate REQUIRED check reported by its own job.
 jobs:
@@ -192,49 +192,6 @@ jobs:
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "M:N surface touched:"; echo "$MATCHED"
-          fi
-
-  # The tier0 gates that read only sources and scripts (`make fast-gates`).
-  # They need no compiler, so this job starts as soon as `changes` finishes
-  # and a break reports in minutes instead of after the build.
-  fast-gates:
-    needs: changes
-    if: needs.changes.outputs.doc-only != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Install toolchain
-        run: ./tools/ci-install-toolchain.sh
-      # `km` (the kimun crate) backs the differential quality bar in
-      # tools/km-new-files-gate.sh. Pinned: a kimun release changes grades,
-      # and a PR that touched no code must not go red for that. Keep the
-      # version in step with KIMUN_VERSION in the gate script.
-      - name: Cache kimun
-        id: cache-kimun
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/km
-          key: kimun-0.45.0-${{ runner.os }}
-      - name: Install kimun
-        if: steps.cache-kimun.outputs.cache-hit != 'true'
-        run: |
-          base=https://github.com/lnds/kimun/releases/download/v0.45.0
-          tgz=km-x86_64-unknown-linux-gnu.tar.gz
-          cd "$RUNNER_TEMP"
-          curl -fsSL -o "$tgz" "$base/$tgz" -o checksums-sha256.txt "$base/checksums-sha256.txt"
-          grep "  $tgz\$" checksums-sha256.txt | sha256sum -c -
-          mkdir -p ~/.cargo/bin
-          tar -xzf "$tgz" -C ~/.cargo/bin km
-      - name: fast gates (audits, ledgers, wiring, hermetic script tests)
-        run: make CC=clang fast-gates
-      - name: Working tree clean check
-        run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "::error::working tree dirty after fast-gates; build artifacts leaked into tracked paths"
-            git status; exit 1
           fi
 
   # Build the C-only kaic2 once and publish the bootstrap chain. Every
@@ -435,7 +392,8 @@ jobs:
 
   # The compiler built by the two-hop chain compiles itself twice and the
   # two emissions must be byte-identical. Required: it is what lets the
-  # shards run on the one-hop artifact.
+  # shards run on the one-hop artifact. It also carries the fast gates, which
+  # read only sources.
   selfhost-fixed-point:
     needs: [changes, bootstrap]
     if: needs.changes.outputs.doc-only != 'true'
@@ -445,6 +403,8 @@ jobs:
       KAIC_BOOT_HOPS: 2
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install toolchain
         run: ./tools/ci-install-toolchain.sh
       - uses: actions/download-artifact@v4
@@ -456,6 +416,30 @@ jobs:
           ./tools/ci-touch-build.sh
       - name: Self-host determinism (kaic2b.c == kaic2c.c)
         run: make CC=clang -C stage2 selfhost
+      # Source-only audits: no compiler runs, and nothing waits for this job.
+      # `km` (the kimun crate) backs the differential quality bar in
+      # tools/km-new-files-gate.sh. Pinned: a kimun release changes grades,
+      # and a PR that touched no code must not go red for that. Keep the
+      # version in step with KIMUN_VERSION in the gate script.
+      - name: Cache kimun
+        id: cache-kimun
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/km
+          key: kimun-0.45.0-${{ runner.os }}
+      - name: Install kimun
+        if: steps.cache-kimun.outputs.cache-hit != 'true'
+        run: |
+          base=https://github.com/lnds/kimun/releases/download/v0.45.0
+          tgz=km-x86_64-unknown-linux-gnu.tar.gz
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o "$tgz" "$base/$tgz" -o checksums-sha256.txt "$base/checksums-sha256.txt"
+          grep "  $tgz\$" checksums-sha256.txt | sha256sum -c -
+          mkdir -p ~/.cargo/bin
+          tar -xzf "$tgz" -C ~/.cargo/bin km
+      - name: fast gates (audits, ledgers, wiring, hermetic script tests)
+        if: ${{ !cancelled() }}
+        run: make CC=clang fast-gates
       - name: Working tree clean check
         run: |
           if [ -n "$(git status --porcelain)" ]; then
@@ -483,7 +467,7 @@ jobs:
         run: make CC=clang test-doc-blocks
 
   # The tier0 gates that need a built kaic2 (`make kaic2-gates`): namespace,
-  # symid, builtin tables, demos baseline, heap-ceiling. Three groups on three
+  # symid, builtin tables, demos baseline, heap-ceiling. Two groups on two
   # runners, balanced by measured cost.
   # Consumes the shared kaic2 (selfhost re-runs the binary twice and diffs —
   # determinism coverage is unchanged by sharing the build).
@@ -493,7 +477,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [symid, demos, rest]
+        include:
+          - group: a
+            targets: kaic2-gates-symid kaic2-gates-rest
+          - group: b
+            targets: kaic2-gates-demos
     name: tier0 (${{ matrix.group }})
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -511,7 +499,7 @@ jobs:
           chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
           ./tools/ci-touch-build.sh
       - name: tier0 gates that need kaic2 (${{ matrix.group }})
-        run: make CC=clang kaic2-gates-${{ matrix.group }}
+        run: make CC=clang -k ${{ matrix.targets }}
       # A PR labelled `runtime-text-identical` claims that stage2/runtime.h
       # still preprocesses to the text its base has, so that no existing
       # platform compiles anything new. Held to it under both compilers. The
@@ -532,37 +520,6 @@ jobs:
           if [ -n "$(git status --porcelain)" ]; then
             echo "::error::working tree dirty after tier0; build artifacts leaked into tracked paths"
             git status; exit 1
-          fi
-
-  # The tier0 gates that measure the compiler as a subject (what it
-  # allocates, how much memory it takes): they run on the two-hop artifact,
-  # whose codegen is this tree's.
-  tier0-subject:
-    needs: [changes, bootstrap]
-    if: needs.changes.outputs.doc-only != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 35
-    env:
-      KAIC_BOOT_HOPS: 2
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Install toolchain
-        run: ./tools/ci-install-toolchain.sh
-      - uses: actions/download-artifact@v4
-        with:
-          name: kaic2-c-full
-      - name: Restore artifact mtimes (no rebuild)
-        run: |
-          chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
-          ./tools/ci-touch-build.sh
-      - name: tier0 gates that measure the compiler (subject)
-        run: make CC=clang kaic2-gates-subject
-      - name: Working tree clean check
-        run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "::error::working tree dirty after tier0-subject"; git status; exit 1
           fi
 
   tier1-shard-1:
@@ -807,7 +764,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [7, 8, 9, 10, 11, 12]
+        shard: [7, 8, 9, 10]
     name: tier1-shard-${{ matrix.shard }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -1261,18 +1218,18 @@ jobs:
           fi
           exit $rc
 
-  # Aggregator: the REQUIRED check. Green iff fast-gates, tier0, every shard and, when
+  # Aggregator: the REQUIRED check. Green iff tier0, the two-hop bootstrap, every shard and, when
   # the diff reaches its paths, tier1-asan are green: a job left out of
   # `needs` runs without blocking anything. Keeping the name `tier1` means
   # branch protection needs no edit. A doc-only PR reaches here via the
   # skipped jobs and still reports SUCCESS, satisfying the required check.
   tier1:
-    needs: [changes, fast-gates, doc-blocks, tier0, tier0-subject, bootstrap, selfhost-fixed-point, tier1-shard-1, tier1-shard-2, tier1-shard-3, tier1-shard-4, tier1-shard-5, tier1-shard-6, tier1-shard-7, tier1-asan, tier1-gcc15]
+    needs: [changes, doc-blocks, tier0, bootstrap, selfhost-fixed-point, tier1-shard-1, tier1-shard-2, tier1-shard-3, tier1-shard-4, tier1-shard-5, tier1-shard-6, tier1-shard-7, tier1-asan, tier1-gcc15]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Gate on fast-gates, doc-blocks, tier0, all shards and tier1-asan
+      - name: Gate on doc-blocks, tier0, the bootstrap, all shards and tier1-asan
         run: |
           if [ "${{ needs.changes.result }}" != "success" ]; then
             echo "::error::tier1 FAIL — the changes job did not succeed (see its log)"; exit 1
@@ -1283,9 +1240,7 @@ jobs:
           if [ "${{ needs.changes.outputs.doc-only }}" = "true" ]; then
             echo "tier1 OK — doc-only PR: doc blocks green, shards skipped"; exit 0
           fi
-          rf='${{ needs.fast-gates.result }}'
           r0='${{ needs.tier0.result }}'
-          rs='${{ needs.tier0-subject.result }}'
           rb='${{ needs.bootstrap.result }}'
           rx='${{ needs.selfhost-fixed-point.result }}'
           r1='${{ needs.tier1-shard-1.result }}'
@@ -1297,11 +1252,8 @@ jobs:
           r7='${{ needs.tier1-shard-7.result }}'
           ra='${{ needs.tier1-asan.result }}'
           asan='${{ needs.changes.outputs.asan }}'
-          echo "results: fast-gates=$rf tier0=$r0 subject=$rs bootstrap=$rb fixed-point=$rx shards 1=$r1 2=$r2 3=$r3 4=$r4 5=$r5 6=$r6 7=$r7 asan=$ra (in scope: $asan)"
-          if [ "$rf" != "success" ]; then
-            echo "::error::tier1 FAIL — fast-gates did not succeed"; exit 1
-          fi
-          if [ "$r0" != "success" ] || [ "$rs" != "success" ]; then
+          echo "results: tier0=$r0 bootstrap=$rb fixed-point=$rx shards 1=$r1 2=$r2 3=$r3 4=$r4 5=$r5 6=$r6 7=$r7 asan=$ra (in scope: $asan)"
+          if [ "$r0" != "success" ]; then
             echo "::error::tier1 FAIL — tier0 did not succeed"; exit 1
           fi
           if [ "$rb" != "success" ] || [ "$rx" != "success" ]; then
@@ -1316,4 +1268,4 @@ jobs:
           if [ "${{ needs.tier1-gcc15.result }}" != "success" ]; then
             echo "::error::tier1 FAIL — tier1-gcc15 did not succeed"; exit 1
           fi
-          echo "tier1 OK — fast-gates, tier0, all shards, tier1-gcc15 and tier1-asan (when in scope) green"
+          echo "tier1 OK — tier0, bootstrap, fast-gates, all shards, tier1-gcc15 and tier1-asan (when in scope) green"

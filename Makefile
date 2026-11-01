@@ -1,4 +1,4 @@
-.PHONY: fast-gates kaic2-gates kaic2-gates-symid kaic2-gates-demos kaic2-gates-rest kaic2-gates-subject test-compiler-lint-ratchet test-symid-names-static test-symid-names-compiled bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-symid-pipeline test-decl-symid-survives test-field-types test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-mn-idle-cpu test-upgrade-resolver test-release-platforms test-kaic-boot test-native-probe test-cli-flags test-kai-cli test-eval-order-gcc test-musttail-gcc clean warm-core tier0 test-header-deps test-bin-kai-prereq test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 tier1-shard-8 tier1-shard-9 tier1-shard-10 tier1-shard-11 tier1-shard-12 test-light-partition test-core-cache-tid test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily daily-tail tier1-unsharded coverage-probe stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-binserialize-linearity test-rc-budget bin/kai test-walker-catchall-audit test-diag-channel-audit test-core-full test-stdlib-naming
+.PHONY: fast-gates kaic2-gates kaic2-gates-symid kaic2-gates-demos kaic2-gates-rest kaic2-gates-subject test-compiler-lint-ratchet test-symid-names-static test-symid-names-compiled bench-mn-throughput all kaic0 kaic1 kaic2 kaic2-fast kaic2-fast-verify kaic-boot-verify kaic-boot-verify-one kaic-boot-verify-cross test test-stage0 test-stage1 test-stage2 test-demos test-multi-module test-import-stdlib test-import-prelude-dedup test-import-qualified-record test-fmt test-fmt-package test-fmt-width test-fmt-ledger test-fmt-selfhost test-fmt-help-scope test-fmt-property test-namespace-matrix test-namespace-matrix-status test-km-ledger test-namespace-classes test-corrective-ratchet test-km-new-files test-migrate test-bench test-check test-typecheck test-check-parity test-library-mode test-lsp test-diagnostics-collected test-native-diag-path test-watch-survives-error test-negative test-stage1-rejections test-stage1-imports test-stage1-homonyms test-stage1-shadow-capture test-stage2-graph test-symtab test-resolve-sym test-symid-survives test-symid-pipeline test-decl-symid-survives test-field-types test-respelling-confined test-rboxed-prim-scope test-kai-namespace test-native-namespace test-module-name-ident test-private-type-shadow-audit test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-tls-hoist-gate test-stdlib-modules test-independence-oracle test-packages test-editions test-binserialize-budget test-issue-779-asan demos-verify demos-no-regression selfhost test-arena test-heap-limit test-modular-selfhost test-perceus-1131-modular-escape test-mn-tsan test-mn-determinism test-mn-corpus test-mn-reactor-bench test-mn-idle-cpu test-upgrade-resolver test-release-platforms test-kaic-boot test-native-probe test-cli-flags test-kai-cli test-eval-order-gcc test-musttail-gcc clean warm-core tier0 test-header-deps test-bin-kai-prereq test-llvm-force-guard test-parity-preserve-native tier1 tier1-shard-1 tier1-shard-2 tier1-shard-3 tier1-shard-4 tier1-shard-5 tier1-shard-6 tier1-shard-7 tier1-shard-8 tier1-shard-9 tier1-shard-10 test-light-partition test-core-cache-tid test-doc tier1-asan tier1-asan-a tier1-asan-b tier1-backend-parity daily daily-tail tier1-unsharded coverage-probe stress-fixtures test-posix-shell rc-leak-gate test-partition-linearity test-binserialize-linearity test-rc-budget bin/kai test-walker-catchall-audit test-diag-channel-audit test-core-full test-stdlib-naming
 
 # A bare kaic2 with no `--edition` runs the OLDEST edition (tongariki),
 # so a recipe driving the binary directly would test the previous
@@ -634,19 +634,17 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 #
 #  shard 1 — the 4 GB self-compiles + stateful caches (memory-bound), and
 #            the second half of the Perceus RC leak ledger.
-#  shard 2 — the first group of C axes of the namespace-collision corpus.
+#  shard 2 — the C axes of the namespace-collision corpus.
 #  shard 3 — partition + BinSerialize linearity, core text, HTTP redirects,
 #            fmt meaning-preservation corpus part 1/3.
 #  shard 4 — the whole-compiler modular self-host, and the first half of
 #            the Perceus RC leak ledger.
 #  shard 5 — fmt fixtures + fmt self-hosting, packages, editions, kai info.
 #  shard 6 — the modular-escape gate, fmt meaning-preservation part 2/3.
-#  shard 7 — the CLI/tooling tail.
+#  shard 7 — the CLI/tooling tail and the two C-modular axes of the namespace-collision corpus.
 #  shard 8 — fmt meaning-preservation part 3/3.
 #  shard 9  — the kai CLI scripts (`test-kai-cli`).
-#  shard 10 — the second group of C axes of the namespace-collision corpus.
-#  shard 11 — the two C-modular axes of the namespace-collision corpus.
-#  shard 12 — the self-compile cache identity gate.
+#  shard 10 — the self-compile cache identity gate.
 #
 # The Perceus RC leak ledger is split in two (KAI_LEAK_SHARD): shard 4 runs
 # the first half, shard 1 the second. The demos baseline is a tier0 gate, so
@@ -680,7 +678,7 @@ tier1: test rc-leak-gate test-partition-linearity test-binserialize-linearity de
 # `test-light-partition` in tier0). `test-doc-blocks` is the exception: it
 # runs in its own tier1.yml job so doc-only PRs run it too.
 # Adding a phase to `tier1` means adding it to a shard.
-TIER1_LIGHT_SLICES := 12
+TIER1_LIGHT_SLICES := 10
 TIER1_SELFHOSTS ?= 1
 # A fixture's C build is almost all clang optimising the runtime and the
 # core it includes, and a test needs its program to run, not to run fast.
@@ -703,14 +701,14 @@ test-light-partition:
 tier1-shard-1: kaic2
 	$(tier1-shard-start)
 	$(MAKE) -C stage2 test-costly-parallel
-	$(MAKE) -C stage2 test-heap-limit
+	$(MAKE) kaic2-gates-subject
 	$(MAKE) -C stage2 test-user-cache
 	$(MAKE) -C stage2 test-core-cache
 	KAI_LEAK_SHARD=2/2 $(MAKE) rc-leak-gate
 	$(call tier1-light-slice,1)
 	$(MAKE) test-field-types FIELD_TYPES_SHARD=1/8
 	$(call tier1-shard-wall,1)
-	@echo "tier1-shard-1 OK — costly self-compiles + caches + light slice 1/$(TIER1_LIGHT_SLICES)"
+	@echo "tier1-shard-1 OK — costly self-compiles + caches + the gates that measure the compiler + light slice 1/$(TIER1_LIGHT_SLICES)"
 
 # The matrix gate runs right after the C-only namespace-collision axes so it
 # reads their ratchet status (tests/namespace_matrix.sh refuses green over a
@@ -720,6 +718,7 @@ tier1-shard-2: kaic2
 	$(tier1-shard-start)
 	$(call tier1-light-slice,2)
 	$(MAKE) -C stage2 test-namespace-collisions-c-axes-1 LIGHT_OPT=$(TIER1_LIGHT_OPT)
+	$(MAKE) -C stage2 test-namespace-collisions-c-axes-2 LIGHT_OPT=$(TIER1_LIGHT_OPT)
 	$(MAKE) test-namespace-matrix
 	$(MAKE) test-field-types FIELD_TYPES_SHARD=2/8
 	$(call tier1-shard-wall,2)
@@ -770,6 +769,7 @@ endif
 tier1-shard-7: kaic2
 	$(tier1-shard-start)
 	$(MAKE) $(TIER1_CLI_TAIL)
+	$(MAKE) -C stage2 test-namespace-collisions-modular-axes LIGHT_OPT=$(TIER1_LIGHT_OPT)
 	$(call tier1-light-slice,7)
 	$(MAKE) test-field-types FIELD_TYPES_SHARD=7/8
 	$(call tier1-shard-wall,7)
@@ -792,26 +792,12 @@ tier1-shard-9: kaic2
 
 tier1-shard-10: kaic2
 	$(tier1-shard-start)
-	$(MAKE) -C stage2 test-namespace-collisions-c-axes-2 LIGHT_OPT=$(TIER1_LIGHT_OPT)
-	$(call tier1-light-slice,10)
-	$(call tier1-shard-wall,10)
-	@echo "tier1-shard-10 OK — namespace-collision corpus (C axes, second group) + light slice 10/$(TIER1_LIGHT_SLICES)"
-
-tier1-shard-11: kaic2
-	$(tier1-shard-start)
-	$(MAKE) -C stage2 test-namespace-collisions-modular-axes LIGHT_OPT=$(TIER1_LIGHT_OPT)
-	$(call tier1-light-slice,11)
-	$(call tier1-shard-wall,11)
-	@echo "tier1-shard-11 OK — namespace-collision C-modular axes + light slice 11/$(TIER1_LIGHT_SLICES)"
-
-tier1-shard-12: kaic2
-	$(tier1-shard-start)
 ifneq ($(TIER1_SELFHOSTS),0)
 	$(MAKE) -C stage2 test-selfcompile-cache-identity
 endif
-	$(call tier1-light-slice,12)
-	$(call tier1-shard-wall,12)
-	@echo "tier1-shard-12 OK — self-compile cache identity (TIER1_SELFHOSTS=$(TIER1_SELFHOSTS)) + light slice 12/$(TIER1_LIGHT_SLICES)"
+	$(call tier1-light-slice,10)
+	$(call tier1-shard-wall,10)
+	@echo "tier1-shard-10 OK — self-compile cache identity (TIER1_SELFHOSTS=$(TIER1_SELFHOSTS)) + light slice 10/$(TIER1_LIGHT_SLICES)"
 
 # `kai info` smoke (no kaic2 required; pure shell + awk + python3 for
 # JSON validation). Guards against deleted .md, broken cmd_info
