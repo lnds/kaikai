@@ -26,7 +26,9 @@ wins, so the op (and any call made there) resolves through the stack lookup,
 not the caller's slot. The fiber-local builtins
 (`Cancel`/`Link`/`Monitor`/`Spawn`/`Actor`) resolve through the runtime's
 per-fiber disposition (`kai_evidence_lookup_node`), because their handler is
-installed inside the fiber and must not cross a `spawn`. `Ffi` is a zero-op
+installed inside the fiber and never cross a `spawn` (the spawn-boundary check
+rejects a spawned row that carries any `Actor` instance the child does not
+handle). `Ffi` is a zero-op
 boundary marker that dispatches nothing. This mirrors Koka's split of `io`
 (runtime-resolved) from handled effects (evidence vectors).
 

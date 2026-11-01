@@ -135,6 +135,11 @@ monitoring, and message routing need it.
 ## Spawning actors
 <!-- coverage: skip --> spawn_actor + Monitor shipped in Fibers Tier 2 (2026-04-30, v0.5.0+); coverage via m8x_4_recv_blocking + m8_monitor.kai + m8_trap_exit.kai + demos/ping_pong/
 
+An `Actor` instance never crosses a spawn: the spawned body handles every
+instance it performs, `send` included, or the spawn is a compile error.
+`spawn_actor` handles the one instance its body is typed at; a child that
+uses another mailbox installs its own `with_mailbox`.
+
 An actor is spawned through `Spawn` just like any other fiber,
 with an `Actor[msg]` handler wrapped around the body so
 `send` / `receive` / `self` are in scope. The body reaches them
