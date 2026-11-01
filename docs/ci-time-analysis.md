@@ -196,9 +196,11 @@ parallelism.
   script tests, `km` new-file grades. No compiler is built or run, so the
   job starts right after `changes`, beside `build`, and reports in minutes.
 - **`tier0`** (`make kaic2-gates`, `KAIC2_GATES`) — the gates that need the
-  built kaic2, cheapest first: fmt-corpus classification
-  (`test-fmt-classify`, parse-only), the compiled half of the symid names
-  gate, builtin tables, kaic1 rejections, then the slow cache/demos gates.
+  built kaic2: the compiled half of the symid names gate, builtin tables,
+  kaic1 rejections, then the slow cache/demos gates. CI runs them as three
+  matrix groups on three runners (`kaic2-gates-symid`, `-demos`, `-rest`).
+  The fmt-corpus classification (`test-fmt-classify`) is not in the list:
+  the fmt-property shards parse and classify the same corpus.
 
 A gate lives in exactly one half; `tier0-gates` is their union and
 `make tier0` still runs everything plus the selfhost. A gate belongs in

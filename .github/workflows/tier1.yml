@@ -25,11 +25,11 @@ on:
 # Superseding is right on a PR branch (only the tip matters) and wrong on
 # main, where `github.ref` is constant: every merge would kill the in-flight
 # run of the commit before it, and that run is the only record that the
-# commit was ever verified. Cancel on pull_request only, and give each main
-# commit its own group: a group holds one pending run, so a third push would
-# still cancel the queued one.
+# commit was ever verified. Cancel on pull_request only. A group holds one
+# running and one pending run, so main keeps the tip's verification and one
+# queued commit; the PR gated every commit in between.
 concurrency:
-  group: tier1-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  group: tier1-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -73,10 +73,10 @@ jobs:
           fetch-depth: 0
       # Runs on every PR, doc-only included; `tier1` fails when this job does.
       - name: No Claude attribution trailer in the PR body or commits
-        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        if: github.event_name == 'pull_request'
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
-        run: tools/check-attribution-trailers.sh "${{ github.event.pull_request.base.sha || github.event.before }}" "${{ github.event.pull_request.head.sha || github.sha }}"
+        run: tools/check-attribution-trailers.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
       - name: Detect doc-only diff
         id: doc-only
         run: |
@@ -98,15 +98,15 @@ jobs:
           fi
       # Gates the shard-4 whole-compiler self-hosts: they only detect
       # regressions introduced by changes to the sources they compile.
-      # On push the diff is event.before..sha; merge_group always runs them.
+      # PR-only — on push/merge_group the self-hosts always run.
       - name: Detect compiler-source diff
         id: compiler-touch
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ] && [ "${{ github.event_name }}" != "push" ]; then
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "touch=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          BASE_SHA="${{ github.event.pull_request.base.sha || github.event.before }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
           if [ -z "$CHANGED" ]; then
             echo "touch=true" >> "$GITHUB_OUTPUT"; exit 0
@@ -346,12 +346,18 @@ jobs:
         run: make CC=clang test-doc-blocks
 
   # The tier0 gates that need a built kaic2 (`make kaic2-gates`): namespace,
-  # symid, builtin tables, demos baseline, heap-ceiling.
+  # symid, builtin tables, demos baseline, heap-ceiling. Three groups on three
+  # runners, balanced by measured cost.
   # Consumes the shared kaic2 (selfhost re-runs the binary twice and diffs —
   # determinism coverage is unchanged by sharing the build).
   tier0:
     needs: [changes, build]
     if: needs.changes.outputs.doc-only != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [symid, demos, rest]
+    name: tier0 (${{ matrix.group }})
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -367,8 +373,8 @@ jobs:
         run: |
           chmod +x stage0/kaic0 stage1/kaic1 stage2/kaic2
           ./tools/ci-touch-build.sh
-      - name: tier0 gates that need kaic2 (namespace, symid, builtin tables, demos baseline)
-        run: make CC=clang kaic2-gates
+      - name: tier0 gates that need kaic2 (${{ matrix.group }})
+        run: make CC=clang kaic2-gates-${{ matrix.group }}
       # A PR labelled `runtime-text-identical` claims that stage2/runtime.h
       # still preprocesses to the text its base has, so that no existing
       # platform compiles anything new. Held to it under both compilers. The
@@ -729,7 +735,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [a, b, c]
+        shard: [1, 2, 3, 4]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -760,13 +766,8 @@ jobs:
       - name: tier1-wasm-${{ matrix.shard }} (corpus under node vs the C oracle)
         run: |
           . tools/lib/corpus.sh
-          all="$KAI_CORPUS_DEFAULT_DIRS examples/web"
-          case "${{ matrix.shard }}" in
-            a) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 1') ;;
-            b) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 2') ;;
-            c) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 0') ;;
-          esac
-          TARGET_BACKEND=wasm NATIVE_PARITY_RATCHET=1 BACKEND_PARITY_DIRS="$dirs" \
+          TARGET_BACKEND=wasm NATIVE_PARITY_RATCHET=1 \
+            BACKEND_PARITY_DIRS="$KAI_CORPUS_DEFAULT_DIRS examples/web" BACKEND_PARITY_SHARD="${{ matrix.shard }}/4" \
             ./tools/ci-bounded-step.sh 2400 "tier1-wasm-${{ matrix.shard }}" tools/test-backend-parity.sh
 
   # The parity corpus built for wasm32-wasi and run under wasmtime, against the
@@ -778,7 +779,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [a, b, c]
+        shard: [1, 2, 3, 4]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -828,16 +829,11 @@ jobs:
       - name: tier1-wasi-${{ matrix.shard }} (corpus under wasmtime vs the C oracle)
         run: |
           . tools/lib/corpus.sh
-          all="$KAI_CORPUS_DEFAULT_DIRS examples/wasi"
-          case "${{ matrix.shard }}" in
-            a) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 1') ;;
-            b) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 2') ;;
-            c) dirs=$(echo $all | tr ' ' '\n' | awk 'NR % 3 == 0') ;;
-          esac
-          TARGET_BACKEND=wasi NATIVE_PARITY_RATCHET=1 BACKEND_PARITY_DIRS="$dirs" \
+          TARGET_BACKEND=wasi NATIVE_PARITY_RATCHET=1 \
+            BACKEND_PARITY_DIRS="$KAI_CORPUS_DEFAULT_DIRS examples/wasi" BACKEND_PARITY_SHARD="${{ matrix.shard }}/4" \
             ./tools/ci-bounded-step.sh 2400 "tier1-wasi-${{ matrix.shard }}" tools/test-backend-parity.sh
       - name: tier1-wasi target checks (run, args, env, exit status, refusals)
-        if: matrix.shard == 'a'
+        if: matrix.shard == 1
         run: ./tools/ci-bounded-step.sh 600 "tier1-wasi-target" tools/test-wasi.sh
 
   # The wasm32-browser target: pinned toolchain fetched from an empty cache,
@@ -934,13 +930,13 @@ jobs:
             git status; exit 1
           fi
 
-  # Compile-cost A/B against the PR's base (one updating PR comment) or, on
-  # push, against the previous main tip (step summary). Not in the tier1
-  # aggregator's `needs`: it runs beside the shards. The base compiler comes from the exact-match bootstrap
+  # Compile-cost A/B against the PR's base, posted as one updating PR comment.
+  # Not in the tier1 aggregator's `needs`: it informs, never blocks, and runs
+  # beside the shards. The base compiler comes from the exact-match bootstrap
   # cache (main's build saved it) and is built here only on a miss.
   cost-ab:
     needs: [changes, build]
-    if: needs.changes.outputs.compiler-touch == 'true' && (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+    if: github.event_name == 'pull_request' && needs.changes.outputs.compiler-touch == 'true' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 50
     permissions:
@@ -960,10 +956,7 @@ jobs:
       - name: Pick the base commit
         id: base-sha
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            sha="${{ github.event.before }}"
-            git fetch --depth=1 origin "$sha"
-          elif git rev-parse --verify -q HEAD^2 >/dev/null; then
+          if git rev-parse --verify -q HEAD^2 >/dev/null; then
             sha="$(git rev-parse HEAD^1)"
           else
             sha="${{ github.event.pull_request.base.sha }}"
@@ -1028,14 +1021,6 @@ jobs:
           head/tools/cost-ab.sh --markdown --rounds 5 --fail-above 1 --base-tree "$PWD" --branch-tree "$PWD/head" \
             stage2/kaic2 pr-artifact/stage2/kaic2 > cost-ab.md || rc=$?
           cat cost-ab.md
-          if [ "${{ github.event_name }}" = "push" ]; then
-            {
-              echo "### Compile cost vs previous main tip (\`${{ steps.base-sha.outputs.sha }}\`)"
-              echo
-              cat cost-ab.md
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit $rc
-          fi
           {
             echo '<!-- cost-ab -->'
             echo "### Compile cost vs \`${GITHUB_BASE_REF}\` (\`${{ steps.base-sha.outputs.sha }}\`)"

@@ -223,6 +223,22 @@ export KAI_CORPUS_PKG_CACHE
 
 kai_corpus_entry_points > "$tmp/entry-points"
 
+# BACKEND_PARITY_SHARD=I/N keeps every N-th entry point of the sorted list
+# (part I of N). The parts are disjoint and cover the list, and
+# interleaving spreads the costly directories across them.
+if [ -n "${BACKEND_PARITY_SHARD:-}" ]; then
+  shard_i=0; shard_n=0
+  if printf '%s\n' "$BACKEND_PARITY_SHARD" | grep -Eq '^[1-9][0-9]*/[1-9][0-9]*$'; then
+    shard_i="${BACKEND_PARITY_SHARD%/*}"; shard_n="${BACKEND_PARITY_SHARD#*/}"
+  fi
+  if [ "$shard_i" -lt 1 ] || [ "$shard_i" -gt "$shard_n" ]; then
+    echo "test-backend-parity FAIL — BACKEND_PARITY_SHARD='$BACKEND_PARITY_SHARD' is not I/N with 1 <= I <= N"
+    exit 2
+  fi
+  awk -v i="$shard_i" -v n="$shard_n" 'NR % n == i % n' "$tmp/entry-points" > "$tmp/entry-points.part"
+  mv "$tmp/entry-points.part" "$tmp/entry-points"
+fi
+
 # Jobs: number of parallel workers. Defaults to the host's logical CPU count;
 # override via BACKEND_PARITY_JOBS. macOS uses sysctl, Linux uses nproc.
 if [ -n "${BACKEND_PARITY_JOBS:-}" ]; then
@@ -380,6 +396,11 @@ if [ "${NATIVE_PARITY_RATCHET:-0}" = "1" ]; then
   grep -vE '^[[:space:]]*(#|$)' "$baseline_file" | sort -u > "$tmp/failing.all"
   : > "$tmp/failing.base"
   for d in $KAI_CORPUS_DIRS; do grep "^$d/" "$tmp/failing.all" >> "$tmp/failing.base" || true; done
+  if [ -n "${BACKEND_PARITY_SHARD:-}" ]; then
+    sort -u "$tmp/entry-points" > "$tmp/entry-points.sorted"
+    sort -u "$tmp/failing.base" | comm -12 "$tmp/entry-points.sorted" - > "$tmp/failing.base.part"
+    mv "$tmp/failing.base.part" "$tmp/failing.base"
+  fi
   sort -u -o "$tmp/failing.base" "$tmp/failing.base"
   # New gaps = failing now but not allowed. Closed gaps = allowed but
   # now passing.
