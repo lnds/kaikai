@@ -186,6 +186,20 @@ boot release emit "$out" 2>/dev/null
 boot release emit "$out" 2>/dev/null
 ok "KAIC_BOOT_HOPS=1 takes one hop, records it, and is reused only under the same setting"
 
+make_kaic2 "$work/k1" emitter
+: > "$HOP_LOG"
+(KAIC_BOOT_EMITTER="$work/k1"; export KAIC_BOOT_EMITTER; boot release emit "$out" 2>/dev/null) || fail "emit through an emitter failed"
+[ "$(head -n 1 "$out")" = "/* emitter stdlib=$root/stdlib args=--edition hanga-roa main.kai */" ] \
+  || fail "the emitter did not run with this tree's stdlib and edition: $(head -n 1 "$out")"
+[ ! -s "$HOP_LOG" ] || fail "an emit through an emitter still linked a kaic2-a"
+grep -q '^hops=2$' "$out.id" || fail "an emit through an emitter does not record two hops"
+case "$(boot_of)" in "release kaikai-v9.9.9-"*) ;; *) fail "the emitter's record names boot [$(boot_of)]" ;; esac
+is_fresh release "emitter C, no emitter asked"
+(KAIC_BOOT_EMITTER="$work/k1"; export KAIC_BOOT_EMITTER; KAIC_BOOT_HOPS=1; export KAIC_BOOT_HOPS; boot release emit "$out" 2>/dev/null) && fail "an emitter was accepted for a one-hop boot"
+(KAIC_BOOT_EMITTER="$work/missing"; export KAIC_BOOT_EMITTER; boot release emit "$out" 2>/dev/null) && fail "a missing emitter was accepted"
+boot release emit "$out" 2>/dev/null
+ok "KAIC_BOOT_EMITTER stands in for the second hop and leaves the two-hop record a literal hop writes"
+
 echo 'fn o() = 2' > "$root/stdlib/other.kai"
 is_fresh release "non-core stdlib edit"
 echo 'fn x() = 3' > "$root/stdlib/core/x.kai"
