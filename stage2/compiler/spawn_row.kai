@@ -38,6 +38,7 @@ import compiler.expr_positions
 import compiler.core_types
 import compiler.infer_handle_walk
 import compiler.core_refs
+import compiler.infer_unify_rows
 
 #[doc("Reject a spawned thunk the child fiber cannot honour: an effect it cannot resolve, or a captured value it would mutate as a copy. Each diagnostic names the file declaring the decl it fires on; `tab` names what it reports; `carriers` are the types whose capture is a mutation the child cannot share; `edges` are the instantiations the typer recorded.")]
 pub fn check_spawn_rows(
@@ -519,7 +520,7 @@ fn check_spawned_mailboxes(
           row.labels,
           l => match l.ty_args {
             [m] ->
-              not any(covered, c => inf_ty_to_string(site.tab, c) == inf_ty_to_string(site.tab, m))
+              not any(covered, c => ty_eq_shape_concrete(c, m))
             _ -> false
           }
         )
@@ -601,19 +602,17 @@ fn read_thunk(e: Expr, line: Int, col: Int) : Option[Expr] {
   }
 }
 
-type MailboxScan = { tys: [String], seen: [SymId] }
+type MailboxScan = { tys: [Ty], seen: [SymId] }
 
 fn thunk_reads_mailbox(tab: SymTab, typed: [Decl], thunk: Expr, msg: Ty) : Bool {
   let sc = scan_mailboxes(tab, typed, MailboxScan { tys: [], seen: [] }, thunk)
-  let want = inf_ty_to_string(tab, msg)
-  any(sc.tys, t => t == want)
+  any(sc.tys, t => ty_eq_shape_concrete(t, msg))
 }
 
 fn scan_mailboxes(tab: SymTab, typed: [Decl], sc: MailboxScan, e: Expr) : MailboxScan {
   let here = match e.kind {
-    ECall(callee, args_) -> match callee.kind {
-      ESym(op, _) -> add_mailbox_msg(tab, sc, op, callee.ty, list_length(args_))
-      EOp(r) -> add_mailbox_msg(tab, sc, r.eff, callee.ty, list_length(args_))
+    ECall(callee, _) -> match callee.kind {
+      EOp(r) -> add_mailbox_msg(sc, r, callee.ty)
       _ -> sc
     }
     ESym(s, _) -> follow_mailboxes(tab, typed, sc, s)
@@ -637,20 +636,17 @@ fn follow_mailboxes(tab: SymTab, typed: [Decl], sc: MailboxScan, s: SymId) : Mai
 # `send` takes the destination and the message, so it names its mailbox and
 # reads none; `self`, `receive` and `receive_timeout` read the one they are
 # typed at.
-fn add_mailbox_msg(
-  tab: SymTab,
-  sc: MailboxScan,
-  op: SymId,
-  callee_ty: Option[Ty],
-  nargs: Int
-) : MailboxScan = match callee_ty {
-  Some(TyCon(_, [m])) -> if effect_is(op, CeActor) and nargs != 2 {
-    MailboxScan { tys: [inf_ty_to_string(tab, m), ...sc.tys], seen: sc.seen }
-  } else {
-    sc
+# `send` names its destination and reads no mailbox; the other `Actor`
+# operations read the one of the instance they are typed at.
+fn add_mailbox_msg(sc: MailboxScan, r: OpRef, callee_ty: Option[Ty]) : MailboxScan =
+  match callee_ty {
+    Some(TyCon(_, [m])) -> if effect_is(r.eff, CeActor) and written_text(r.op) != "send" {
+      MailboxScan { tys: [m, ...sc.tys], seen: sc.seen }
+    } else {
+      sc
+    }
+    _ -> sc
   }
-  _ -> sc
-}
 
 fn report_mailbox_uncovered(
   site: SpawnSite,
