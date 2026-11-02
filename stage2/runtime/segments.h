@@ -710,6 +710,22 @@ static KaiEvidence *kai_evidence_find_node(const char *eff_label, KaiEvidence *d
     return node != NULL ? node : def;
 }
 
+/* True when no user handler of Mutable is in effect, so a Ref read and write
+ * reach the default handler. The walk of `kai_evidence_find_node` without its
+ * cancellation poll: the take it guards must not be preceded by a poll that
+ * runs after the cell was emptied, and this runs before. */
+static KaiValue *kai_core_ref_take_ok(void) {
+    KaiFiber *f = kai_current_fiber();
+    const char *l = KAI_EFF("Mutable");
+    KaiEvidence *n = f->seg != NULL ? kai_seg_lookup(f, l, NULL) : kai_ev_find_fiber(f, l);
+    return kai_bool(n == NULL);
+}
+
+static KaiValue *_kai_core_ref_take_ok_thunk(KaiValue *s, KaiValue **a, int n) {
+    (void) s; (void) a; (void) n;
+    return kai_core_ref_take_ok();
+}
+
 /* m7a #6e: same lookup but returns the whole node so the op-call
  * site can reach the handle's jmp_buf if a discard happens. */
 static KaiEvidence *kai_evidence_lookup_node_l(const char *eff_label) {
