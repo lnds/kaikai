@@ -84,6 +84,16 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.192.1 (2026-11-02)
+
+### Fixed
+
+- **typer**: drop the import the resume scanner no longer uses
+
+### Changed
+
+- **typer**: drop name-based loop detection from the resume scanner
+
 ## v0.192.0 (2026-11-01)
 
 ### BREAKING CHANGE
