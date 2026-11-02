@@ -22,27 +22,17 @@ import compiler.symtab
 fn prc_same_ty(a0: Ty, b0: Ty) : Bool {
   let a = prc_erased_ty(a0)
   let b = prc_erased_ty(b0)
-  match a {
-    TyListT(x) -> match b {
-      TyListT(y) -> prc_same_ty(x, y)
-      _ -> false
-    }
-    TyFnT(ps, r, _) -> match b {
-      TyFnT(qs, q, _) -> prc_same_tys(ps, qs) and prc_same_ty(r, q)
-      _ -> false
-    }
-    TyCon(s, xs) -> match b {
-      TyCon(t, ys) -> sym_raw(s) >= 0 and sym_same(s, t) and prc_same_tys(xs, ys)
-      _ -> false
-    }
-    TyShapeApp(_, x) -> match b {
-      TyShapeApp(_, y) -> prc_same_ty(x, y)
-      _ -> false
-    }
-    TyUnion(xs) -> match b {
-      TyUnion(ys) -> prc_same_tys(xs, ys)
-      _ -> false
-    }
+  match (a, b) {
+    (TyListT(x), TyListT(y)) -> prc_same_ty(x, y)
+    (TyFnT(ps, r, _), TyFnT(qs, q, _)) -> prc_same_tys(ps, qs) and prc_same_ty(r, q)
+    (TyCon(s, xs), TyCon(t, ys)) -> sym_raw(s) >= 0 and sym_same(s, t) and prc_same_tys(xs, ys)
+    (TyShapeApp(_, x), TyShapeApp(_, y)) -> prc_same_ty(x, y)
+    (TyUnion(xs), TyUnion(ys)) -> prc_same_tys(xs, ys)
+    (TyListT(_), _) -> false
+    (TyFnT(_, _, _), _) -> false
+    (TyCon(_, _), _) -> false
+    (TyShapeApp(_, _), _) -> false
+    (TyUnion(_), _) -> false
     _ -> prc_leaf_ty(a) >= 0 and prc_leaf_ty(a) == prc_leaf_ty(b)
   }
 }
@@ -456,14 +446,20 @@ pub(pkg) fn reuse_pattern_cells(p: Pattern, ctors: CtorIx) : [(Int, ReuseCell)] 
   _ -> []
 }
 
-fn rc_slots(subs: [Pattern], ks: [Int], i: Int, ctors: CtorIx) : [(Int, ReuseCell)] = match subs {
-  [] -> []
-  [sp, ...rest] -> {
-    let tl = rc_slots(rest, ks, i + 1, ctors)
-    match rc_cell(sp, kind_at(ks, i), ctors) {
-      Some(c) -> [(i, c), ...tl]
-      None -> tl
-    }
+fn rc_slots(subs: [Pattern], ks: [Int], i: Int, ctors: CtorIx) : [(Int, ReuseCell)] =
+  list_reverse(rc_slots_acc(subs, ks, i, ctors, []))
+
+fn rc_slots_acc(
+  subs: [Pattern],
+  ks: [Int],
+  i: Int,
+  ctors: CtorIx,
+  acc: [(Int, ReuseCell)]
+) : [(Int, ReuseCell)] = match subs {
+  [] -> acc
+  [sp, ...rest] -> match rc_cell(sp, kind_at(ks, i), ctors) {
+    Some(c) -> rc_slots_acc(rest, ks, i + 1, ctors, [(i, c), ...acc])
+    None -> rc_slots_acc(rest, ks, i + 1, ctors, acc)
   }
 }
 
@@ -481,32 +477,33 @@ fn rc_cell(sp: Pattern, k: Int, ctors: CtorIx) : Option[ReuseCell] =
   }
 
 # Only boxed slots carry a reference to settle.
-fn rc_kids(isubs: [Pattern], ks: [Int], j: Int, ctors: CtorIx) : [CellKid] = match isubs {
-  [] -> []
-  [sp, ...rest] -> {
-    let k = kind_at(ks, j)
-    let tl = rc_kids(rest, ks, j + 1, ctors)
-    if k != 0 {
-      tl
-    } else {
-      match rc_cell(sp, k, ctors) {
-        Some(c) -> [KidCell(j, c), ...tl]
-        None -> match sp.pkind {
-          PBind(b) -> [KidBind(j, b.id), ...tl]
-          _ -> [KidDrop(j), ...tl]
+fn rc_kids(isubs: [Pattern], ks: [Int], j: Int, ctors: CtorIx) : [CellKid] =
+  list_reverse(rc_kids_acc(isubs, ks, j, ctors, []))
+
+fn rc_kids_acc(isubs: [Pattern], ks: [Int], j: Int, ctors: CtorIx, acc: [CellKid]) : [CellKid] =
+  match isubs {
+    [] -> acc
+    [sp, ...rest] -> {
+      let k = kind_at(ks, j)
+      if k != 0 {
+        rc_kids_acc(rest, ks, j + 1, ctors, acc)
+      } else {
+        match rc_cell(sp, k, ctors) {
+          Some(c) -> rc_kids_acc(rest, ks, j + 1, ctors, [KidCell(j, c), ...acc])
+          None -> match sp.pkind {
+            PBind(b) -> rc_kids_acc(rest, ks, j + 1, ctors, [KidBind(j, b.id), ...acc])
+            _ -> rc_kids_acc(rest, ks, j + 1, ctors, [KidDrop(j), ...acc])
+          }
         }
       }
     }
   }
-}
 
 pub(pkg) fn reusable_tags(decls: [Decl], ids: ProtoIds, ctors: CtorIx, entry: SymId) : [Int] =
   list_reverse(collect_reuse_tags(live_decls(decls, ids, entry), ctors, []))
 
-fn reuse_site_tag(ctors: CtorIx, ctor: Expr) : Option[Int] = match reuse_site_row(ctors, ctor) {
-  Some(row) -> Some(ctor_row_tag(row))
-  None -> None
-}
+fn reuse_site_tag(ctors: CtorIx, ctor: Expr) : Option[Int] =
+  map(reuse_site_row(ctors, ctor), ctor_row_tag)
 
 fn reuse_site_row(ctors: CtorIx, ctor: Expr) : Option[VariantEntry] = match ctor.kind {
   ECall(cf, _) -> ctor_ix_site(ctors, cf)

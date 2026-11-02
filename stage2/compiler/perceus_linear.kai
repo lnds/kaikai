@@ -66,15 +66,10 @@ pub(pkg) fn pcs_branch_aware_skip_params(
   pnames: [Binder],
   body: Expr,
   bmap: BorrowMap
-) : [Binder] = match pnames {
-  [] -> []
-  [h, ...rest] -> {
-    # Borrowed reads still count here: the branch planter assumes one read
-    # per path, and a lent read ahead of the move is a second one.
-    let rest_skip = pcs_branch_aware_skip_params(rest, body, bmap)
-    if pcs_param_moves_raw(h, body, bmap) { [h, ...rest_skip] } else { rest_skip }
-  }
-}
+) : [Binder] =
+  # Borrowed reads still count here: the branch planter assumes one read
+  # per path, and a lent read ahead of the move is a second one.
+  filter(pnames, h => pcs_param_moves_raw(h, body, bmap))
 
 # Each condition walks the body, so a failing one spares the rest.
 fn pcs_param_moves_raw(h: Binder, body: Expr, bmap: BorrowMap) : Bool =
@@ -338,17 +333,7 @@ pub(pkg) fn pcs_owned_scope_move_params(
   borrowed: [Binder],
   tab: SymTab
 ) : [Binder] =
-  match pnames {
-    [] -> []
-    [p, ...rest] -> {
-      let rest_sel = pcs_owned_scope_move_params(rest, body, skip, bmap, cmap, borrowed, tab)
-      if pcs_has(skip, p.id) {
-        rest_sel
-      } else {
-        if pcs_owned_param_moves(p, body, bmap, cmap, tab) { [p, ...rest_sel] } else { rest_sel }
-      }
-    }
-  }
+  filter(pnames, p => (not pcs_has(skip, p.id)) and pcs_owned_param_moves(p, body, bmap, cmap, tab))
 
 # The narrow-shape check for condition 4+5: `body` must be a top-level match
 # (peeling the exit wrap) whose scrutinee omits `p`, and every arm either
@@ -409,27 +394,29 @@ fn pcs_bmlp_loop(
   bmap: BorrowMap,
   borrowed: [Binder],
   skip_set: [Binder]
-) : [Binder] / Console = match pnames {
-  [] -> []
-  [nm, ...rest] -> {
-    let more = pcs_bmlp_loop(self_name, rest, body, uses, bmap, borrowed, skip_set)
-    if pcs_has(borrowed, nm.id) or pcs_has(skip_set, nm.id) {
-      more
-    } else {
-      match last_use_for(nm.id, uses) {
-        LuAt(_, _) ->
-          if pcs_read_count(nm.id, uses) >= 2
-            and pcs_max_paths_b_expr(nm, body, bmap) == 1
-            and pcs_nm_absent_from_nonrec_tails(self_name, nm, body, bmap) {
-            [nm, ...more]
-          } else {
-            more
-          }
-        _ -> more
-      }
+) : [Binder] / Console =
+  filter(pnames, nm => pcs_bmlp_keeps(self_name, nm, body, uses, bmap, borrowed, skip_set))
+
+fn pcs_bmlp_keeps(
+  self_name: SelfRef,
+  nm: Binder,
+  body: Expr,
+  uses: UseIx,
+  bmap: BorrowMap,
+  borrowed: [Binder],
+  skip_set: [Binder]
+) : Bool / Console =
+  if pcs_has(borrowed, nm.id) or pcs_has(skip_set, nm.id) {
+    false
+  } else {
+    match last_use_for(nm.id, uses) {
+      LuAt(_, _) ->
+        pcs_read_count(nm.id, uses) >= 2
+          and pcs_max_paths_b_expr(nm, body, bmap) == 1
+          and pcs_nm_absent_from_nonrec_tails(self_name, nm, body, bmap)
+      _ -> false
     }
   }
-}
 
 # True iff `nm` appears in no tail position that is not a self-call —
 # i.e. every base arm is `nm`-free. A tail self-call is skipped (that is
@@ -514,7 +501,7 @@ fn pcs_max_paths_b_kind(nm: Binder, k: ExprKind, bmap: BorrowMap) : Int = match 
     # of `nm` are borrows, not consumers, and do not count. The slots are
     # looked up only for a call that takes `nm` bare.
     let positions = if pcs_any_arg_bare(nm.id, xs) { pcs_borrow_slots(bmap, f) } else { [] }
-    pcs_max_paths_b_expr(nm, f, bmap) + pcs_max_paths_b_args(nm, xs, positions, 0, bmap)
+    pcs_max_paths_b_expr(nm, f, bmap) + pcs_max_paths_b_args(nm, xs, positions, bmap)
   }
   # Branch positions are alternatives of each other — the count takes
   # the MAX across them — which the flat position list cannot express;
@@ -528,15 +515,14 @@ fn pcs_max_paths_b_kind(nm: Binder, k: ExprKind, bmap: BorrowMap) : Int = match 
   _ -> pcs_max_paths_b_ps(nm, xp_positions_kind(k), bmap)
 }
 
-fn pcs_max_paths_b_ps(nm: Binder, ps: [XPos], bmap: BorrowMap) : Int = match ps {
-  [] -> 0
-  [XP(r, c), ...rest] ->
-    (match r {
-      XLam -> 0
-      _ -> pcs_max_paths_b_expr(nm, c, bmap)
-    })
-      + pcs_max_paths_b_ps(nm, rest, bmap)
-}
+fn pcs_max_paths_b_ps(nm: Binder, ps: [XPos], bmap: BorrowMap) : Int =
+  map_sum(
+    ps,
+    xp => match xp {
+      XP(XLam, _) -> 0
+      XP(_, c) -> pcs_max_paths_b_expr(nm, c, bmap)
+    }
+  )
 
 # Walk args, charging 0 for any arg whose index is a borrowed slot of the
 # callee (the use is a borrow, not a consume). The discount applies ONLY
@@ -546,18 +532,14 @@ fn pcs_max_paths_b_ps(nm: Binder, ps: [XPos], bmap: BorrowMap) : Int = match ps 
 # reads while EVALUATING the arg — the callee borrows only the resulting
 # value — so those reads must count in full; discounting them starves the
 # dup insertion and the inner call frees the binder's only ref.
-fn pcs_max_paths_b_args(nm: Binder, es: [Expr], positions: [Int], i: Int, bmap: BorrowMap) : Int =
-  match es {
-    [] -> 0
-    [h, ...rest] -> {
-      let bare = pcs_is_leaf_ref(prc_peel_unit(h))
-      let here = if pcs_has_int(positions, i) and bare {
-        0
-      } else {
-        pcs_max_paths_b_expr(nm, h, bmap)
-      }
-      here + pcs_max_paths_b_args(nm, rest, positions, i + 1, bmap)
-    }
+fn pcs_max_paths_b_args(nm: Binder, es: [Expr], positions: [Int], bmap: BorrowMap) : Int =
+  sum(map_indexed(es, (i, h) => pcs_max_paths_b_arg(nm, h, pcs_has_int(positions, i), bmap)))
+
+fn pcs_max_paths_b_arg(nm: Binder, h: Expr, borrowed_slot: Bool, bmap: BorrowMap) : Int =
+  if borrowed_slot and pcs_is_leaf_ref(prc_peel_unit(h)) {
+    0
+  } else {
+    pcs_max_paths_b_expr(nm, h, bmap)
   }
 
 fn pcs_max_paths_b_alt2(nm: Binder, t: Expr, opt_e: Option[Expr], bmap: BorrowMap) : Int {
@@ -796,25 +778,17 @@ fn pcs_branchy_single_loop(
   body: Expr,
   uses: UseIx,
   skip: [Binder]
-) : [Binder] = match pnames {
-  [] -> []
-  [p, ...rest] -> {
-    let r = pcs_branchy_single_loop(rest, body, uses, skip)
-    if pcs_has(skip, p.id) {
-      r
-    } else if pcs_read_count(p.id, uses) != 1 {
-      r
-    } else if pcs_tail_call_arg(p, body) {
-      r
-    } else {
-      match last_use_for(p.id, uses) {
-        LuAt(_, _) ->
-          if pcs_consumed_on_every_path(p, body) { r } else { [p, ...r] }
-        _ -> r
-      }
+) : [Binder] = filter(pnames, p => pcs_branchy_single_keeps(p, body, uses, skip))
+
+fn pcs_branchy_single_keeps(p: Binder, body: Expr, uses: UseIx, skip: [Binder]) : Bool =
+  if pcs_has(skip, p.id) or pcs_read_count(p.id, uses) != 1 or pcs_tail_call_arg(p, body) {
+    false
+  } else {
+    match last_use_for(p.id, uses) {
+      LuAt(_, _) -> not pcs_consumed_on_every_path(p, body)
+      _ -> false
     }
   }
-}
 
 # `p` is passed bare to a call in tail position: the callee takes it over, so
 # a dup before the call and a drop after it would end the tail call.
@@ -856,13 +830,7 @@ pub(pkg) fn pcs_branch_aware_skip_locals_b(
   cmap: ConsumeIndex,
   borrowed: [Binder],
   tab: SymTab
-) : [Binder] = match binders {
-  [] -> []
-  [h, ...rest] -> {
-    let rest_skip = pcs_branch_aware_skip_locals_b(rest, body, bmap, cmap, borrowed, tab)
-    if pcs_local_moves_raw(h, body, bmap, cmap, tab) { [h, ...rest_skip] } else { rest_skip }
-  }
-}
+) : [Binder] = filter(binders, h => pcs_local_moves_raw(h, body, bmap, cmap, tab))
 
 # Every arg-slot use of h lands in a consuming slot or a declared borrow
 # that runs before the consuming read. Any other non-consuming slot
