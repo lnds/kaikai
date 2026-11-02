@@ -53,24 +53,39 @@ fn mm_scrut_vars(scruts: [Expr], i: Int, line: Int, col: Int) : [Expr] = match s
 fn mm_scrut_name(i: Int) : String = string_concat("__mm_s_", int_to_string(i))
 
 # An arm no value escapes ends the chain: the arms after it are dead.
-fn mm_arms(vars: [Expr], arms: [MMArm], line: Int, col: Int) : Expr = match arms {
-  [] -> mm_trap(line, col)
+fn mm_arms(vars: [Expr], arms: [MMArm], line: Int, col: Int) : Expr =
+  mm_chain(vars, arms, [], line, col)
+
+type MMHit = MMHit(Expr, Arm)
+
+fn mm_chain(vars: [Expr], arms: [MMArm], hits: [MMHit], line: Int, col: Int) : Expr = match arms {
+  [] -> mm_close(hits, mm_trap(line, col), line, col)
   [MMArm(pats, guard, body), ...rest] -> match mm_split(mm_columns(vars, pats), guard) {
-    None -> mm_bind(mm_columns(vars, pats), n => true, body, line, col)
+    None ->
+      mm_close(hits, mm_bind(mm_columns(vars, pats), n => true, body, line, col), line, col)
     Some(MMSplit(MMCol(sv, p), others)) -> {
       let hit = Arm(
         p,
         mm_guard(others, guard, line, col),
         mm_bind(others, n => mm_body_binds(n, guard, body), body, line, col)
       )
-      mk_expr(
-        EMatch(sv, [hit, Arm(mm_wild(line, col), None, mm_arms(vars, rest, line, col))]),
+      mm_chain(vars, rest, [MMHit(sv, hit), ...hits], line, col)
+    }
+  }
+}
+
+fn mm_close(hits: [MMHit], last: Expr, line: Int, col: Int) : Expr =
+  foldl(
+    hits,
+    last,
+    (inner, h) => match h {
+      MMHit(sv, hit) -> mk_expr(
+        EMatch(sv, [hit, Arm(mm_wild(line, col), None, inner)]),
         line,
         col
       )
     }
-  }
-}
+  )
 
 fn mm_columns(vars: [Expr], pats: [Pattern]) : [MMCol] = match vars {
   [] -> []
@@ -116,34 +131,38 @@ fn mm_irrefutable(p: Pattern) : Bool = match p.pkind {
 # Whether the columns beside the pivot match and the written guard holds.
 # The written guard is the only reader of what a column binds here.
 fn mm_guard(others: [MMCol], guard: Option[Expr], line: Int, col: Int) : Option[Expr] =
-  match others {
-    [] -> guard
-    [MMCol(sv, p), ...rest] -> {
-      let inner = mm_guard(rest, guard, line, col)
-      let read = n => mm_reads(guard, n)
-      if not mm_irrefutable(p) {
-        Some(
-          mm_match(
-            sv,
-            ub_pat(p, read),
-            mm_or_true(inner, line, col),
-            Some(mk_expr(EBool(false), line, col)),
-            line,
-            col
-          )
+  foldr(others, guard, (c, inner) => mm_guard_col(c, inner, guard, line, col))
+
+fn mm_guard_col(
+  c: MMCol,
+  inner: Option[Expr],
+  guard: Option[Expr],
+  line: Int,
+  col: Int
+) : Option[Expr] = match c {
+  MMCol(sv, p) -> {
+    let read = n => mm_reads(guard, n)
+    if not mm_irrefutable(p) {
+      Some(
+        mm_match(
+          sv,
+          ub_pat(p, read),
+          mm_or_true(inner, line, col),
+          Some(mk_expr(EBool(false), line, col)),
+          line,
+          col
         )
-      } else {
-        match inner {
-          Some(g) -> if mm_keeps(p, read) {
-            Some(mm_match(sv, ub_pat(p, read), g, None, line, col))
-          } else {
-            inner
-          }
-          None -> None
-        }
-      }
+      )
+    } else {
+      inner
+        || (g => if mm_keeps(p, read) {
+          Some(mm_match(sv, ub_pat(p, read), g, None, line, col))
+        } else {
+          inner
+        })
     }
   }
+}
 
 fn mm_or_true(g: Option[Expr], line: Int, col: Int) : Expr = match g {
   Some(e) -> e
@@ -153,10 +172,11 @@ fn mm_or_true(g: Option[Expr], line: Int, col: Int) : Expr = match g {
 # `body` under the binders `keep` accepts of the columns beside the pivot.
 # The guard has matched them, so a refutable one cannot miss.
 fn mm_bind(cols: [MMCol], keep: (Binder) -> Bool, body: Expr, line: Int, col: Int) : Expr =
-  match cols {
-    [] -> body
-    [MMCol(sv, p), ...rest] -> {
-      let inner = mm_bind(rest, keep, body, line, col)
+  foldr(cols, body, (c, inner) => mm_bind_col(c, inner, keep, line, col))
+
+fn mm_bind_col(c: MMCol, inner: Expr, keep: (Binder) -> Bool, line: Int, col: Int) : Expr =
+  match c {
+    MMCol(sv, p) ->
       if not mm_keeps(p, keep) {
         inner
       } else if mm_irrefutable(p) {
@@ -164,7 +184,6 @@ fn mm_bind(cols: [MMCol], keep: (Binder) -> Bool, body: Expr, line: Int, col: In
       } else {
         mm_match(sv, ub_pat(p, keep), inner, Some(mm_trap(line, col)), line, col)
       }
-    }
   }
 
 # A binder only the guard reads stays out of the body, and one nothing
@@ -284,7 +303,4 @@ fn ub_fields(fs: [PField], keep: (Binder) -> Bool) : [PField] = match fs {
 }
 
 fn ub_rest(rest: Option[Binder], keep: (Binder) -> Bool, line: Int, col: Int) : Option[Binder] =
-  match rest {
-    Some(r) -> if keep(r) { rest } else { Some(ub_rest_sentinel(line, col)) }
-    None -> None
-  }
+  rest || (r => if keep(r) { rest } else { Some(ub_rest_sentinel(line, col)) })

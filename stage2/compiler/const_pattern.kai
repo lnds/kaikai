@@ -78,10 +78,7 @@ fn cpat_arm(a: Arm, cs: [CDecl]) : Arm = match a {
   Arm(pat, opt_g, body) -> {
     let inner = cpat_unshadowed(cs, map(pat_binders(pat, []), b => written_text(b.name)), [])
     let body2 = cpat_expr(body, inner)
-    let g2 = match opt_g {
-      Some(g) -> Some(cpat_expr(g, inner))
-      None -> None
-    }
+    let g2 = opt_g | (g => cpat_expr(g, inner))
     match cpat_top(pat, cs) {
       CPR(pat2, guards) -> Arm(pat2, cpat_and_all(g2, guards), body2)
     }
@@ -100,13 +97,15 @@ fn cpat_unshadowed(cs: [CDecl], binders: [String], acc: [CDecl]) : [CDecl] = mat
 
 # The user's guard, if any, is tested after every equality: a binder it
 # reads must already be known to hold the constant's value.
-fn cpat_and_all(user: Option[Expr], guards: [Expr]) : Option[Expr] = match guards {
-  [] -> user
-  [g, ...rest] -> match cpat_and_all(user, rest) {
-    None -> Some(g)
-    Some(r) -> Some(mk_expr(EBinop(BoAnd, g, r), g.line, g.col))
-  }
-}
+fn cpat_and_all(user: Option[Expr], guards: [Expr]) : Option[Expr] =
+  foldr(
+    guards,
+    user,
+    (g, acc) => match acc {
+      None -> Some(g)
+      Some(r) -> Some(mk_expr(EBinop(BoAnd, g, r), g.line, g.col))
+    }
+  )
 
 # Only the top of an arm reads a lowercase binder as a constant; a
 # nested lowercase name is always a binder.
@@ -221,25 +220,28 @@ fn cpat_eq(pat: Pattern, name: String, const_ref: Expr) : CPRes {
 
 type CPResList = CPRs([Pattern], [Expr])
 
-fn cpat_pats(ps: [Pattern], cs: [CDecl]) : CPResList = match ps {
-  [] -> CPRs([], [])
-  [p, ...rest] -> match cpat_pat(p, cs) {
-    CPR(p2, gs) -> match cpat_pats(rest, cs) {
-      CPRs(rest2, gs2) -> CPRs([p2, ...rest2], list_append(gs, gs2))
+fn cpat_pats(ps: [Pattern], cs: [CDecl]) : CPResList = cpat_pats_loop(ps, cs, [], [])
+
+fn cpat_pats_loop(ps: [Pattern], cs: [CDecl], out: [Pattern], gss: [[Expr]]) : CPResList =
+  match ps {
+    [] -> CPRs(list_reverse(out), concat(list_reverse(gss)))
+    [p, ...rest] -> match cpat_pat(p, cs) {
+      CPR(p2, gs) -> cpat_pats_loop(rest, cs, [p2, ...out], [gs, ...gss])
     }
   }
-}
 
 type CPFieldList = CPFs([PField], [Expr])
 
-fn cpat_pfields(fs: [PField], cs: [CDecl]) : CPFieldList = match fs {
-  [] -> CPFs([], [])
-  [PField(name, sub, short), ...rest] -> match cpat_pat(sub, cs) {
-    CPR(sub2, gs) -> match cpat_pfields(rest, cs) {
-      CPFs(rest2, gs2) -> CPFs([PField(name, sub2, short), ...rest2], list_append(gs, gs2))
+fn cpat_pfields(fs: [PField], cs: [CDecl]) : CPFieldList = cpat_pfields_loop(fs, cs, [], [])
+
+fn cpat_pfields_loop(fs: [PField], cs: [CDecl], out: [PField], gss: [[Expr]]) : CPFieldList =
+  match fs {
+    [] -> CPFs(list_reverse(out), concat(list_reverse(gss)))
+    [PField(name, sub, short), ...rest] -> match cpat_pat(sub, cs) {
+      CPR(sub2, gs) ->
+        cpat_pfields_loop(rest, cs, [PField(name, sub2, short), ...out], [gs, ...gss])
     }
   }
-}
 
 #[doc("The declarations with every such initialiser moved into a function, and the table rows of the functions minted.")]
 pub(pkg) type ConstInits = { decls: [Decl], rows: [NEnt] }
@@ -282,10 +284,7 @@ fn ci_loop(ds: [Decl], tab: SymTab, target: String, out: [Decl], rows: [NEnt]) :
 # and a module declares a constant's name once.
 fn ci_name(const_name: String) : String = string_concat("__kai_const_", const_name)
 
-fn ci_home(mo: Option[String], target: String) : String = match mo {
-  Some(m) -> m
-  None -> target
-}
+fn ci_home(mo: Option[String], target: String) : String = mo ?? target
 
 fn ci_is_body(e: Expr) : Bool =
   if ln_is_empty(ln_with_expr(ln_empty(), e)) { ci_has_lambda(e) } else { true }
@@ -302,10 +301,7 @@ fn ci_any_lambda(ps: [XPos]) : Bool = match ps {
 
 # The call stands where the body stood: same position, type and mode.
 fn ci_call(init: FnId, body: Expr) : Expr {
-  let fty = match body.ty {
-    Some(t) -> Some(TyFnT([], t, row_empty()))
-    None -> None
-  }
+  let fty = body.ty | (t => TyFnT([], t, row_empty()))
   let callee = Expr {
     kind: ESym(fnid_sym(init), spec_none()),
     line: body.line,
@@ -466,10 +462,7 @@ fn drp_expr(e: Expr) : Expr {
 
 fn drp_arm(a: Arm) : Arm = match a {
   Arm(pat, guard, body) -> {
-    let guard1 = match guard {
-      Some(g) -> Some(drp_expr(g))
-      None -> None
-    }
+    let guard1 = guard | (g => drp_expr(g))
     match drp_pat(pat, []) {
       DrpPat(p1, checks) -> Arm(p1, drp_guard(list_reverse(checks), guard1), drp_expr(body))
     }
@@ -528,10 +521,12 @@ fn drp_fields(fs: [PField], out: [PField], acc: [Expr]) : DrpFields = match fs {
 }
 
 # The range checks, conjoined in source order ahead of the user's guard.
-fn drp_guard(checks: [Expr], guard: Option[Expr]) : Option[Expr] = match checks {
-  [] -> guard
-  [c, ...rest] -> match drp_guard(rest, guard) {
-    None -> Some(c)
-    Some(g) -> Some(mk_expr(EBinop(BoAnd, c, g), c.line, c.col))
-  }
-}
+fn drp_guard(checks: [Expr], guard: Option[Expr]) : Option[Expr] =
+  foldr(
+    checks,
+    guard,
+    (c, acc) => match acc {
+      None -> Some(c)
+      Some(g) -> Some(mk_expr(EBinop(BoAnd, c, g), c.line, c.col))
+    }
+  )
