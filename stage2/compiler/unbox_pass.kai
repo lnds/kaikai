@@ -405,6 +405,59 @@ fn unbox_stmts_aware(
 
 type UbStmt = UbStmt(Stmt, [LocBind])
 
+fn unbox_let_aware(
+  pat: Pattern,
+  ann: Option[TypeExpr],
+  rhs: Expr,
+  rest: [Stmt],
+  tail: Option[Expr],
+  env: [LocBind],
+  fns: FnIndex,
+  cis: CtorIntIx,
+  nat: Bool
+) : UbStmt / Console {
+  let rhs1 = unbox_expr_aware(rhs, env, fns, cis, nat)
+  match pat.pkind {
+    PBind(nm) -> unbox_let_bind(pat, ann, nm, rhs1, rest, tail, env, nat)
+    PVariant(ctor, subs) ->
+      UbStmt(
+        SLet(pat, ann, rhs1),
+        seed_variant_int_binders(ctor, subs, let_scope(rhs, rest, tail), cis, nat, env, fns)
+      )
+    _ -> UbStmt(SLet(pat, ann, rhs1), env)
+  }
+}
+
+fn unbox_let_bind(
+  pat: Pattern,
+  ann: Option[TypeExpr],
+  nm: Binder,
+  rhs1: Expr,
+  rest: [Stmt],
+  tail: Option[Expr],
+  env: [LocBind],
+  nat: Bool
+) : UbStmt = match rhs1.mode {
+  MUnboxed ->
+    if stmt_rhs_is_cell_init(rhs1) {
+      # A promoted var cell never demotes: its reads/writes ride the `__cell_*`
+      # intrinsics, and the emitters declare it as a raw mutable local.
+      UbStmt(SLet(pat, ann, rhs1), [LB(nm.id, MUnboxed), ...env])
+    } else if name_captured_in_block(rest, tail, nm) {
+      # A closure capture stays boxed: the capture array expects a boxed value
+      # for `nm`, so demote it and unbox/wrap at the read site.
+      UbStmt(SLet(pat, ann, expr_to_boxed(rhs1)), env)
+    } else {
+      UbStmt(SLet(pat, ann, rhs1), [LB(nm.id, MUnboxed), ...env])
+    }
+  _ ->
+    if let_rhs_unboxes_at_binding(rhs1, nat) and (not name_captured_in_block(rest, tail, nm)) {
+      UbStmt(SLet(pat, ann, expr_to_unboxed(rhs1)), [LB(nm.id, MUnboxed), ...env])
+    } else {
+      UbStmt(SLet(pat, ann, rhs1), env)
+    }
+}
+
 fn unbox_stmt_aware(
   s: Stmt,
   rest: [Stmt],
@@ -415,46 +468,7 @@ fn unbox_stmt_aware(
   nat: Bool
 ) : UbStmt / Console {
   match s {
-    SLet(pat, ann, rhs) -> {
-      let rhs1 = unbox_expr_aware(rhs, env, fns, cis, nat)
-      match pat.pkind {
-        PBind(nm) -> match rhs1.mode {
-          MUnboxed -> if stmt_rhs_is_cell_init(rhs1) {
-            # A promoted var cell never demotes: its reads/writes ride
-            # the `__cell_*` intrinsics (no read of `nm` exists for the
-            # capture/interp scans to find), and the emitters declare it
-            # as a raw mutable local.
-            UbStmt(SLet(pat, ann, rhs1), [LB(nm.id, MUnboxed), ...env])
-          } else {
-            # Closure capture stays boxed (Phase 2 non-goal table:
-            # `Closure capture (ELambda free var) → boxed`). If `nm`
-            # is referenced from within any subsequent ELambda, the
-            # capture array would expect `kai_<nm>` and find a raw
-            # `int64_t` — break the boxed convention. Demote to
-            # MBoxed so the binding lives as `KaiValue *kai_<nm>`
-            # and the unbox/wrap happens at the read site.
-            if name_captured_in_block(rest, tail, nm) {
-              let rhs_box = expr_to_boxed(rhs1)
-              UbStmt(SLet(pat, ann, rhs_box), env)
-            } else {
-              UbStmt(SLet(pat, ann, rhs1), [LB(nm.id, MUnboxed), ...env])
-            }
-          }
-          _ -> if let_rhs_unboxes_at_binding(rhs1, nat)
-            and (not name_captured_in_block(rest, tail, nm)) {
-            UbStmt(SLet(pat, ann, expr_to_unboxed(rhs1)), [LB(nm.id, MUnboxed), ...env])
-          } else {
-            UbStmt(SLet(pat, ann, rhs1), env)
-          }
-        }
-        PVariant(ctor, subs) ->
-          UbStmt(
-            SLet(pat, ann, rhs1),
-            seed_variant_int_binders(ctor, subs, let_scope(rhs, rest, tail), cis, nat, env, fns)
-          )
-        _ -> UbStmt(SLet(pat, ann, rhs1), env)
-      }
-    }
+    SLet(pat, ann, rhs) -> unbox_let_aware(pat, ann, rhs, rest, tail, env, fns, cis, nat)
     SVar(n, ty, rhs, l, c) ->
       UbStmt(SVar(n, ty, unbox_expr_aware(rhs, env, fns, cis, nat), l, c), env)
     SAssert(cond, m) -> UbStmt(

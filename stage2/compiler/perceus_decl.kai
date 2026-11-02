@@ -174,6 +174,316 @@ fn pcs_paramless_body(
   pcs_strip_borrow_args_d(reused_body, scx)
 }
 
+fn perceus_decl_boxed(
+  d: Decl,
+  fns: FnIndex,
+  bmap: BorrowMap,
+  cmap: ConsumeIndex,
+  opaque_ret_fns: [FnId],
+  prim_bmap: BorrowMap,
+  caps: CapScope,
+  cores: SymSet,
+  tab: SymTab
+) : Decl / Console = match d {
+  DFn(is_pub, fsym, tparams, params, opt_ret, row, body, ln, cl, nl, nc, mo) -> {
+    let me = SelfRef(fsym)
+    # Boxed and MIXED-signature fns share this path. A mixed-sig fn
+    # (e.g. `insert_loop(t: RBTree, k: Int, v: Int)`) has BOXED params
+    # (the tree `t`) that need the full borrow + arm-top-move + exit-
+    # drop discipline — skipping it (the old all-UFn branch) left the
+    # boxed children un-dup'd in the shared branch and un-dropped at
+    # exit, leaking the spine (rb-tree: reuse 19.6M→6.2M, 19.3M
+    # leaked). The RAW params carry no rc and must NOT be dup'd/dropped
+    # (#709 corruption), so they join the skip-set and are excluded
+    # from the unused-param drops below — exactly like a borrowed param.
+    # Capability params carry evidence, not RC'd data: out of the scope
+    # (no use is a dup/move candidate) AND into the raw set (no unused-
+    # param drop) — the same no-rc treatment as an unboxed scalar.
+    let cap_pnames = pcap_param_names(caps, mo, params)
+    let raw_pnames = pcs_list_union(prc_raw_param_names(fns, fsym, params), cap_pnames)
+    let pnames = pcs_strs_minus(map(params, .binder), cap_pnames)
+    let uses = pcs_use_index_in(
+      body,
+      pnames,
+      pcs_strs_minus(pnames, raw_pnames),
+      f => prs_raw_arg_positions(f, fns)
+    )
+    # Borrow inference (Koka). A borrowed param is inspect-only:
+    # the body reads it WITHOUT dup (so it must be in the skip-set,
+    # never dup'd) and its match scrutinee is wrapped in
+    # __perceus_borrow so emit_match skips the exit decref → the
+    # callee never touches the param's RC. The caller side
+    # (pcs_strip_borrow_args) strips the __perceus_dup on the matching
+    # argument → no incref is paid either. Net: zero RC on the
+    # inspected param, which is exactly the 37%-of-wall traffic the
+    # rb-tree spends on is_red / comparisons.
+    let borrowed = pcs_borrow_params_hybrid(is_pub, me, params, pnames, body, tab)
+    # Issue #599 — branch-aware skip-set: params read <= 1 time per
+    # path transfer ownership raw (no dup). Borrowed params join the
+    # skip-set too (they are never dup'd) — union the two.
+    # Plus the arm-binder per-path move set (Koka Parc per-branch
+    # ownership): pattern binders of SELF-RECURSIVE MODULO-CONS arms whose
+    # max-path count (borrow-aware, discounting is_red(l)) is <= 1,
+    # consumed-on-every-path, all-consumers-linear. Restricted to
+    # self-rec-modulo-cons arms because emit disposes only those via the
+    # borrow-model (arm-top reuse); a non-self-rec arm keeps the legacy
+    # emit and moving its binders would double-free (the regexp UAF). This
+    # is the half that lets insert_loop's Black arm move l/r instead of
+    # spuriously dup'ing them — the ~8.8-nodes-per-insert spine leak.
+    # Binder names are unique per fn, so each arm's gate decides for its
+    # own binders only.
+    let arm_moves = pcs_collect_arm_skip_binders(me, true, body, bmap, cmap, borrowed, tab)
+    # Issue #817 — goto-tail arm-binders (read once per branch, consumed
+    # on every path, consuming slot): moved on EVERY use, the
+    # `list.filter`/`map` `kai_t` (tail) case. Distinct from `arm_moves`
+    # (reuse-in-place); this is the free-cell-then-goto model.
+    let goto_moves = pcs_collect_goto_tail_moves(me, body, bmap, uses, cmap, borrowed, tab)
+    let skip_set0 = pcs_list_union(
+      pcs_list_union(
+        pcs_list_union(
+          pcs_list_union(
+            pcs_params_moved_raw(
+              pnames,
+              body,
+              uses,
+              bmap,
+              pcs_list_union(raw_pnames, borrowed)
+            ),
+            borrowed
+          ),
+          arm_moves
+        ),
+        goto_moves
+      ),
+      raw_pnames
+    )
+    # Koka Parc `ownedInScope`: owned sibling params read once-per-path in
+    # a top-level match, moved at their single use with the exit drop
+    # replaced by a branch-local drop in the arms that never read them.
+    let owned_moves =
+      pcs_owned_scope_move_params(pnames, body, skip_set0, bmap, cmap, borrowed, tab)
+    let skip_set = pcs_list_union(skip_set0, owned_moves)
+    # Issue #817 — arm-binders whose LAST use lands in a consuming slot
+    # but which are NOT in `skip_set` (so the conservative dup orphans
+    # the birth ref: the `list.filter`-over-heap leak). `pcs_is_non_last`
+    # moves the last read of these, keeping earlier reads dup'd.
+    # Excluded from `skip_set` (which moves ALL reads); this set moves
+    # only the last one.
+    # Issue #817 — move-at-last-use candidates. RESTRICTED to binders
+    # that live in a goto-tail arm whose cons cascade is SAFE (the
+    # `filter` `h` shape: a guard-less `[h, ...t] -> if p(h) { recur }`
+    # with no leading SLet / inner-match consuming a sibling). Only
+    # there does the #3 `kai_decref(_scr)` shallow-decref guarantee no
+    # cascade double-consume. A binder outside such an arm is left to
+    # its conservative dup (no leak win lost beyond filter/map/flat_map,
+    # which all have this shape). Then minus `skip_set` (already
+    # moved on every use).
+    # `safe_arm_binders` ⊆ `pcs_all_arm_binders` (both walk the same
+    # tree; the safe set only adds the cascade gate), so the inter
+    # never drops a safe binder the candidate set lacks.
+    let safe_arm_binders = pcs_collect_safe_arm_binders(me, body, bmap, uses)
+    # Params whose sole consumer is a borrow-discounted re-thread
+    # (#1126). They must not dup on any read (the borrow read is
+    # stripped; the single re-thread transfers raw), yet — unlike a
+    # skip_set param — they DO keep their exit drop, because the base
+    # arm that never re-threads owns the container and must free it.
+    let borrow_move_params = pcs_collect_borrow_move_last_params(
+      me,
+      pnames,
+      body,
+      uses,
+      bmap,
+      borrowed,
+      skip_set
+    )
+    # Arm binders of a borrowed param read only in borrowed slots: released
+    # as their arm starts, every read a borrow.
+    let borrow_only =
+      prt_borrow_only_binders(body, borrowed, c => pcs_user_borrow_slots(bmap, c))
+    let move_last0 = pcs_strs_minus(
+      pcs_list_union(
+        pcs_strs_inter(
+          pcs_collect_move_last_set(pcs_all_arm_binders(body, []), body, uses, cmap, tab),
+          safe_arm_binders
+        ),
+        pcs_collect_move_last_lets(body, uses, cmap, skip_set, tab)
+      ),
+      pcs_list_union(skip_set, borrow_only)
+    )
+    # Let-bound opaque handles whose birth ref needs an end-of-scope
+    # drop (each shim call consumes a dup; the birth ref is released
+    # here, even when the last use is in tail position).
+    let opaque_lets = pcs_collect_opaque_let_binders(body, opaque_ret_fns, [])
+    # Lets lent and then handed over: bare on every read, paid by the
+    # owning one, so they join both the moved set and the payers' set.
+    let lend_lets = pcs_lend_move_lets(body, uses, pcs_list_union(skip_set, opaque_lets), bmap)
+    let move_last_set = pcs_list_union(move_last0, lend_lets)
+    # `rewrite_skip_set` suppresses the dup wrap for #1126 borrow-move
+    # params too, so the re-thread transfers raw. The exit-drop set
+    # (`skip_set`) deliberately excludes them: the base arm still frees
+    # the container. Keep the two sets distinct.
+    let moved0 = pcs_list_union(pcs_list_union(skip_set, borrow_move_params), lend_lets)
+    # Arm binders read at most once per path move on every read; the
+    # branch payer releases them on the alternatives that skip them.
+    let path_moves = ppm_path_moves(
+      body,
+      uses,
+      pcs_list_union(moved0, pnames),
+      borrowed,
+      (nm, b) => pcs_max_paths_in_expr(nm, b) <= 1
+        and pcs_all_consumers_linear(nm, b)
+        and pcs_uses_only_consuming_slots(nm, b, cmap, bm_empty(), tab),
+      f => pcs_borrow_slots(bmap, f),
+      (nm, b) => pcs_let_lends_then_moves(nm, b, bmap)
+    )
+    let rewrite_skip_set = pcs_list_union(moved0, path_moves)
+    # Single-use params whose only read sits on some-but-not-all paths:
+    # forced to dup at the read (force_set) and released by a forced
+    # exit drop, so the paths that skip the read stay balanced.
+    let branchy_single =
+      pcs_branchy_single_use_params(me, fsym, pnames, body, uses, rewrite_skip_set, tab)
+    # Arm binders in the same shape (sole read behind a short-circuit
+    # edge of their own arm — an `and`/`or` guard/arg RHS): forced to
+    # dup too. Their payers are the arm-drop and guard-fail planters,
+    # which re-derive from the rewritten arm (a dup'd-only binder
+    # plants).
+    let branchy_arms = pcs_branchy_arm_binders(body, me, uses, rewrite_skip_set, [])
+    # Block-let binders in the same shape: forced to dup too, paid by
+    # the block-exit collector (statement reads) or the post-tail
+    # pass (tail reads).
+    let branchy_lets = pcs_branchy_let_binders(
+      body,
+      me,
+      uses,
+      pcs_list_union(rewrite_skip_set, pnames)
+    )
+    let force_all = pcs_list_union(pcs_list_union(branchy_single, branchy_arms), branchy_lets)
+    # The exit drop keeps the #1126 borrow-move params: only their
+    # re-thread moves, and the base path still owns the container.
+    let psets = PcsParamSets { moved: skip_set, forced: force_all }
+    let new_body0 =
+      pcs_rewrite_expr(body, pnames, uses, rewrite_skip_set, force_all, bmap, move_last_set)
+    let new_body1 = pcs_force_opaque_exit_drops(new_body0, opaque_lets, uses)
+    # The block-exit collector below declines a binding whose last read
+    # sits in the tail (the drop would have to run after the tail value
+    # exists). `ptd_tail_exit_drops` releases exactly those. The fn's own
+    # boxed borrowed positions gate the self-call arg hoist: a reference
+    # hoisted into a temp for a borrowed slot would lose its ownership
+    # marking. A raw slot carries none.
+    let boxed_bpos = pcs_boxed_positions(pcs_borrow_lookup(bmap, fsym), params, raw_pnames, 0)
+    let new_body =
+      ptd_tail_exit_drops(new_body1, me, uses, move_last_set, branchy_lets, boxed_bpos)
+    let arm_dropped = pcs_arm_drop_pass(
+      new_body,
+      me,
+      PcsArmCx {
+        uses: uses,
+        moved: rewrite_skip_set,
+        boxed_bpos: boxed_bpos,
+        borrow_only: borrow_only,
+        borrowed: borrowed,
+        bmap: bmap,
+        forced: force_all
+      },
+      tab
+    )
+    # A param its read pays is released on the paths that skip the read.
+    let read_paid = pcs_strs_minus(
+      pcs_names_paid_by(pnames, uses, psets, PyRead),
+      pcs_list_union(borrowed, raw_pnames)
+    )
+    let branch_paid = pbp_branch_drops(arm_dropped, pnames, uses, path_moves, read_paid)
+    # Every owned position a borrowed binder reaches takes a dup, before
+    # reuse recognition turns a ctor or cons literal into a reuse cell.
+    let owned_body = pop_own_positions(
+      branch_paid,
+      pcs_strs_minus(borrowed, raw_pnames),
+      f => pcs_borrow_slots(bmap, f)
+    )
+    let reused_body = pcs_recognise_reuse_expr_b(owned_body, borrowed, tab)
+    # Borrowed params carry no exit obligation — exclude from the
+    # unused-param drop. Raw params (mixed-sig) likewise carry no rc,
+    # so they must not receive an unused-param drop either.
+    let drop_params = pcs_params_minus(pcs_params_minus(params, borrowed), raw_pnames)
+    # Issue #1120 — a param used ONLY in a borrowed-prim slot (`a[i]`).
+    # Its container access stays CONSUMING (the strip below keeps the
+    # dup + the `array_get` symbol) so the runtime decref reclaims it —
+    # no exit-drop wrap, which would reset a raw sibling param's unbox
+    # scope in the emitter. The borrow win is the loop shape (container
+    # re-threaded, not last-use), which this exclusion leaves untouched.
+    # Params AND locally-bound arrays read only through `a[i]` (never
+    # consumed) keep all their accesses consuming; a container with a
+    # later consuming use (the loop re-thread) is NOT borrow-only and its
+    # reads ARE rewritten to the borrow variant. A borrowed param holds no
+    # reference for the runtime to reclaim, so it is never one of them.
+    let bl_names = pcs_list_union(pnames, pcs_let_binder_names(body, []))
+    let borrow_last =
+      pcs_strs_minus(pcs_collect_borrow_last_set(bl_names, body, prim_bmap), borrowed)
+    let body_with_drops = pcs_wrap_param_drops(reused_body, drop_params, uses, psets)
+    # Callee flip: wrap borrowed scrutinees so emit_match skips the
+    # decref. Caller flip: strip __perceus_dup on borrowed-slot args,
+    # keeping the last-use of a borrow-only container consuming.
+    let body_borrow_scr = pcs_wrap_borrow_scrutinees(body_with_drops, borrowed)
+    # Closure flip (#1130): route `f(args)` through a borrowed
+    # function-typed param to the borrowing indirect call. `borrowed`
+    # is in the skip-set (never dup'd); the borrowing call does not
+    # consume, so the closure's exit drop frees it exactly once.
+    let borrowed_closures = pcs_borrowed_closure_names(borrowed, params)
+    let body_borrow_call = pcs_wrap_borrow_calls(body_borrow_scr, borrowed_closures)
+    # Bare-move detection: names whose bare reads are NOT owned moves —
+    # the skip/move/reuse sets (union already includes borrowed + raw
+    # params) plus the exit-dropped opaque locals and force-dup'd
+    # branchy singles.
+    let no_wrap = pcs_list_union(
+      pcs_list_union(pcs_list_union(rewrite_skip_set, opaque_lets), branchy_single),
+      borrow_only
+    )
+    let scx = StripCx {
+      bmap: bmap,
+      borrow_last: borrow_last,
+      no_wrap: no_wrap,
+      raw_no_wrap: pcs_strs_minus(
+        no_wrap,
+        pcs_strs_minus(
+          pcs_list_union(pcs_list_union(path_moves, goto_moves), arm_moves),
+          pcs_list_union(pcs_list_union(opaque_lets, borrow_only), branchy_single)
+        )
+      ),
+      uses: uses,
+      fns: fns,
+      cores: cores
+    }
+    let body_borrow = pcs_strip_borrow_args_d(body_borrow_call, scx)
+    let self_bpos =
+      pcs_borrow_positions(map(params, .binder), pcs_strs_minus(borrowed, raw_pnames), 0)
+    let body_lent = plt_lend_binders(
+      body_borrow,
+      me,
+      self_bpos,
+      borrowed,
+      f => pcs_boxed_borrow_slots(bmap, fns, f)
+    )
+    let body_taken = pst_take_state(
+      ptk_take_fields(body_lent, pcs_strs_minus(pcs_strs_minus(pnames, borrowed), raw_pnames))
+    )
+    DFn(
+      is_pub,
+      fsym,
+      tparams,
+      bbe_stamp_borrowed(params, pcs_strs_minus(borrowed, raw_pnames), raw_pnames),
+      opt_ret,
+      row,
+      body_taken,
+      ln,
+      cl,
+      nl,
+      nc,
+      mo
+    )
+  }
+  _ -> d
+}
+
 pub(pkg) fn perceus_decl_b(
   d: Decl,
   fns: FnIndex,
@@ -240,299 +550,7 @@ pub(pkg) fn perceus_decl_b(
           mo
         )
       } else {
-        # Boxed and MIXED-signature fns share this path. A mixed-sig fn
-        # (e.g. `insert_loop(t: RBTree, k: Int, v: Int)`) has BOXED params
-        # (the tree `t`) that need the full borrow + arm-top-move + exit-
-        # drop discipline — skipping it (the old all-UFn branch) left the
-        # boxed children un-dup'd in the shared branch and un-dropped at
-        # exit, leaking the spine (rb-tree: reuse 19.6M→6.2M, 19.3M
-        # leaked). The RAW params carry no rc and must NOT be dup'd/dropped
-        # (#709 corruption), so they join the skip-set and are excluded
-        # from the unused-param drops below — exactly like a borrowed param.
-        # Capability params carry evidence, not RC'd data: out of the scope
-        # (no use is a dup/move candidate) AND into the raw set (no unused-
-        # param drop) — the same no-rc treatment as an unboxed scalar.
-        let cap_pnames = pcap_param_names(caps, mo, params)
-        let raw_pnames = pcs_list_union(prc_raw_param_names(fns, fsym, params), cap_pnames)
-        let pnames = pcs_strs_minus(map(params, .binder), cap_pnames)
-        let uses = pcs_use_index_in(
-          body,
-          pnames,
-          pcs_strs_minus(pnames, raw_pnames),
-          f => prs_raw_arg_positions(f, fns)
-        )
-        # Borrow inference (Koka). A borrowed param is inspect-only:
-        # the body reads it WITHOUT dup (so it must be in the skip-set,
-        # never dup'd) and its match scrutinee is wrapped in
-        # __perceus_borrow so emit_match skips the exit decref → the
-        # callee never touches the param's RC. The caller side
-        # (pcs_strip_borrow_args) strips the __perceus_dup on the matching
-        # argument → no incref is paid either. Net: zero RC on the
-        # inspected param, which is exactly the 37%-of-wall traffic the
-        # rb-tree spends on is_red / comparisons.
-        let borrowed = pcs_borrow_params_hybrid(is_pub, me, params, pnames, body, tab)
-        # Issue #599 — branch-aware skip-set: params read <= 1 time per
-        # path transfer ownership raw (no dup). Borrowed params join the
-        # skip-set too (they are never dup'd) — union the two.
-        # Plus the arm-binder per-path move set (Koka Parc per-branch
-        # ownership): pattern binders of SELF-RECURSIVE MODULO-CONS arms whose
-        # max-path count (borrow-aware, discounting is_red(l)) is <= 1,
-        # consumed-on-every-path, all-consumers-linear. Restricted to
-        # self-rec-modulo-cons arms because emit disposes only those via the
-        # borrow-model (arm-top reuse); a non-self-rec arm keeps the legacy
-        # emit and moving its binders would double-free (the regexp UAF). This
-        # is the half that lets insert_loop's Black arm move l/r instead of
-        # spuriously dup'ing them — the ~8.8-nodes-per-insert spine leak.
-        # Binder names are unique per fn, so each arm's gate decides for its
-        # own binders only.
-        let arm_moves = pcs_collect_arm_skip_binders(me, true, body, bmap, cmap, borrowed, tab)
-        # Issue #817 — goto-tail arm-binders (read once per branch, consumed
-        # on every path, consuming slot): moved on EVERY use, the
-        # `list.filter`/`map` `kai_t` (tail) case. Distinct from `arm_moves`
-        # (reuse-in-place); this is the free-cell-then-goto model.
-        let goto_moves = pcs_collect_goto_tail_moves(me, body, bmap, uses, cmap, borrowed, tab)
-        let skip_set0 = pcs_list_union(
-          pcs_list_union(
-            pcs_list_union(
-              pcs_list_union(
-                pcs_params_moved_raw(
-                  pnames,
-                  body,
-                  uses,
-                  bmap,
-                  pcs_list_union(raw_pnames, borrowed)
-                ),
-                borrowed
-              ),
-              arm_moves
-            ),
-            goto_moves
-          ),
-          raw_pnames
-        )
-        # Koka Parc `ownedInScope`: owned sibling params read once-per-path in
-        # a top-level match, moved at their single use with the exit drop
-        # replaced by a branch-local drop in the arms that never read them.
-        let owned_moves =
-          pcs_owned_scope_move_params(pnames, body, skip_set0, bmap, cmap, borrowed, tab)
-        let skip_set = pcs_list_union(skip_set0, owned_moves)
-        # Issue #817 — arm-binders whose LAST use lands in a consuming slot
-        # but which are NOT in `skip_set` (so the conservative dup orphans
-        # the birth ref: the `list.filter`-over-heap leak). `pcs_is_non_last`
-        # moves the last read of these, keeping earlier reads dup'd.
-        # Excluded from `skip_set` (which moves ALL reads); this set moves
-        # only the last one.
-        # Issue #817 — move-at-last-use candidates. RESTRICTED to binders
-        # that live in a goto-tail arm whose cons cascade is SAFE (the
-        # `filter` `h` shape: a guard-less `[h, ...t] -> if p(h) { recur }`
-        # with no leading SLet / inner-match consuming a sibling). Only
-        # there does the #3 `kai_decref(_scr)` shallow-decref guarantee no
-        # cascade double-consume. A binder outside such an arm is left to
-        # its conservative dup (no leak win lost beyond filter/map/flat_map,
-        # which all have this shape). Then minus `skip_set` (already
-        # moved on every use).
-        # `safe_arm_binders` ⊆ `pcs_all_arm_binders` (both walk the same
-        # tree; the safe set only adds the cascade gate), so the inter
-        # never drops a safe binder the candidate set lacks.
-        let safe_arm_binders = pcs_collect_safe_arm_binders(me, body, bmap, uses)
-        # Params whose sole consumer is a borrow-discounted re-thread
-        # (#1126). They must not dup on any read (the borrow read is
-        # stripped; the single re-thread transfers raw), yet — unlike a
-        # skip_set param — they DO keep their exit drop, because the base
-        # arm that never re-threads owns the container and must free it.
-        let borrow_move_params = pcs_collect_borrow_move_last_params(
-          me,
-          pnames,
-          body,
-          uses,
-          bmap,
-          borrowed,
-          skip_set
-        )
-        # Arm binders of a borrowed param read only in borrowed slots: released
-        # as their arm starts, every read a borrow.
-        let borrow_only =
-          prt_borrow_only_binders(body, borrowed, c => pcs_user_borrow_slots(bmap, c))
-        let move_last0 = pcs_strs_minus(
-          pcs_list_union(
-            pcs_strs_inter(
-              pcs_collect_move_last_set(pcs_all_arm_binders(body, []), body, uses, cmap, tab),
-              safe_arm_binders
-            ),
-            pcs_collect_move_last_lets(body, uses, cmap, skip_set, tab)
-          ),
-          pcs_list_union(skip_set, borrow_only)
-        )
-        # Let-bound opaque handles whose birth ref needs an end-of-scope
-        # drop (each shim call consumes a dup; the birth ref is released
-        # here, even when the last use is in tail position).
-        let opaque_lets = pcs_collect_opaque_let_binders(body, opaque_ret_fns, [])
-        # Lets lent and then handed over: bare on every read, paid by the
-        # owning one, so they join both the moved set and the payers' set.
-        let lend_lets = pcs_lend_move_lets(body, uses, pcs_list_union(skip_set, opaque_lets), bmap)
-        let move_last_set = pcs_list_union(move_last0, lend_lets)
-        # `rewrite_skip_set` suppresses the dup wrap for #1126 borrow-move
-        # params too, so the re-thread transfers raw. The exit-drop set
-        # (`skip_set`) deliberately excludes them: the base arm still frees
-        # the container. Keep the two sets distinct.
-        let moved0 = pcs_list_union(pcs_list_union(skip_set, borrow_move_params), lend_lets)
-        # Arm binders read at most once per path move on every read; the
-        # branch payer releases them on the alternatives that skip them.
-        let path_moves = ppm_path_moves(
-          body,
-          uses,
-          pcs_list_union(moved0, pnames),
-          borrowed,
-          (nm, b) => pcs_max_paths_in_expr(nm, b) <= 1
-            and pcs_all_consumers_linear(nm, b)
-            and pcs_uses_only_consuming_slots(nm, b, cmap, bm_empty(), tab),
-          f => pcs_borrow_slots(bmap, f),
-          (nm, b) => pcs_let_lends_then_moves(nm, b, bmap)
-        )
-        let rewrite_skip_set = pcs_list_union(moved0, path_moves)
-        # Single-use params whose only read sits on some-but-not-all paths:
-        # forced to dup at the read (force_set) and released by a forced
-        # exit drop, so the paths that skip the read stay balanced.
-        let branchy_single =
-          pcs_branchy_single_use_params(me, fsym, pnames, body, uses, rewrite_skip_set, tab)
-        # Arm binders in the same shape (sole read behind a short-circuit
-        # edge of their own arm — an `and`/`or` guard/arg RHS): forced to
-        # dup too. Their payers are the arm-drop and guard-fail planters,
-        # which re-derive from the rewritten arm (a dup'd-only binder
-        # plants).
-        let branchy_arms = pcs_branchy_arm_binders(body, me, uses, rewrite_skip_set, [])
-        # Block-let binders in the same shape: forced to dup too, paid by
-        # the block-exit collector (statement reads) or the post-tail
-        # pass (tail reads).
-        let branchy_lets = pcs_branchy_let_binders(
-          body,
-          me,
-          uses,
-          pcs_list_union(rewrite_skip_set, pnames)
-        )
-        let force_all = pcs_list_union(pcs_list_union(branchy_single, branchy_arms), branchy_lets)
-        # The exit drop keeps the #1126 borrow-move params: only their
-        # re-thread moves, and the base path still owns the container.
-        let psets = PcsParamSets { moved: skip_set, forced: force_all }
-        let new_body0 =
-          pcs_rewrite_expr(body, pnames, uses, rewrite_skip_set, force_all, bmap, move_last_set)
-        let new_body1 = pcs_force_opaque_exit_drops(new_body0, opaque_lets, uses)
-        # The block-exit collector below declines a binding whose last read
-        # sits in the tail (the drop would have to run after the tail value
-        # exists). `ptd_tail_exit_drops` releases exactly those. The fn's own
-        # boxed borrowed positions gate the self-call arg hoist: a reference
-        # hoisted into a temp for a borrowed slot would lose its ownership
-        # marking. A raw slot carries none.
-        let boxed_bpos = pcs_boxed_positions(pcs_borrow_lookup(bmap, fsym), params, raw_pnames, 0)
-        let new_body =
-          ptd_tail_exit_drops(new_body1, me, uses, move_last_set, branchy_lets, boxed_bpos)
-        let arm_dropped = pcs_arm_drop_pass(
-          new_body,
-          me,
-          PcsArmCx {
-            uses: uses,
-            moved: rewrite_skip_set,
-            boxed_bpos: boxed_bpos,
-            borrow_only: borrow_only,
-            borrowed: borrowed,
-            bmap: bmap,
-            forced: force_all
-          },
-          tab
-        )
-        # A param its read pays is released on the paths that skip the read.
-        let read_paid = pcs_strs_minus(
-          pcs_names_paid_by(pnames, uses, psets, PyRead),
-          pcs_list_union(borrowed, raw_pnames)
-        )
-        let branch_paid = pbp_branch_drops(arm_dropped, pnames, uses, path_moves, read_paid)
-        # Every owned position a borrowed binder reaches takes a dup, before
-        # reuse recognition turns a ctor or cons literal into a reuse cell.
-        let owned_body = pop_own_positions(
-          branch_paid,
-          pcs_strs_minus(borrowed, raw_pnames),
-          f => pcs_borrow_slots(bmap, f)
-        )
-        let reused_body = pcs_recognise_reuse_expr_b(owned_body, borrowed, tab)
-        # Borrowed params carry no exit obligation — exclude from the
-        # unused-param drop. Raw params (mixed-sig) likewise carry no rc,
-        # so they must not receive an unused-param drop either.
-        let drop_params = pcs_params_minus(pcs_params_minus(params, borrowed), raw_pnames)
-        # Issue #1120 — a param used ONLY in a borrowed-prim slot (`a[i]`).
-        # Its container access stays CONSUMING (the strip below keeps the
-        # dup + the `array_get` symbol) so the runtime decref reclaims it —
-        # no exit-drop wrap, which would reset a raw sibling param's unbox
-        # scope in the emitter. The borrow win is the loop shape (container
-        # re-threaded, not last-use), which this exclusion leaves untouched.
-        # Params AND locally-bound arrays read only through `a[i]` (never
-        # consumed) keep all their accesses consuming; a container with a
-        # later consuming use (the loop re-thread) is NOT borrow-only and its
-        # reads ARE rewritten to the borrow variant. A borrowed param holds no
-        # reference for the runtime to reclaim, so it is never one of them.
-        let bl_names = pcs_list_union(pnames, pcs_let_binder_names(body, []))
-        let borrow_last =
-          pcs_strs_minus(pcs_collect_borrow_last_set(bl_names, body, prim_bmap), borrowed)
-        let body_with_drops = pcs_wrap_param_drops(reused_body, drop_params, uses, psets)
-        # Callee flip: wrap borrowed scrutinees so emit_match skips the
-        # decref. Caller flip: strip __perceus_dup on borrowed-slot args,
-        # keeping the last-use of a borrow-only container consuming.
-        let body_borrow_scr = pcs_wrap_borrow_scrutinees(body_with_drops, borrowed)
-        # Closure flip (#1130): route `f(args)` through a borrowed
-        # function-typed param to the borrowing indirect call. `borrowed`
-        # is in the skip-set (never dup'd); the borrowing call does not
-        # consume, so the closure's exit drop frees it exactly once.
-        let borrowed_closures = pcs_borrowed_closure_names(borrowed, params)
-        let body_borrow_call = pcs_wrap_borrow_calls(body_borrow_scr, borrowed_closures)
-        # Bare-move detection: names whose bare reads are NOT owned moves —
-        # the skip/move/reuse sets (union already includes borrowed + raw
-        # params) plus the exit-dropped opaque locals and force-dup'd
-        # branchy singles.
-        let no_wrap = pcs_list_union(
-          pcs_list_union(pcs_list_union(rewrite_skip_set, opaque_lets), branchy_single),
-          borrow_only
-        )
-        let scx = StripCx {
-          bmap: bmap,
-          borrow_last: borrow_last,
-          no_wrap: no_wrap,
-          raw_no_wrap: pcs_strs_minus(
-            no_wrap,
-            pcs_strs_minus(
-              pcs_list_union(pcs_list_union(path_moves, goto_moves), arm_moves),
-              pcs_list_union(pcs_list_union(opaque_lets, borrow_only), branchy_single)
-            )
-          ),
-          uses: uses,
-          fns: fns,
-          cores: cores
-        }
-        let body_borrow = pcs_strip_borrow_args_d(body_borrow_call, scx)
-        let self_bpos =
-          pcs_borrow_positions(map(params, .binder), pcs_strs_minus(borrowed, raw_pnames), 0)
-        let body_lent = plt_lend_binders(
-          body_borrow,
-          me,
-          self_bpos,
-          borrowed,
-          f => pcs_boxed_borrow_slots(bmap, fns, f)
-        )
-        let body_taken = pst_take_state(
-          ptk_take_fields(body_lent, pcs_strs_minus(pcs_strs_minus(pnames, borrowed), raw_pnames))
-        )
-        DFn(
-          is_pub,
-          fsym,
-          tparams,
-          bbe_stamp_borrowed(params, pcs_strs_minus(borrowed, raw_pnames), raw_pnames),
-          opt_ret,
-          row,
-          body_taken,
-          ln,
-          cl,
-          nl,
-          nc,
-          mo
-        )
+        perceus_decl_boxed(d, fns, bmap, cmap, opaque_ret_fns, prim_bmap, caps, cores, tab)
       }
     }
     DTest(desc, body, ln, cl, mo) ->
@@ -803,7 +821,7 @@ fn pcs_ret_is_opaque(opt_ret: Option[TypeExpr], opaque_names: [SymId]) : Bool = 
 
 fn pcs_has_sym(ss: [SymId], s: SymId) : Bool = match ss {
   [] -> false
-  [h, ...rest] -> if sym_raw(s) >= 0 and sym_same(h, s) { true } else { pcs_has_sym(rest, s) }
+  [h, ...rest] -> (sym_raw(s) >= 0 and sym_same(h, s)) or pcs_has_sym(rest, s)
 }
 
 # The types declared `extern "C" opaque`, recovered from the
@@ -910,22 +928,21 @@ fn pcap_effect(t: SymTab, s: SymId) : Bool = ncls_same(sym_class(t, s), NCEffect
 # every candidate is an effect is there no value type it could mean.
 fn pcap_all_effects(t: SymTab, ss: [SymId]) : Bool = match ss {
   [] -> true
-  [s, ...rest] -> if pcap_effect(t, s) { pcap_all_effects(t, rest) } else { false }
+  [s, ...rest] -> pcap_effect(t, s) and pcap_all_effects(t, rest)
 }
 
 fn pcap_has(ss: [SymId], s: SymId) : Bool = match ss {
   [] -> false
-  [h, ...rest] -> if sym_raw(s) >= 0 and sym_same(h, s) { true } else { pcap_has(rest, s) }
+  [h, ...rest] -> (sym_raw(s) >= 0 and sym_same(h, s)) or pcap_has(rest, s)
 }
 
-fn pcap_declared(decls: [Decl], effects: Bool, acc: [SymId]) : [SymId] =
-  match decls {
-    [] -> acc
-    [d, ...rest] -> match d {
-      DEffect(_, s, _, _, _, _, _, _, _, _) ->
-        pcap_declared(rest, effects, if effects { [s, ...acc] } else { acc })
-      DType(_, s, _, _, _, _, _, _, _, _) ->
-        pcap_declared(rest, effects, if effects { acc } else { [s, ...acc] })
-      _ -> pcap_declared(rest, effects, acc)
-    }
-  }
+fn pcap_declared(decls: [Decl], effects: Bool, acc: [SymId]) : [SymId] = match decls {
+  [] -> acc
+  [d, ...rest] -> pcap_declared(rest, effects, pcap_add(d, effects, acc))
+}
+
+fn pcap_add(d: Decl, effects: Bool, acc: [SymId]) : [SymId] = match d {
+  DEffect(_, s, _, _, _, _, _, _, _, _) -> if effects { [s, ...acc] } else { acc }
+  DType(_, s, _, _, _, _, _, _, _, _) -> if effects { acc } else { [s, ...acc] }
+  _ -> acc
+}

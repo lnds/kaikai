@@ -388,7 +388,7 @@ pub(pkg) type UnwSite
 pub(pkg) fn unw_match_at(sites: [UnwSite], site: Int) : Bool = match sites {
   [] -> false
   [s, ...rest] -> match s {
-    UnwMatch(k) -> if k == site { true } else { unw_match_at(rest, site) }
+    UnwMatch(k) -> k == site or unw_match_at(rest, site)
     _ -> unw_match_at(rest, site)
   }
 }
@@ -577,8 +577,7 @@ fn uw_owned_borrow_var(a: Expr) : Option[LocalId] = match a.kind {
 
 fn uw_consumed_besides(xs: [Expr], skip: Int, i: Int, n: LocalId) : Bool = match xs {
   [] -> false
-  [x, ...rest] ->
-    if i != skip and tcl_consumes(x, n) { true } else { uw_consumed_besides(rest, skip, i + 1, n) }
+  [x, ...rest] -> (i != skip and tcl_consumes(x, n)) or uw_consumed_besides(rest, skip, i + 1, n)
 }
 
 #[doc("`pend` without the binders `e` consumes or might consume: `pend` itself when it consumes none.")]
@@ -587,7 +586,7 @@ fn unw_filter(pend: [LocalId], e: Expr) : [LocalId] =
 
 fn uw_any_consumed(pend: [LocalId], e: Expr) : Bool = match pend {
   [] -> false
-  [p, ...rest] -> if tcl_consumes(e, p) { true } else { uw_any_consumed(rest, e) }
+  [p, ...rest] -> tcl_consumes(e, p) or uw_any_consumed(rest, e)
 }
 
 fn uw_unconsumed(pend: [LocalId], e: Expr) : [LocalId] = match pend {
@@ -690,7 +689,7 @@ fn unw_walk(
 # Returns the pending set after `e` and the sites found inside it.
 fn uw_expr(e: Expr, pend: [LocalId], z: [LocalId], fx: UwFx, sites: [UnwSite]) : UwR =
   match e.kind {
-    EBlock(ss, ot) -> uw_block(ss, ot, pend, z, fx, sites)
+    EBlock(ss, ot) -> uw_block(ss, ot, pend, z, fx, sites, [])
     EIf(c, t, oe) -> uw_if(c, t, oe, pend, z, fx, sites)
     EMatch(s, arms) -> uw_match(e, s, arms, pend, z, fx, sites)
     EHandle(body, _, _, oi, _, _, oret) -> uw_handle(e, body, oi, oret, pend, z, fx, sites)
@@ -850,7 +849,7 @@ fn uw_exit(e: Expr, inner: Expr, pend: [LocalId], z: [LocalId], fx: UwFx, sites:
 
 fn uw_all_pads(ss: [UnwSite]) : Bool = match ss {
   [] -> true
-  [s, ...rest] -> if unw_is_pad(s) { uw_all_pads(rest) } else { false }
+  [s, ...rest] -> unw_is_pad(s) and uw_all_pads(rest)
 }
 
 # Children run left to right: each child is walked once, and a site
@@ -903,15 +902,6 @@ fn uw_block(
   pend: [LocalId],
   z: [LocalId],
   fx: UwFx,
-  sites: [UnwSite]
-) : UwR = uw_block_loop(ss, ot, pend, z, fx, sites, [])
-
-fn uw_block_loop(
-  ss: [Stmt],
-  ot: Option[Expr],
-  pend: [LocalId],
-  z: [LocalId],
-  fx: UwFx,
   sites: [UnwSite],
   bound: [[LocalId]]
 ) : UwR = match ss {
@@ -920,17 +910,12 @@ fn uw_block_loop(
       None -> UwR { pend: pend, sites: sites }
       Some(t) -> uw_expr(t, pend, z, fx, sites)
     }
-    UwR { pend: uw_minus_each(r.pend, bound), sites: r.sites }
+    UwR { pend: foldl(bound, r.pend, (p, bs) => unw_minus(p, bs)), sites: r.sites }
   }
   [s, ...rest] -> {
     let r = uw_stmt(s, pend, z, fx, sites)
-    uw_block_loop(rest, ot, r.pend, z, fx, r.sites, [unw_stmt_binders(s), ...bound])
+    uw_block(rest, ot, r.pend, z, fx, r.sites, [unw_stmt_binders(s), ...bound])
   }
-}
-
-fn uw_minus_each(pend: [LocalId], bss: [[LocalId]]) : [LocalId] = match bss {
-  [] -> pend
-  [bs, ...rest] -> uw_minus_each(unw_minus(pend, bs), rest)
 }
 
 fn uw_stmt(s: Stmt, pend: [LocalId], z: [LocalId], fx: UwFx, sites: [UnwSite]) : UwR = match s {
@@ -1115,14 +1100,8 @@ pub(pkg) type UnwCallee = UnwTransfer(LocalId) | UnwDup(LocalId)
 #[doc("The closure a call goes through: a local, or a dup of one, in callee position that `bound` accepts.")]
 pub(pkg) fn unw_callee_of(f: Expr, bound: (LocalId) -> Bool) : Option[UnwCallee] = match f.kind {
   ELocal(n) -> if bound(n) { Some(UnwTransfer(n)) } else { None }
-  ECall(g, xs) -> match g.kind {
-    EMark(MkDup) -> match xs {
-      [inner] -> match inner.kind {
-        ELocal(n) -> if bound(n) { Some(UnwDup(n)) } else { None }
-        _ -> None
-      }
-      _ -> None
-    }
+  ECall(g, [inner]) -> match (g.kind, inner.kind) {
+    (EMark(MkDup), ELocal(n)) -> if bound(n) { Some(UnwDup(n)) } else { None }
     _ -> None
   }
   _ -> None

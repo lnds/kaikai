@@ -73,7 +73,7 @@ fn pcs_fed_kind(k: ExprKind, opaque_lets: [Binder], uses: UseIx) : ExprKind / Co
   EIf(c, t, oe) -> EIf(
     c,
     pcs_force_opaque_exit_drops(t, opaque_lets, uses),
-    oe | (e2 => pcs_force_opaque_exit_drops(e2, opaque_lets, uses))
+    map(oe, e2 => pcs_force_opaque_exit_drops(e2, opaque_lets, uses))
   )
   _ -> k
 }
@@ -120,7 +120,7 @@ fn pcs_fed_make_drops(names: [Binder]) : [Stmt] = match names {
 # Recurse into each statement's sub-expressions (handles bound in inner
 # blocks get their own drop there).
 fn pcs_fed_stmts(stmts: [Stmt], opaque_lets: [Binder], uses: UseIx) : [Stmt] / Console =
-  stmts | (s => pcs_fed_stmt(s, opaque_lets, uses))
+  map(stmts, s => pcs_fed_stmt(s, opaque_lets, uses))
 
 fn pcs_fed_stmt(s: Stmt, opaque_lets: [Binder], uses: UseIx) : Stmt / Console = match s {
   SLet(p, t, e) -> SLet(p, t, pcs_force_opaque_exit_drops(e, opaque_lets, uses))
@@ -301,7 +301,10 @@ fn ppd_plant_kind(e: Expr, self_name: SelfRef, names: [Binder], bpos: [Int]) : O
     ECall(f, xs) -> Some(ppd_hoist_with(e, f, xs, ppd_drops(names, e.line, e.col), bpos))
     EIf(c, t, oe) -> ppd_plant_if(e, c, t, oe, self_name, names, bpos)
     EMatch(s, arms) ->
-      ppd_plant_arms(arms, self_name, names, bpos, []) | (arms2 => ppd_rekind(e, EMatch(s, arms2)))
+      map(
+        ppd_plant_arms(arms, self_name, names, bpos, []),
+        arms2 => ppd_rekind(e, EMatch(s, arms2))
+      )
     EBlock(bstmts, obt) -> ppd_plant_block(e, bstmts, obt, self_name, names, bpos)
     _ -> None
   }
@@ -314,12 +317,15 @@ fn ppd_plant_if(
   self_name: SelfRef,
   names: [Binder],
   bpos: [Int]
-) : Option[Expr] = oe
-  || (e2 => ppd_both(
-    ppd_plant(t, self_name, names, bpos),
-    ppd_plant(e2, self_name, names, bpos),
-    (t2, e22) => ppd_rekind(e, EIf(c, t2, Some(e22)))
-  ))
+) : Option[Expr] =
+  and_then(
+    oe,
+    e2 => ppd_both(
+      ppd_plant(t, self_name, names, bpos),
+      ppd_plant(e2, self_name, names, bpos),
+      (t2, e22) => ppd_rekind(e, EIf(c, t2, Some(e22)))
+    )
+  )
 
 fn ppd_plant_block(
   e: Expr,
@@ -328,15 +334,15 @@ fn ppd_plant_block(
   self_name: SelfRef,
   names: [Binder],
   bpos: [Int]
-) : Option[Expr] = obt
-  || (bt => {
+) : Option[Expr] =
+  and_then(obt, bt => {
     # An inner planting already hoisted this call's args: every read is
     # behind the temps, so these drops slot in before the tail. Hoisting
     # again would bind a temp to its own name inside one C scope.
     if ppd_is_hoist_block(bstmts) {
       Some(ppd_rekind(e, EBlock(list_append(bstmts, ppd_drops(names, e.line, e.col)), Some(bt))))
     } else {
-      ppd_map(
+      map(
         ppd_plant(bt, self_name, names, bpos),
         bt2 => ppd_rekind(e, EBlock(bstmts, Some(bt2)))
       )
@@ -359,10 +365,8 @@ fn ppd_plant_arms(
   }
 }
 
-fn ppd_map(o: Option[Expr], f: (Expr) -> Expr) : Option[Expr] = o | (x => f(x))
-
 fn ppd_both(a: Option[Expr], b: Option[Expr], f: (Expr, Expr) -> Expr) : Option[Expr] =
-  a || (x => (b | (y => f(x, y))))
+  and_then(a, x => map(b, y => f(x, y)))
 
 fn ppd_rekind(e: Expr, k: ExprKind) : Expr =
   Expr { kind: k, line: e.line, col: e.col, ty: e.ty, mode: e.mode, site: e.site }
@@ -446,13 +450,13 @@ fn ppd_stays(a: Expr, bpos: [Int], i: Int) : Bool = match a.kind {
 # A block the planting pass built around a self-call: arg temps, drops,
 # then the call as tail. Consumers that reason about "reads in the tail"
 # must treat the whole block as the tail — the temps ARE the call's args.
-pub(pkg) fn ppd_is_hoist_block(stmts: [Stmt]) : Bool = any(
-  stmts,
-  s => match s {
-    SLet(pat, _, _) -> ret_slot_binds_tail_arg(pat, 0)
-    _ -> false
+pub(pkg) fn ppd_is_hoist_block(stmts: [Stmt]) : Bool = match stmts {
+  [] -> false
+  [s, ...rest] -> match s {
+    SLet(pat, _, _) -> ret_slot_binds_tail_arg(pat, 0) or ppd_is_hoist_block(rest)
+    _ -> ppd_is_hoist_block(rest)
   }
-)
+}
 
 pub(pkg) fn ppd_drops(names: [Binder], ln: Int, cl: Int) : [Stmt] = match names {
   [] -> []
@@ -542,12 +546,12 @@ fn ppd_arms_all_self_call(arms: [Arm], self_name: SelfRef) : Bool = match arms {
   }
 }
 
-fn ppd_arms_self_call(arms: [Arm], self_name: SelfRef) : Bool = any(
-  arms,
-  a => match a {
-    Arm(_, _, b) -> ppd_has_self_call(b, self_name)
+fn ppd_arms_self_call(arms: [Arm], self_name: SelfRef) : Bool = match arms {
+  [] -> false
+  [a, ...rest] -> match a {
+    Arm(_, _, b) -> ppd_has_self_call(b, self_name) or ppd_arms_self_call(rest, self_name)
   }
-)
+}
 
 # Post-tail exit drops for let-bound block locals.
 #
@@ -736,13 +740,13 @@ fn ptd_needs_drop(
 
 # `pcs_append_drops` puts its drops at the top level of the same block, so a
 # shallow scan sees every drop that could already cover `nm`.
-fn ptd_has_drop(nm: LocalId, stmts: [Stmt]) : Bool = any(
-  stmts,
-  s => match s {
-    SExprStmt(e) -> ptd_is_drop_of(nm, e)
-    _ -> false
+fn ptd_has_drop(nm: LocalId, stmts: [Stmt]) : Bool = match stmts {
+  [] -> false
+  [s, ...rest] -> match s {
+    SExprStmt(e) -> ptd_is_drop_of(nm, e) or ptd_has_drop(nm, rest)
+    _ -> ptd_has_drop(nm, rest)
   }
-)
+}
 
 fn ptd_is_drop_of(nm: LocalId, e: Expr) : Bool = match e.kind {
   ECall(f, args_) -> match f.kind {
@@ -800,11 +804,7 @@ fn phg_opt_keeps(oe: Option[Expr], self_name: SelfRef, bpos: [Int]) : Bool = mat
 fn phg_args_keep(xs: [Expr], bpos: [Int], i: Int) : Bool = match xs {
   [] -> true
   [a, ...rest] ->
-    if phg_unmarked(a) or (not any(bpos, b => b == i)) {
-      phg_args_keep(rest, bpos, i + 1)
-    } else {
-      false
-    }
+    (phg_unmarked(a) or (not any(bpos, b => b == i))) and phg_args_keep(rest, bpos, i + 1)
 }
 
 # A bare read stays in place; an immediate Int, a Bool, unit and an absent
