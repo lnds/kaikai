@@ -290,10 +290,7 @@ fn bind_unit_dims(v: Int, us: [UnitExprT], s: Subst) : Option[Subst] / Mutable {
   if occurs_unit(v, bound, s) {
     None
   } else {
-    match unit_kind_gate(s, v, bound) {
-      None -> None
-      Some(s1) -> Some(subst_unit_extend(s1, v, bound))
-    }
+    unit_kind_gate(s, v, bound) | (s1 => subst_unit_extend(s1, v, bound))
   }
 }
 
@@ -301,35 +298,31 @@ fn unify_abelian_diff(t: UTable, s: Subst) : Option[Subst] / Mutable {
   if utable_is_one(t) {
     Some(s)
   } else {
-    match utable_pick_min_var(t) {
-      None -> None  # only syms left, but non-zero — fail
-      Some(pick) -> {
-        let rest = utable_drop_var(t, pick.id)
-        let k = pick.exp
-        if utable_all_divisible(rest, k) {
-          # Bind `pick.id := (-rest) / k`. occurs check guards against
-          # self-cycle (would be unusual since we removed the var).
-          let bound = utable_to_tree(utable_negdiv(rest, k))
-          if occurs_unit(pick.id, bound, s) {
-            None
-          } else {
-            match unit_kind_gate(s, pick.id, bound) {
-              None -> None
-              Some(s1) -> Some(subst_unit_extend(s1, pick.id, bound))
-            }
-          }
-        } else {
-          # Pivot does not cleanly divide the remainder. The classical
-          # Kennedy/Stuckey fix introduces a fresh unit-var w and
-          # rewrites `pick := w * (low/k)` so the residual equation
-          # uses smaller exponents. The lane fixtures don't exercise
-          # this path (every case the lane ships pivots with |k|=1).
-          # Refuse here so the failure is loud rather than silent —
-          # see docs/units-of-measure.md §Risks "polynomial" guarantee.
-          None
-        }
-      }
+    utable_pick_min_var(t) || (pick => unify_abelian_pick(t, s, pick))
+  }
+}
+
+fn unify_abelian_pick(t: UTable, s: Subst, pick: UPickVar) : Option[Subst] / Mutable {
+  let rest = utable_drop_var(t, pick.id)
+  let k = pick.exp
+  if utable_all_divisible(rest, k) {
+    # Bind `pick.id := (-rest) / k`. occurs check guards against
+    # self-cycle (would be unusual since we removed the var).
+    let bound = utable_to_tree(utable_negdiv(rest, k))
+    if occurs_unit(pick.id, bound, s) {
+      None
+    } else {
+      unit_kind_gate(s, pick.id, bound) | (s1 => subst_unit_extend(s1, pick.id, bound))
     }
+  } else {
+    # Pivot does not cleanly divide the remainder. The classical
+    # Kennedy/Stuckey fix introduces a fresh unit-var w and
+    # rewrites `pick := w * (low/k)` so the residual equation
+    # uses smaller exponents. The lane fixtures don't exercise
+    # this path (every case the lane ships pivots with |k|=1).
+    # Refuse here so the failure is loud rather than silent —
+    # see docs/units-of-measure.md §Risks "polynomial" guarantee.
+    None
   }
 }
 
@@ -337,10 +330,7 @@ fn unify_abelian_diff(t: UTable, s: Subst) : Option[Subst] / Mutable {
 # `TyVarT(n)` via subst_lookup, then recurses on the replacement so a
 # chained binding `?t0 -> ?t1 -> Int` collapses to `Int`.
 #[doc("Typer-internal helper `apply_ty` shared across the infer modules.")]
-pub fn apply_ty(s: Subst, t: Ty) : Ty = match apply_ty_opt(s, t) {
-  None -> t
-  Some(t1) -> t1
-}
+pub fn apply_ty(s: Subst, t: Ty) : Ty = apply_ty_opt(s, t) ?? t
 
 # `None` means the substitution left the subtree untouched, so callers
 # keep the input node instead of rebuilding an identical one. Nominal
@@ -362,43 +352,28 @@ fn apply_ty_opt(s: Subst, t: Ty) : Option[Ty] {
     TyHandle -> None
     TyAny -> None
     TyNothing -> None
-    TyVarT(n) -> match subst_lookup(s, n) {
-      Some(t2) -> Some(apply_ty(s, t2))
-      None -> None
-    }
-    TyListT(inner) -> match apply_ty_opt(s, inner) {
-      None -> None
-      Some(i1) -> Some(TyListT(i1))
-    }
+    TyVarT(n) -> subst_lookup(s, n) | (t2 => apply_ty(s, t2))
+    TyListT(inner) -> apply_ty_opt(s, inner) | (i1 => TyListT(i1))
     TyFnT(params, ret, row) -> {
       let ps = apply_tys_opt(s, params)
       let rt = apply_ty_opt(s, ret)
       let rw = apply_row_opt(s, row)
       match ps {
         None -> match rt {
-          None -> match rw {
-            None -> None
-            Some(rw1) -> Some(TyFnT(params, ret, rw1))
-          }
+          None -> rw | (rw1 => TyFnT(params, ret, rw1))
           Some(rt1) -> Some(TyFnT(params, rt1, opt_row_or(rw, row)))
         }
         Some(ps1) -> Some(TyFnT(ps1, opt_ty_or(rt, ret), opt_row_or(rw, row)))
       }
     }
-    TyCon(sid, atys) -> match apply_tys_opt(s, atys) {
-      None -> None
-      Some(as1) -> Some(TyCon(sid, as1))
-    }
+    TyCon(sid, atys) -> apply_tys_opt(s, atys) | (as1 => TyCon(sid, as1))
     # Once the shape var binds to a constructor witness, reconstruct the
     # concrete applied type (`s := List, A := Int` → `TyListT(Int)`), so
     # a resolved `TyShapeApp` never survives past substitution. Unbound,
     # only the argument is walked.
     TyShapeApp(sv, arg) -> match subst_lookup(s, sv) {
       Some(wit) -> Some(shape_reapply(apply_ty(s, wit), apply_ty(s, arg)))
-      None -> match apply_ty_opt(s, arg) {
-        None -> None
-        Some(a1) -> Some(TyShapeApp(sv, a1))
-      }
+      None -> apply_ty_opt(s, arg) | (a1 => TyShapeApp(sv, a1))
     }
     # applying a substitution to a dimensioned type recurses into
     # both the base type and the unit expression. Unit-vars chase
@@ -409,10 +384,7 @@ fn apply_ty_opt(s: Subst, t: Ty) : Option[Ty] {
     # substitutions don't touch the predicate Expr (it
     # references value-level identifiers, not Ty vars); just recurse
     # through the base.
-    TyRefineT(base, p, al) -> match apply_ty_opt(s, base) {
-      None -> None
-      Some(b1) -> Some(TyRefineT(b1, p, al))
-    }
+    TyRefineT(base, p, al) -> apply_ty_opt(s, base) | (b1 => TyRefineT(b1, p, al))
     # substitute through each component then
     # re-normalise. A substitution can change a component's mangled
     # form (e.g. `?t0` → `Int`), which can re-order the canonical
@@ -422,49 +394,43 @@ fn apply_ty_opt(s: Subst, t: Ty) : Option[Ty] {
 }
 
 #[doc("Typer-internal helper `apply_tys` shared across the infer modules.")]
-pub fn apply_tys(s: Subst, ts: [Ty]) : [Ty] = match apply_tys_opt(s, ts) {
-  None -> ts
-  Some(ts1) -> ts1
-}
+pub fn apply_tys(s: Subst, ts: [Ty]) : [Ty] = apply_tys_opt(s, ts) ?? ts
 
 # `None` keeps the caller's list. A spine is only rebuilt once an
 # element actually changed; the prefix before it is shared verbatim.
-fn apply_tys_opt(s: Subst, ts: [Ty]) : Option[[Ty]] {
+fn apply_tys_opt(s: Subst, ts: [Ty]) : Option[[Ty]] = apply_tys_scan(s, ts, [])
+
+fn apply_tys_scan(s: Subst, ts: [Ty], seen: [Ty]) : Option[[Ty]] {
   match ts {
     [] -> None
     [t, ...rest] -> match apply_ty_opt(s, t) {
-      Some(t1) -> Some([t1, ...apply_tys(s, rest)])
-      None -> match apply_tys_opt(s, rest) {
-        None -> None
-        Some(rest1) -> Some([t, ...rest1])
-      }
+      Some(t1) -> Some(rev_onto(seen, [t1, ...apply_tys(s, rest)]))
+      None -> apply_tys_scan(s, rest, [t, ...seen])
     }
   }
 }
 
-#[doc("Typer-internal helper `apply_label_args_opt` shared across the infer modules.")]
-pub fn apply_label_args_opt(s: Subst, l: Label) : Option[Label] =
-  match apply_tys_opt(s, l.ty_args) {
-    None -> None
-    Some(as1) -> Some(Label { ...l, ty_args: as1 })
-  }
-
-#[doc("Typer-internal helper `apply_labels` shared across the infer modules.")]
-pub fn apply_labels(s: Subst, ls: [Label]) : [Label] = match apply_labels_opt(s, ls) {
-  None -> ls
-  Some(ls1) -> ls1
+fn rev_onto[a](rev: [a], tail: [a]) : [a] = match rev {
+  [] -> tail
+  [h, ...rest] -> rev_onto(rest, [h, ...tail])
 }
 
+#[doc("Typer-internal helper `apply_label_args_opt` shared across the infer modules.")]
+pub fn apply_label_args_opt(s: Subst, l: Label) : Option[Label] =
+  apply_tys_opt(s, l.ty_args) | (as1 => Label { ...l, ty_args: as1 })
+
+#[doc("Typer-internal helper `apply_labels` shared across the infer modules.")]
+pub fn apply_labels(s: Subst, ls: [Label]) : [Label] = apply_labels_opt(s, ls) ?? ls
+
 #[doc("Typer-internal helper `apply_labels_opt` shared across the infer modules.")]
-pub fn apply_labels_opt(s: Subst, ls: [Label]) : Option[[Label]] {
+pub fn apply_labels_opt(s: Subst, ls: [Label]) : Option[[Label]] = apply_labels_scan(s, ls, [])
+
+fn apply_labels_scan(s: Subst, ls: [Label], seen: [Label]) : Option[[Label]] {
   match ls {
     [] -> None
     [h, ...rest] -> match apply_label_args_opt(s, h) {
-      Some(h1) -> Some([h1, ...apply_labels(s, rest)])
-      None -> match apply_labels_opt(s, rest) {
-        None -> None
-        Some(rest1) -> Some([h, ...rest1])
-      }
+      Some(h1) -> Some(rev_onto(seen, [h1, ...apply_labels(s, rest)]))
+      None -> apply_labels_scan(s, rest, [h, ...seen])
     }
   }
 }
@@ -472,25 +438,16 @@ pub fn apply_labels_opt(s: Subst, ls: [Label]) : Option[[Label]] {
 # Resolve a row under the current substitution: apply_ty to each
 # label payload, and chase the tail var if it's bound.
 #[doc("Typer-internal helper `apply_row` shared across the infer modules.")]
-pub fn apply_row(s: Subst, r: Row) : Row = match apply_row_opt(s, r) {
-  None -> r
-  Some(r1) -> r1
-}
+pub fn apply_row(s: Subst, r: Row) : Row = apply_row_opt(s, r) ?? r
 
 # `None` means neither the labels nor the tail moved, so the row is
 # returned as-is rather than copied field by field.
 fn apply_row_opt(s: Subst, r: Row) : Option[Row] {
   let labels1 = apply_labels_opt(s, r.labels)
   match r.tail {
-    None -> match labels1 {
-      None -> None
-      Some(ls) -> Some(Row { labels: ls, tail: None, display_alias: r.display_alias })
-    }
+    None -> labels1 | (ls => Row { labels: ls, tail: None, display_alias: r.display_alias })
     Some(v) -> match subst_row_lookup(s, v) {
-      None -> match labels1 {
-        None -> None
-        Some(ls) -> Some(Row { labels: ls, tail: Some(v), display_alias: r.display_alias })
-      }
+      None -> labels1 | (ls => Row { labels: ls, tail: Some(v), display_alias: r.display_alias })
       Some(r2) -> {
         let r2r = apply_row(s, r2)
         Some(Row {
@@ -548,10 +505,7 @@ fn partition_by_homes_walk(
   [] -> acc
   [d, ...rest_d] -> {
     let explicit = decl_explicit_module_origin(d)
-    let anchor1 = match explicit {
-      Some(m) -> m
-      None -> current_anchor
-    }
+    let anchor1 = explicit ?? current_anchor
     let home = decide_partition_home(d, target_mod, anchor1)
     let next_anchor = if home == target_mod { target_mod } else { anchor1 }
     let acc1 = bucket_push(acc, home, d, [])
