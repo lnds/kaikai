@@ -84,6 +84,23 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.192.2 (2026-11-02)
+
+### Fixed
+
+- **lint**: treat the right operand of or/and as tail position
+
+### Changed
+
+- **perceus**: take a Ref read only while no user Mutable handler is in effect
+- **perceus**: a Ref read by its own write hands its value over
+- **typer**: clear the last compiler-lint findings and split the files over the size cap
+- **perceus**: clear compiler-lint findings in the RC and perceus pass files (#3400)
+- **typer**: clear compiler-lint findings in the typer-area files (#3402)
+- **compiler**: walk expression positions with tail loops instead of closures
+- **compiler**: keep the or/and self-call shapes and drop the dead helpers
+- **compiler**: clear the compiler-lint findings in the backend and frontend passes
+
 ## v0.192.1 (2026-11-02)
 
 ### Fixed
