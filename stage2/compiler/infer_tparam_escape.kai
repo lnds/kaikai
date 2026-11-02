@@ -312,9 +312,18 @@ pub fn filter_labels_matching_res(
   cell: LocalId,
   tyargs: [Ty],
   sub: Subst
+) : FilterResult / Mutable = filter_labels_loop(xs, hsym, cell, tyargs, sub, [])
+
+fn filter_labels_loop(
+  xs: [Label],
+  hsym: SymId,
+  cell: LocalId,
+  tyargs: [Ty],
+  sub: Subst,
+  kept_rev: [Label]
 ) : FilterResult / Mutable {
   match xs {
-    [] -> FilterResult { kept: [], sub: sub }
+    [] -> FilterResult { kept: list_reverse(kept_rev), sub: sub }
     [h, ...rest] -> {
       # The guard ignores a function type's effect row; `unify` compares
       # it, so a label the unify rejects stays undischarged.
@@ -325,11 +334,8 @@ pub fn filter_labels_matching_res(
         None
       }
       match bound {
-        Some(sub1) -> filter_labels_matching_res(rest, hsym, cell, tyargs, sub1)
-        None -> {
-          let r = filter_labels_matching_res(rest, hsym, cell, tyargs, sub)
-          FilterResult { kept: [h, ...r.kept], sub: r.sub }
-        }
+        Some(sub1) -> filter_labels_loop(rest, hsym, cell, tyargs, sub1, kept_rev)
+        None -> filter_labels_loop(rest, hsym, cell, tyargs, sub, [h, ...kept_rev])
       }
     }
   }
@@ -401,19 +407,9 @@ fn dischargeable_heads(ax: Ty, bx: Ty, s: Subst) : Bool =
     _ -> ty_eq_shape(ax, bx)
   }
 
-fn ty_list_dischargeable(a: [Ty], b: [Ty], s: Subst) : Bool {
-  match a {
-    [] -> match b {
-      [] -> true
-      _ -> false
-    }
-    [ah, ...arest] -> match b {
-      [] -> false
-      [bh, ...brest] -> ty_dischargeable(apply_ty(s, ah), apply_ty(s, bh), s)
-        and ty_list_dischargeable(arest, brest, s)
-    }
-  }
-}
+fn ty_list_dischargeable(a: [Ty], b: [Ty], s: Subst) : Bool =
+  list_length(a) == list_length(b)
+    and all(zip(a, b), p => ty_dischargeable(apply_ty(s, p.fst), apply_ty(s, p.snd), s))
 
 # Merge two label lists, deduplicating by (eff name + unifiable
 # ty_args). Used when synth_handle stitches the outer row back with
@@ -565,18 +561,16 @@ pub fn try_record_type_call(
   col: Int
 ) : Option[Inferred] / Console + File + Mutable {
   let rec_opt = match callee.kind {
-    EName(nm) -> match rec_find(st.recs, callee_type_sym(st, callee)) {
-      None -> None
-      Some(r) -> match settle_name(st, None, nm, TyAny, value_classes()) {
+    EName(nm) -> rec_find(st.recs, callee_type_sym(st, callee))
+      || (r => match settle_name(st, None, nm, TyAny, value_classes()) {
         SetOne(_) -> None
         SetTie(_) -> None
         _ -> Some(r)
-      }
-    }
+      })
     _ -> None
   }
-  match rec_opt {
-    Some(r) -> match r {
+  rec_opt
+    | (r => match r {
       RI(rsym, _, fs, _) -> {
         let rnm = written_text(decl_name(st.env.tab, rsym))
         let perr = mk_diag(
@@ -588,28 +582,24 @@ pub fn try_record_type_call(
           []
         )
         let root = with_ty(mk_expr(ECall(callee, args_), line, col), TyAny)
-        Some(
-          mk_inferred(
-            st_bump_err(
-              st_help(
-                st_push_diag(st, perr),
-                concat_all([
-                  "construct it with the record literal form: `",
-                  rnm,
-                  " { ",
-                  rec_fields_hint(fs),
-                  " }`"
-                ])
-              )
-            ),
-            TyAny,
-            root
-          )
+        mk_inferred(
+          st_bump_err(
+            st_help(
+              st_push_diag(st, perr),
+              concat_all([
+                "construct it with the record literal form: `",
+                rnm,
+                " { ",
+                rec_fields_hint(fs),
+                " }`"
+              ])
+            )
+          ),
+          TyAny,
+          root
         )
       }
-    }
-    None -> None
-  }
+    })
 }
 
 # The handle calls each lambda: its effects are the caller's.
@@ -673,13 +663,13 @@ pub fn pick_by_first_arg(
   col: Int
 ) : FirstArg / Mutable {
   let run = probe_first_arg(st, candidates, target_ty, [])
-  let concrete = filter(run.hits, h => h.concrete)
+  let concrete = filter(run.hits, .concrete)
   let pool = if list_is_empty(concrete) { run.hits } else { concrete }
   match pool {
     [] -> FaNone
     [h] -> FaOne(pick_at(h.pick, run.st))
     _ -> {
-      let syms = map(pool, h => h.sym)
+      let syms = map(pool, .sym)
       match headless_pool(st, candidates, target_ty, syms) {
         Some(ss) -> FaTie(run.st, ss)
         None -> pick_in_pool(st, run, pool, syms, target_ty, line, col)
@@ -794,15 +784,13 @@ fn probe_first_arg(
 # `TyCon` whose declaration has ops registered is a capability.
 #[doc("Typer-internal helper `cap_eff_of_var` shared across the infer modules.")]
 pub fn cap_eff_of_var(st: InferState, l: LocalId) : Option[SymId] =
-  match env_local(st.env, l) {
-    None -> None
-    Some(sc) -> match sc {
+  env_local(st.env, l)
+    || (sc => match sc {
       Scheme(_, _, _, _, ty) -> match apply_ty(st.sub, ty) {
         TyCon(esym, _) -> if env_has_effect(st.env, esym) { Some(esym) } else { None }
         _ -> None
       }
-    }
-  }
+    })
 
 # Apply the substitution to a list of fresh-tyvar ids, producing the
 # resolved type for each. Avoids an inline lambda that would capture
@@ -850,17 +838,15 @@ pub fn binop_dispatch_proto_heterogeneous(
     false
   } else {
     let bp = binop_proto(op)
-    let picked = match op_proto_core(bp) {
-      None -> None
-      Some(cp) -> binop_pick_proto_dispatch(
+    let picked = op_proto_core(bp)
+      || (cp => binop_pick_proto_dispatch(
         st.protos.impls,
         core_proto_id(cp),
         op_proto_method(bp),
         lt,
         rt,
         st.sub
-      )
-    }
+      ))
     match picked {
       Some(_) -> true
       None -> false
@@ -878,23 +864,21 @@ fn binop_pick_proto_dispatch(
 ) : Option[BinopProtoChoice] {
   let l = apply_ty(sub, lt)
   let r = apply_ty(sub, rt)
-  match inf_disp_head(l) {
-    None -> None
-    Some(lh) -> match inf_disp_head(r) {
-      None -> None
-      Some(rh) -> {
-        # Try (receiver = lhs, arg = rhs) first.
-        if impl_pair_exists(impls, proto, op, lh, [rh]) {
-          Some(BPC(lh, [rh]))
-          # Mirror: (receiver = rhs, arg = lhs).
-        } else if impl_pair_exists(impls, proto, op, rh, [lh]) {
-          Some(BPC(rh, [lh]))
-        } else {
-          None
-        }
-      }
-    }
-  }
+  inf_disp_head(l)
+    || (lh => {
+      inf_disp_head(r)
+        || (rh => {
+          # Try (receiver = lhs, arg = rhs) first.
+          if impl_pair_exists(impls, proto, op, lh, [rh]) {
+            Some(BPC(lh, [rh]))
+            # Mirror: (receiver = rhs, arg = lhs).
+          } else if impl_pair_exists(impls, proto, op, rh, [lh]) {
+            Some(BPC(rh, [lh]))
+          } else {
+            None
+          }
+        })
+    })
 }
 
 # The dispatcher answers `Self`, the receiver's own type with its unit.
@@ -936,10 +920,8 @@ pub fn binop_check_against_impl(
   let method = op_proto_method(bp)
   let lt = apply_ty(st.sub, lt0)
   let rt = apply_ty(st.sub, rt0)
-  let impl_sym = match op_proto_core(bp) {
-    None -> None
-    Some(cp) -> binop_impl_sym(st.protos.impls, core_proto_id(cp), method, lt, rt, st.sub)
-  }
+  let impl_sym = op_proto_core(bp)
+    || (cp => binop_impl_sym(st.protos.impls, core_proto_id(cp), method, lt, rt, st.sub))
   match impl_sym {
     None -> BinopImpl(st, None)
     Some(sym) -> match env_sym(st.env, sym) {
