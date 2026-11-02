@@ -1,0 +1,346 @@
+#[doc("Typing of effect-op calls: direct, alias-bound and capability-provided ops, cell reads and writes, `Ref` ops and function-field method calls.")]
+
+import compiler.diag
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_ids
+import compiler.written
+import compiler.symtab
+import compiler.unit_walk
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_state
+import compiler.infer_clause_holes
+import compiler.infer_env_exhaust
+import compiler.diag_type_text
+import compiler.infer_apply
+import compiler.infer_tparam_escape
+import compiler.infer_head_dispatch
+import compiler.infer_handle_walk
+import compiler.core_types
+import compiler.infer_row_kinds
+import compiler.infer_call_labels
+import compiler.infer_instantiate
+import compiler.infer_unit_tables
+import compiler.infer_unify_rows
+import compiler.infer_fuse_arith
+import compiler.infer_call_args
+
+# detect the surface shape `Eff.op(args)` and treat it as
+# an op call. Args are unified against the op's parameter types; the
+# result type is the op's return type; `Eff` is added to the caller's row.
+#
+# The resolver settled the head: a declared effect (a row alias reads as
+# the component that declares the op) is its id, an alias binder or a
+# capability parameter is the local it is. If `Eff` is an effect but the
+# op is missing, we emit a dedicated diagnostic instead of falling
+# through to the generic `unknown identifier` path.
+#[doc("Shared with the sibling modules of the same pass.")]
+pub(pkg) fn try_op_call(
+  st: InferState,
+  callee: Expr,
+  args_: [Expr],
+  line: Int,
+  col: Int
+) : Option[Inferred] / Console + File + Mutable =
+  match callee.kind {
+    EField(base, op_name) -> try_op_on(st, base, op_name, args_, line, col)
+    _ -> None
+  }
+
+fn try_op_on(
+  st: InferState,
+  base: Expr,
+  op_name: String,
+  args_: [Expr],
+  line: Int,
+  col: Int
+) : Option[Inferred] / Console + File + Mutable =
+  match base.kind {
+    ESym(bsym, _) -> try_op_on_effect(st, bsym, op_name, args_, line, col)
+    ELocal(l) -> try_op_on_local(st, l, op_name, args_, line, col)
+    _ -> None
+  }
+
+fn try_op_on_effect(
+  st: InferState,
+  bsym: SymId,
+  op_name: String,
+  args_: [Expr],
+  line: Int,
+  col: Int
+) : Option[Inferred] / Console + File + Mutable =
+  match env_op(st.env, bsym, written(op_name)) {
+    Some(sc) -> Some(
+      record_op_res(
+        synth_op_call_with_scheme(st, sc, args_, bsym, op_name, line, col),
+        bsym,
+        written(op_name),
+        None,
+        false,
+        line,
+        col
+      )
+    )
+    None -> if env_has_effect(st.env, bsym) {
+      Some(synth_op_call_unknown_op(st, bsym, op_name, line, col))
+    } else {
+      None
+    }
+  }
+
+# A local heads the op: an alias bound by an enclosing `handle ... with Eff as name`,
+# else a capability parameter, whose op does not join the row.
+fn try_op_on_local(
+  st: InferState,
+  l: LocalId,
+  op_name: String,
+  args_: [Expr],
+  line: Int,
+  col: Int
+) : Option[Inferred] / Console + File + Mutable =
+  match lookup_alias_taggable(st.aliases, l) {
+    None -> cap_op_call(st, l, op_name, args_, line, col)
+    Some(taggable) -> try_op_on_alias(st, l, taggable, op_name, args_, line, col)
+  }
+
+# A `with Eff as name` binding dispatches against the handle's own evidence node;
+# `var`/State/Reader cells keep the by-id dispatch. Inside a lambda the instance is
+# not named and the ambient lookup runs. The row label carries the cell either way,
+# so row identity holds inside a lambda too.
+#[doc("Shared with the sibling modules of the same pass.")]
+pub(pkg) fn try_op_on_alias(
+  st: InferState,
+  l: LocalId,
+  taggable: Bool,
+  real_op: String,
+  args_: [Expr],
+  line: Int,
+  col: Int
+) : Option[Inferred] / Console + File + Mutable {
+  let asym = lookup_alias_sym(st.aliases, l)
+  let via = if not taggable {
+    untagged_alias_via(asym)
+  } else if eff_is_cell_effect(asym) {
+    ViaAlias(l)
+  } else {
+    ViaRecv(l)
+  }
+  match env_op(st.env, asym, written(real_op)) {
+    Some(sc) -> Some(
+      record_op_res(
+        synth_op_call_with_scheme_keys(st, sc, args_, asym, real_op, via, Some(l), line, col),
+        asym,
+        written(real_op),
+        Some(l),
+        taggable,
+        line,
+        col
+      )
+    )
+    None -> if env_has_effect(st.env, asym) {
+      Some(synth_op_call_unknown_op(st, asym, real_op, line, col))
+    } else {
+      None
+    }
+  }
+}
+
+# `recv.f(args)` calls the function-typed field `f`; a resolved receiver without that field has no such method.
+#[doc("Shared with the sibling modules of the same pass.")]
+pub(pkg) fn try_method_call(
+  st: InferState,
+  callee: Expr,
+  args_: [Expr],
+  line: Int,
+  col: Int
+) : Option[Inferred] / Console + File + Mutable {
+  match callee.kind {
+    EField(obj, ident) -> {
+      let r = w_synth(st, obj)
+      let obj_ty = apply_ty(r.st.sub, r.ty)
+      if record_has_field(r.st, obj_ty, ident) or ty_unsettled(obj_ty) {
+        None
+      } else {
+        Some(method_call_error(r.st, ident, r.expr, args_, line, col))
+      }
+    }
+    _ -> None
+  }
+}
+
+# `@r` and `r := v` read and write a `Ref`: the target's type decides, and
+# `Mutable` carries the `ref_get` / `ref_set` ops. A target whose type is
+# not yet known is unified with `Ref[t]` by the op's own signature.
+#[doc("Shared with the sibling modules of the same pass.")]
+pub(pkg) fn synth_ref_op(
+  st: InferState,
+  target: Expr,
+  op: String,
+  rest: [Expr],
+  what: String,
+  line: Int,
+  col: Int
+) : Inferred / Console + File + Mutable {
+  let r = w_synth(st, target)
+  let ty = apply_ty(r.st.sub, r.ty)
+  if ty_unsettled(ty) or ty_is_ref(ty) {
+    let ms = core_effect_id(CeMutable)
+    match env_op(st.env, ms, written(op)) {
+      Some(sc) -> synth_op_call_with_scheme(st, sc, [target, ...rest], ms, op, line, col)
+      None -> mk_inferred(r.st, TyAny, with_ty(mk_expr(ECall(target, rest), line, col), TyAny))
+    }
+  } else {
+    let perr = mk_diag(
+      SevError,
+      st.file,
+      line,
+      col,
+      "#{what} a `Ref`, found `#{inf_ty_to_string(st.env.tab, ty)}`",
+      []
+    )
+    mk_inferred(
+      st_bump_err(st_push_diag(r.st, perr)),
+      TyAny,
+      with_ty(mk_expr(ECall(target, rest), line, col), TyAny)
+    )
+  }
+}
+
+fn ty_is_ref(t: Ty) : Bool = match t {
+  TyCon(tcs, _) -> core_ty_is(tcs, CtRef)
+  _ -> false
+}
+
+# Type `name.op(args)` where `name` is a capability value. Dispatch the op to the
+# effect it carries; codegen reads `name`'s evidence node. The effect does NOT
+# join the row — the capability is provided, not demanded.
+fn cap_op_call(
+  st: InferState,
+  l: LocalId,
+  op_name: String,
+  args_: [Expr],
+  line: Int,
+  col: Int
+) : Option[Inferred] / Console + File + Mutable =
+  cap_eff_of_var(st, l)
+    | (esym => match env_op(st.env, esym, written(op_name)) {
+      Some(sc) ->
+        synth_op_call_provided(
+          st_capture_label(st, l, line, col),
+          sc,
+          args_,
+          l,
+          esym,
+          op_name,
+          line,
+          col
+        )
+      None -> synth_op_call_unknown_op(st, esym, op_name, line, col)
+    })
+
+fn synth_op_call_with_scheme(
+  st: InferState,
+  sc: TyScheme,
+  args_: [Expr],
+  esym: SymId,
+  op: String,
+  line: Int,
+  col: Int
+) : Inferred / Console + File + Mutable {
+  # No alias: a direct `Eff.op(...)` call is not a `with ... as <name>`
+  # cell, so it reaches the ambient handler and its row label is the
+  # effect's own.
+  synth_op_call_with_scheme_keys(st, sc, args_, esym, op, ViaAmbient, None, line, col)
+}
+
+# An op call on a PROVIDED capability (`c.op(...)` where `c: Eff` is a value
+# parameter, §6 named instances). Types the call exactly like a normal op call —
+# instantiate, unify args against the op scheme — but does NOT add the effect to
+# the body's row: a capability passed in is satisfied by the caller, not demanded
+# by this function (design §3 "capability as a parameter does not enter the row").
+# Codegen reads the evidence from the parameter's own slot, so distinct instances
+# stay distinct by parameter position.
+fn synth_op_call_provided(
+  st: InferState,
+  sc: TyScheme,
+  args_: [Expr],
+  recv: LocalId,
+  esym: SymId,
+  op: String,
+  line: Int,
+  col: Int
+) : Inferred / Console + File + Mutable {
+  let inst = note_spawn_op(st_instantiate_report(st, sc), esym, line, col)
+  let ra = synth_many_expecting(inst.st, args_, fn_param_tys(inst.st, inst.ty))
+  let rv = st_fresh_ty(ra.st)
+  let expected = fn_ty(ra.tys, rv.ty)
+  let st2 =
+    st_unify_callee(rv.st, inst.ty, expected, op_what(st, "cap op call ", esym, op), line, col)
+  let ty = apply_ty(st2.sub, rv.ty)
+  # The callee goes through the receiver, so codegen reads `recv`'s own
+  # evidence slot rather than walking by effect — distinct capability params
+  # resolve to distinct nodes. No row label: the capability is provided, not
+  # demanded.
+  let root =
+    with_ty(mk_expr(ECall(op_callee(esym, op, ViaRecv(recv), line, col), ra.exprs), line, col), ty)
+  mk_inferred(st2, ty, root)
+}
+
+fn synth_op_call_with_scheme_keys(
+  st: InferState,
+  sc: TyScheme,
+  args_: [Expr],
+  esym: SymId,
+  op: String,
+  via: OpVia,
+  row_alias: Option[LocalId],
+  line: Int,
+  col: Int
+) : Inferred / Console + File + Mutable {
+  # capture the fresh ids minted by instantiation. For
+  # parametric effects (where the scheme quantifies over the effect's
+  # tparams) these fresh tyvars are the row label's ty_args. For
+  # stateless effects the list is empty and the label has none.
+  # per-op generic schemes also quantify over op-level
+  # tparams; those are NOT part of the row label's ty_args. Use the
+  # `op_eff_arities` table to take only the first N fresh ids
+  # (corresponding to the effect's tparams) for the row.
+  # `via` routes the perform through the handle's own instance; the
+  # type-level lookups (op_eff_arities, row label) read the effect.
+  let inst = note_spawn_op(st_instantiate_report(st, sc), esym, line, col)
+  let eff_fresh = take_first(inst.fresh, eff_tparam_arity(st.op_eff_arities, esym))
+  # Read before unifying: the substitution's slots mutate in place.
+  let pinned = map(eff_fresh, id => occurs(id, inst.ty, inst.st.sub))
+  let ra = synth_many_expecting(inst.st, args_, fn_param_tys(inst.st, inst.ty))
+  let rv = st_fresh_ty(ra.st)
+  let op_row = match inst.ty {
+    TyFnT(_, _, r) -> r
+    _ -> inf_row_empty()
+  }
+  let expected = TyFnT(ra.tys, rv.ty, op_row)
+  let st2u0 =
+    st_unify_callee(rv.st, inst.ty, expected, op_what(st, "op call ", esym, op), line, col)
+  let st2 = st_add_row_tail(st2u0, op_row.tail, line, col)
+  let row_args = phantom_eff_args(eff_fresh, pinned, st2.sub)
+  # tag the row label with the cell so two distinct
+  # `with <eff> as <name>` cells stay distinct labels. The cell is
+  # discharged symmetrically by its own handler.
+  let cell = alias_cell(row_alias)
+  let lab = label_in_cell(esym, row_args, cell)
+  # stash the effect + live payload tyvar ids before
+  # `st_add_label`, whose dedup may drop this label against a sibling op's
+  # concrete label of the same effect. The deferred-field drain reads it
+  # to pin a receiver the dropped label was the only carrier for, under
+  # the final sub so the `match` binder's receiver-to-payload link shows.
+  let st2p = st_push_op_payload_vars(st2, esym, cell, eff_fresh)
+  # The cell keeps distinct cells apart, so this only
+  # threads ty_args between ops of the same cell (`cur.set` → `cur.get`).
+  let st2u = st_unify_dedup_label(st2p, lab, line, col)
+  let st3 = st_add_label(st2u, lab, line, col)
+  let ty = apply_ty(st3.sub, rv.ty)
+  # The callee carries the instance the perform resolved to, for evidence selection.
+  let callee = with_ty(op_callee(esym, op, via, line, col), TyCon(esym, row_args))
+  let root = with_ty(mk_expr(ECall(callee, ra.exprs), line, col), ty)
+  mk_inferred(st3, ty, root)
+}
