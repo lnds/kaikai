@@ -222,6 +222,15 @@ static KaiValue *kai_core_ref_get(KaiValue *r) {
     return v;
 }
 
+/* The value leaves with the cell's own reference; the cell holds unit
+ * until the store the compiler pairs this read with. */
+static KaiValue *kai_core_ref_take(KaiValue *r) {
+    KaiValue *v = r->as.ref.cell;
+    r->as.ref.cell = kai_unit();
+    kai_decref(r);
+    return v;
+}
+
 static KaiValue *kai_core_ref_set(KaiValue *r, KaiValue *v) {
     /* Drop the old contents, steal `v` into the cell; consume `r`.
      * Surface contract is Unit-typed. No bounds check, no index. */
@@ -233,6 +242,10 @@ static KaiValue *kai_core_ref_set(KaiValue *r, KaiValue *v) {
         kai_decref(v);
     }
     return kai_unit();
+}
+
+static KaiValue *kai_core_ref_store(KaiValue *r, KaiValue *v) {
+    return kai_core_ref_set(r, v);
 }
 
 /* ---------- core: lists ---------- */

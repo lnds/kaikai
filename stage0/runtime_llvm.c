@@ -551,6 +551,8 @@ KAIX_CORE_THUNK2(array_same)
 KAIX_CORE_THUNK2(array_get)
 KAIX_CORE_THUNK2(array_get_borrow)
 KAIX_CORE_THUNK2(array_take)
+KAIX_CORE_THUNK1(ref_take)
+KAIX_CORE_THUNK2(ref_store)
 KAIX_CORE_THUNK3(array_set)
 KAIX_CORE_THUNK3(array_grow)
 KAIX_CORE_THUNK2(vec_make)
@@ -1495,6 +1497,8 @@ KaiValue *kaix_core_int128_to_int(KaiValue *v)     { return kai_core_int128_to_i
 KaiValue *kaix_core_ref_make(KaiValue *init)                          { return kai_core_ref_make(init); }
 KaiValue *kaix_core_ref_get(KaiValue *r)                              { return kai_core_ref_get(r); }
 KaiValue *kaix_core_ref_set(KaiValue *r, KaiValue *v)                 { return kai_core_ref_set(r, v); }
+KaiValue *kaix_core_ref_take(KaiValue *r)                             { return kai_core_ref_take(r); }
+KaiValue *kaix_core_ref_store(KaiValue *r, KaiValue *v)               { return kai_core_ref_store(r, v); }
 KaiValue *kaix_core_defer(KaiValue *thunk)                            { return kai_seq_defer(thunk); }
 KaiValue *kaix_core_force(KaiValue *s)                                { return kai_seq_force(s); }
 KaiValue *kaix_core_filter_cell(KaiValue *s, KaiValue *p)             { return kai_seq_filter(s, p); }

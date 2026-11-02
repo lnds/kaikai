@@ -171,6 +171,11 @@ fn main() : Unit / Stdout = {
   stays in place, whether it starts from a literal, a `let`-bound
   vector or a qualified call (`var v := vec.make(n, 0)`).
   `KAI_TRACE_RC=1` prints the `vec_inplace` / `vec_cow` counts of a run.
+- A `Ref[Vec[t]]` written from its own read (`r := vec.set(@r, i, x)`)
+  stays in place when nothing evaluated after `@r` performs an effect:
+  no later `@q`, no call whose row has effects, no closure over the
+  cell passed in. A second `@r` in the arguments, or one after the
+  write, copies.
 - A vector stays in place however it reaches the write, as long as
   nothing else holds it: bound from a constructor field
   (`Box(v, n) -> Box(vec_set(v, i, x), n + 1)`), a record pattern
