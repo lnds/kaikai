@@ -449,12 +449,11 @@ Rules that follow from the desugar:
 
 ### Effect-row impact
 
-Because the implicit `handle` closes `State[t]` in the same
-block, the enclosing function's effect row **does not** gain
-`State[t]`. A `var counter := 0` inside a function of signature
+Because the `var` is a cell local to its block, the enclosing
+function's effect row **does not** gain `State[t]` or `Mutable`. A `var counter := 0` inside a function of signature
 `: Int / Console` leaves the signature untouched.
 
-`var` encapsulates `State[t]` and nothing else. Any other
+`var` encapsulates its cell and nothing else. Any other
 effect the body uses — `Console.print(counter)`,
 `File.write_file(...)`, `Spawn.yield()` — still appears in the
 enclosing function's row, same as without the `var`. The sugar
@@ -1457,7 +1456,7 @@ fn main() : Unit / Stdout + Mutable = {
 
 Parsing this unambiguously walks:
 
-- `var counter := 0` — statement, declares a `State[Int]` cell.
+- `var counter := 0` — statement, declares an `Int` cell.
 - `each(events) { e -> ... }` — call with trailing lambda.
   Inside the lambda, `counter` and `buffer` are in scope.
 - `counter < max` — `counter` is an ordinary `Ident` the checker

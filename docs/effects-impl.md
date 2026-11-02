@@ -963,8 +963,7 @@ transformations are hard-coded and tested.
 
 ### Why split
 
-Pre-resolve sugars produce stdlib names (`Mutable.array_get`,
-`State[t]` for `var`'s implicit handler) that resolve must look
+Pre-resolve sugars produce stdlib names (`Mutable.array_get`, …) that resolve must look
 up uniformly with hand-written calls — so they have to run
 *before* resolve. Capability sugars are the opposite: a naked
 read `cap` cannot rewrite without knowing whether `cap` denotes
@@ -983,11 +982,10 @@ handler invocations. The mechanism:
 
 All three must hold:
 
-1. The `var` binding desugars to a canonical `State[t]` handler
-   (the one the desugar pass emits — user-written handlers do
-   not trigger specialisation).
-2. The captured `state` does not escape into a closure that
-   outlives the `handle`'s body.
+1. The `var` binding is the sugar's own cell (user-written
+   handlers do not trigger specialisation).
+2. The cell does not escape into a closure. A captured `var`
+   keeps a `Ref` cell instead of a slot.
 3. The initial value is a normal expression (not itself the
    result of another op call that could fail).
 
