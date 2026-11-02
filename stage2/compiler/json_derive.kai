@@ -315,48 +315,69 @@ fn jd_tower(
   slot: Int,
   line: Int,
   col: Int
-) : Expr = match jfs {
-  [] -> jd_call("Ok", [jd_record(d, list_reverse(bound), line, col)], line, col)
+) : Expr {
+  let (steps, bound_end) = jd_tower_steps(jfs, bound, slot, [])
+  let ok = jd_call("Ok", [jd_record(d, list_reverse(bound_end), line, col)], line, col)
+  foldl(steps, ok, (tail, st) => jd_tower_step(d, st, tail, line, col))
+}
+
+fn jd_tower_steps(
+  jfs: [JsonField],
+  bound: [String],
+  slot: Int,
+  acc: [(JsonField, Int)]
+) : ([(JsonField, Int)], [String]) = match jfs {
+  [] -> (acc, bound)
   [f, ...rest] -> match f {
-    JF(name, wire, shape, dflt, skip) ->
-      if skip {
-        # No wire value: reconstruct from the default, or `None` for an
-        # `Option`. `let name = <value>` then continue the tower.
-        let value = jd_skip_value(shape, dflt, line, col)
-        let tail = jd_tower(d, rest, [name, ...bound], slot, line, col)
-        jd_expr(
-          EBlock([SLet(jd_bind(jd_field_var(name), line, col), None, value)], Some(tail)),
-          line,
-          col
-        )
-      } else {
-        let node = jd_lib(
-          "json_bind_field",
-          [jd_var("v", line, col), jd_str(wire, line, col)],
-          line,
-          col
-        )
-        let sub = jd_lib(
-          "json_path_field",
-          [jd_var("path", line, col), jd_str(wire, line, col)],
-          line,
-          col
-        )
-        # A `#[json(default)]` field substitutes the default when the key
-        # is absent (`JNull`); an absent field with no default still errors
-        # in the leaf reader, preserving #1280's required-field policy.
-        let next = slot + jd_dec_lams(shape)
-        let tail = jd_tower(d, rest, [name, ...bound], next, line, col)
-        let ok_arm =
-          Arm(jd_ctor_pat("Ok", [jd_bind(jd_field_var(name), line, col)], line, col), None, tail)
-        let read = match dflt {
-          None -> jd_decode(d, shape, node, sub, slot, line, col)
-          Some(dv) -> jd_default_read(d, shape, node, sub, dv, slot, line, col)
-        }
-        jd_expr(EMatch(read, [ok_arm, jd_err_arm(line, col)]), line, col)
-      }
+    JF(name, _, shape, _, skip) ->
+      jd_tower_steps(
+        rest,
+        [name, ...bound],
+        if skip { slot } else { slot + jd_dec_lams(shape) },
+        [(f, slot), ...acc]
+      )
   }
 }
+
+fn jd_tower_step(d: DeriveFor, st: (JsonField, Int), tail: Expr, line: Int, col: Int) : Expr =
+  match st {
+    (f, slot) -> match f {
+      JF(name, wire, shape, dflt, skip) ->
+        if skip {
+          # No wire value: reconstruct from the default, or `None` for an
+          # `Option`. `let name = <value>` then continue the tower.
+          let value = jd_skip_value(shape, dflt, line, col)
+          jd_expr(
+            EBlock([SLet(jd_bind(jd_field_var(name), line, col), None, value)], Some(tail)),
+            line,
+            col
+          )
+        } else {
+          let node = jd_lib(
+            "json_bind_field",
+            [jd_var("v", line, col), jd_str(wire, line, col)],
+            line,
+            col
+          )
+          let sub = jd_lib(
+            "json_path_field",
+            [jd_var("path", line, col), jd_str(wire, line, col)],
+            line,
+            col
+          )
+          # A `#[json(default)]` field substitutes the default when the key
+          # is absent (`JNull`); an absent field with no default still errors
+          # in the leaf reader, preserving the required-field policy.
+          let ok_arm =
+            Arm(jd_ctor_pat("Ok", [jd_bind(jd_field_var(name), line, col)], line, col), None, tail)
+          let read = match dflt {
+            None -> jd_decode(d, shape, node, sub, slot, line, col)
+            Some(dv) -> jd_default_read(d, shape, node, sub, dv, slot, line, col)
+          }
+          jd_expr(EMatch(read, [ok_arm, jd_err_arm(line, col)]), line, col)
+        }
+    }
+  }
 
 # The value a `#[json(skip)]` field takes on decode: its `#[json(default)]`
 # expression, or `None` when it has none (the validator guarantees a bare
@@ -827,12 +848,13 @@ fn jd_count_shapes(shapes: [JsonShape], acc: Int) : Int = match shapes {
 }
 
 # `"A, B, C"` — the variant names for the unknown-tag error's expected set.
-fn jd_variant_names(d: DeriveFor, variants: [Variant]) : String = match variants {
-  [] -> ""
-  [v, ...rest] -> match v {
-    Var(ctor, _, _, _) -> match rest {
-      [] -> jd_ctor_name(d, ctor)
-      _ -> concat_all([jd_ctor_name(d, ctor), ", ", jd_variant_names(d, rest)])
-    }
-  }
-}
+fn jd_variant_names(d: DeriveFor, variants: [Variant]) : String =
+  join_with(
+    map(
+      variants,
+      v => match v {
+        Var(ctor, _, _, _) -> jd_ctor_name(d, ctor)
+      }
+    ),
+    ", "
+  )

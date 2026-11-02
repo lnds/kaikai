@@ -35,15 +35,13 @@ pub(pkg) fn cache_serialize_tcmodule(m: TypecheckedModule, key_sha: String) : Ar
 
 #[doc("Deserialise a KAB2 typed-module blob; `None` on any header or payload mismatch, which the caller treats as a miss.")]
 pub(pkg) fn cache_deserialize_tcmodule(buf: Array[Byte]) : Option[TypecheckedModule] =
-  match cache_read_header(buf) {
-    None -> None
-    Some(hdr) -> match hdr {
+  cache_read_header(buf)
+    || (hdr => match hdr {
       CHdr(_, pos) -> match typecheckedmodule_from_bytes(buf, pos) {
         Ok(c) -> if c.pos == array_length(buf) { Some(c.value) } else { None }
         Err(_) -> None
       }
-    }
-  }
+    })
 
 #[doc("Content hash of one module's decl stream — the `source changed` term of the typed-module key. Taken over the serialized decls rather than the source text, so a formatting-only edit that parses identically still hits.")]
 pub(pkg) fn tm_decls_hex(ds: [Decl]) : String =
@@ -185,7 +183,7 @@ fn canon_ty(t: Ty, vr: VarRemap) : CanonTy = match t {
     CT(ci, vr2) -> CT(TyListT(ci), vr2)
   }
   TyFnT(as_, ret, row) -> canon_ty_fn(as_, ret, row, vr)
-  TyCon(s, targs) -> match canon_ty_list(map(targs, a => a), vr) {
+  TyCon(s, targs) -> match canon_ty_list(map(targs, a => a), vr, []) {
     CTL(cargs, vr2) -> CT(TyCon(s, cargs), vr2)
   }
   TyDimT(inner, u) -> match canon_ty(inner, vr) {
@@ -194,7 +192,7 @@ fn canon_ty(t: Ty, vr: VarRemap) : CanonTy = match t {
   TyRefineT(base, pred, al) -> match canon_ty(base, vr) {
     CT(cb, vr2) -> CT(TyRefineT(cb, pred, al), vr2)
   }
-  TyUnion(cs) -> match canon_ty_list(map(cs, a => a), vr) {
+  TyUnion(cs) -> match canon_ty_list(map(cs, a => a), vr, []) {
     CTL(ccs, vr2) -> CT(TyUnion(ccs), vr2)
   }
   TyShapeApp(id, arg) -> canon_ty_shape(id, arg, vr)
@@ -210,7 +208,7 @@ fn canon_ty_fn(as_: [Ty], ret: Ty, row: Row, vr: VarRemap) : CanonTy {
     tail: row.tail,
     display_alias: row.display_alias
   }
-  match canon_ty_list(map(as_, a => a), vr) {
+  match canon_ty_list(map(as_, a => a), vr, []) {
     CTL(cas, vr2) -> canon_ty_fn_ret(cas, ret, row2, vr2)
   }
 }
@@ -232,19 +230,17 @@ fn canon_ty_shape(id: Int, arg: Ty, vr: VarRemap) : CanonTy =
     }
   }
 
-fn canon_ty_list(xs: [Ty], vr: VarRemap) : CanonTyL = match xs {
-  [] -> CTL([], vr)
+fn canon_ty_list(xs: [Ty], vr: VarRemap, acc: [Ty]) : CanonTyL = match xs {
+  [] -> CTL(list_reverse(acc), vr)
   [h, ...t] -> match canon_ty(h, vr) {
-    CT(ch, vr2) -> match canon_ty_list(t, vr2) {
-      CTL(ct, vr3) -> CTL([ch, ...ct], vr3)
-    }
+    CT(ch, vr2) -> canon_ty_list(t, vr2, [ch, ...acc])
   }
 }
 
 type CanonRow = CRw(Row, VarRemap)
 
 fn canon_row(r: Row, vr: VarRemap) : CanonRow {
-  let cl = canon_label_list(r.labels, vr)
+  let cl = canon_label_list(r.labels, vr, [])
   match cl {
     CLL(clabels, vr2) ->
       match r.tail {
@@ -258,12 +254,10 @@ fn canon_row(r: Row, vr: VarRemap) : CanonRow {
 
 type CanonLabelL = CLL([Label], VarRemap)
 
-fn canon_label_list(ls: [Label], vr: VarRemap) : CanonLabelL = match ls {
-  [] -> CLL([], vr)
-  [l, ...rest] -> match canon_ty_list(map(l.ty_args, a => a), vr) {
-    CTL(cargs, vr2) -> match canon_label_list(rest, vr2) {
-      CLL(crest, vr3) -> CLL([Label { ...l, ty_args: cargs }, ...crest], vr3)
-    }
+fn canon_label_list(ls: [Label], vr: VarRemap, acc: [Label]) : CanonLabelL = match ls {
+  [] -> CLL(list_reverse(acc), vr)
+  [l, ...rest] -> match canon_ty_list(map(l.ty_args, a => a), vr, []) {
+    CTL(cargs, vr2) -> canon_label_list(rest, vr2, [Label { ...l, ty_args: cargs }, ...acc])
   }
 }
 
@@ -322,12 +316,12 @@ fn canon_scheme_body(
 
 type CanonIntL = CIL([Int], VarRemap)
 
-fn canon_int_list(xs: [Int], vr: VarRemap) : CanonIntL = match xs {
-  [] -> CIL([], vr)
+fn canon_int_list(xs: [Int], vr: VarRemap) : CanonIntL = canon_int_list_acc(xs, vr, [])
+
+fn canon_int_list_acc(xs: [Int], vr: VarRemap, acc: [Int]) : CanonIntL = match xs {
+  [] -> CIL(list_reverse(acc), vr)
   [h, ...t] -> match vr_index(vr, h) {
-    CV(ci, vr2) -> match canon_int_list(t, vr2) {
-      CIL(ct, vr3) -> CIL([ci, ...ct], vr3)
-    }
+    CV(ci, vr2) -> canon_int_list_acc(t, vr2, [ci, ...acc])
   }
 }
 
@@ -468,7 +462,7 @@ fn canon_unioninfo(u: UnionInfo) : UnionInfo = match u {
     # Copy the variant's list slot before threading it through a
     # `match`-driven walk (stage1 bootstrap slot-corruption idiom).
     let tys2 = map(tys, ty => ty)
-    match canon_ty_list(tys2, vr_empty()) {
+    match canon_ty_list(tys2, vr_empty(), []) {
       CTL(ctys, _) -> UI(nm, ctys, l, c)
     }
   }

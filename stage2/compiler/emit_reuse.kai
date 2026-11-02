@@ -91,20 +91,28 @@ pub fn cons_untaken_drops(head_taken: Bool, rest_taken: Bool) : String =
 
 #[doc("Release, before the overwrite, each flat pointer slot of a variant the rebuild does not take.")]
 pub fn rv_untaken_slot_drops(subs: [Pattern], ks: [Int], i: Int, taken: [LocalId]) : String =
-  match subs {
-    [] -> ""
-    [sp, ...rest] -> match ks {
-      [] -> ""
-      [k, ...krest] -> {
-        let here = if k == 0 and rv_untaken(sp, taken) {
-          concat_all(["kai_decref(kai_var_slots(_scr)[", int_to_string(i), "].ptr); "])
-        } else {
-          ""
-        }
-        cat2(here, rv_untaken_slot_drops(rest, krest, i + 1, taken))
+  rv_untaken_drops_acc(subs, ks, i, taken, [])
+
+fn rv_untaken_drops_acc(
+  subs: [Pattern],
+  ks: [Int],
+  i: Int,
+  taken: [LocalId],
+  acc: [String]
+) : String = match subs {
+  [] -> concat_all(list_reverse(acc))
+  [sp, ...rest] -> match ks {
+    [] -> concat_all(list_reverse(acc))
+    [k, ...krest] -> {
+      let here = if k == 0 and rv_untaken(sp, taken) {
+        concat_all(["kai_decref(kai_var_slots(_scr)[", int_to_string(i), "].ptr); "])
+      } else {
+        ""
       }
+      rv_untaken_drops_acc(rest, krest, i + 1, taken, [here, ...acc])
     }
   }
+}
 
 fn rv_untaken(sp: Pattern, taken: [LocalId]) : Bool = match sp.pkind {
   PWild -> true
@@ -198,20 +206,20 @@ pub fn rv_fresh_from_temps(
     "}); "
   ])
 
-fn rv_temp_slots(ks: [Int], i: Int) : String = match ks {
-  [] -> ""
-  [k, ...rest] -> {
-    concat_all([
-      if i == 0 { "" } else { ", " },
-      "{",
-      rv_slot_field(k),
-      " = _rv",
-      int_to_string(i),
-      "}",
-      rv_temp_slots(rest, i + 1)
-    ])
-  }
-}
+fn rv_temp_slots(ks: [Int], i: Int) : String =
+  concat_all(
+    map_indexed(
+      ks,
+      (j, k) => concat_all([
+        if i + j == 0 { "" } else { ", " },
+        "{",
+        rv_slot_field(k),
+        " = _rv",
+        int_to_string(i + j),
+        "}"
+      ])
+    )
+  )
 
 #[doc("The `KaiVarSlot` member a slot of kind `k` lives in.")]
 pub fn rv_slot_field(k: Int) : String =
@@ -265,7 +273,7 @@ fn rv_donor_slot(i: Int) : String = concat_all(["kai_var_slots(_scr)[", int_to_s
 pub fn rv_cell_binds(ns: LocalNames, sp: Pattern, cell: String, ctors: CtorIx) : String =
   match sp.pkind {
     PVariant(r, isubs) ->
-      rv_cell_binds_loop(ns, isubs, reuse_ctor_kinds(ctors, r, isubs), cell, 0, ctors)
+      rv_cell_binds_loop(ns, isubs, reuse_ctor_kinds(ctors, r, isubs), cell, 0, ctors, [])
     _ -> ""
   }
 
@@ -275,9 +283,10 @@ fn rv_cell_binds_loop(
   ks: [Int],
   cell: String,
   j: Int,
-  ctors: CtorIx
+  ctors: CtorIx,
+  acc: [String]
 ) : String = match isubs {
-  [] -> ""
+  [] -> concat_all(list_reverse(acc))
   [sp, ...rest] -> {
     let k = kind_at(ks, j)
     let slot = rv_cell_slot(cell, j)
@@ -285,7 +294,7 @@ fn rv_cell_binds_loop(
       PBind(b) -> rv_bind(ln_emitted(ns, b.id), k, slot)
       _ -> if reuse_is_cell(sp, k) { rv_cell_binds(ns, sp, cat2(slot, ".ptr"), ctors) } else { "" }
     }
-    cat2(here, rv_cell_binds_loop(ns, rest, ks, cell, j + 1, ctors))
+    rv_cell_binds_loop(ns, rest, ks, cell, j + 1, ctors, [here, ...acc])
   }
 }
 
@@ -413,10 +422,7 @@ fn rd_scan_capable_kind(k: ExprKind) : Bool = match k {
   _ -> false
 }
 
-fn rd_stmts_capable(ss: [Stmt]) : Bool = match ss {
-  [] -> false
-  [s, ...rest] -> rd_stmt_capable(s) or rd_stmts_capable(rest)
-}
+fn rd_stmts_capable(ss: [Stmt]) : Bool = any(ss, rd_stmt_capable)
 
 fn rd_stmt_capable(s: Stmt) : Bool = match s {
   SLet(_, _, e) -> rd_body_is_capable(e)
@@ -428,14 +434,10 @@ fn rd_stmt_capable(s: Stmt) : Bool = match s {
 # An arm rebuilds a variant when its body constructs a data constructor
 # (uppercase head) that embeds a nested constructor — the rotation shape
 # the reuse-variant path lowers with a fresh third cell.
-fn rd_arms_have_variant_rebuild(arms: [Arm]) : Bool = match arms {
-  [] -> false
-  [a, ...rest] -> match a {
-    Arm(pat, _, body) -> {
-      let here = rd_pat_deconstructs_variant(pat) and rd_expr_builds_nested_ctor(body)
-      here or rd_arms_have_variant_rebuild(rest)
-    }
-  }
+fn rd_arms_have_variant_rebuild(arms: [Arm]) : Bool = any(arms, rd_arm_variant_rebuild)
+
+fn rd_arm_variant_rebuild(a: Arm) : Bool = match a {
+  Arm(pat, _, body) -> rd_pat_deconstructs_variant(pat) and rd_expr_builds_nested_ctor(body)
 }
 
 # A donation-capable arm has the ROTATION shape: it deconstructs an INNER
@@ -451,13 +453,14 @@ fn rd_pat_deconstructs_variant(p: Pattern) : Bool = match p.pkind {
   _ -> false
 }
 
-fn rd_any_sub_is_nested_variant(subs: [Pattern]) : Bool = match subs {
-  [] -> false
-  [s, ...rest] -> match s.pkind {
-    PVariant(_, isubs) -> list_length(isubs) > 0 or rd_any_sub_is_nested_variant(rest)
-    _ -> rd_any_sub_is_nested_variant(rest)
-  }
-}
+fn rd_any_sub_is_nested_variant(subs: [Pattern]) : Bool =
+  any(
+    subs,
+    s => match s.pkind {
+      PVariant(_, isubs) -> list_length(isubs) > 0
+      _ -> false
+    }
+  )
 
 # The rebuild is a reuse-variant arm: Perceus rewrote the arm's tail ctor
 # `Ctor(...)` into `__perceus_reuse_variant(__pcs_scr, Ctor(...))` (the same

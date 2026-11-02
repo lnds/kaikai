@@ -44,16 +44,23 @@ pub(pkg) fn rqc_segmented(
   tabs: ModTables,
   fx: [RqcFx],
   df: DiagFiles
+) : [Decl] / Console + File = rqc_segmented_onto(segs, decls, tabs, fx, df, [])
+
+fn rqc_segmented_onto(
+  segs: [ImportSeg],
+  decls: [Decl],
+  tabs: ModTables,
+  fx: [RqcFx],
+  df: DiagFiles,
+  chunks: [[Decl]]
 ) : [Decl] / Console + File = match segs {
   # Past the marks lie the root file's own decls, which resolve
   # through the root scope (recorded under "").
-  [] -> rqc_decls(decls, mtabs_of(tabs, "").entries, fx, df)
+  [] -> concat(list_reverse([rqc_decls(decls, mtabs_of(tabs, "").entries, fx, df), ...chunks]))
   [ISeg(home, n), ...rest] -> {
     let mt = mtabs_of(tabs, home).entries
-    list_append(
-      rqc_decls(seg_take(decls, n), mt, fx, df),
-      rqc_segmented(rest, seg_drop(decls, n), tabs, fx, df)
-    )
+    let here = rqc_decls(seg_take(decls, n), mt, fx, df)
+    rqc_segmented_onto(rest, seg_drop(decls, n), tabs, fx, df, [here, ...chunks])
   }
 }
 
@@ -64,7 +71,7 @@ pub(pkg) fn qualtype_segmented(
   tabs: ModTables,
   imps: [ModImports]
 ) : QualTyped =
-  qualtype_seg_loop(segs, decls, tab, tabs, imps, qualtype_list_homes(tab))
+  qualtype_seg_loop(segs, decls, tab, tabs, imps, qualtype_list_homes(tab), [])
 
 fn qualtype_seg_loop(
   segs: [ImportSeg],
@@ -72,19 +79,27 @@ fn qualtype_seg_loop(
   tab: SymTab,
   tabs: ModTables,
   imps: [ModImports],
-  homes: [SymId]
+  homes: [SymId],
+  done: [QualTyped]
 ) : QualTyped = match segs {
-  [] -> qualtype_decls(
-    decls,
-    tab,
-    qualtype_scoped(
+  [] -> {
+    let last = qualtype_decls(
+      decls,
       tab,
-      mtabs_of(tabs, "").entries,
-      Some(tab.root),
-      imports_of_owner(imps, ""),
-      homes
+      qualtype_scoped(
+        tab,
+        mtabs_of(tabs, "").entries,
+        Some(tab.root),
+        imports_of_owner(imps, ""),
+        homes
+      )
     )
-  )
+    let parts = list_reverse([last, ...done])
+    QualTyped {
+      decls: concat(map(parts, .decls)),
+      rows: concat(map(parts, .rows))
+    }
+  }
   [ISeg(home, n), ...rest] -> {
     let mt = qualtype_scoped(
       tab,
@@ -94,11 +109,7 @@ fn qualtype_seg_loop(
       homes
     )
     let here = qualtype_decls(seg_take(decls, n), tab, mt)
-    let more = qualtype_seg_loop(rest, seg_drop(decls, n), tab, tabs, imps, homes)
-    QualTyped {
-      decls: list_append(here.decls, more.decls),
-      rows: list_append(here.rows, more.rows)
-    }
+    qualtype_seg_loop(rest, seg_drop(decls, n), tab, tabs, imps, homes, [here, ...done])
   }
 }
 
@@ -110,24 +121,18 @@ fn imports_of_owner(imps: [ModImports], owner: String) : [String] = match imps {
 # Only `EMatch` arms and `EBlock` lets carry patterns after lowering;
 # every other position descends through `xp_positions`.
 #[doc("One diagnostic per qualified variant pattern whose module is not imported or does not export the constructor.")]
-pub(pkg) fn pqchk_decls(ds: [Decl], mt: [ModuleEntry], df: DiagFiles) : [Diagnostic] = match ds {
-  [] -> []
-  [d, ...rest] -> {
-    let cx = PqCx { d: d, mt: mt, df: df }
-    list_append(
-      list_append(pqchk_exprs(decl_preds(d), cx), pqchk_exprs(decl_exprs(d), cx)),
-      pqchk_decls(rest, mt, df)
-    )
-  }
+pub(pkg) fn pqchk_decls(ds: [Decl], mt: [ModuleEntry], df: DiagFiles) : [Diagnostic] =
+  flat_map(ds, d => pqchk_decl(d, mt, df))
+
+fn pqchk_decl(d: Decl, mt: [ModuleEntry], df: DiagFiles) : [Diagnostic] {
+  let cx = PqCx { d: d, mt: mt, df: df }
+  list_append(pqchk_exprs(decl_preds(d), cx), pqchk_exprs(decl_exprs(d), cx))
 }
 
 # The diagnostic file is read off the decl only when a diagnostic is made.
 type PqCx = { d: Decl, mt: [ModuleEntry], df: DiagFiles }
 
-fn pqchk_exprs(es: [Expr], cx: PqCx) : [Diagnostic] = match es {
-  [] -> []
-  [e, ...rest] -> list_append(pqchk_expr(e, cx), pqchk_exprs(rest, cx))
-}
+fn pqchk_exprs(es: [Expr], cx: PqCx) : [Diagnostic] = flat_map(es, e => pqchk_expr(e, cx))
 
 fn pqchk_expr(e: Expr, cx: PqCx) : [Diagnostic] {
   let own = match e.kind {
@@ -140,21 +145,30 @@ fn pqchk_expr(e: Expr, cx: PqCx) : [Diagnostic] {
   list_append(own, pqchk_positions(xp_positions(e), cx))
 }
 
-fn pqchk_positions(ps: [XPos], cx: PqCx) : [Diagnostic] = match ps {
-  [] -> []
-  [XP(_, e), ...rest] -> list_append(pqchk_expr(e, cx), pqchk_positions(rest, cx))
-}
+fn pqchk_positions(ps: [XPos], cx: PqCx) : [Diagnostic] =
+  flat_map(
+    ps,
+    p => match p {
+      XP(_, e) -> pqchk_expr(e, cx)
+    }
+  )
 
-fn pqchk_arms(arms: [Arm], cx: PqCx) : [Diagnostic] = match arms {
-  [] -> []
-  [Arm(pat, _, _), ...rest] -> list_append(pqchk_pat(pat, cx), pqchk_arms(rest, cx))
-}
+fn pqchk_arms(arms: [Arm], cx: PqCx) : [Diagnostic] =
+  flat_map(
+    arms,
+    a => match a {
+      Arm(pat, _, _) -> pqchk_pat(pat, cx)
+    }
+  )
 
-fn pqchk_stmts(stmts: [Stmt], cx: PqCx) : [Diagnostic] = match stmts {
-  [] -> []
-  [SLet(pat, _, _), ...rest] -> list_append(pqchk_pat(pat, cx), pqchk_stmts(rest, cx))
-  [_, ...rest] -> pqchk_stmts(rest, cx)
-}
+fn pqchk_stmts(stmts: [Stmt], cx: PqCx) : [Diagnostic] =
+  flat_map(
+    stmts,
+    s => match s {
+      SLet(pat, _, _) -> pqchk_pat(pat, cx)
+      _ -> []
+    }
+  )
 
 fn pqchk_pat(pat: Pattern, cx: PqCx) : [Diagnostic] = match pat.pkind {
   PVariant(r, subs) -> list_append(pqchk_ref(r, cx, pat), pqchk_pats(subs, cx))
@@ -208,15 +222,15 @@ fn pqchk_qualifier(q: String, ctor: String, cx: PqCx, pat: Pattern) : [Diagnosti
     }
   }
 
-fn pqchk_pats(ps: [Pattern], cx: PqCx) : [Diagnostic] = match ps {
-  [] -> []
-  [p, ...rest] -> list_append(pqchk_pat(p, cx), pqchk_pats(rest, cx))
-}
+fn pqchk_pats(ps: [Pattern], cx: PqCx) : [Diagnostic] = flat_map(ps, p => pqchk_pat(p, cx))
 
-fn pqchk_pfields(fs: [PField], cx: PqCx) : [Diagnostic] = match fs {
-  [] -> []
-  [PField(_, sub, _), ...rest] -> list_append(pqchk_pat(sub, cx), pqchk_pfields(rest, cx))
-}
+fn pqchk_pfields(fs: [PField], cx: PqCx) : [Diagnostic] =
+  flat_map(
+    fs,
+    f => match f {
+      PField(_, sub, _) -> pqchk_pat(sub, cx)
+    }
+  )
 
 #[doc("`pqchk_decls` over an import-segmented stream, each segment against its own module table.")]
 pub(pkg) fn pqchk_segmented(
@@ -224,14 +238,22 @@ pub(pkg) fn pqchk_segmented(
   decls: [Decl],
   tabs: ModTables,
   df: DiagFiles
+) : [Diagnostic] = pqchk_segs(segs, decls, tabs, df, [])
+
+fn pqchk_segs(
+  segs: [ImportSeg],
+  decls: [Decl],
+  tabs: ModTables,
+  df: DiagFiles,
+  chunks: [[Diagnostic]]
 ) : [Diagnostic] = match segs {
-  [] -> pqchk_decls(decls, mtabs_of(tabs, "").entries, df)
+  [] -> concat(list_reverse([pqchk_decls(decls, mtabs_of(tabs, "").entries, df), ...chunks]))
   [ISeg(home, n), ...rest] -> {
     let mt = mtabs_of(tabs, home).entries
-    list_append(
+    pqchk_segs(rest, seg_drop(decls, n), tabs, df, [
       pqchk_decls(seg_take(decls, n), mt, df),
-      pqchk_segmented(rest, seg_drop(decls, n), tabs, df)
-    )
+      ...chunks
+    ])
   }
 }
 
@@ -293,10 +315,7 @@ pub(pkg) fn rqc_decls(
   mt: [ModuleEntry],
   fx: [RqcFx],
   df: DiagFiles
-) : [Decl] / Console + File = match decls {
-  [] -> []
-  [d, ...rest] -> [rqc_decl(d, mt, fx, decl_diag_file(d, df)), ...rqc_decls(rest, mt, fx, df)]
-}
+) : [Decl] / Console + File = map(decls, d => rqc_decl(d, mt, fx, decl_diag_file(d, df)))
 
 fn rqc_decl(d: Decl, mt: [ModuleEntry], fx: [RqcFx], file: String) : Decl / Console + File =
   decl_map_inner(d, x => rqc_leaf(x, mt, fx, file))
@@ -356,31 +375,28 @@ fn rqc_effect_ops(
   mt: [ModuleEntry],
   fx: [RqcFx],
   file: String
-) : [EffectOp] / Console + File = match ops {
-  [] -> []
-  [EffOp(n, tps, ps, ret, l, c), ...rest] ->
-    [
-      EffOp(
-        n,
-        tps,
-        rqc_params(ps, [], mt, fx, file),
-        rqc_ty(ret, fn_param_names(ps), mt, fx, file),
-        l,
-        c
-      ),
-      ...rqc_effect_ops(rest, mt, fx, file)
-    ]
-}
+) : [EffectOp] / Console + File =
+  map(
+    ops,
+    op => match op {
+      EffOp(n, tps, ps, ret, l, c) ->
+        EffOp(
+          n,
+          tps,
+          rqc_params(ps, [], mt, fx, file),
+          rqc_ty(ret, fn_param_names(ps), mt, fx, file),
+          l,
+          c
+        )
+    }
+  )
 
 fn rqc_sub_decls(
   decls: [Decl],
   mt: [ModuleEntry],
   fx: [RqcFx],
   file: String
-) : [Decl] / Console + File = match decls {
-  [] -> []
-  [d, ...rest] -> [rqc_decl(d, mt, fx, file), ...rqc_sub_decls(rest, mt, fx, file)]
-}
+) : [Decl] / Console + File = map(decls, d => rqc_decl(d, mt, fx, file))
 
 fn import_hole_known_stdlib() : [String] = [
   "core", "actor", "effects", "loop", "protocols", "reader",
@@ -817,10 +833,7 @@ fn qualtype_decl(d: Decl, tab: SymTab, mt: [ModuleEntry]) : Decl = match d {
       n,
       tps,
       qualtype_params(ps, mt),
-      match ret_opt {
-        None -> None
-        Some(te) -> Some(qualtype_te(te, mt))
-      },
+      ret_opt | (te => qualtype_te(te, mt)),
       qualtype_row(row, mt),
       qualtype_expr(body, mt),
       l,
