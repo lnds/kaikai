@@ -536,28 +536,53 @@ fn derive_binser_record_decode_chain(
   pos_e: Expr,
   line: Int,
   col: Int
-) : Expr {
-  match remaining {
-    [] -> derive_binser_record_ok_value(tsym, all_fields, pos_e, line, col)
-    [fd, ...rest] -> match fd {
-      FD(_, _, ftype, _, _, _) -> {
-        let then_e = derive_binser_record_decode_chain(
-          hs,
-          tsym,
-          rest,
-          all_fields,
-          idx + 1,
-          derive_binser_field_next(ftype, idx, line, col),
-          line,
-          col
-        )
-        # One column inside the field's writer slot, so writer and
-        # decoder lambdas of one field stay distinct.
-        derive_binser_field_guard(hs, ftype, idx, pos_e, then_e, line, col + idx * 16 + 1, col)
-      }
-    }
-  }
+) : Expr = match decode_walk(map(remaining, field_decl_type), idx, pos_e, line, col, []) {
+  DecodeWalk(end_e, steps) ->
+    decode_wrap(
+      hs,
+      steps,
+      derive_binser_record_ok_value(tsym, all_fields, end_e, line, col),
+      line,
+      col
+    )
 }
+
+type DecodeStep = DecodeStep(TypeExpr, Int, Expr)
+
+# The cursor after the last field, and the steps latest first.
+type DecodeWalk = DecodeWalk(Expr, [DecodeStep])
+
+fn decode_walk(
+  types: [TypeExpr],
+  idx: Int,
+  pos_e: Expr,
+  line: Int,
+  col: Int,
+  acc: [DecodeStep]
+) : DecodeWalk = match types {
+  [] -> DecodeWalk(pos_e, acc)
+  [t, ...rest] ->
+    decode_walk(
+      rest,
+      idx + 1,
+      derive_binser_field_next(t, idx, line, col),
+      line,
+      col,
+      [DecodeStep(t, idx, pos_e), ...acc]
+    )
+}
+
+# One column inside the field's writer slot, so writer and decoder lambdas
+# of one field stay distinct.
+fn decode_wrap(hs: HeadScope, steps: [DecodeStep], last: Expr, line: Int, col: Int) : Expr =
+  foldl(
+    steps,
+    last,
+    (then_e, s) => match s {
+      DecodeStep(t, i, p) ->
+        derive_binser_field_guard(hs, t, i, p, then_e, line, col + i * 16 + 1, col)
+    }
+  )
 
 fn derive_binser_record_ok_value(
   tsym: SymId,
@@ -686,52 +711,51 @@ fn derive_binser_sum_tag_chain(
   line: Int,
   col: Int
 ) : Expr {
-  match variants {
-    [] -> mk_expr(
-      ECall(
-        binser_name("Err", line, col),
-        [
-          mk_expr(
-            EStr(
-              concat_all(
-                ["\"BinSerialize ", tname, ": invalid tag\""]
-              ),
-              false
-            ),
-            line,
-            col
-          )
-        ]
-      ),
-      line,
-      col
-    )
-    [v, ...rest] -> {
-      let cond = mk_expr(
-        EBinop(
-          BoEq,
-          mk_name("__tag", line, col),
-          mk_expr(mk_int_synth(idx), line, col)
-        ),
-        line,
-        col
-      )
-      # The variant's writer window, shifted by half so writer and
-      # decoder lambdas of one variant stay distinct.
-      let vcol = col + idx * 256 + 128
-      let then_e = derive_binser_sum_payload_decode(hs, v, start_pos, line, vcol)
-      let else_e = derive_binser_sum_tag_chain(
-        hs,
-        tname,
-        rest,
-        idx + 1,
-        start_pos,
-        line,
-        col
-      )
-      mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
+  let invalid = mk_expr(
+    ECall(
+      binser_name("Err", line, col),
+      [
+        mk_expr(
+          EStr(concat_all(["\"BinSerialize ", tname, ": invalid tag\""]), false),
+          line,
+          col
+        )
+      ]
+    ),
+    line,
+    col
+  )
+  let branches = map_indexed(variants, (i, v) => {
+    derive_binser_sum_tag_branch(hs, v, idx + i, start_pos, line, col)
+  })
+  foldr(
+    branches,
+    invalid,
+    (b, else_e) => match b {
+      TagBranch(cond, then_e) -> mk_expr(EIf(cond, then_e, Some(else_e)), line, col)
     }
-  }
+  )
+}
+
+type TagBranch = TagBranch(Expr, Expr)
+
+fn derive_binser_sum_tag_branch(
+  hs: HeadScope,
+  v: Variant,
+  idx: Int,
+  start_pos: Expr,
+  line: Int,
+  col: Int
+) : TagBranch {
+  let cond = mk_expr(
+    EBinop(BoEq, mk_name("__tag", line, col), mk_expr(mk_int_synth(idx), line, col)),
+    line,
+    col
+  )
+  # The variant's writer window, shifted by half so writer and
+  # decoder lambdas of one variant stay distinct.
+  let vcol = col + idx * 256 + 128
+  TagBranch(cond, derive_binser_sum_payload_decode(hs, v, start_pos, line, vcol))
 }
 
 # Same shape as record-decode chain, but the final `Ok` builds a
@@ -771,26 +795,16 @@ fn derive_binser_sum_decode_chain(
   pos_e: Expr,
   line: Int,
   col: Int
-) : Expr {
-  match remaining {
-    [] -> {
-      let args = derive_binser_field_values(all_vargs, 0, start_pos, line, col)
-      binser_ok_cursor(mk_expr(ECall(mk_sym(vsym, line, col), args), line, col), pos_e, line, col)
-    }
-    [vt, ...rest] -> {
-      let then_e = derive_binser_sum_decode_chain(
-        hs,
-        vsym,
-        rest,
-        all_vargs,
-        idx + 1,
-        start_pos,
-        derive_binser_field_next(vt, idx, line, col),
-        line,
-        col
-      )
-      derive_binser_field_guard(hs, vt, idx, pos_e, then_e, line, col + idx * 16 + 1, col)
-    }
+) : Expr = match decode_walk(remaining, idx, pos_e, line, col, []) {
+  DecodeWalk(end_e, steps) -> {
+    let args = derive_binser_field_values(all_vargs, 0, start_pos, line, col)
+    let ok = binser_ok_cursor(
+      mk_expr(ECall(mk_sym(vsym, line, col), args), line, col),
+      end_e,
+      line,
+      col
+    )
+    decode_wrap(hs, steps, ok, line, col)
   }
 }
 
