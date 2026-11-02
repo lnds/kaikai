@@ -176,10 +176,8 @@ fn pcs_maybe_rename_borrow_prim(callee: Expr, positions: [Int]) : Expr =
   }
 
 # The lending sibling of the builtin a callee names.
-fn pcs_lending_form(callee: Expr) : Option[CoreBuiltin] = match builtin_ref(callee) {
-  Some(b) -> builtin_lending_form(b)
-  None -> None
-}
+fn pcs_lending_form(callee: Expr) : Option[CoreBuiltin] =
+  builtin_ref(callee) || (b => builtin_lending_form(b))
 
 # A mark whose slot 0 holds a value it invokes rather than consumes.
 fn pcs_callee_borrows_slot0(callee: Expr) : Bool = match callee.kind {
@@ -295,10 +293,7 @@ fn pcs_any_arg_is_lambda(xs: [Expr]) : Bool = match xs {
 
 pub(pkg) fn pcs_name_in_expr(nm: Binder, e: Expr) : Bool = pcs_read_outside_lambda(nm, e)
 
-fn pcs_name_in_exprs(nm: Binder, xs: [Expr]) : Bool = match xs {
-  [] -> false
-  [h, ...rest] -> pcs_name_in_expr(nm, h) or pcs_name_in_exprs(nm, rest)
-}
+fn pcs_name_in_exprs(nm: Binder, xs: [Expr]) : Bool = any(xs, h => pcs_name_in_expr(nm, h))
 
 fn pcs_consuming_slots_kind(
   nm: Binder,
@@ -385,16 +380,16 @@ fn pcs_consuming_slots_ps(
   cmap: ConsumeIndex,
   bm: BorrowMap,
   tab: SymTab
-) : Bool = match ps {
-  [] -> true
-  [XP(r, c), ...rest] ->
-    (match r {
+) : Bool = all(
+  ps,
+  xp => match xp {
+    XP(r, c) -> match r {
       XLam -> false
       XMsg -> not pcs_name_in_expr(nm, c)
       _ -> pcs_uses_only_consuming_slots(nm, c, cmap, bm, tab)
-    })
-      and pcs_consuming_slots_ps(nm, rest, cmap, bm, tab)
-}
+    }
+  }
+)
 
 fn pcs_consuming_args(
   nm: Binder,
@@ -415,7 +410,11 @@ fn pcs_consuming_args(
     } else {
       pcs_uses_only_consuming_slots(nm, h, cmap, bm, tab)
     }
-    here and pcs_consuming_args(nm, rest, consumed, is_ctor, i + 1, cmap, bm, tab)
+    if here {
+      pcs_consuming_args(nm, rest, consumed, is_ctor, i + 1, cmap, bm, tab)
+    } else {
+      false
+    }
   }
 }
 
@@ -425,18 +424,17 @@ fn pcs_consuming_arms(
   cmap: ConsumeIndex,
   bm: BorrowMap,
   tab: SymTab
-) : Bool = match arms {
-  [] -> true
-  [a, ...rest] -> match a {
+) : Bool = all(
+  arms,
+  a => match a {
     Arm(_, opt_g, b) ->
       (match opt_g {
         None -> true
         Some(g) -> pcs_uses_only_consuming_slots(nm, g, cmap, bm, tab)
       })
         and pcs_uses_only_consuming_slots(nm, b, cmap, bm, tab)
-        and pcs_consuming_arms(nm, rest, cmap, bm, tab)
   }
-}
+)
 
 # The callee's consuming slots and whether it builds a constructor, as the
 # last-use move check reads them.
@@ -521,13 +519,21 @@ pub(pkg) fn pcs_user_borrow_slots(bmap: BorrowMap, callee: Expr) : [Int] = match
 }
 
 pub(pkg) fn pcs_boxed_positions(bpos: [Int], params: [Param], raw: [Binder], i: Int) : [Int] =
-  match params {
-    [] -> []
-    [p, ...rest] -> {
-      let tl = pcs_boxed_positions(bpos, rest, raw, i + 1)
-      if pcs_has_int(bpos, i) and (not pcs_has(raw, p.binder.id)) { [i, ...tl] } else { tl }
-    }
+  list_reverse(pcs_boxed_positions_acc(bpos, params, raw, i, []))
+
+fn pcs_boxed_positions_acc(
+  bpos: [Int],
+  params: [Param],
+  raw: [Binder],
+  i: Int,
+  acc: [Int]
+) : [Int] = match params {
+  [] -> acc
+  [p, ...rest] -> {
+    let keep = pcs_has_int(bpos, i) and (not pcs_has(raw, p.binder.id))
+    pcs_boxed_positions_acc(bpos, rest, raw, i + 1, if keep { [i, ...acc] } else { acc })
   }
+}
 
 type PopCx = { borrowed: [Binder], slots: (Expr) -> [Int] }
 
@@ -615,7 +621,11 @@ fn pop_hoisted(pat: Pattern, rhs: Expr, tail: Option[Expr], cx: PopCx) : Expr = 
 fn pop_reads_lent(pat: Pattern, args_: [Expr], slots: [Int], i: Int) : Bool = match args_ {
   [] -> false
   [a, ...rest] ->
-    (pop_reads_bind(pat, a) and any(slots, p => p == i)) or pop_reads_lent(pat, rest, slots, i + 1)
+    if pop_reads_bind(pat, a) and any(slots, p => p == i) {
+      true
+    } else {
+      pop_reads_lent(pat, rest, slots, i + 1)
+    }
 }
 
 fn pop_reads_bind(pat: Pattern, a: Expr) : Bool = match pat.pkind {
@@ -768,7 +778,7 @@ pub(pkg) fn pcs_build_consume_map(decls: [Decl], acc: ConsumeIndex, tab: SymTab)
 
 fn pcs_consume_entry_of(d: Decl, acc: ConsumeIndex, tab: SymTab) : ConsumeIndex = match d {
   DFn(_, fsym, _, params, _, _, body, _, _, _, _, _) -> {
-    let pnames = map(params, p => p.binder)
+    let pnames = params | .binder
     # An FFI shim's body is opaque to the consuming-use walk, so a normal
     # scan finds nothing consumed. The shim decrefs every boxed input, so
     # mark each (a Unit param carries no boxed value and is skipped); else
@@ -836,11 +846,12 @@ fn pcs_consumes_expr(p: LocalId, e: Expr, tab: SymTab) : Bool = match e.kind {
   _ -> pcs_consumes_ps(p, xp_positions(e), tab)
 }
 
-fn pcs_consumes_ps(p: LocalId, ps: [XPos], tab: SymTab) : Bool = match ps {
-  [] -> false
-  [XP(r, c), ...rest] ->
-    (xrole_inline(r) and pcs_consumes_expr(p, c, tab)) or pcs_consumes_ps(p, rest, tab)
-}
+fn pcs_consumes_ps(p: LocalId, ps: [XPos], tab: SymTab) : Bool = any(
+  ps,
+  xp => match xp {
+    XP(r, c) -> xrole_inline(r) and pcs_consumes_expr(p, c, tab)
+  }
+)
 
 fn pcs_arms_bind_children(arms: [Arm]) : Bool = match arms {
   [] -> false
@@ -852,17 +863,14 @@ fn pcs_arms_bind_children(arms: [Arm]) : Bool = match arms {
   }
 }
 
-fn pcs_any_bare_var(p: LocalId, xs: [Expr]) : Bool = match xs {
-  [] -> false
-  [h, ...rest] -> pcs_is_bare(p, h) or pcs_any_bare_var(p, rest)
-}
+fn pcs_any_bare_var(p: LocalId, xs: [Expr]) : Bool = any(xs, h => pcs_is_bare(p, h))
 
-fn pcs_fields_bare_var(p: LocalId, fis: [FieldInit]) : Bool = match fis {
-  [] -> false
-  [h, ...rest] -> match h {
-    FI(_, e) -> pcs_is_bare(p, e) or pcs_fields_bare_var(p, rest)
+fn pcs_fields_bare_var(p: LocalId, fis: [FieldInit]) : Bool = any(
+  fis,
+  h => match h {
+    FI(_, e) -> pcs_is_bare(p, e)
   }
-}
+)
 
 # A plain slot and a trailing spread store the ref; a middle spread copies
 # the spine out and releases it.
@@ -880,14 +888,11 @@ fn pcs_elems_bare_var(p: LocalId, els: [ListElem]) : Bool = match els {
       Some(e) -> pcs_is_bare(p, e)
       None -> false
     }
-    here or pcs_elems_bare_var(p, rest)
+    if here { true } else { pcs_elems_bare_var(p, rest) }
   }
 }
 
-fn pcs_has_fn(fs: [FnId], f: FnId) : Bool = match fs {
-  [] -> false
-  [h, ...rest] -> fnid_eq(h, f) or pcs_has_fn(rest, f)
-}
+fn pcs_has_fn(fs: [FnId], f: FnId) : Bool = any(fs, h => fnid_eq(h, f))
 
 pub(pkg) fn pcs_collect_opaque_let_binders(
   e: Expr,

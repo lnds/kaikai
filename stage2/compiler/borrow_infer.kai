@@ -48,14 +48,21 @@ pub(pkg) fn borrow_infer_params(
   pnames: [Binder],
   body: Expr
 ) : [Binder] =
-  binf_loop(tab, self_name, pnames, 0, body)
+  binf_loop(tab, self_name, pnames, 0, body, [])
 
-fn binf_loop(tab: SymTab, self_name: SelfRef, rem: [Binder], i: Int, body: Expr) : [Binder] =
+fn binf_loop(
+  tab: SymTab,
+  self_name: SelfRef,
+  rem: [Binder],
+  i: Int,
+  body: Expr,
+  acc: [Binder]
+) : [Binder] =
   match rem {
-    [] -> []
+    [] -> list_reverse(acc)
     [h, ...rest] -> {
-      let more = binf_loop(tab, self_name, rest, i + 1, body)
-      if binf_param_borrowable(tab, self_name, h, i, body) { [h, ...more] } else { more }
+      let kept = if binf_param_borrowable(tab, self_name, h, i, body) { [h, ...acc] } else { acc }
+      binf_loop(tab, self_name, rest, i + 1, body, kept)
     }
   }
 
@@ -232,7 +239,7 @@ fn binf_self_args_ok(
     } else {
       binf_uses_ok(tab, self_name, nm, i, a)
     }
-    here and binf_self_args_ok(tab, self_name, nm, i, rest, j + 1)
+    if here { binf_self_args_ok(tab, self_name, nm, i, rest, j + 1) } else { false }
   }
 }
 
@@ -248,7 +255,8 @@ fn binf_arg_is_borrow_through(nm: LocalId, a: Expr) : Bool = match a.kind {
 fn binf_arms_rebuild_ctor(tab: SymTab, arms: [Arm]) : Bool = match arms {
   [] -> false
   [a, ...rest] -> match a {
-    Arm(_, _, b) -> binf_tail_rebuilds_ctor(tab, b) or binf_arms_rebuild_ctor(tab, rest)
+    Arm(_, _, b) ->
+      if binf_tail_rebuilds_ctor(tab, b) { true } else { binf_arms_rebuild_ctor(tab, rest) }
   }
 }
 
@@ -258,7 +266,7 @@ fn binf_arms_rebuild_ctor(tab: SymTab, arms: [Arm]) : Bool = match arms {
 fn binf_arms_list_deconstruct(arms: [Arm]) : Bool = match arms {
   [] -> false
   [a, ...rest] -> match a {
-    Arm(p, _, _) -> binf_pat_is_list_rest(p) or binf_arms_list_deconstruct(rest)
+    Arm(p, _, _) -> if binf_pat_is_list_rest(p) { true } else { binf_arms_list_deconstruct(rest) }
   }
 }
 
@@ -299,7 +307,7 @@ fn binf_args_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, xs: [Expr]
         ELocal(u) -> not local_eq(u, nm)  # bare arg to a non-self call = owned pass
         _ -> binf_uses_ok(tab, self_name, nm, i, a)
       }
-      here and binf_args_ok(tab, self_name, nm, i, rest)
+      if here { binf_args_ok(tab, self_name, nm, i, rest) } else { false }
     }
   }
 
@@ -330,15 +338,23 @@ fn binf_opt_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, oe: Option[
 fn binf_stmts_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, stmts: [Stmt]) : Bool =
   match stmts {
     [] -> true
-    [s, ...rest] -> binf_exprs_ok(tab, self_name, nm, i, stmt_exprs(s))
-      and binf_stmts_ok(tab, self_name, nm, i, rest)
+    [s, ...rest] ->
+      if binf_exprs_ok(tab, self_name, nm, i, stmt_exprs(s)) {
+        binf_stmts_ok(tab, self_name, nm, i, rest)
+      } else {
+        false
+      }
   }
 
 fn binf_exprs_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, es: [Expr]) : Bool =
   match es {
     [] -> true
     [e, ...rest] ->
-      binf_uses_ok(tab, self_name, nm, i, e) and binf_exprs_ok(tab, self_name, nm, i, rest)
+      if binf_uses_ok(tab, self_name, nm, i, e) {
+        binf_exprs_ok(tab, self_name, nm, i, rest)
+      } else {
+        false
+      }
   }
 
 # Escape analysis for the relaxed borrow inference (issue #1131).
@@ -367,8 +383,11 @@ fn binf_arms_binders_borrowed(self_name: SelfRef, i: Int, arms: [Arm]) : Bool = 
   [a, ...rest] -> match a {
     Arm(p, _, abody) -> {
       let names = binf_pat_binders(p, [])
-      binf_none_escapes(self_name, i, names, abody)
-        and binf_arms_binders_borrowed(self_name, i, rest)
+      if binf_none_escapes(self_name, i, names, abody) {
+        binf_arms_binders_borrowed(self_name, i, rest)
+      } else {
+        false
+      }
     }
   }
 }
@@ -376,8 +395,12 @@ fn binf_arms_binders_borrowed(self_name: SelfRef, i: Int, arms: [Arm]) : Bool = 
 fn binf_none_escapes(self_name: SelfRef, i: Int, names: [LocalId], abody: Expr) : Bool =
   match names {
     [] -> true
-    [h, ...rest] -> (not binf_escapes(self_name, i, h, true, abody))
-      and binf_none_escapes(self_name, i, rest, abody)
+    [h, ...rest] ->
+      if not binf_escapes(self_name, i, h, true, abody) {
+        binf_none_escapes(self_name, i, rest, abody)
+      } else {
+        false
+      }
   }
 
 # `h` escapes `e` iff a reference to it survives the evaluation of `e`: `e`
@@ -479,7 +502,7 @@ fn binf_any_arg_escapes(self_name: SelfRef, i: Int, h: LocalId, xs: [Expr]) : Bo
       ELocal(u) -> local_eq(u, h)
       _ -> binf_escapes(self_name, i, h, false, a)
     }
-    here or binf_any_arg_escapes(self_name, i, h, rest)
+    if here { true } else { binf_any_arg_escapes(self_name, i, h, rest) }
   }
 }
 
@@ -510,14 +533,18 @@ fn binf_self_args_escape(
         _ -> binf_escapes(self_name, i, h, false, a)
       }
     }
-    here or binf_self_args_escape(self_name, i, h, rest, j + 1, tail)
+    if here { true } else { binf_self_args_escape(self_name, i, h, rest, j + 1, tail) }
   }
 }
 
 fn binf_exprs_escape(self_name: SelfRef, i: Int, h: LocalId, es: [Expr]) : Bool = match es {
   [] -> false
   [e, ...rest] ->
-    binf_escapes(self_name, i, h, false, e) or binf_exprs_escape(self_name, i, h, rest)
+    if binf_escapes(self_name, i, h, false, e) {
+      true
+    } else {
+      binf_exprs_escape(self_name, i, h, rest)
+    }
 }
 
 fn binf_stmts_escape(self_name: SelfRef, i: Int, h: LocalId, stmts: [Stmt]) : Bool = match stmts {
@@ -527,7 +554,7 @@ fn binf_stmts_escape(self_name: SelfRef, i: Int, h: LocalId, stmts: [Stmt]) : Bo
       SLet(_, _, rhs) -> not binf_absent(h, rhs)
       _ -> binf_exprs_escape(self_name, i, h, stmt_exprs(s))
     }
-    here or binf_stmts_escape(self_name, i, h, rest)
+    if here { true } else { binf_stmts_escape(self_name, i, h, rest) }
   }
 }
 
@@ -536,7 +563,11 @@ fn binf_arms_escape(self_name: SelfRef, i: Int, h: LocalId, tail: Bool, arms: [A
     [] -> false
     [a, ...rest] -> match a {
       Arm(_, _, b) ->
-        binf_escapes(self_name, i, h, tail, b) or binf_arms_escape(self_name, i, h, tail, rest)
+        if binf_escapes(self_name, i, h, tail, b) {
+          true
+        } else {
+          binf_arms_escape(self_name, i, h, tail, rest)
+        }
     }
   }
 
@@ -608,7 +639,7 @@ fn binf_present_transparent(nm: LocalId, k: ExprKind) : Bool = match k {
 
 fn binf_any_present(nm: LocalId, es: [Expr]) : Bool = match es {
   [] -> false
-  [e, ...rest] -> binf_var_present(nm, e) or binf_any_present(nm, rest)
+  [e, ...rest] -> if binf_var_present(nm, e) { true } else { binf_any_present(nm, rest) }
 }
 
 fn binf_present_opt(nm: LocalId, oe: Option[Expr]) : Bool = match oe {
@@ -624,25 +655,26 @@ fn binf_present_arms(nm: LocalId, arms: [Arm]) : Bool = match arms {
         None -> false
         Some(gg) -> binf_var_present(nm, gg)
       }
-      g_here or binf_var_present(nm, b) or binf_present_arms(nm, rest)
+      if g_here or binf_var_present(nm, b) { true } else { binf_present_arms(nm, rest) }
     }
   }
 }
 
 fn binf_present_stmts(nm: LocalId, stmts: [Stmt]) : Bool = match stmts {
   [] -> false
-  [s, ...rest] -> binf_present_exprs(nm, stmt_exprs(s)) or binf_present_stmts(nm, rest)
+  [s, ...rest] ->
+    if binf_present_exprs(nm, stmt_exprs(s)) { true } else { binf_present_stmts(nm, rest) }
 }
 
 fn binf_present_exprs(nm: LocalId, es: [Expr]) : Bool = match es {
   [] -> false
-  [e, ...rest] -> binf_var_present(nm, e) or binf_present_exprs(nm, rest)
+  [e, ...rest] -> if binf_var_present(nm, e) { true } else { binf_present_exprs(nm, rest) }
 }
 
 fn binf_absent_fields(nm: LocalId, fis: [FieldInit]) : Bool = match fis {
   [] -> true
   [f, ...rest] -> match f {
-    FI(_, v) -> binf_absent(nm, v) and binf_absent_fields(nm, rest)
+    FI(_, v) -> if binf_absent(nm, v) { binf_absent_fields(nm, rest) } else { false }
   }
 }
 
@@ -653,14 +685,14 @@ fn binf_absent_elems(nm: LocalId, els: [ListElem]) : Bool = match els {
       ElPlain(e) -> binf_absent(nm, e)
       ElSpread(e) -> binf_absent(nm, e)
     }
-    ok and binf_absent_elems(nm, rest)
+    if ok { binf_absent_elems(nm, rest) } else { false }
   }
 }
 
 fn binf_present_fields(nm: LocalId, fis: [FieldInit]) : Bool = match fis {
   [] -> false
   [f, ...rest] -> match f {
-    FI(_, v) -> binf_var_present(nm, v) or binf_present_fields(nm, rest)
+    FI(_, v) -> if binf_var_present(nm, v) { true } else { binf_present_fields(nm, rest) }
   }
 }
 
@@ -671,7 +703,7 @@ fn binf_present_elems(nm: LocalId, els: [ListElem]) : Bool = match els {
       ElPlain(e) -> binf_var_present(nm, e)
       ElSpread(e) -> binf_var_present(nm, e)
     }
-    here or binf_present_elems(nm, rest)
+    if here { true } else { binf_present_elems(nm, rest) }
   }
 }
 

@@ -164,15 +164,14 @@ fn pcs_has_bare_read(nm: Binder, e: Expr) : Bool = match e.kind {
   _ -> pcs_hbr_ps(nm, xp_positions(e))
 }
 
-fn pcs_hbr_ps(nm: Binder, ps: [XPos]) : Bool = match ps {
-  [] -> false
-  [XP(_, c), ...rest] -> pcs_has_bare_read(nm, c) or pcs_hbr_ps(nm, rest)
-}
+fn pcs_hbr_ps(nm: Binder, ps: [XPos]) : Bool = any(
+  ps,
+  xp => match xp {
+    XP(_, c) -> pcs_has_bare_read(nm, c)
+  }
+)
 
-fn pcs_hbr_list(nm: Binder, xs: [Expr]) : Bool = match xs {
-  [] -> false
-  [h, ...rest] -> pcs_has_bare_read(nm, h) or pcs_hbr_list(nm, rest)
-}
+fn pcs_hbr_list(nm: Binder, xs: [Expr]) : Bool = any(xs, h => pcs_has_bare_read(nm, h))
 
 pub(pkg) fn pcs_inject_arm_drops(
   body: Expr,
@@ -299,10 +298,7 @@ fn pcs_dd_kind(
       EIf(
         c,
         pcs_distribute_dead_drops(t, drops, fn_name, hoist, held, who, tab),
-        match opt_e {
-          None -> None
-          Some(e) -> Some(pcs_distribute_dead_drops(e, drops, fn_name, hoist, held, who, tab))
-        }
+        opt_e | (e => pcs_distribute_dead_drops(e, drops, fn_name, hoist, held, who, tab))
       )
     EMatch(s, arms) -> EMatch(s, pcs_dd_arms(arms, drops, fn_name, hoist, held, who, tab))
     EBlock(stmts, opt_tail) -> match opt_tail {
@@ -392,10 +388,8 @@ fn pcs_dd_arms(
 
 # The binder a drop releases, of those in `who`: the statement names it by
 # identity alone.
-fn pcs_drop_binder(d: Stmt, who: [Binder]) : Option[Binder] = match ppd_drop_name(d) {
-  Some(l) -> pcs_binder_of(who, l)
-  None -> None
-}
+fn pcs_drop_binder(d: Stmt, who: [Binder]) : Option[Binder] =
+  ppd_drop_name(d) || (l => pcs_binder_of(who, l))
 
 fn pcs_binder_of(bs: [Binder], l: LocalId) : Option[Binder] = match bs {
   [] -> None
@@ -403,16 +397,14 @@ fn pcs_binder_of(bs: [Binder], l: LocalId) : Option[Binder] = match bs {
 }
 
 # The binders of `drops` the leaf does not move.
-fn pcs_unmoved_names(drops: [Stmt], leaf: Expr, who: [Binder]) : [Binder] = match drops {
-  [] -> []
-  [d, ...rest] -> {
-    let tl = pcs_unmoved_names(rest, leaf, who)
-    match pcs_drop_binder(d, who) {
-      Some(nm) -> if pcs_has_bare_read(nm, leaf) { tl } else { [nm, ...tl] }
-      None -> tl
+fn pcs_unmoved_names(drops: [Stmt], leaf: Expr, who: [Binder]) : [Binder] =
+  flat_map(
+    drops,
+    d => match pcs_drop_binder(d, who) {
+      Some(nm) -> if pcs_has_bare_read(nm, leaf) { [] } else { [nm] }
+      None -> []
     }
-  }
-}
+  )
 
 # Under a scope binding `names`: a rebound name would make a leaf read the
 # inner binder, not the dropped one, so no drop moves past the leaf's reads.
@@ -483,16 +475,14 @@ fn pcs_drop_owed_in(d: Stmt, leaf: Expr, who: [Binder]) : Bool = match pcs_drop_
 
 # Drops whose binder the leaf never mentions, closure captures included —
 # only those may run before the leaf's argument evaluation.
-fn pcs_drops_dead_in(drops: [Stmt], leaf: Expr, who: [Binder]) : [Stmt] = match drops {
-  [] -> []
-  [d, ...rest] -> {
-    let tl = pcs_drops_dead_in(rest, leaf, who)
-    match pcs_drop_binder(d, who) {
-      Some(nm) -> if pcs_mentions(nm, leaf) { tl } else { [d, ...tl] }
-      None -> tl
+fn pcs_drops_dead_in(drops: [Stmt], leaf: Expr, who: [Binder]) : [Stmt] =
+  flat_map(
+    drops,
+    d => match pcs_drop_binder(d, who) {
+      Some(nm) -> if pcs_mentions(nm, leaf) { [] } else { [d] }
+      None -> []
     }
-  }
-}
+  )
 
 pub(pkg) fn pcs_is_self_tail_call(e: Expr, fn_name: SelfRef) : Bool {
   match e.kind {
@@ -670,11 +660,12 @@ fn pcs_atsc_arms(self_name: SelfRef, arms: [Arm]) : Bool = match arms {
     pcs_arm_all_tails_self_call(self_name, b) and pcs_atsc_arms_rest(self_name, rest)
 }
 
-fn pcs_atsc_arms_rest(self_name: SelfRef, arms: [Arm]) : Bool = match arms {
-  [] -> true
-  [Arm(_, _, b), ...rest] ->
-    pcs_arm_all_tails_self_call(self_name, b) and pcs_atsc_arms_rest(self_name, rest)
-}
+fn pcs_atsc_arms_rest(self_name: SelfRef, arms: [Arm]) : Bool = all(
+  arms,
+  a => match a {
+    Arm(_, _, b) -> pcs_arm_all_tails_self_call(self_name, b)
+  }
+)
 
 pub(pkg) fn pcs_collect_goto_tail_moves(
   self_name: SelfRef,
@@ -743,38 +734,47 @@ fn pcs_gtm_arms(
   cmap: ConsumeIndex,
   borrowed: [Binder],
   tab: SymTab
-) : [Binder] / Console = match arms {
-  [] -> []
-  [a, ...rest] -> match a {
-    Arm(pat, opt_g, body) -> {
-      let nested = pcs_collect_goto_tail_moves(self_name, body, bmap, uses, cmap, borrowed, tab)
-      let pb = prc_pat_bindings(pat, [])
-      let here = match opt_g {
-        # Issue #817 — additionally require cons-cascade safety: the #3
-        # `kai_decref(_scr)` frees the matched cons cell when its rc hits
-        # 1 and CASCADES `decref` to ALL its slots. Moving a binder strips
-        # the dup that kept the cell's rc above 1, so the cascade fires —
-        # and if ANY sibling binder is CONSUMED outside the self-tail-call
-        # (e.g. `vpa_sig_params`'s `match p.ptype` consumes `p`), the
-        # cascade double-consumes it (and the inner-match reads it after)
-        # → UAF. Block the whole pattern's move when that holds.
-        None -> {
-          let pure_tail = pcs_arm_all_tails_self_call(self_name, body)
-          let safe = pure_tail and pcs_cons_cascade_safe(pb, body, self_name, uses)
-          if safe {
-            pcs_branch_aware_skip_locals_b(pb, body, bmap, cmap, borrowed, tab)
-          } else {
-            []
-          }
-        }
-        Some(_) -> []
-      }
+) : [Binder] / Console =
+  foldr(
+    map(arms, a => pcs_gtm_arm(self_name, a, bmap, uses, cmap, borrowed, tab)),
+    [],
+    (p, acc) => pcs_list_union(p, acc)
+  )
 
-      pcs_list_union(
-        pcs_list_union(here, nested),
-        pcs_gtm_arms(self_name, rest, bmap, uses, cmap, borrowed, tab)
-      )
+fn pcs_gtm_arm(
+  self_name: SelfRef,
+  a: Arm,
+  bmap: BorrowMap,
+  uses: UseIx,
+  cmap: ConsumeIndex,
+  borrowed: [Binder],
+  tab: SymTab
+) : [Binder] / Console = match a {
+  Arm(pat, opt_g, body) -> {
+    let nested = pcs_collect_goto_tail_moves(self_name, body, bmap, uses, cmap, borrowed, tab)
+    let pb = prc_pat_bindings(pat, [])
+    let here = match opt_g {
+      # Issue #817 — additionally require cons-cascade safety: the #3
+      # `kai_decref(_scr)` frees the matched cons cell when its rc hits
+      # 1 and CASCADES `decref` to ALL its slots. Moving a binder strips
+      # the dup that kept the cell's rc above 1, so the cascade fires —
+      # and if ANY sibling binder is CONSUMED outside the self-tail-call
+      # (e.g. `vpa_sig_params`'s `match p.ptype` consumes `p`), the
+      # cascade double-consumes it (and the inner-match reads it after)
+      # → UAF. Block the whole pattern's move when that holds.
+      None -> {
+        let pure_tail = pcs_arm_all_tails_self_call(self_name, body)
+        let safe = pure_tail and pcs_cons_cascade_safe(pb, body, self_name, uses)
+        if safe {
+          pcs_branch_aware_skip_locals_b(pb, body, bmap, cmap, borrowed, tab)
+        } else {
+          []
+        }
+      }
+      Some(_) -> []
     }
+
+    pcs_list_union(here, nested)
   }
 }
 
@@ -786,19 +786,21 @@ fn pcs_gtm_stmts(
   cmap: ConsumeIndex,
   borrowed: [Binder],
   tab: SymTab
-) : [Binder] / Console = match stmts {
-  [] -> []
-  [s, ...rest] -> {
-    let here = match s {
-      SLet(_, _, e) -> pcs_collect_goto_tail_moves(self_name, e, bmap, uses, cmap, borrowed, tab)
-      SVar(_, _, e, _, _) ->
-        pcs_collect_goto_tail_moves(self_name, e, bmap, uses, cmap, borrowed, tab)
-      SExprStmt(e) -> pcs_collect_goto_tail_moves(self_name, e, bmap, uses, cmap, borrowed, tab)
-      _ -> []
-    }
-    pcs_list_union(here, pcs_gtm_stmts(self_name, rest, bmap, uses, cmap, borrowed, tab))
-  }
-}
+) : [Binder] / Console =
+  foldr(
+    map(
+      stmts,
+      s => match s {
+        SLet(_, _, e) -> pcs_collect_goto_tail_moves(self_name, e, bmap, uses, cmap, borrowed, tab)
+        SVar(_, _, e, _, _) ->
+          pcs_collect_goto_tail_moves(self_name, e, bmap, uses, cmap, borrowed, tab)
+        SExprStmt(e) -> pcs_collect_goto_tail_moves(self_name, e, bmap, uses, cmap, borrowed, tab)
+        _ -> []
+      }
+    ),
+    [],
+    (here, acc) => pcs_list_union(here, acc)
+  )
 
 pub(pkg) fn pcs_collect_safe_arm_binders(
   self_name: SelfRef,
@@ -849,9 +851,15 @@ fn pcs_sab_arms(
   arms: [Arm],
   bmap: BorrowMap,
   uses: UseIx
-) : [Binder] / Console = match arms {
-  [] -> []
-  [a, ...rest] -> match a {
+) : [Binder] / Console =
+  foldr(
+    map(arms, a => pcs_sab_arm(self_name, a, bmap, uses)),
+    [],
+    (p, acc) => pcs_list_union(p, acc)
+  )
+
+fn pcs_sab_arm(self_name: SelfRef, a: Arm, bmap: BorrowMap, uses: UseIx) : [Binder] / Console =
+  match a {
     Arm(pat, opt_g, body) -> {
       let nested = pcs_collect_safe_arm_binders(self_name, body, bmap, uses)
       let pb = prc_pat_bindings(pat, [])
@@ -863,31 +871,29 @@ fn pcs_sab_arms(
         }
         Some(_) -> []
       }
-      pcs_list_union(
-        pcs_list_union(here, nested),
-        pcs_sab_arms(self_name, rest, bmap, uses)
-      )
+      pcs_list_union(here, nested)
     }
   }
-}
 
 fn pcs_sab_stmts(
   self_name: SelfRef,
   stmts: [Stmt],
   bmap: BorrowMap,
   uses: UseIx
-) : [Binder] / Console = match stmts {
-  [] -> []
-  [s, ...rest] -> {
-    let here = match s {
-      SLet(_, _, e) -> pcs_collect_safe_arm_binders(self_name, e, bmap, uses)
-      SVar(_, _, e, _, _) -> pcs_collect_safe_arm_binders(self_name, e, bmap, uses)
-      SExprStmt(e) -> pcs_collect_safe_arm_binders(self_name, e, bmap, uses)
-      _ -> []
-    }
-    pcs_list_union(here, pcs_sab_stmts(self_name, rest, bmap, uses))
-  }
-}
+) : [Binder] / Console =
+  foldr(
+    map(
+      stmts,
+      s => match s {
+        SLet(_, _, e) -> pcs_collect_safe_arm_binders(self_name, e, bmap, uses)
+        SVar(_, _, e, _, _) -> pcs_collect_safe_arm_binders(self_name, e, bmap, uses)
+        SExprStmt(e) -> pcs_collect_safe_arm_binders(self_name, e, bmap, uses)
+        _ -> []
+      }
+    ),
+    [],
+    (here, acc) => pcs_list_union(here, acc)
+  )
 
 # Walk a fn body, collecting EVERY guard-less match arm's pattern binders
 # that pass the borrow-aware branch-aware safety check over THAT arm's body.
@@ -945,14 +951,17 @@ fn pcs_collect_arm_skip_ps(
   cmap: ConsumeIndex,
   borrowed: [Binder],
   tab: SymTab
-) : [Binder] = match ps {
-  [] -> []
-  [XP(_, c), ...rest] ->
-    pcs_list_union(
-      pcs_collect_arm_skip_binders(self_name, tl, c, bmap, cmap, borrowed, tab),
-      pcs_collect_arm_skip_ps(self_name, tl, rest, bmap, cmap, borrowed, tab)
-    )
-}
+) : [Binder] =
+  foldr(
+    map(
+      ps,
+      xp => match xp {
+        XP(_, c) -> pcs_collect_arm_skip_binders(self_name, tl, c, bmap, cmap, borrowed, tab)
+      }
+    ),
+    [],
+    (here, acc) => pcs_list_union(here, acc)
+  )
 
 fn pcs_collect_arm_skip_arms(
   self_name: SelfRef,
@@ -962,48 +971,57 @@ fn pcs_collect_arm_skip_arms(
   cmap: ConsumeIndex,
   borrowed: [Binder],
   tab: SymTab
-) : [Binder] = match arms {
-  [] -> []
-  [a, ...rest] -> match a {
-    Arm(pat, opt_g, body) -> {
-      # Descend into the body for NESTED matches — those are never toplevel.
-      let nested = pcs_collect_arm_skip_binders(self_name, false, body, bmap, cmap, borrowed, tab)
-      # Move this arm's binders when emit disposes the scrutinee via a reuse-
-      # model that does NOT cascade into the moved child:
-      #  (1) self-rec modulo-cons (`self(...)` in a ctor slot) → TRMC arm-top
-      #      reuse (insert_loop). Sound at ANY depth: the arm-top steals the
-      #      matched cell, which IS the cell the TRMC step rebuilds.
-      #  (2) cons-overwrite — reconstructs the SAME ctor it matched in tail
-      #      position → emit's try_reuse_variant_arm overwrites _scr in place.
-      #      Sound ONLY at the fn-body's TOP-LEVEL match (`tl`): there the
-      #      reused cell IS the cell the result replaces. In a NESTED match over
-      #      a binder (gap3's `match l { Node(ll,..) -> match ll { ... } }`) the
-      #      reused cell is the INNER scrutinee (ll) but the result replaces the
-      #      OUTER node (l) — the in-place overwrite builds a self-referential
-      #      cycle (gap3 stack-overflows in `size`). Hence the `tl` gate.
-      let reuse_shape = pcs_arm_self_modulo_cons(self_name, body, tab)
-        or (tl and pcs_arm_cons_overwrite(pat, body, tab))
-      let here = match opt_g {
-        None ->
-          if reuse_shape {
-            pcs_branch_aware_skip_locals_b(
-              prc_pat_bindings(pat, []),
-              body,
-              bmap,
-              cmap,
-              borrowed,
-              tab
-            )
-          } else {
-            []
-          }
-        Some(_) -> []
-      }
-      pcs_list_union(
-        pcs_list_union(here, nested),
-        pcs_collect_arm_skip_arms(self_name, tl, rest, bmap, cmap, borrowed, tab)
-      )
+) : [Binder] =
+  foldr(
+    map(arms, a => pcs_collect_arm_skip_arm(self_name, tl, a, bmap, cmap, borrowed, tab)),
+    [],
+    (p, acc) => pcs_list_union(p, acc)
+  )
+
+fn pcs_collect_arm_skip_arm(
+  self_name: SelfRef,
+  tl: Bool,
+  a: Arm,
+  bmap: BorrowMap,
+  cmap: ConsumeIndex,
+  borrowed: [Binder],
+  tab: SymTab
+) : [Binder] = match a {
+  Arm(pat, opt_g, body) -> {
+    # Descend into the body for NESTED matches — those are never toplevel.
+    let nested = pcs_collect_arm_skip_binders(self_name, false, body, bmap, cmap, borrowed, tab)
+    # Move this arm's binders when emit disposes the scrutinee via a reuse-
+    # model that does NOT cascade into the moved child:
+    #  (1) self-rec modulo-cons (`self(...)` in a ctor slot) → TRMC arm-top
+    #      reuse (insert_loop). Sound at ANY depth: the arm-top steals the
+    #      matched cell, which IS the cell the TRMC step rebuilds.
+    #  (2) cons-overwrite — reconstructs the SAME ctor it matched in tail
+    #      position → emit's try_reuse_variant_arm overwrites _scr in place.
+    #      Sound ONLY at the fn-body's TOP-LEVEL match (`tl`): there the
+    #      reused cell IS the cell the result replaces. In a NESTED match over
+    #      a binder (gap3's `match l { Node(ll,..) -> match ll { ... } }`) the
+    #      reused cell is the INNER scrutinee (ll) but the result replaces the
+    #      OUTER node (l) — the in-place overwrite builds a self-referential
+    #      cycle (gap3 stack-overflows in `size`). Hence the `tl` gate.
+    let reuse_shape = pcs_arm_self_modulo_cons(self_name, body, tab)
+      or (tl and pcs_arm_cons_overwrite(pat, body, tab))
+    let here = match opt_g {
+      None ->
+        if reuse_shape {
+          pcs_branch_aware_skip_locals_b(
+            prc_pat_bindings(pat, []),
+            body,
+            bmap,
+            cmap,
+            borrowed,
+            tab
+          )
+        } else {
+          []
+        }
+      Some(_) -> []
     }
+    pcs_list_union(here, nested)
   }
 }
 
@@ -1056,10 +1074,7 @@ fn pcs_tails_ctor_kind(cname: SymId, k: ExprKind, tab: SymTab) : Bool = match k 
 # earlier in-place write already clobbered: bare EVar, scalar literal, dup of a
 # binder, or a ctor whose own slots are all simple. A non-ctor fn call is NOT
 # simple (it may read a binder that derives the donor's slots).
-fn pcs_all_slots_simple(xs: [Expr], tab: SymTab) : Bool = match xs {
-  [] -> true
-  [h, ...rest] -> pcs_slot_simple(h, tab) and pcs_all_slots_simple(rest, tab)
-}
+fn pcs_all_slots_simple(xs: [Expr], tab: SymTab) : Bool = all(xs, h => pcs_slot_simple(h, tab))
 
 # A slot of a cons-overwrite rebuild is "simple" iff it is a bare binder, a
 # scalar, or a dup of a binder — NOT a NESTED ctor that embeds a pointer
@@ -1094,13 +1109,12 @@ fn pcs_slot_simple(e: Expr, tab: SymTab) : Bool = match e.kind {
   _ -> false
 }
 
-fn pcs_tails_ctor_arms(cname: SymId, arms: [Arm], tab: SymTab) : Bool = match arms {
-  [] -> true
-  [a, ...rest] -> match a {
-    Arm(_, _, b) ->
-      pcs_arm_tails_rebuild_ctor(cname, b, tab) and pcs_tails_ctor_arms(cname, rest, tab)
+fn pcs_tails_ctor_arms(cname: SymId, arms: [Arm], tab: SymTab) : Bool = all(
+  arms,
+  a => match a {
+    Arm(_, _, b) -> pcs_arm_tails_rebuild_ctor(cname, b, tab)
   }
-}
+)
 
 pub(pkg) fn pcs_guard_close_births(g: Expr, bound: [Binder]) : Expr {
   let drops = pcs_guard_fail_drops(bound, g, [])
@@ -1202,7 +1216,7 @@ fn pcs_planned_decls(decls: [Decl], acc: [BorrowDecl]) : [BorrowDecl] = match de
       let pos = if body_has_raw_entry(body) {
         boxed_param_positions(params, 0)
       } else {
-        pcs_borrow_positions(map(params, p => p.binder), pcs_explicit_borrow_names(params), 0)
+        pcs_borrow_positions(params | .binder, pcs_explicit_borrow_names(params), 0)
       }
       pcs_planned_decls(rest, [BD(fsym, pos), ...acc])
     }
@@ -1224,7 +1238,7 @@ fn pcs_borrowed_positions(
   } else if body_is_extern(body) {
     []
   } else {
-    let pnames = map(params, p => p.binder)
+    let pnames = params | .binder
     pcs_borrow_positions(pnames, pcs_borrow_params_hybrid(is_pub, me, params, pnames, body, tab), 0)
   }
 

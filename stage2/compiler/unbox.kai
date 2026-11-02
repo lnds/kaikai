@@ -184,10 +184,8 @@ fn both_raw_operands(a: Expr, b: Expr, env: [LocBind], fns: FnIndex) : Bool =
 fn arith_has_raw_form(op: BinOp, opt_ty: Option[Ty]) : Bool =
   if binop_eq(op, BoMod) and (not ty_is_integral_raw(opt_ty)) {
     false
-  } else if binop_is_division(op) and ty_is_int128_opt(opt_ty) {
-    false
   } else {
-    true
+    not (binop_is_division(op) and ty_is_int128_opt(opt_ty))
   }
 
 # An integer `^` with a small literal exponent unrolls to bare
@@ -269,7 +267,7 @@ fn lb_lent(env: [LocBind], nm: LocalId) : Bool {
   match env {
     [] -> false
     [LB(n, _), ...rest] -> if local_eq(n, nm) { false } else { lb_lent(rest, nm) }
-    [LBLent(n), ...rest] -> local_eq(n, nm) or lb_lent(rest, nm)
+    [LBLent(n), ...rest] -> if local_eq(n, nm) { true } else { lb_lent(rest, nm) }
   }
 }
 
@@ -439,10 +437,7 @@ fn seed_variant_int_loop(
   match subs {
     [] -> env
     [sp, ...rest] -> {
-      let slot_is_int = match list_nth_bool(flags, i) {
-        Some(b) -> b
-        None -> false
-      }
+      let slot_is_int = list_nth_bool(flags, i) ?? false
       let env1 = match sp.pkind {
         PBind(nm) ->
           # The C oracle's mode-slave border is TOTAL, so it seeds a kind-1
@@ -706,10 +701,7 @@ fn nrab_slot_loop(
 ) : [RawArmBinder] / Console = match subs {
   [] -> acc
   [sp, ...rest] -> {
-    let slot_is_int = match list_nth_bool(flags, i) {
-      Some(b) -> b
-      None -> false
-    }
+    let slot_is_int = list_nth_bool(flags, i) ?? false
     let acc1 = match sp.pkind {
       PBind(nm) -> {
         let boxed_free = slot_is_int and (not expr_captures(body, nm))
@@ -737,10 +729,7 @@ pub(pkg) fn raw_arm_binder_at(tbl: [RawArmBinder], nm: LocalId, line: Int, col: 
     }
   }
 
-fn ctor_int_flags(cis: CtorIntIx, s: SymId) : [Bool] = match ctor_int_slots_of(cis, s) {
-  Some(flags) -> flags
-  None -> []
-}
+fn ctor_int_flags(cis: CtorIntIx, s: SymId) : [Bool] = ctor_int_slots_of(cis, s) ?? []
 
 pub(pkg) fn expr_captures(e: Expr, b: Binder) : Bool =
   uses_have_in_lam(scan_uses_expr(e, false), b.id)
@@ -930,13 +919,15 @@ fn nab_ctor_args_ok(
   [x, ...rest] -> match flags {
     [f, ...fr] -> {
       let ok = if nab_is_var(nm, x) { f } else { nab_uses_ok(nm, x, cis, fns) }
-      ok and nab_ctor_args_ok(nm, fr, rest, cis, fns)
+      if ok { nab_ctor_args_ok(nm, fr, rest, cis, fns) } else { false }
     }
     # More args than declared slots: never raw here, but keep walking the
     # remaining args for other uses of `nm`.
-    [] -> (not nab_is_var(nm, x))
-      and nab_uses_ok(nm, x, cis, fns)
-      and nab_ctor_args_ok(nm, [], rest, cis, fns)
+    [] -> if (not nab_is_var(nm, x)) and nab_uses_ok(nm, x, cis, fns) {
+      nab_ctor_args_ok(nm, [], rest, cis, fns)
+    } else {
+      false
+    }
   }
 }
 
@@ -955,11 +946,13 @@ fn nab_call_args_ok(
   [x, ...rest] -> match mask {
     [m, ...mr] -> {
       let ok = if nab_is_var(nm, x) { m } else { nab_uses_ok(nm, x, cis, fns) }
-      ok and nab_call_args_ok(nm, mr, rest, cis, fns)
+      if ok { nab_call_args_ok(nm, mr, rest, cis, fns) } else { false }
     }
-    [] -> (not nab_is_var(nm, x))
-      and nab_uses_ok(nm, x, cis, fns)
-      and nab_call_args_ok(nm, [], rest, cis, fns)
+    [] -> if (not nab_is_var(nm, x)) and nab_uses_ok(nm, x, cis, fns) {
+      nab_call_args_ok(nm, [], rest, cis, fns)
+    } else {
+      false
+    }
   }
 }
 
@@ -1014,10 +1007,8 @@ fn nab_opt(nm: LocalId, oe: Option[Expr], cis: CtorIntIx, fns: FnIndex) : Bool /
     Some(e) -> nab_uses_ok(nm, e, cis, fns)
   }
 
-fn nab_stmts(nm: LocalId, ss: [Stmt], cis: CtorIntIx, fns: FnIndex) : Bool / Console = match ss {
-  [] -> true
-  [s, ...rest] -> nab_stmt(nm, s, cis, fns) and nab_stmts(nm, rest, cis, fns)
-}
+fn nab_stmts(nm: LocalId, ss: [Stmt], cis: CtorIntIx, fns: FnIndex) : Bool / Console =
+  all(ss, s => nab_stmt(nm, s, cis, fns))
 
 fn nab_stmt(nm: LocalId, s: Stmt, cis: CtorIntIx, fns: FnIndex) : Bool / Console = match s {
   SExprStmt(e) -> nab_uses_ok(nm, e, cis, fns)
@@ -1052,45 +1043,37 @@ fn nab_mentions(nm: LocalId, e: Expr) : Bool / Console = match e.kind {
   _ -> false
 }
 
-fn nab_mentions_list(nm: LocalId, es: [Expr]) : Bool / Console = match es {
-  [] -> false
-  [e, ...r] -> nab_mentions(nm, e) or nab_mentions_list(nm, r)
-}
+fn nab_mentions_list(nm: LocalId, es: [Expr]) : Bool / Console = any(es, e => nab_mentions(nm, e))
 
 fn nab_mentions_opt(nm: LocalId, oe: Option[Expr]) : Bool / Console = match oe {
   None -> false
   Some(e) -> nab_mentions(nm, e)
 }
 
-fn nab_mentions_arms(nm: LocalId, arms: [Arm]) : Bool / Console = match arms {
-  [] -> false
-  [a, ...r] -> (match a {
+fn nab_mentions_arms(nm: LocalId, arms: [Arm]) : Bool / Console = any(
+  arms,
+  a => match a {
     Arm(p, g, b) -> nab_pat(nm, p) or nab_mentions_opt(nm, g) or nab_mentions(nm, b)
-  })
-    or nab_mentions_arms(nm, r)
-}
+  }
+)
 
-fn nab_mentions_fields(nm: LocalId, fis: [FieldInit]) : Bool / Console = match fis {
-  [] -> false
-  [f, ...r] -> (match f {
+fn nab_mentions_fields(nm: LocalId, fis: [FieldInit]) : Bool / Console = any(
+  fis,
+  f => match f {
     FI(_, e) -> nab_mentions(nm, e)
-  })
-    or nab_mentions_fields(nm, r)
-}
+  }
+)
 
-fn nab_mentions_elems(nm: LocalId, els: [ListElem]) : Bool / Console = match els {
-  [] -> false
-  [el, ...r] -> (match el {
+fn nab_mentions_elems(nm: LocalId, els: [ListElem]) : Bool / Console = any(
+  els,
+  el => match el {
     ElPlain(e) -> nab_mentions(nm, e)
     ElSpread(e) -> nab_mentions(nm, e)
-  })
-    or nab_mentions_elems(nm, r)
-}
+  }
+)
 
-fn nab_mentions_stmts(nm: LocalId, ss: [Stmt]) : Bool / Console = match ss {
-  [] -> false
-  [s, ...r] -> nab_stmt_mentions(nm, s) or nab_mentions_stmts(nm, r)
-}
+fn nab_mentions_stmts(nm: LocalId, ss: [Stmt]) : Bool / Console =
+  any(ss, s => nab_stmt_mentions(nm, s))
 
 fn nab_stmt_mentions(nm: LocalId, s: Stmt) : Bool / Console = match s {
   SExprStmt(e) -> nab_mentions(nm, e)
@@ -1118,15 +1101,11 @@ fn nab_pat(nm: LocalId, p: Pattern) : Bool / Console = match p.pkind {
   _ -> false
 }
 
-fn nab_pats(nm: LocalId, ps: [Pattern]) : Bool / Console = match ps {
-  [] -> false
-  [p, ...r] -> nab_pat(nm, p) or nab_pats(nm, r)
-}
+fn nab_pats(nm: LocalId, ps: [Pattern]) : Bool / Console = any(ps, p => nab_pat(nm, p))
 
-fn nab_pfields(nm: LocalId, fs: [PField]) : Bool / Console = match fs {
-  [] -> false
-  [f, ...r] -> (match f {
+fn nab_pfields(nm: LocalId, fs: [PField]) : Bool / Console = any(
+  fs,
+  f => match f {
     PField(_, sub, _) -> nab_pat(nm, sub)
-  })
-    or nab_pfields(nm, r)
-}
+  }
+)

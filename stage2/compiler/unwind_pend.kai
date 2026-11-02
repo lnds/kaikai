@@ -252,10 +252,7 @@ pub(pkg) fn unw_with_fib(u: UnwFrame, f: String) : UnwFrame =
   }
 
 #[doc("The native register holding `u`'s fiber cache.")]
-pub(pkg) fn unw_fib(u: UnwFrame) : String = match u.fib {
-  Some(f) -> f
-  None -> ""
-}
+pub(pkg) fn unw_fib(u: UnwFrame) : String = u.fib ?? ""
 
 #[doc("`u` asking (or not) the next `match` to register its scrutinee.")]
 pub(pkg) fn unw_with_scr(u: UnwFrame, b: Bool) : UnwFrame =
@@ -333,8 +330,11 @@ fn uw_seeds_masked(params: [Param], mask: [Bool], ucx: UnwCx) : [LocalId] = matc
       [_, ...r] -> r
       [] -> []
     }
-    let tail = uw_seeds_masked(rest, mrest, ucx)
-    if raw or p.pborrow or unw_is_cap_param(ucx, p.ptype) { tail } else { [p.binder.id, ...tail] }
+    if raw or p.pborrow or unw_is_cap_param(ucx, p.ptype) {
+      uw_seeds_masked(rest, mrest, ucx)
+    } else {
+      [p.binder.id, ...uw_seeds_masked(rest, mrest, ucx)]
+    }
   }
 }
 
@@ -388,7 +388,7 @@ pub(pkg) type UnwSite
 pub(pkg) fn unw_match_at(sites: [UnwSite], site: Int) : Bool = match sites {
   [] -> false
   [s, ...rest] -> match s {
-    UnwMatch(k) -> k == site or unw_match_at(rest, site)
+    UnwMatch(k) -> if k == site { true } else { unw_match_at(rest, site) }
     _ -> unw_match_at(rest, site)
   }
 }
@@ -551,19 +551,16 @@ fn unw_lent(f: Expr, xs: [Expr], live: [LocalId]) : [LocalId] = uw_lent_at(f, xs
 
 fn uw_lent_at(f: Expr, all: [Expr], xs: [Expr], i: Int, live: [LocalId]) : [LocalId] = match xs {
   [] -> []
-  [a, ...rest] -> {
-    let more = uw_lent_at(f, all, rest, i + 1, live)
-    match uw_owned_borrow_var(a) {
-      Some(n) ->
-        if unw_has(live, n)
-          and (not tcl_consumes(f, n))
-          and (not uw_consumed_besides(all, i, 0, n)) {
-          [n, ...more]
-        } else {
-          more
-        }
-      None -> more
-    }
+  [a, ...rest] -> match uw_owned_borrow_var(a) {
+    Some(n) ->
+      if unw_has(live, n)
+        and (not tcl_consumes(f, n))
+        and (not uw_consumed_besides(all, i, 0, n)) {
+        [n, ...uw_lent_at(f, all, rest, i + 1, live)]
+      } else {
+        uw_lent_at(f, all, rest, i + 1, live)
+      }
+    None -> uw_lent_at(f, all, rest, i + 1, live)
   }
 }
 
@@ -580,7 +577,8 @@ fn uw_owned_borrow_var(a: Expr) : Option[LocalId] = match a.kind {
 
 fn uw_consumed_besides(xs: [Expr], skip: Int, i: Int, n: LocalId) : Bool = match xs {
   [] -> false
-  [x, ...rest] -> (i != skip and tcl_consumes(x, n)) or uw_consumed_besides(rest, skip, i + 1, n)
+  [x, ...rest] ->
+    if i != skip and tcl_consumes(x, n) { true } else { uw_consumed_besides(rest, skip, i + 1, n) }
 }
 
 #[doc("`pend` without the binders `e` consumes or might consume: `pend` itself when it consumes none.")]
@@ -589,7 +587,7 @@ fn unw_filter(pend: [LocalId], e: Expr) : [LocalId] =
 
 fn uw_any_consumed(pend: [LocalId], e: Expr) : Bool = match pend {
   [] -> false
-  [p, ...rest] -> tcl_consumes(e, p) or uw_any_consumed(rest, e)
+  [p, ...rest] -> if tcl_consumes(e, p) { true } else { uw_any_consumed(rest, e) }
 }
 
 fn uw_unconsumed(pend: [LocalId], e: Expr) : [LocalId] = match pend {
@@ -608,24 +606,25 @@ fn uw_filter_each(pend: [LocalId], es: [Expr]) : [LocalId] = match es {
 }
 
 #[doc("The union of every list in `eaten` except the `i`-th.")]
-fn unw_others(eaten: [[LocalId]], i: Int, j: Int) : [LocalId] = match eaten {
-  [] -> []
-  [e, ...rest] ->
-    if i == j { unw_others(rest, i, j + 1) } else { unw_union(e, unw_others(rest, i, j + 1)) }
+fn unw_others(eaten: [[LocalId]], i: Int) : [LocalId] =
+  uw_others_rev(list_reverse(eaten), i, list_length(eaten) - 1, [])
+
+fn uw_others_rev(rs: [[LocalId]], i: Int, j: Int, acc: [LocalId]) : [LocalId] = match rs {
+  [] -> acc
+  [e, ...rest] -> uw_others_rev(rest, i, j - 1, if i == j { acc } else { unw_union(e, acc) })
 }
 
 #[doc("The binders of `xs` mentioned only in `h`'s inline code: never in its clauses, never elsewhere in `body`, never one of `jumps`.")]
 fn unw_confined(xs: [LocalId], h: Expr, jumps: [LocalId], body: Expr) : [LocalId] = match xs {
   [] -> []
   [x, ...rest] -> {
-    let tail = unw_confined(rest, h, jumps, body)
     let inside = uw_count(x, h, true)
     if (not unw_has(jumps, x))
       and inside == uw_count(x, h, false)
       and inside == uw_count(x, body, false) {
-      [x, ...tail]
+      [x, ...unw_confined(rest, h, jumps, body)]
     } else {
-      tail
+      unw_confined(rest, h, jumps, body)
     }
   }
 }
@@ -633,14 +632,15 @@ fn unw_confined(xs: [LocalId], h: Expr, jumps: [LocalId], body: Expr) : [LocalId
 # Reads of `x` in `e`. `inline_only` skips lambda and clause bodies.
 fn uw_count(x: LocalId, e: Expr, inline_only: Bool) : Int = match e.kind {
   ELocal(l) -> if local_eq(l, x) { 1 } else { 0 }
-  _ -> uw_count_ps(x, xp_positions(e), inline_only)
+  _ -> uw_count_ps(x, xp_positions(e), inline_only, 0)
 }
 
-fn uw_count_ps(x: LocalId, ps: [XPos], inline_only: Bool) : Int = match ps {
-  [] -> 0
-  [XP(r, c), ...rest] ->
-    (if inline_only and (not xrole_inline(r)) { 0 } else { uw_count(x, c, inline_only) })
-      + uw_count_ps(x, rest, inline_only)
+fn uw_count_ps(x: LocalId, ps: [XPos], inline_only: Bool, n: Int) : Int = match ps {
+  [] -> n
+  [XP(r, c), ...rest] -> {
+    let here = if inline_only and (not xrole_inline(r)) { 0 } else { uw_count(x, c, inline_only) }
+    uw_count_ps(x, rest, inline_only, n + here)
+  }
 }
 
 #[doc("True when a call of `f` reads its operand without taking it: a dup, a borrow, a guard-fail drop.")]
@@ -850,7 +850,7 @@ fn uw_exit(e: Expr, inner: Expr, pend: [LocalId], z: [LocalId], fx: UwFx, sites:
 
 fn uw_all_pads(ss: [UnwSite]) : Bool = match ss {
   [] -> true
-  [s, ...rest] -> unw_is_pad(s) and uw_all_pads(rest)
+  [s, ...rest] -> if unw_is_pad(s) { uw_all_pads(rest) } else { false }
 }
 
 # Children run left to right: each child is walked once, and a site
@@ -866,7 +866,7 @@ fn uw_nary(e: Expr, pend: [LocalId], z: [LocalId], fx: UwFx, sites: [UnwSite]) :
       let rs = uw_walk_children(ps, pend, z, fx)
       let eaten = map(rs, r => unw_minus(pend, r.pend))
       UwR {
-        pend: unw_minus(pend, unw_others(eaten, -1, 0)),
+        pend: unw_minus(pend, unw_others(eaten, -1)),
         sites: uw_join(ps, rs, eaten, [], sites)
       }
     }
@@ -904,16 +904,33 @@ fn uw_block(
   z: [LocalId],
   fx: UwFx,
   sites: [UnwSite]
+) : UwR = uw_block_loop(ss, ot, pend, z, fx, sites, [])
+
+fn uw_block_loop(
+  ss: [Stmt],
+  ot: Option[Expr],
+  pend: [LocalId],
+  z: [LocalId],
+  fx: UwFx,
+  sites: [UnwSite],
+  bound: [[LocalId]]
 ) : UwR = match ss {
-  [] -> match ot {
-    None -> UwR { pend: pend, sites: sites }
-    Some(t) -> uw_expr(t, pend, z, fx, sites)
+  [] -> {
+    let r = match ot {
+      None -> UwR { pend: pend, sites: sites }
+      Some(t) -> uw_expr(t, pend, z, fx, sites)
+    }
+    UwR { pend: uw_minus_each(r.pend, bound), sites: r.sites }
   }
   [s, ...rest] -> {
     let r = uw_stmt(s, pend, z, fx, sites)
-    let after = uw_block(rest, ot, r.pend, z, fx, r.sites)
-    UwR { pend: unw_minus(after.pend, unw_stmt_binders(s)), sites: after.sites }
+    uw_block_loop(rest, ot, r.pend, z, fx, r.sites, [unw_stmt_binders(s), ...bound])
   }
+}
+
+fn uw_minus_each(pend: [LocalId], bss: [[LocalId]]) : [LocalId] = match bss {
+  [] -> pend
+  [bs, ...rest] -> uw_minus_each(unw_minus(pend, bs), rest)
 }
 
 fn uw_stmt(s: Stmt, pend: [LocalId], z: [LocalId], fx: UwFx, sites: [UnwSite]) : UwR = match s {
@@ -970,7 +987,7 @@ fn uw_stmt_nary(
   let rs = uw_walk_children(ps, pend, z, fx)
   let eaten = map(rs, r => unw_minus(pend, r.pend))
   UwR {
-    pend: unw_minus(unw_filter_stmt(pend, s), unw_others(eaten, -1, 0)),
+    pend: unw_minus(unw_filter_stmt(pend, s), unw_others(eaten, -1)),
     sites: uw_join(ps, rs, eaten, [], sites)
   }
 }
@@ -1008,7 +1025,7 @@ fn uw_arms(
     let seeded =
       if owned { unw_union(rg.pend, unw_minus(unw_rc_binders(bs), fx.banned)) } else { rg.pend }
     let rb = uw_expr(body, seeded, z, fx, rg.sites)
-    let out = unw_minus(rb.pend, map(bs, b => b.id))
+    let out = unw_minus(rb.pend, map(bs, .id))
     let acc2 = match acc {
       None -> Some(out)
       Some(p) -> Some(unw_inter(p, out))
@@ -1054,7 +1071,7 @@ fn uw_handle(
 # A match scope is a site only when an arm holds a call that can unwind:
 # the emitter then registers the scrutinee for the arms' extent.
 fn uw_scope_site(e: Expr, before: [UnwSite], after: [UnwSite]) : [UnwSite] =
-  if uw_brackets(after) == uw_brackets(before) {
+  if uw_brackets(after, 0) == uw_brackets(before, 0) {
     after
   } else if unw_match_at(after, e.site) {
     after
@@ -1062,9 +1079,9 @@ fn uw_scope_site(e: Expr, before: [UnwSite], after: [UnwSite]) : [UnwSite] =
     [UnwMatch(e.site), ...after]
   }
 
-fn uw_brackets(ss: [UnwSite]) : Int = match ss {
-  [] -> 0
-  [s, ...rest] -> if unw_is_pad(s) { uw_brackets(rest) } else { 1 + uw_brackets(rest) }
+fn uw_brackets(ss: [UnwSite], n: Int) : Int = match ss {
+  [] -> n
+  [s, ...rest] -> uw_brackets(rest, if unw_is_pad(s) { n } else { n + 1 })
 }
 
 # A pasted loop body runs in this frame, once per iteration: a binder the

@@ -60,9 +60,9 @@ fn plo_call(nm: Binder, f: Expr, xs: [Expr], lent: (Expr) -> [Int], before: Lo) 
 # A call that takes `nm` bare after it was handed over reads it late; so does
 # one that both owns and borrows it, or owns it twice.
 fn plo_handed(nm: Binder, xs: [Expr], slots: [Int], before: Lo) : Lo = match before {
-  LoHeld -> match plo_bare(nm, xs, slots, 0, false) {
+  LoHeld -> match plo_bare(nm, xs, slots, 0, false, 0) {
     0 -> LoHeld
-    1 -> if plo_bare(nm, xs, slots, 0, true) == 0 { LoGone } else { LoLate }
+    1 -> if plo_bare(nm, xs, slots, 0, true, 0) == 0 { LoGone } else { LoLate }
     _ -> LoLate
   }
   _ -> LoLate
@@ -75,11 +75,12 @@ fn plo_args(nm: Binder, xs: [Expr], lent: (Expr) -> [Int], st: Lo) : Lo = match 
 }
 
 # The bare reads of `nm` among `xs` that sit in a borrowed slot (`want`) or outside one.
-fn plo_bare(nm: Binder, xs: [Expr], slots: [Int], i: Int, want: Bool) : Int = match xs {
-  [] -> 0
-  [x, ...rest] ->
-    (if plo_is_bare(nm, x) and contains(slots, i) == want { 1 } else { 0 })
-      + plo_bare(nm, rest, slots, i + 1, want)
+fn plo_bare(nm: Binder, xs: [Expr], slots: [Int], i: Int, want: Bool, n: Int) : Int = match xs {
+  [] -> n
+  [x, ...rest] -> {
+    let here = if plo_is_bare(nm, x) and contains(slots, i) == want { 1 } else { 0 }
+    plo_bare(nm, rest, slots, i + 1, want, n + here)
+  }
 }
 
 # A unit coercion is identity at runtime, so the callee takes the binder itself.
@@ -132,10 +133,18 @@ fn plo_deferred(st: Lo, nm: Binder, c: Expr) : Lo = if pcs_mentions(nm, c) { LoL
 
 fn plo_arms(nm: Binder, arms: [Arm], lent: (Expr) -> [Int], pre: Lo) : Lo = match arms {
   [] -> pre
-  [Arm(_, og, b)] -> plo_then(plo_guard(pre, nm, og, lent), nm, b, lent)
   [Arm(_, og, b), ...rest] ->
-    plo_join(plo_then(plo_guard(pre, nm, og, lent), nm, b, lent), plo_arms(nm, rest, lent, pre))
+    plo_arms_join(nm, rest, lent, pre, plo_then(plo_guard(pre, nm, og, lent), nm, b, lent))
 }
+
+fn plo_arms_join(nm: Binder, arms: [Arm], lent: (Expr) -> [Int], pre: Lo, acc: Lo) : Lo =
+  match arms {
+    [] -> acc
+    [Arm(_, og, b), ...rest] -> {
+      let st = plo_then(plo_guard(pre, nm, og, lent), nm, b, lent)
+      plo_arms_join(nm, rest, lent, pre, plo_join(acc, st))
+    }
+  }
 
 # A guard that fails falls through to the later arms, so it may only lend.
 fn plo_guard(pre: Lo, nm: Binder, og: Option[Expr], lent: (Expr) -> [Int]) : Lo = match og {
@@ -283,7 +292,8 @@ fn plt_has_back_edge(e: Expr, self_name: SelfRef) : Bool = match e.kind {
 
 fn plt_arms_back_edge(arms: [Arm], self_name: SelfRef) : Bool = match arms {
   [] -> false
-  [Arm(_, _, b), ...rest] -> plt_has_back_edge(b, self_name) or plt_arms_back_edge(rest, self_name)
+  [Arm(_, _, b), ...rest] ->
+    if plt_has_back_edge(b, self_name) { true } else { plt_arms_back_edge(rest, self_name) }
 }
 
 fn plt_opt_back_edge(oe: Option[Expr], self_name: SelfRef) : Bool = match oe {
@@ -364,7 +374,8 @@ fn plt_call_args(f: Expr, xs: [Expr], cx: PltCx, sc: PltScope, tail: Bool) : [Ex
 
 fn plt_any_named(xs: [Expr], names: [Binder], back_edge: Bool) : Bool = match xs {
   [] -> false
-  [a, ...rest] -> plt_names(a, names, back_edge) or plt_any_named(rest, names, back_edge)
+  [a, ...rest] ->
+    if plt_names(a, names, back_edge) { true } else { plt_any_named(rest, names, back_edge) }
 }
 
 fn plt_names(a: Expr, names: [Binder], back_edge: Bool) : Bool = match plt_read(a, back_edge).kind {
@@ -510,7 +521,7 @@ fn prs_opt_ty_is_heap_scalar(opt_t: Option[Ty]) : Bool = match opt_t {
 
 fn prs_has_pos(xs: [Int], i: Int) : Bool = match xs {
   [] -> false
-  [x, ...rest] -> x == i or prs_has_pos(rest, i)
+  [x, ...rest] -> if x == i { true } else { prs_has_pos(rest, i) }
 }
 
 pub(pkg) fn prt_borrow_only_binders(
@@ -585,28 +596,30 @@ fn prt_subs(subs: [Pattern], acc: [Binder]) : [Binder] = match subs {
 fn prt_borrows(nm: LocalId, e: Expr, slots: (Expr) -> [Int]) : Int = match e.kind {
   ECall(f, xs) -> {
     let here = match f.kind {
-      ESym(_, _) -> prt_borrowed_args(nm, xs, slots(f), 0)
-      ELocal(_) -> prt_borrowed_args(nm, xs, slots(f), 0)
-      EOp(_) -> prt_borrowed_args(nm, xs, slots(f), 0)
+      ESym(_, _) -> prt_borrowed_args(nm, xs, slots(f), 0, 0)
+      ELocal(_) -> prt_borrowed_args(nm, xs, slots(f), 0, 0)
+      EOp(_) -> prt_borrowed_args(nm, xs, slots(f), 0, 0)
       _ -> 0
     }
-    here + prt_borrows_ps(nm, xp_positions(e), slots)
+    prt_borrows_ps(nm, xp_positions(e), slots, here)
   }
-  _ -> prt_borrows_ps(nm, xp_positions(e), slots)
+  _ -> prt_borrows_ps(nm, xp_positions(e), slots, 0)
 }
 
-fn prt_borrows_ps(nm: LocalId, ps: [XPos], slots: (Expr) -> [Int]) : Int = match ps {
-  [] -> 0
-  [XP(r, c), ...rest] ->
-    (if xrole_inline(r) { prt_borrows(nm, c, slots) } else { 0 }) + prt_borrows_ps(nm, rest, slots)
+fn prt_borrows_ps(nm: LocalId, ps: [XPos], slots: (Expr) -> [Int], n: Int) : Int = match ps {
+  [] -> n
+  [XP(r, c), ...rest] -> {
+    let here = if xrole_inline(r) { prt_borrows(nm, c, slots) } else { 0 }
+    prt_borrows_ps(nm, rest, slots, n + here)
+  }
 }
 
-fn prt_borrowed_args(nm: LocalId, xs: [Expr], bpos: [Int], i: Int) : Int = match xs {
-  [] -> 0
+fn prt_borrowed_args(nm: LocalId, xs: [Expr], bpos: [Int], i: Int, n: Int) : Int = match xs {
+  [] -> n
   [a, ...rest] -> {
     let here =
       if prt_arg_reads(a, nm) and list_has_int(bpos, i) and prt_is_rc(a.ty) { 1 } else { 0 }
-    here + prt_borrowed_args(nm, rest, bpos, i + 1)
+    prt_borrowed_args(nm, rest, bpos, i + 1, n + here)
   }
 }
 
@@ -633,12 +646,12 @@ fn prt_is_rc(ty: Option[Ty]) : Bool = match ty {
 # Every mention of `nm`: reads and lambda captures.
 fn prt_mentions(nm: Binder, e: Expr) : Int = match e.kind {
   ELocal(u) -> if local_eq(u, nm.id) { 1 } else { 0 }
-  _ -> prt_mentions_ps(nm, xp_positions(e))
+  _ -> prt_mentions_ps(nm, xp_positions(e), 0)
 }
 
-fn prt_mentions_ps(nm: Binder, ps: [XPos]) : Int = match ps {
-  [] -> 0
-  [XP(_, c), ...rest] -> prt_mentions(nm, c) + prt_mentions_ps(nm, rest)
+fn prt_mentions_ps(nm: Binder, ps: [XPos], n: Int) : Int = match ps {
+  [] -> n
+  [XP(_, c), ...rest] -> prt_mentions_ps(nm, rest, n + prt_mentions(nm, c))
 }
 
 pub(pkg) fn prc_raw_param_names(fns: FnIndex, fid: FnId, params: [Param]) : [Binder] {
