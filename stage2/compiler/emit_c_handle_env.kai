@@ -84,53 +84,43 @@ pub(pkg) fn ev_name_of(tab: SymTab, effs: [Decl], s: SymId) : String =
 fn handle_env_struct_name(enc_fn: String, line: Int, col: Int) : String =
   handler_scoped_sym("env", enc_fn, line, col)
 
-pub(pkg) fn emit_lam_arg_reads(params: [Param], i: Int, ns: LocalNames) : String {
-  match params {
-    [] -> ""
-    [p, ...rest] -> concat_all([
-      "    KaiValue *",
-      c_local(ln_emitted(ns, p.binder.id)),
-      " = args[",
+pub(pkg) fn emit_lam_arg_reads(params: [Param], i: Int, ns: LocalNames) : String =
+  concat_all(
+    map_indexed(
+      params,
+      (j, p) => concat_all([
+        "    KaiValue *",
+        c_local(ln_emitted(ns, p.binder.id)),
+        " = args[",
+        int_to_string(i + j),
+        "];\n"
+      ])
+    )
+  )
+
+pub(pkg) fn emit_lam_cap_reads(caps: [Capture], i: Int, ns: LocalNames) : String =
+  concat_all(map_indexed(caps, (j, c) => emit_lam_cap_read(c, i + j, ns)))
+
+fn emit_lam_cap_read(c: Capture, i: Int, ns: LocalNames) : String =
+  match c {
+    # A captured handler id rides the closure as a boxed kai_int, an
+    # immediate under the tagged-Int representation: read it via kai_intf,
+    # never `->as.i`, which would deref the tagged value.
+    CapAlias(a) -> concat_all([
+      "    KaiHandlerId ",
+      c_alias_id(ln_emitted(ns, a)),
+      " = (KaiHandlerId) kai_intf(self->as.clo.captures[",
       int_to_string(i),
-      "];\n",
-      emit_lam_arg_reads(rest, i + 1, ns)
+      "]);\n"
+    ])
+    CapLocal(l) -> concat_all([
+      "    KaiValue *",
+      c_local(ln_emitted(ns, l)),
+      " = self->as.clo.captures[",
+      int_to_string(i),
+      "];\n"
     ])
   }
-}
-
-pub(pkg) fn emit_lam_cap_reads(caps: [Capture], i: Int, ns: LocalNames) : String {
-  match caps {
-    [] -> ""
-    [c, ...rest] -> {
-      let read_line = match c {
-        # A captured handler id: unpack the kai_int back to a
-        # KaiHandlerId so the tagged-op emit
-        # (`kai_evidence_lookup_node_by_id(kai_alias_<a>_id)`)
-        # finds the local in scope.
-        # The capture is a boxed handler-id (kai_int), which under the
-        # Koka tagged-Int representation is an IMMEDIATE, not a heap
-        # pointer — read it via kai_intf (understands both forms), not
-        # `->as.i` which would deref the tagged value and segv.
-        CapAlias(a) -> concat_all([
-          "    KaiHandlerId ",
-          c_alias_id(ln_emitted(ns, a)),
-          " = (KaiHandlerId) kai_intf(self->as.clo.captures[",
-          int_to_string(i),
-          "]);\n"
-        ])
-        CapLocal(l) -> concat_all([
-          "    KaiValue *",
-          c_local(ln_emitted(ns, l)),
-          " = self->as.clo.captures[",
-          int_to_string(i),
-          "];\n"
-        ])
-      }
-
-      concat_all([read_line, emit_lam_cap_reads(rest, i + 1, ns)])
-    }
-  }
-}
 
 # Every param is owned by the invocation (kai_apply hands ownership per
 # call, #298) yet a closure body only ever DUPs its reads — `in_lam`
@@ -141,19 +131,13 @@ pub(pkg) fn emit_lam_cap_reads(caps: [Capture], i: Int, ns: LocalNames) : String
 # construction, released in the KAI_CLOSURE destructor); a per-call drop
 # would UAF after the first of N invocations.
 pub(pkg) fn emit_lam_param_decrefs(params: [Param], taken: [LocalId], ns: LocalNames) : String =
-  match params {
-    [] -> ""
-    [p, ...rest] ->
-      if any(taken, t => local_eq(t, p.binder.id)) {
-        emit_lam_param_decrefs(rest, taken, ns)
-      } else {
-        concat_all([
-          "    kai_decref(",
-          c_local(ln_emitted(ns, p.binder.id)),
-          ");\n",
-          emit_lam_param_decrefs(rest, taken, ns)
-        ])
-      }
+  concat_all(map(params, p => emit_lam_param_decref(p, taken, ns)))
+
+fn emit_lam_param_decref(p: Param, taken: [LocalId], ns: LocalNames) : String =
+  if any(taken, t => local_eq(t, p.binder.id)) {
+    ""
+  } else {
+    concat_all(["    kai_decref(", c_local(ln_emitted(ns, p.binder.id)), ");\n"])
   }
 
 fn emit_one_lam_forward(l: LamInfo) : String =
@@ -223,23 +207,23 @@ pub(pkg) fn emit_clause_forward(c: ClauseInfo, effs: [Decl], tab: SymTab) : Stri
 # handle skip emission. Captures are unioned across all clauses of
 # the matching handle so the struct layout covers every clause body.
 pub(pkg) fn emit_handle_env_typedefs(cs: [ClauseInfo]) : String =
-  emit_handle_env_typedefs_loop(cs, [])
+  emit_handle_env_typedefs_loop(cs, [], [])
 
-fn emit_handle_env_typedefs_loop(cs: [ClauseInfo], seen: [String]) : String {
+fn emit_handle_env_typedefs_loop(cs: [ClauseInfo], seen: [String], acc: [String]) : String {
   match cs {
-    [] -> ""
+    [] -> concat_all(list_reverse(acc))
     [c, ...rest] -> {
       let k = clause_parts(c)
       let key = handle_env_struct_name(k.enc_fn.sym, k.line, k.col)
       if list_has(seen, key) {
-        emit_handle_env_typedefs_loop(rest, seen)
+        emit_handle_env_typedefs_loop(rest, seen, acc)
       } else {
         let caps = handle_captures_at(cs, k.enc_fn, k.line, k.col)
         let decl = match caps {
           [] -> ""
           _ -> emit_handle_env_typedef(key, caps)
         }
-        concat_all([decl, emit_handle_env_typedefs_loop(rest, [key, ...seen])])
+        emit_handle_env_typedefs_loop(rest, [key, ...seen], [decl, ...acc])
       }
     }
   }
@@ -259,17 +243,8 @@ fn emit_handle_env_typedef(env_name: String, caps: [Capture]) : String =
     "};\n\n"
   ])
 
-fn emit_handle_env_typedef_fields(layout: [Capture], caps: [Capture]) : String {
-  match caps {
-    [] -> ""
-    [c, ...rest] -> concat_all([
-      "    KaiValue *",
-      env_field(layout, c),
-      ";\n",
-      emit_handle_env_typedef_fields(layout, rest)
-    ])
-  }
-}
+fn emit_handle_env_typedef_fields(layout: [Capture], caps: [Capture]) : String =
+  concat_all(map(caps, c => concat_all(["    KaiValue *", env_field(layout, c), ";\n"])))
 
 # m7b #11: stateful-clause prologue. `state` and `log` are aliases of
 # `self->state`. Both names are bound (the two are aliases of the same
@@ -334,15 +309,8 @@ pub(pkg) fn emit_clause_env_prologue(
   }
 }
 
-fn emit_clause_env_reads(ns: LocalNames, layout: [Capture], caps: [Capture]) : String {
-  match caps {
-    [] -> ""
-    [c, ...rest] -> concat_all([
-      clause_env_read(ns, layout, c),
-      emit_clause_env_reads(ns, layout, rest)
-    ])
-  }
-}
+fn emit_clause_env_reads(ns: LocalNames, layout: [Capture], caps: [Capture]) : String =
+  concat_all(map(caps, c => clause_env_read(ns, layout, c)))
 
 # Wrapper around `emit_expr` that flips the in-clause flag, so that
 # `resume(v, ns)` lowers to a state-write before the resume call.
@@ -406,30 +374,22 @@ pub(pkg) fn emit_lambda_ref(x: Expr, cx: EmitCtx) : String {
 # constructors. Mirrors emit_list_tail's cons-spine shape; uses the
 # same kai_variant signature emit_ident_value uses for a bare
 # nullary constructor reference.
-pub(pkg) fn emit_variants_of_list(ctors: [SymId], cx: EmitCtx) : String {
-  match ctors {
-    [] -> "kai_nil()"
-    [c, ...rest] -> {
-      # A constructor the index lays out no row for keeps tag 0, as an
-      # unregistered name did.
-      let row = match ctor_ix_row(cx.ctor_ix, c) {
-        Some(r) -> r
-        None -> EV(0, [], 0, c)
-      }
-      match row {
-        EV(_, _, tag, rc) -> concat_all([
-          "kai_cons(kai_variant_u(",
-          int_to_string(tag),
-          ", \"",
-          ctor_cell_name(cx.tab, rc),
-          "\", 0, 0, NULL), ",
-          emit_variants_of_list(rest, cx),
-          ")"
-        ])
-      }
+pub(pkg) fn emit_variants_of_list(ctors: [SymId], cx: EmitCtx) : String =
+  foldr(ctors, "kai_nil()", (c, tail) => {
+    # A constructor the index lays out no row for keeps tag 0.
+    let row = ctor_ix_row(cx.ctor_ix, c) ?? EV(0, [], 0, c)
+    match row {
+      EV(_, _, tag, rc) -> concat_all([
+        "kai_cons(kai_variant_u(",
+        int_to_string(tag),
+        ", \"",
+        ctor_cell_name(cx.tab, rc),
+        "\", 0, 0, NULL), ",
+        tail,
+        ")"
+      ])
     }
-  }
-}
+  })
 
 # m7e §13 — lower `expr!` to a statement-expression that evaluates
 # `inner`, returns the success payload, or short-circuits the
@@ -551,19 +511,19 @@ pub(pkg) fn emit_handle_env_alloc(
   }
 }
 
-fn emit_handle_env_field_assigns(ns: LocalNames, layout: [Capture], caps: [Capture]) : String {
-  match caps {
-    [] -> ""
-    [c, ...rest] -> concat_all([
-      "_env.",
-      env_field(layout, c),
-      " = ",
-      handle_env_field_value(ns, c),
-      "; ",
-      emit_handle_env_field_assigns(ns, layout, rest)
-    ])
-  }
-}
+fn emit_handle_env_field_assigns(ns: LocalNames, layout: [Capture], caps: [Capture]) : String =
+  concat_all(
+    map(
+      caps,
+      c => concat_all([
+        "_env.",
+        env_field(layout, c),
+        " = ",
+        handle_env_field_value(ns, c),
+        "; "
+      ])
+    )
+  )
 
 # A handler-id capture rides the env boxed, like a lambda's.
 fn handle_env_field_value(ns: LocalNames, c: Capture) : String = match c {
@@ -610,29 +570,21 @@ pub(pkg) fn emit_clause_assignments(
   enc: String,
   hline: Int,
   hcol: Int
-) : String {
-  match cs {
-    [] -> ""
-    [c, ...rest] -> match c {
-      HC(head, _, _, _, _) ->
-        # `finally` is not an op: it has no `Ev` slot and is wired to the
-        # evidence node instead.
-        if is_lifecycle_clause(head) {
-          emit_clause_assignments(rest, enc, hline, hcol)
-        } else {
-          let op_name = clause_head_word(head)
-          concat_all([
-            "_ev.",
-            op_name,
-            " = &",
-            user_clause_sym(enc, hline, hcol, op_name),
-            "; ",
-            emit_clause_assignments(rest, enc, hline, hcol)
-          ])
-        }
-    }
+) : String =
+  concat_all(map(cs, c => emit_clause_assignment(c, enc, hline, hcol)))
+
+fn emit_clause_assignment(c: HClause, enc: String, hline: Int, hcol: Int) : String =
+  match c {
+    HC(head, _, _, _, _) ->
+      # `finally` is not an op: it has no `Ev` slot and is wired to the
+      # evidence node instead.
+      if is_lifecycle_clause(head) {
+        ""
+      } else {
+        let op_name = clause_head_word(head)
+        concat_all(["_ev.", op_name, " = &", user_clause_sym(enc, hline, hcol, op_name), "; "])
+      }
   }
-}
 
 pub(pkg) fn expr_is_perceus_drop_call(x: Expr) : Bool {
   match x.kind {
