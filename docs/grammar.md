@@ -1065,7 +1065,7 @@ cap                     ≡  Cap.get()                   (* naked cell read *)
 cap := v                ≡  Cap.set(v)
 a[i] := v               ≡  Mutable.array_set(a, i, v)  (* indexed write *)
 a[i]                    ≡  Mutable.array_get(a, i)     (* indexed read *)
-var x := init           ≡  handle { ... } with State[t](init) { ... }
+var x := init           ≡  a local cell, read and written in place
 ```
 
 `:=` is the single mark of mutability: `var x := init` declares the

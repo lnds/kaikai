@@ -2180,7 +2180,9 @@ test-issue-1179-var-slot-loop: $(TARGET) build
 	    && { echo "issue_1179 FAIL ($$fn still carries a State clause)"; exit 1; } || true; \
 	done; \
 	grep -q "kaiu_issue_1179_each_closure_state__each_sum__clause" build/issue_1179_each_closure_state.c \
-	  || { echo "issue_1179 FAIL (each_sum lost its State clauses)"; exit 1; }; \
+	  && { echo "issue_1179 FAIL (each_sum kept a State handler)"; exit 1; } || true; \
+	grep -q "kaix_core_ref_make" build/issue_1179_each_closure_state.c \
+	  || { echo "issue_1179 FAIL (each_sum lost its Ref cell)"; exit 1; }; \
 	for cell in acc_int acc_real flag post; do \
 	  grep -Eq "^[[:space:]]+(int64_t|double|int32_t) ([^;()=]*[ ,])?r_$${cell}__slot_[0-9]+[,;]" build/issue_1179_cell_register.c \
 	    || { echo "issue_1179 FAIL ($$cell not promoted to a raw cell)"; exit 1; }; \
@@ -2203,7 +2205,7 @@ test-issue-1179-var-slot-loop: $(TARGET) build
 	  || { echo "var_interp_slot FAIL (kir dump)"; exit 1; }; \
 	grep -q "total__slot_[0-9][0-9]*: i64" build/var_interp_slot.kir \
 	  || { echo "var_interp_slot FAIL (total not a raw i64 register in KIR)"; exit 1; }; \
-	echo "issue-1179-var-slot-loop OK (loops slot + inline, scalar cells raw, each keeps State, an interpolated var stays a slot)"
+	echo "issue-1179-var-slot-loop OK (loops slot + inline, scalar cells raw, a captured var is a Ref cell, an interpolated var stays a slot)"
 
 # Issue #1214 — a non-literal PURE scalar var init (`var m := n`,
 # `var m := n*2+1`) promotes to a raw register just like a literal init,
@@ -6666,7 +6668,7 @@ test-perceus-1135-vec-raw-native: $(TARGET) bin-kai build
 # write a vector its holder hands over first: a `var` slot refilled by the
 # write, and a constructor cell the match releases as the arm starts.
 PERCEUS_VEC_LEND_FIXTURES := vec_lend_then_write:600:0 vec_lend_then_write_local:4:0 vec_read_after_write:0:4 \
-  vec_var_loop_write:470:0 vec_in_ctor_write:400:0 ref_vec_take_write:200:0 ref_vec_take_keeps_copy:0:4 \
+  vec_var_loop_write:470:0 vec_in_ctor_write:400:0 ref_vec_take_write:200:0 ref_vec_take_keeps_copy:0:4 var_captured_vec_write:200:0 var_captured_keeps_copy:0:4 \
   vec_own_record_fresh:20000:0 vec_own_record_spread:20000:0 vec_own_record_pattern:20000:0 \
   vec_own_tuple_let:20000:0 vec_own_var_module_set:20000:0 vec_own_handler_state:20000:0 vec_own_dead_closure:40000:0 vec_own_pattern_nested:60000:0
 
