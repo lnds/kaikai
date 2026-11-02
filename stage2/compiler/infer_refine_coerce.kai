@@ -1,0 +1,282 @@
+#[doc("Coercion of values meeting refined types, constructor payloads and lambda parameters.")]
+
+import compiler.infer_patterns
+import compiler.util
+import compiler.diag
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.resolve_names
+import compiler.symtab
+import compiler.infer_glue
+import compiler.infer_env
+import compiler.infer_state
+import compiler.infer_call_labels
+import compiler.infer_env_exhaust
+import compiler.diag_type_text
+import compiler.infer_apply
+import compiler.infer_fuse_arith
+import compiler.written
+import compiler.local_names
+import compiler.refinements
+import compiler.refine_coerce
+import compiler.refine_types
+import compiler.fmt
+import compiler.unit_walk
+import compiler.infer_local_mutation
+
+# A value meeting a refined type: a refuting literal is an error, and
+# an unproven value is bound once and checked before it flows on.
+#[doc("Typer-internal helper `refine_coerce` shared across the infer modules.")]
+pub fn refine_coerce(
+  m: MintedExpr,
+  expected: Ty,
+  what: String,
+  line: Int,
+  col: Int
+) : MintedExpr / Console + File + Mutable =
+  if not (rc_mentions(expected) or rc_mentions_in(m.st.sub, m.pair.ty)) {
+    m
+  } else {
+    let want = apply_ty(m.st.sub, expected)
+    let m1 = refine_flow(m, want, what, line, col)
+    if rc_may_owe(want) { refine_coerce_applied(m1, want, what, line, col) } else { m1 }
+  }
+
+fn refine_coerce_applied(
+  m: MintedExpr,
+  want: Ty,
+  what: String,
+  line: Int,
+  col: Int
+) : MintedExpr / Console + File + Mutable {
+  match want {
+    TyFnT(_, ret, _) -> match m.pair.expr.kind {
+      ELambda(ps, body) -> {
+        let b = refine_coerce_tail(mk_inferred(m.st, typed_ty_or(body, ret), body), ret, what)
+        MintedExpr {
+          st: b.st,
+          pair: ExprTy { expr: Expr { ...m.pair.expr, kind: ELambda(ps, b.expr) }, ty: m.pair.ty }
+        }
+      }
+      _ -> m
+    }
+    _ -> refine_coerce_value(m, want, what, line, col)
+  }
+}
+
+fn refine_coerce_value(
+  m: MintedExpr,
+  want: Ty,
+  what: String,
+  line: Int,
+  col: Int
+) : MintedExpr / Console + File + Mutable {
+  match rc_verdict(want, m.pair.expr, apply_ty(m.st.sub, m.pair.ty)) {
+    RcProven -> m
+    RcRefuted(why) -> {
+      # The refuted value and the refinement it carries read the locals in scope.
+      let names = ln_with_binder(st_local_names(m.st), pred_self_binder())
+      let show = e => fmt_expr_text(e, m.st.env.tab, names)
+      let perr = mk_diag(
+        SevError,
+        m.st.file,
+        line,
+        col,
+        concat_all([what, ": ", loose_text(why, show, show)]),
+        []
+      )
+      MintedExpr { st: st_bump_err(st_push_diag(m.st, perr)), pair: m.pair }
+    }
+    RcCheck(preds) -> {
+      let r = refine_checked(m.st, m.pair.expr, m.pair.ty, preds, rc_is_dim(want))
+      MintedExpr { st: r.st, pair: ExprTy { expr: r.expr, ty: r.ty } }
+    }
+  }
+}
+
+# A constructor has no body to check its fields on entry, so its call
+# coerces each argument to the declared payload type.
+#[doc("Typer-internal helper `coerce_ctor_args` shared across the infer modules.")]
+pub fn coerce_ctor_args(
+  st: InferState,
+  callee: Expr,
+  args_: [Expr],
+  arg_tys: [Ty],
+  callee_ty: Ty
+) : InferredList / Console + File + Mutable =
+  if not list_any_may_owe(fn_param_tys(st, callee_ty)) {
+    InferredList { st: st, tys: arg_tys, exprs: args_ }
+  } else {
+    match callee_ctor_name(st.env.tab, callee) {
+      Some(cn) ->
+        coerce_args_to(st, args_, arg_tys, fn_param_tys(st, callee_ty), "argument of `#{cn}`")
+      None -> InferredList { st: st, tys: arg_tys, exprs: args_ }
+    }
+  }
+
+# A lambda passed where its parameter's type has a refined return
+# checks that return in its own body.
+#[doc("Typer-internal helper `coerce_lambda_args` shared across the infer modules.")]
+pub fn coerce_lambda_args(
+  r: InferredList,
+  callee_ty: Ty
+) : InferredList / Console + File + Mutable =
+  if not list_any_lambda(r.exprs) {
+    r
+  } else {
+    let params = fn_param_tys(r.st, callee_ty)
+    if not list_any_may_owe(params) {
+      r
+    } else {
+      coerce_args_to(r.st, r.exprs, r.tys, map(params, p => fn_ret_only(p)), "lambda result")
+    }
+  }
+
+# Under an expected type, a generic constructor's payload takes the
+# refined type the expectation gives its variable, as `Some(v)` does
+# for an `Option[Pos]`.
+#[doc("Typer-internal helper `ctor_coerce_expected` shared across the infer modules.")]
+pub fn ctor_coerce_expected(r: Inferred, expected: Ty) : Inferred / Console + File + Mutable =
+  match r.expr.kind {
+    ECall(c, args_) -> match callee_ctor_name(r.st.env.tab, c) {
+      Some(cn) -> if not rc_mentions(apply_ty(r.st.sub, expected)) {
+        r
+      } else {
+        match ctor_fresh_sig(r.st.env, c) {
+          TyFnT(ps, res, _) -> {
+            let binds = rc_var_binds(res, apply_ty(r.st.sub, expected))
+            if binds == [] {
+              r
+            } else {
+              let ca = coerce_args_to(
+                r.st,
+                args_,
+                map(args_, a => typed_ty_or(a, TyAny)),
+                map(ps, p => rc_subst(p, binds)),
+                "argument of `#{cn}`"
+              )
+              mk_inferred(ca.st, r.ty, Expr { ...r.expr, kind: ECall(c, ca.exprs) })
+            }
+          }
+          _ -> r
+        }
+      }
+      None -> r
+    }
+    _ -> r
+  }
+
+fn coerce_args_to(
+  st: InferState,
+  args_: [Expr],
+  arg_tys: [Ty],
+  params: [Ty],
+  what: String
+) : InferredList / Console + File + Mutable =
+  coerce_args_loop(st, args_, arg_tys, params, what, [], [])
+
+# A list that runs out first leaves the other lists' remainder as it came.
+fn coerce_args_loop(
+  st: InferState,
+  args_: [Expr],
+  arg_tys: [Ty],
+  params: [Ty],
+  what: String,
+  tys: [Ty],
+  exprs: [Expr]
+) : InferredList / Console + File + Mutable =
+  match args_ {
+    [a, ...rest] -> match arg_tys {
+      [t, ...trest] -> match params {
+        [p, ...prest] -> {
+          let m = refine_coerce(
+            MintedExpr { st: st, pair: ExprTy { expr: a, ty: t } },
+            p,
+            what,
+            a.line,
+            a.col
+          )
+          coerce_args_loop(
+            m.st,
+            rest,
+            trest,
+            prest,
+            what,
+            [m.pair.ty, ...tys],
+            [m.pair.expr, ...exprs]
+          )
+        }
+        [] -> coerce_args_done(st, args_, arg_tys, tys, exprs)
+      }
+      [] -> coerce_args_done(st, args_, arg_tys, tys, exprs)
+    }
+    [] -> coerce_args_done(st, args_, arg_tys, tys, exprs)
+  }
+
+fn coerce_args_done(
+  st: InferState,
+  args_: [Expr],
+  arg_tys: [Ty],
+  tys: [Ty],
+  exprs: [Expr]
+) : InferredList =
+  InferredList {
+    st: st,
+    tys: prepend_reverse_tys(tys, arg_tys),
+    exprs: prepend_reverse_exprs(exprs, args_)
+  }
+
+fn prepend_reverse_tys(xs: [Ty], acc: [Ty]) : [Ty] = match xs {
+  [] -> acc
+  [x, ...rest] -> prepend_reverse_tys(rest, [x, ...acc])
+}
+
+fn prepend_reverse_exprs(xs: [Expr], acc: [Expr]) : [Expr] = match xs {
+  [] -> acc
+  [x, ...rest] -> prepend_reverse_exprs(rest, [x, ...acc])
+}
+
+# A block's value is its tail; checking the tail keeps the block's
+# prefix (the requires checks a call site reads) in front.
+#[doc("Typer-internal helper `refine_coerce_tail` shared across the infer modules.")]
+pub fn refine_coerce_tail(
+  r: Inferred,
+  expected: Ty,
+  what: String
+) : Inferred / Console + File + Mutable = match r.expr.kind {
+  EBlock(ss, Some(t)) -> {
+    let inner = refine_coerce_tail(mk_inferred(r.st, typed_ty_or(t, r.ty), t), expected, what)
+    mk_inferred(inner.st, r.ty, Expr { ...r.expr, kind: EBlock(ss, Some(inner.expr)) })
+  }
+  _ -> {
+    let m = refine_coerce(
+      MintedExpr { st: r.st, pair: ExprTy { expr: r.expr, ty: r.ty } },
+      expected,
+      what,
+      r.expr.line,
+      r.expr.col
+    )
+    mk_inferred(m.st, m.pair.ty, m.pair.expr)
+  }
+}
+
+fn refine_checked(
+  st: InferState,
+  v: Expr,
+  vty: Ty,
+  preds: [Expr],
+  strip: Bool
+) : Inferred / Console + File + Mutable {
+  let rv = binder_minted("__rv")
+  let pat = mk_pat(PBind(rv), v.line, v.col)
+  let named = p => pred_local_names(p, l => st_local_text(st, l), ln_empty())
+  let checks = w_synth_stmts(
+    check_pattern(st, pat, vty),
+    map(preds, p => rc_assert(rv, p, st.refine_ctx, strip, st.env.tab, named(p)))
+  )
+  let tail = w_synth(checks.st, mk_local(rv.id, v.line, v.col))
+  let block = mk_expr(EBlock([SLet(pat, None, v), ...checks.stmts], Some(tail.expr)), v.line, v.col)
+  mk_inferred(st_restore_entries(st, tail.st), vty, with_ty(block, vty))
+}
