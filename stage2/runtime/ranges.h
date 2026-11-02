@@ -643,6 +643,9 @@ static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
  * fixed-width Int boxes ended up crossing threads by pointer; without
  * one, adding a tag is a compile error until it is classified here. */
 typedef enum { KAI_COPY_REGION = 0, KAI_COPY_CROSS = 1 } KaiCopyMode;
+
+/* `variant_tag` of a KAI_REF. */
+enum { KAI_REF_USER = 0, KAI_REF_VAR = 1, KAI_REF_VAR_FOREIGN = 2 };
 static KAI_RC_NOINLINE KaiValue *kai_closure(KaiFn fn, int arity, int n_captures, KaiValue **captures);
 static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
     if (!v) return v;
@@ -837,6 +840,11 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
         case KAI_REF: {
             if (mode == KAI_COPY_REGION) return kai_incref(v);
             KaiValue *c = kai_alloc(KAI_REF);
+            if (v->variant_tag != KAI_REF_USER) {
+                c->variant_tag = KAI_REF_VAR_FOREIGN;
+                c->as.ref.cell = kai_unit();
+                return c;
+            }
             c->as.ref.cell = kai_deep_copy(v->as.ref.cell, mode);
             return c;
         }

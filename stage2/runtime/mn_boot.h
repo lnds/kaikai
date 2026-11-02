@@ -506,19 +506,10 @@ static KAI_RC_NOINLINE KaiValue *kai_spawn_fiber_stamped(KaiValue *thunk, KaiVal
     KaiFiber *f = (KaiFiber *) calloc(1, sizeof(KaiFiber));
     if (!f) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     f->parent       = kai_current_fiber();
-    /* The fiber owns its thunk for its whole lifetime. At N=1 an incref
-     * suffices (one thread). At N>1 the fiber may run on another
-     * scheduler thread, so sharing the closure would race its non-atomic
-     * rc (and its captures') between the spawner and the fiber body —
-     * exactly the cross-thread-share the message copy path forbids. Copy
-     * the thunk into a single-owner tree that migrates with the fiber. */
-    if (kai_nthreads > 1) {
-        f->thunk = kai_deep_copy_cross(thunk);
-    } else {
-        /* incref to retain a ref the fiber owns; the caller-side ref is
-         * still the caller's to manage (Perceus decrefs at call-site exit). */
-        f->thunk = kai_incref(thunk);
-    }
+    /* The fiber owns a single-owner copy of its thunk that migrates with it:
+     * at N>1 sharing would race the non-atomic rc, and at every N the copy
+     * is what keeps a captured `var` cell unreachable from the child. */
+    f->thunk = kai_deep_copy_cross(thunk);
     /* Capabilities do not cross a spawn: a value-transportable effect
      * rides the child thunk's own evidence frame, and a fiber-local
      * effect resolves against this fiber's own disposition (cancel pad,

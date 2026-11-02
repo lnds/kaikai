@@ -198,17 +198,14 @@ EOF
   cat > "$dir/aborted.kai" <<'EOF'
 import spawn
 
-fn main() : Int / Spawn = handle {
-  let reader = () => { let _ = c; () }
+fn main() : Int / Spawn = {
+  var counter := 0
+  let reader = () => { let _ = counter; () }
   nursery { n ->
     let _f = n.spawn(() => { let g = reader; g(); () })
     ()
   }
   0
-} with State[Int](0) as c {
-  get(resume) -> resume(state)
-  set(v, resume) -> resume((), v)
-  return(x) -> x
 }
 EOF
   cat > "$dir/spin.kai" <<'EOF'

@@ -577,7 +577,7 @@ static KaiValue *kai_default_mutable_array_grow(void *self, KaiValue *a,
  * mirroring the array_* clauses above. */
 static KaiValue *kai_default_mutable_ref_make(void *self, KaiValue *init, KaiCont *k) {
     (void) self;
-    return kai_cont_resume(k, kai_core_ref_make(kai_incref(init)));
+    return kai_cont_resume(k, kai_ref_new(kai_incref(init)));
 }
 
 static KaiValue *kai_default_mutable_ref_get(void *self, KaiValue *r, KaiCont *k) {

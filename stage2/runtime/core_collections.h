@@ -206,17 +206,28 @@ static KaiValue *kai_core_vec_from_list(KaiValue *xs) {
  * (The earlier length-1 KAI_ARRAY hack from #257 is replaced here.)
  * RC: a Ref owns one strong reference to its cell. All three ops obey
  * the callee-consumes convention. */
-static KaiValue *kai_core_ref_make(KaiValue *init) {
-    /* Steal `init` straight into the cell — no incref/decref dance
-     * (the array-backed version did one of each; this is strictly less
-     * RC work, which matters on the hot path of Front A). */
+static KaiValue *kai_ref_new(KaiValue *init) {
     KaiValue *r = kai_alloc(KAI_REF);
     r->as.ref.cell = init;
     return r;
 }
 
+/* The cell a `var` lowers to; its thread-border copy is KAI_REF_VAR_FOREIGN
+ * and aborts on first access. */
+static KaiValue *kai_core_ref_make(KaiValue *init) {
+    KaiValue *r = kai_ref_new(init);
+    r->variant_tag = KAI_REF_VAR;
+    return r;
+}
+
+static KAI_RC_NOINLINE void kai_ref_foreign_abort(void) {
+    kai_eprintf("kai: capability not reachable in this fiber: a captured var\n");
+    kai_exit(1);
+}
+
 static KaiValue *kai_core_ref_get(KaiValue *r) {
     /* Hand back a fresh strong reference to the cell; consume `r`. */
+    if (r && r->variant_tag == KAI_REF_VAR_FOREIGN) kai_ref_foreign_abort();
     KaiValue *v = r ? kai_incref(r->as.ref.cell) : NULL;
     if (r) kai_decref(r);
     return v;
@@ -225,6 +236,7 @@ static KaiValue *kai_core_ref_get(KaiValue *r) {
 /* The value leaves with the cell's own reference; the cell holds unit
  * until the store the compiler pairs this read with. */
 static KaiValue *kai_core_ref_take(KaiValue *r) {
+    if (r->variant_tag == KAI_REF_VAR_FOREIGN) kai_ref_foreign_abort();
     KaiValue *v = r->as.ref.cell;
     r->as.ref.cell = kai_unit();
     kai_decref(r);
@@ -235,6 +247,7 @@ static KaiValue *kai_core_ref_set(KaiValue *r, KaiValue *v) {
     /* Drop the old contents, steal `v` into the cell; consume `r`.
      * Surface contract is Unit-typed. No bounds check, no index. */
     if (r) {
+        if (r->variant_tag == KAI_REF_VAR_FOREIGN) kai_ref_foreign_abort();
         kai_decref(r->as.ref.cell);
         r->as.ref.cell = v;       /* steals v */
         kai_decref(r);
