@@ -512,6 +512,8 @@ KaiValue *kaix_real_to_string_thunk(KaiValue *s, KaiValue **a, int n);
 static inline KaiValue *kaix_rec_stamp(KaiValue *rec, int32_t head_tag);
 static inline KaiValue *kaix_record(int n, KaiValue **fields, const char **names);
 KaiValue *kaix_reduce_thunk(KaiValue *s, KaiValue **a, int n);
+KaiValue *kaix_ref_get_thunk(KaiValue *s, KaiValue **a, int n);
+KaiValue *kaix_ref_make_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_ref_store_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_ref_take_ok_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_ref_take_thunk(KaiValue *s, KaiValue **a, int n);

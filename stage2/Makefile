@@ -8803,8 +8803,10 @@ test-kir-var-escape-state-1173: $(TARGET) bin-kai build
 	  || { echo "kir-var-escape-state-1173 FAIL (output diff)"; diff ../examples/perceus/var_escapes_stays_state_1173.out.expected build/s2-1173vesc.out; exit 1; }; \
 	kir=$$($(KAIC2) --path ../stdlib --emit=kir $$src 2>/dev/null | awk '/^fn kaiu_main/,/^}/'); \
 	echo "$$kir" | grep -q 'install State' \
-	  || { echo "kir-var-escape-state-1173 FAIL (State install gone from main — an escaping var was demoted to a slot)"; exit 1; }; \
-	echo "kir-var-escape-state-1173 OK (surviving closure keeps the cell a dispatched State handler)"
+	  && { echo "kir-var-escape-state-1173 FAIL (a captured var kept a State handler)"; exit 1; } || true; \
+	echo "$$kir" | grep -q 'kaix_core_ref_make' \
+	  || { echo "kir-var-escape-state-1173 FAIL (the Ref cell is gone from main — an escaping var was demoted to a slot)"; exit 1; }; \
+	echo "kir-var-escape-state-1173 OK (surviving closure keeps the cell a Ref)"
 
 # Issue #1414 — an inlined while whose predicate tail is a raw Int
 # comparison lowers a raw i1 condbr (no bool.box, no truthy) and the
