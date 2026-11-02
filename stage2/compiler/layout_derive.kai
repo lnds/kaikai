@@ -229,7 +229,7 @@ fn ld_from_bytes_body(d: DeriveFor, lfs: [LayoutField], line: Int, col: Int) : E
   let short = ld_expr(EBinop(BoLt, have, need), line, col)
   let err =
     ld_call("Err", [ld_expr(EStr(ld_short_msg(derive_type_name(d)), false), line, col)], line, col)
-  ld_expr(EIf(short, err, Some(ld_tower(d, lfs, 0, [], line, col))), line, col)
+  ld_expr(EIf(short, err, Some(ld_tower(d, lfs, 0, [], line, col, []))), line, col)
 }
 
 # `EStr` carries the raw source span, quotes included.
@@ -242,9 +242,16 @@ fn ld_tower(
   off: Int,
   bound: [String],
   line: Int,
-  col: Int
+  col: Int,
+  frames: [(Expr, Pattern)]
 ) : Expr = match lfs {
-  [] -> ld_ok_cursor(d, list_reverse(bound), off, line, col)
+  [] -> foldl(
+    frames,
+    ld_ok_cursor(d, list_reverse(bound), off, line, col),
+    (ok, fr) => match fr {
+      (read, bind) -> ld_read_arm(d, read, bind, ok, line, col)
+    }
+  )
   [f, ...rest] -> {
     let getter = match lf_order(f) {
       BigEndian -> "bin_get_uint_be"
@@ -265,21 +272,32 @@ fn ld_tower(
       line,
       col
     )
-    let ok = ld_tower(d, rest, off + lf_width(f), [lf_name(f), ...bound], line, col)
     let bind = mk_pat(PBind(binder_written(lf_name(f))), line, col)
-    let some_arm = Arm(mk_pat(PVariant(derive_ctor_ref("Some"), [bind]), line, col), None, ok)
-    let none_arm = Arm(
-      mk_pat(PVariant(derive_ctor_ref("None"), []), line, col),
-      None,
-      ld_call(
-        "Err",
-        [ld_expr(EStr(ld_short_msg(derive_type_name(d)), false), line, col)],
-        line,
-        col
-      )
+    ld_tower(
+      d,
+      rest,
+      off + lf_width(f),
+      [lf_name(f), ...bound],
+      line,
+      col,
+      [(read, bind), ...frames]
     )
-    ld_expr(EMatch(read, [some_arm, none_arm]), line, col)
   }
+}
+
+fn ld_read_arm(d: DeriveFor, read: Expr, bind: Pattern, ok: Expr, line: Int, col: Int) : Expr {
+  let some_arm = Arm(mk_pat(PVariant(derive_ctor_ref("Some"), [bind]), line, col), None, ok)
+  let none_arm = Arm(
+    mk_pat(PVariant(derive_ctor_ref("None"), []), line, col),
+    None,
+    ld_call(
+      "Err",
+      [ld_expr(EStr(ld_short_msg(derive_type_name(d)), false), line, col)],
+      line,
+      col
+    )
+  )
+  ld_expr(EMatch(read, [some_arm, none_arm]), line, col)
 }
 
 # `Ok(BinCursor { value: T { f: __attach_unit(f), .. }, pos: pos + width })`.
@@ -359,13 +377,9 @@ fn lfo_loop(fields: [FieldDecl], acc: [LayoutField], saw: Bool) : Option[[Layout
 fn layout_field_of(fd: FieldDecl) : Option[LayoutField] = match fd {
   FD(_, name, te, _, _, _) -> match te.tkind {
     TyDim(base, u) -> match base.tkind {
-      TyName(head, _) -> match layout_order_of(u) {
-        Some(order) -> match layout_width_of(derive_bare_text(head)) {
-          Some(w) -> Some(LFld(name, w, order))
-          None -> None
-        }
-        None -> None
-      }
+      TyName(head, _) ->
+        layout_order_of(u)
+          || (order => (layout_width_of(derive_bare_text(head)) | (w => LFld(name, w, order))))
       _ -> None
     }
     _ -> None
@@ -384,14 +398,15 @@ fn layout_order_of(u: UnitExprT) : Option[ByteOrder] = match u {
 # Only the unsigned heads carry a decode-clean unsigned round-trip; signed
 # heads are a follow-up (sign extension), so they are not Layout-bearing yet.
 #[doc("The byte width of an unsigned width annotation (`U32` -> 4); `None` for a signed one, `F32`, or any other name.")]
-fn layout_width_of(name: String) : Option[Int] = match ffi_fixed_of_name(name) {
-  Some(fx) -> if ffi_fixed_is_signed(fx) or ffi_fixed_is_float(fx) {
-    None
-  } else {
-    Some(ffi_fixed_bits(fx) / 8)
-  }
-  None -> None
-}
+fn layout_width_of(name: String) : Option[Int] =
+  ffi_fixed_of_name(name)
+    || (fx => {
+      if ffi_fixed_is_signed(fx) or ffi_fixed_is_float(fx) {
+        None
+      } else {
+        Some(ffi_fixed_bits(fx) / 8)
+      }
+    })
 
 # Why a field is not Layout-bearing. `LOk` keeps the walk total.
 pub(pkg) type LayoutReject

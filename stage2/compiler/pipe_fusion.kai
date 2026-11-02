@@ -119,13 +119,11 @@ pub(pkg) type FusedFold = { source: Expr, stages: [Expr], term: FoldTerminal }
 #[doc("Recognise a `map`-pipe chain into a fold-shaped terminal (`foldl(init, combine)`, `sum`, `product`, `length`) for terminal fusion. A bare range head (`[a..b] |> sum()`) is the zero-stage chain: it fuses with an identity stage so the range is never constructed. `ids` tells a protocol's `foldl` from any other callee. The terminal is recognised by the declaration its callee names: a callee the typer has yet to settle is no terminal.")]
 pub(pkg) fn pipe_fusion_as_terminal_fold(ids: ProtoIds, lhs: Expr, rhs: Expr) : Option[FusedFold] =
   match lhs.kind {
-    EDispatchPipe(PoMap, _, _) -> match pipe_fusion_as_terminal(ids, rhs) {
-      Some(term) -> {
+    EDispatchPipe(PoMap, _, _) -> pipe_fusion_as_terminal(ids, rhs)
+      | (term => {
         let flat = pipe_fusion_flatten_map_chain(lhs)
-        Some(FusedFold { source: flat.source, stages: flat.stages, term: term })
-      }
-      None -> None
-    }
+        FusedFold { source: flat.source, stages: flat.stages, term: term }
+      })
     # Only a RANGE head earns the zero-stage rewrite: for a plain list,
     # `sum(xs)` beats `map_sum(xs, identity)` (monomorphised static loop
     # vs a closure call per element).
@@ -133,10 +131,8 @@ pub(pkg) fn pipe_fusion_as_terminal_fold(ids: ProtoIds, lhs: Expr, rhs: Expr) : 
       if not pipe_fusion_head(lhs) {
         None
       } else {
-        match pipe_fusion_as_terminal(ids, rhs) {
-          Some(term) -> Some(FusedFold { source: lhs, stages: [], term: term })
-          None -> None
-        }
+        pipe_fusion_as_terminal(ids, rhs)
+          | (term => FusedFold { source: lhs, stages: [], term: term })
       }
   }
 
@@ -263,30 +259,40 @@ fn pipe_fusion_bind_stages(stages: [Expr], line: Int, col: Int) : BoundStages =
 type HoistedStages = { binds: [Stmt], refs: [Expr] }
 
 fn pipe_fusion_hoist_lambdas(stages: [Expr], i: Int, line: Int, col: Int) : HoistedStages =
-  match stages {
-    [] -> HoistedStages { binds: [], refs: [] }
-    [s, ...rest] -> {
-      let r = pipe_fusion_hoist_lambdas(rest, i + 1, line, col)
-      match s.kind {
-        ELambda(_, _) -> {
-          let name = concat_all([
-            "__fusev_",
-            int_to_string(line),
-            "_",
-            int_to_string(col),
-            "_",
-            int_to_string(i)
-          ])
-          let pat = Pattern { pkind: PBind(binder_minted(name)), line: line, col: col }
-          HoistedStages {
-            binds: [SLet(pat, None, s), ...r.binds],
-            refs: [mk_local(local_minted(name), line, col), ...r.refs]
-          }
-        }
-        _ -> HoistedStages { binds: r.binds, refs: [s, ...r.refs] }
-      }
+  hoist_lambdas_acc(stages, i, line, col, [], [])
+
+fn hoist_lambdas_acc(
+  stages: [Expr],
+  i: Int,
+  line: Int,
+  col: Int,
+  binds: [Stmt],
+  refs: [Expr]
+) : HoistedStages = match stages {
+  [] -> HoistedStages { binds: list_reverse(binds), refs: list_reverse(refs) }
+  [s, ...rest] -> match s.kind {
+    ELambda(_, _) -> {
+      let name = concat_all([
+        "__fusev_",
+        int_to_string(line),
+        "_",
+        int_to_string(col),
+        "_",
+        int_to_string(i)
+      ])
+      let pat = Pattern { pkind: PBind(binder_minted(name)), line: line, col: col }
+      hoist_lambdas_acc(
+        rest,
+        i + 1,
+        line,
+        col,
+        [SLet(pat, None, s), ...binds],
+        [mk_local(local_minted(name), line, col), ...refs]
+      )
     }
+    _ -> hoist_lambdas_acc(rest, i + 1, line, col, binds, [s, ...refs])
   }
+}
 
 # Compose a stage list `[f, g, ...]` into a single raw closure
 # `x => ...g(f(x))`.
@@ -509,12 +515,21 @@ fn step_literal(head: [Expr]) : Option[Int] = match head {
 
 # Bind each of `es` to a local, in order; a literal or a name is its own
 # reference.
-fn pipe_fusion_bind_all(es: [Expr], i: Int, line: Int, col: Int) : HoistedStages = match es {
-  [] -> HoistedStages { binds: [], refs: [] }
-  [e, ...more] -> {
-    let r = pipe_fusion_bind_all(more, i + 1, line, col)
+fn pipe_fusion_bind_all(es: [Expr], i: Int, line: Int, col: Int) : HoistedStages =
+  bind_all_acc(es, i, line, col, [], [])
+
+fn bind_all_acc(
+  es: [Expr],
+  i: Int,
+  line: Int,
+  col: Int,
+  binds: [Stmt],
+  refs: [Expr]
+) : HoistedStages = match es {
+  [] -> HoistedStages { binds: list_reverse(binds), refs: list_reverse(refs) }
+  [e, ...more] ->
     if reads_free(e) {
-      HoistedStages { binds: r.binds, refs: [e, ...r.refs] }
+      bind_all_acc(more, i + 1, line, col, binds, [e, ...refs])
     } else {
       let name = concat_all([
         "__fuser_",
@@ -525,12 +540,15 @@ fn pipe_fusion_bind_all(es: [Expr], i: Int, line: Int, col: Int) : HoistedStages
         int_to_string(i)
       ])
       let pat = Pattern { pkind: PBind(binder_minted(name)), line: line, col: col }
-      HoistedStages {
-        binds: [SLet(pat, None, e), ...r.binds],
-        refs: [mk_local(local_minted(name), line, col), ...r.refs]
-      }
+      bind_all_acc(
+        more,
+        i + 1,
+        line,
+        col,
+        [SLet(pat, None, e), ...binds],
+        [mk_local(local_minted(name), line, col), ...refs]
+      )
     }
-  }
 }
 
 fn reads_free(e: Expr) : Bool = match e.kind {
@@ -572,10 +590,10 @@ pub(pkg) fn pipe_fusion_as_collect(e: Expr) : Option[FusedCollect] =
 #[doc("Rewrite a pure range-headed collect chain to the pre-sized `range_map_collect_vec` combinator; `None` when the head's length is not statically countable.")]
 pub(pkg) fn pipe_fusion_collect_rewrite(fc: FusedCollect, line: Int, col: Int) : Option[Expr] =
   match fc.source.kind {
-    EBlock(stmts, Some(tail)) -> match collect_over(tail, fc.stages, line, col) {
-      Some(call) -> Some(Expr { ...fc.source, kind: EBlock(stmts, Some(call)) })
-      None -> None
-    }
+    EBlock(stmts, Some(tail)) -> collect_over(tail, fc.stages, line, col)
+      | (call => {
+        Expr { ...fc.source, kind: EBlock(stmts, Some(call)) }
+      })
     _ -> collect_over(fc.source, fc.stages, line, col)
   }
 
@@ -712,10 +730,7 @@ The help for an unbound `name` that a lambda on the spine of one of
 `pipes` binds, when its body ended at a pipe of that spine.
 """)]
 pub(pkg) fn cut_hint(pipes: [Expr], name: String, file: String) : Option[String] / File =
-  match find_cut(pipes, name) {
-    None -> None
-    Some(c) -> Some(cut_help(c, name, file))
-  }
+  find_cut(pipes, name) | (c => cut_help(c, name, file))
 
 fn cut_help(c: Cut, name: String, file: String) : String / File = match c {
   Cut(lam, p) -> {
