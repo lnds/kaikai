@@ -580,17 +580,16 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_spawn(void *self, KaiValue *thunk, KaiC
  * two threads — and two awaiters woken on different threads race each other
  * outright, since the terminate walk unparks the whole chain. The result is a
  * value crossing a thread boundary exactly like a message, so it gets the
- * same treatment: at N>1 the awaiter takes a private copy and the producer's
- * reference is left alone. The wrapper is kept alive by the awaiter's own
- * Fiber[T] handle, so reading it here is safe.
+ * same treatment: at every N the awaiter takes a private copy and the
+ * producer's reference is left alone. The wrapper is kept alive by the
+ * awaiter's own Fiber[T] handle, so reading it here is safe.
  *
  * A CANCELLED target may have unwound before assigning, leaving `result`
  * NULL; the caller's continuation still needs a well-typed value, so that
- * yields unit. At N=1 the incref is unchanged. */
+ * yields unit. */
 static KaiValue *kai_fiber_result_for_awaiter(KaiFiber *f) {
     if (!f->result) return kai_unit();
-    if (kai_nthreads > 1) return kai_deep_copy_cross(f->result);
-    return kai_incref(f->result);
+    return kai_deep_copy_cross(f->result);
 }
 
 KAI_SCHED_FN KaiValue *kai_default_spawn_await(void *self, KaiValue *fib_v, KaiCont *k)
@@ -1184,16 +1183,13 @@ static void kai_link_add_bidirectional(KaiFiber *a, KaiFiber *b) {
  * freed) chain. Each KaiLinkNode is freed as the walk passes it. */
 /* Deliver a system message (link trap-exit reason, monitor pid) into a
  * mailbox owned by an arbitrary fiber, consuming `msg`. Same copy rule as
- * kai_core_mailbox_send: at N=1 a plain push (byte-identical), at N>1 an
- * unconditional deep copy, because the peer's `home_thread` is not stable
- * across the send and the peer's heap must stay single-threaded. */
+ * kai_core_mailbox_send: an unconditional deep copy, because the peer's
+ * `home_thread` is not stable across the send and the peer's heap must stay
+ * single-threaded. */
 static void kai_deliver_to_mailbox(KaiMailbox *mb, KaiValue *msg) {
-    if (kai_nthreads > 1) {
-        KaiValue *copy = kai_deep_copy_cross(msg);
-        kai_decref(msg);
-        kai_mailbox_push_cross_thread(mb, copy);
-    } else {
-        kai_mailbox_push(mb, msg);
-    }
+    KaiValue *copy = kai_deep_copy_cross(msg);
+    kai_decref(msg);
+    if (kai_nthreads > 1) kai_mailbox_push_cross_thread(mb, copy);
+    else kai_mailbox_push(mb, copy);
 }
 
