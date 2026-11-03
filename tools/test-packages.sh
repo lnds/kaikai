@@ -287,6 +287,7 @@ run_positive "build_sub_package"      "build_sub_package"      "build_sub_packag
 run_positive "build_sub_package-sub"  "build_sub_package/sub"  "build_sub_package/sub/main.out.expected"
 run_positive "build_module_qualified" "build_module_qualified" "build_module_qualified/main.out.expected"
 run_positive "nursery_imported_module" "nursery_imported_module" "nursery_imported_module/main.out.expected"
+run_negative "nursery_imported_module_mismatch" "nursery_imported_module_mismatch" "nursery_imported_module_mismatch/main.err.expected"
 
 # A library that spawns its argument is held to the spawn rule the same way
 # for a one-file and a many-file caller, as a file or as a package.

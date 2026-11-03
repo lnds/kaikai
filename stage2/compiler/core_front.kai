@@ -28,8 +28,9 @@ import compiler.refine_coerce
 import compiler.desugar_pos_records
 import compiler.region
 import compiler.resume_segment
-import compiler.desugar_var
-import compiler.desugar_nursery
+import compiler.diag
+import compiler.post_resolve
+import compiler.brand_transp
 import compiler.interp_check
 import compiler.bang_hoist
 import compiler.const_pattern
@@ -185,7 +186,8 @@ pub(pkg) fn core_front_check(
       impls: index(impls),
       blocks: front_blocks(orig),
       origin: front_origins(origins),
-      slots: idx_empty()
+      slots: idx_empty(),
+      transp: brand_transp_index([])
     },
     stream,
     res.decls,
@@ -237,9 +239,9 @@ fn check_line(
   i: Int,
   s: SymId
 ) : String / Console + File {
-  let mine = map(bodies, b => complete_decl(res.env, cx.diag_ctx, cx.target, i, b))
+  let mine = map(bodies, b => complete_decl(cx, None, res.env, i, b).decl)
   let a = tm_decls_hex(mine)
-  let b = tm_decls_hex([lower_vars_decl(r)])
+  let b = tm_decls_hex(post_resolve_decls([r], post_cx(cx, res.env, None)).decls)
   concat_all(["#{decl_name(cx.tab1, s)}", " ", a, " ", b, if a == b { "" } else { " !DIFF" }])
 }
 
@@ -251,7 +253,8 @@ pub(pkg) type FrontCtx = {
   impls: NameIndex[Decl],
   blocks: NameIndex[Decl],
   origin: NameIndex[SymId],
-  slots: NameIndex[Int]
+  slots: NameIndex[Int],
+  transp: BrandTranspIndex
 }
 
 #[doc("The source of completions: how to build the tables when the first body is asked for, the parsed declarations and the resolved stream.")]
@@ -274,7 +277,8 @@ pub(pkg) fn front_ctx(src: FrontSrc) : FrontCtx = FrontCtx {
   impls: front_index(src.impls),
   blocks: front_blocks(src.core),
   origin: front_origins(src.origins),
-  slots: front_slots(src.held, src.stream, 0, idx_empty())
+  slots: front_slots(src.held, src.stream, 0, idx_empty()),
+  transp: brand_transp_index(brand_transp_decls(src.stream))
 }
 
 fn front_index(ds: [Decl]) : NameIndex[Decl] = foldl(
@@ -329,19 +333,43 @@ fn front_slots(held: NameIndex[SymId], ds: [Decl], i: Int, acc: NameIndex[Int]) 
     })
   }
 
-# The declaration resolved on its own, then rewritten and lowered as the stream's are after resolution.
-fn complete_decl(env: Env, df: DiagFiles, target: String, i: Int, d: Decl) : Decl / Console + File {
-  lower_vars_decl(
-    rewrite_nursery_caps_alone(resolve_complete(env, df, target, i, d), env.rs.nursery, df)
+#[doc("A declaration completed on its own and the diagnostics the passes after resolution raised on it.")]
+pub(pkg) type Completed = { decl: Decl, diags: [Diagnostic] }
+
+fn post_cx(cx: CoreFrontCx, env: Env, transp: Option[BrandTranspIndex]) : PostCx = PostCx {
+  vars: true,
+  rewrite: true,
+  nursery: env.rs.nursery,
+  cores: cx.cores,
+  df: cx.diag_ctx,
+  tab: cx.tab3,
+  transp: transp
+}
+
+# The declaration resolved on its own, then taken through the passes the stream's get after resolution.
+fn complete_decl(
+  cx: CoreFrontCx,
+  transp: Option[BrandTranspIndex],
+  env: Env,
+  i: Int,
+  d: Decl
+) : Completed / Console + File {
+  let post = post_resolve_decls(
+    [resolve_complete(env, cx.diag_ctx, cx.target, i, d)],
+    post_cx(cx, env, transp)
   )
+  match post.decls {
+    [c, ..._] -> Completed { decl: c, diags: post.diags }
+    [] -> panic("a completed declaration vanished in the passes after resolution")
+  }
 }
 
 #[doc("The function `s` as the stream would have it had its body not been emptied, or `None` when no parsed declaration of it is known.")]
-pub(pkg) fn front_complete(fc: FrontCtx, env: Env, s: SymId) : Option[Decl] / Console + File =
+pub(pkg) fn front_complete(fc: FrontCtx, env: Env, s: SymId) : Option[Completed] / Console + File =
   match idx_chain_sym(fc.slots, s) {
     [i, ..._] -> {
       match front_bodies(fc, s) {
-        [b, ..._] -> Some(complete_decl(env, fc.cx.diag_ctx, fc.cx.target, i, b))
+        [b, ..._] -> Some(complete_decl(fc.cx, Some(fc.transp), env, i, b))
         [] -> None
       }
     }
