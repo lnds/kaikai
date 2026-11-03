@@ -84,6 +84,18 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.192.3 (2026-11-02)
+
+### Fixed
+
+- **runtime**: a captured var aborts when a spawned fiber touches it (#3408)
+- **perceus**: keep the State handler for a var no closure captures
+- **perceus**: give the var cell builtins no row, native thunks, and move gates off State vars
+
+### Changed
+
+- **perceus**: lower a captured var to a Ref cell so its writes take in place
+
 ## v0.192.2 (2026-11-02)
 
 ### Fixed
