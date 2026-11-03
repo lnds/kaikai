@@ -611,7 +611,7 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg)
     KaiMailbox *mb = kai_mailbox_pin(pid);
     if (!mb) {
         kai_decref(msg);
-    } else if (kai_nthreads > 1) {
+    } else {
         /* Copy unconditionally: no point-in-time "same thread?" answer is
          * sound, since a thief can retarget the receiver's home thread
          * under a lock the sender does not hold, and a Perceus dup across
@@ -619,9 +619,8 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_send(KaiValue *pid, KaiValue *msg)
          * would later share across threads. */
         KaiValue *copy = kai_deep_copy_cross(msg);
         kai_decref(msg);
-        kai_mailbox_push_cross_thread(mb, copy);
-    } else {
-        kai_mailbox_push(mb, msg);
+        if (kai_nthreads > 1) kai_mailbox_push_cross_thread(mb, copy);
+        else kai_mailbox_push(mb, copy);
     }
     if (mb) kai_mailbox_unpin(mb);
     kai_decref(pid);

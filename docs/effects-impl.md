@@ -985,7 +985,10 @@ All three must hold:
 1. The `var` binding is the sugar's own cell (user-written
    handlers do not trigger specialisation).
 2. The cell does not escape into a closure. A captured `var`
-   keeps a `Ref` cell instead of a slot.
+   keeps a `Ref` cell instead of a slot. The thread border copies
+   that cell as one that aborts on first access, so a spawned fiber
+   that reaches the `var` through an alias the escape check cannot
+   see exits 1 with a diagnostic.
 3. The initial value is a normal expression (not itself the
    result of another op call that could fail).
 

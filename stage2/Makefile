@@ -10202,10 +10202,19 @@ test-issue-997-spawn-cell-fiber-local: $(TARGET) build
 	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/issue_997_spawn_cell_runtime_floor.kai > build/iss997rf.c; \
 	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/iss997rf.c -o build/iss997rf $(LDLIBS_M); \
 	rc=0; ./build/iss997rf > build/iss997rf.out 2> build/iss997rf.err || rc=$$?; \
-	[ $$rc -eq 0 ] || { echo "issue-997 FAIL runtime_floor (exit $$rc, want 0 — rc 139 = segfault regressed)"; cat build/iss997rf.out build/iss997rf.err; exit 1; }; \
+	[ $$rc -eq 1 ] || { echo "issue-997 FAIL runtime_floor (exit $$rc, want 1 — rc 139 = segfault regressed)"; cat build/iss997rf.out build/iss997rf.err; exit 1; }; \
 	diff -q ../examples/effects/issue_997_spawn_cell_runtime_floor.out.expected build/iss997rf.out > /dev/null \
 	  || { echo "issue-997 DIFF runtime_floor (stdout)"; diff ../examples/effects/issue_997_spawn_cell_runtime_floor.out.expected build/iss997rf.out; exit 1; }; \
-	echo "issue-997 OK runtime_floor (an aliased captured var runs on the child's copy, no segfault)"; \
+	grep -q "kai: capability not reachable in this fiber" build/iss997rf.err \
+	  && echo "issue-997 OK runtime_floor (a captured var reached from a child reports a clean diagnostic, not a segfault)" \
+	  || { echo "issue-997 FAIL runtime_floor (diagnostic missing on stderr)"; cat build/iss997rf.err; exit 1; }; \
+	$(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/var_spawn_child_write_aborts.kai > build/vscw.c; \
+	$(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/vscw.c -o build/vscw $(LDLIBS_M); \
+	rc=0; ./build/vscw > build/vscw.out 2> build/vscw.err || rc=$$?; \
+	[ $$rc -eq 1 ] && [ ! -s build/vscw.out ] \
+	  && grep -q "kai: capability not reachable in this fiber" build/vscw.err \
+	  && echo "issue-997 OK var_spawn_child_write_aborts (a child write to a captured var aborts, the parent never reads a stale copy)" \
+	  || { echo "issue-997 FAIL var_spawn_child_write_aborts (exit $$rc, want 1 with the diagnostic and no stdout)"; cat build/vscw.out build/vscw.err; exit 1; }; \
 	for name in issue_997_spawn_inner_cell_ok issue_997_spawn_no_cell_ok issue_997_spawn_shadowed_cell_ok; do \
 	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib ../examples/effects/$$name.kai > build/$$name.c; \
 	  $(CC) $(CFLAGS) $(CPPFLAGS_CORE) -I ../stage0 build/$$name.c -o build/$$name $(LDLIBS_M); \
