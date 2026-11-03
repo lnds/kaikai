@@ -286,6 +286,7 @@ run_positive "build_entry_override"   "build_entry_override"   "build_entry_over
 run_positive "build_sub_package"      "build_sub_package"      "build_sub_package/main.out.expected"
 run_positive "build_sub_package-sub"  "build_sub_package/sub"  "build_sub_package/sub/main.out.expected"
 run_positive "build_module_qualified" "build_module_qualified" "build_module_qualified/main.out.expected"
+run_positive "nursery_imported_module" "nursery_imported_module" "nursery_imported_module/main.out.expected"
 
 # A library that spawns its argument is held to the spawn rule the same way
 # for a one-file and a many-file caller, as a file or as a package.
@@ -389,6 +390,7 @@ run_parity  "parity-sibling_pkg_entry"  "sibling_examples_tests"
 run_parity  "parity-sibling_examples"   "sibling_examples_tests/examples/demo"
 run_parity  "parity-cross_pkg_effects"  "cross_package_effects/consumer"
 run_parity  "parity-same_name_shadow"   "same_name_shadowing"
+run_parity  "parity-nursery_imported_module" "nursery_imported_module"
 run_parity  "parity-stdlib_across_deps" "stdlib_across_deps/consumer"
 run_parity  "parity-auto_install"       "auto_install"
 run_parity  "parity-git_tag_alias"      "git_tag_alias"
