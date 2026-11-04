@@ -192,50 +192,111 @@ pub fn tparam_use(binds: [TPBind], id: TLocalId, tas: [Ty]) : Ty = match shape_t
   }
 }
 
-# Build the per-type row-kind-slot table from the whole decl stream.
+# Build the per-type row-kind-slot table from the whole decl stream. A
+# parameter a type forwards to another type's row slot is a row too, so the
+# table is closed under forwarding.
 #[doc("Typer-internal helper `compute_row_kind_slots` shared across the infer modules.")]
-pub fn compute_row_kind_slots(decls: [Decl]) : [RowKindEntry] {
+pub fn compute_row_kind_slots(decls: [Decl], homes: TyHomes) : [RowKindEntry] =
+  row_kind_close(decls, homes, [])
+
+fn row_kind_close(decls: [Decl], homes: TyHomes, table: [RowKindEntry]) : [RowKindEntry] {
+  let next = row_kind_pass(decls, homes, table)
+  if row_kind_total(next, 0) == row_kind_total(table, 0) {
+    next
+  } else {
+    row_kind_close(decls, homes, next)
+  }
+}
+
+fn row_kind_total(table: [RowKindEntry], acc: Int) : Int = match table {
+  [] -> acc
+  [RKE(_, idxs), ...rest] -> row_kind_total(rest, acc + list_length(idxs))
+}
+
+fn row_kind_pass(decls: [Decl], homes: TyHomes, table: [RowKindEntry]) : [RowKindEntry] =
   match decls {
     [] -> []
-    [d, ...rest] -> match row_kind_entry_of(d) {
-      Some(e) -> [e, ...compute_row_kind_slots(rest)]
-      None -> compute_row_kind_slots(rest)
+    [d, ...rest] -> match row_kind_entry_of(d, table, homes) {
+      Some(e) -> [e, ...row_kind_pass(rest, homes, table)]
+      None -> row_kind_pass(rest, homes, table)
     }
   }
-}
 
-fn row_kind_entry_of(d: Decl) : Option[RowKindEntry] = match d {
-  DType(_, sid, tparams, body, _, _, _, _, _, _) -> {
-    let row_names = row_names_of_typebody(body)
-    match row_names {
-      [] -> None
-      _ -> Some(RKE(sid, row_kind_indices(tparams, row_names, 0)))
+fn row_kind_entry_of(d: Decl, table: [RowKindEntry], homes: TyHomes) : Option[RowKindEntry] =
+  match d {
+    DType(_, sid, tparams, body, _, _, _, _, mo, _) -> {
+      let row_names = row_names_of_tes(body_type_exprs(body), table, tsh_view(homes, mo))
+      match row_names {
+        [] -> None
+        _ -> Some(RKE(sid, row_kind_indices(tparams, row_names, 0)))
+      }
     }
+    _ -> None
   }
-  _ -> None
-}
 
-# The parameters a type body uses in row position across all its ctor fields.
-fn row_names_of_typebody(b: TypeBody) : [TLocalId] = match b {
-  TBSum(vs) -> row_names_of_variants(vs, [])
-  TBRecord(fs) -> row_names_of_fields(fs, [])
+fn body_type_exprs(b: TypeBody) : [TypeExpr] = match b {
+  TBSum(vs) -> flat_map(
+    vs,
+    v => match v {
+      Var(_, vargs, _, _) -> vargs
+    }
+  )
+  TBRecord(fs) -> field_type_exprs(fs)
   _ -> []
 }
 
-fn row_names_of_variants(vs: [Variant], acc: [TLocalId]) : [TLocalId] = match vs {
+# The parameters among `tes` used in row position: as a function's row, a
+# continuation's row, or an argument of another type's row slot.
+#[doc("Typer-internal helper `row_names_of_tes` shared across the infer modules.")]
+pub fn row_names_of_tes(tes: [TypeExpr], table: [RowKindEntry], hv: TyHomeView) : [TLocalId] =
+  fwd_row_tes(tes, table, hv, cont_row_names_all(tes, collect_rvars_in_typeexprs(tes, [])))
+
+#[doc("The type expressions of a record's fields.")]
+pub fn field_type_exprs(fs: [FieldDecl]) : [TypeExpr] =
+  map(
+    fs,
+    f => match f {
+      FD(_, _, te, _, _, _) -> te
+    }
+  )
+
+fn fwd_row_tes(
+  ts: [TypeExpr],
+  table: [RowKindEntry],
+  hv: TyHomeView,
+  acc: [TLocalId]
+) : [TLocalId] = match ts {
   [] -> acc
-  [v, ...rest] -> match v {
-    Var(_, vargs, _, _) ->
-      row_names_of_variants(rest, cont_row_names_all(vargs, collect_rvars_in_typeexprs(vargs, acc)))
-  }
+  [t, ...rest] -> fwd_row_tes(rest, table, hv, fwd_row_te(t, table, hv, acc))
 }
 
-#[doc("Typer-internal helper `row_names_of_fields` shared across the infer modules.")]
-pub fn row_names_of_fields(fs: [FieldDecl], acc: [TLocalId]) : [TLocalId] = match fs {
+fn fwd_row_te(t: TypeExpr, table: [RowKindEntry], hv: TyHomeView, acc: [TLocalId]) : [TLocalId] =
+  match t.tkind {
+    TyName(r, tas) ->
+      fwd_row_tes(tas, table, hv, fwd_row_args(tas, row_kind_slots_of(table, r, hv), 0, acc))
+    TyParam(_, tas) -> fwd_row_tes(tas, table, hv, acc)
+    TyList(inner) -> fwd_row_te(inner, table, hv, acc)
+    TyFn(ps, ret, _) -> fwd_row_tes([ret, ...ps], table, hv, acc)
+    TyDim(base, _) -> fwd_row_te(base, table, hv, acc)
+    TyRefine(base, _, _) -> fwd_row_te(base, table, hv, acc)
+    TyRow(_) -> acc
+    TySurface(ts) -> fwd_row_tes(tysurface_children(ts), table, hv, acc)
+  }
+
+fn fwd_row_args(tas: [TypeExpr], idxs: [Int], i: Int, acc: [TLocalId]) : [TLocalId] = match idxs {
   [] -> acc
-  [f, ...rest] -> match f {
-    FD(_, _, te, _, _, _) ->
-      row_names_of_fields(rest, cont_row_names(te, collect_rvars_in_typeexpr(te, acc)))
+  [k, ...ks] -> match tas {
+    [] -> acc
+    [a, ...rest] ->
+      if k == i {
+        let acc1 = match a.tkind {
+          TyParam(rn, []) -> if tids_has(acc, rn) { acc } else { [rn, ...acc] }
+          _ -> acc
+        }
+        fwd_row_args(rest, ks, i + 1, acc1)
+      } else {
+        fwd_row_args(rest, idxs, i + 1, acc)
+      }
   }
 }
 
