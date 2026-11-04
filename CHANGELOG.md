@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.192.4 (2026-11-03)
+
+### Fixed
+
+- **resolver**: expand the nursery handle sugar in a function body completed on demand (#3409)
+
 ## v0.192.3 (2026-11-02)
 
 ### Fixed
