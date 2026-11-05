@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.192.5 (2026-11-04)
+
+### Fixed
+
+- **typer**: read a type parameter forwarded to another type's row slot as a row
+
 ## v0.192.4 (2026-11-03)
 
 ### Fixed
