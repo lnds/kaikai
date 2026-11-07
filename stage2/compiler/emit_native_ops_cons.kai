@@ -399,6 +399,67 @@ fn nemit_variant_reuse_call_sym(
   ncall_finish(ctx, sym, p, ptb, ab)
 }
 
+type NTokDef = NTokDef(String, Int)
+
+#[doc("Record the capture arity of each reuse-token register whose every definition steals at one arity.")]
+pub fn nemit_token_arities(ctx: Handle, blocks: [KBlock]) : Unit / Console {
+  let cands = flat_map(blocks, b => flat_map(b.stmts, ntok_steal_def))
+  match cands {
+    [] -> ()
+    _ -> {
+      let others = flat_map(blocks, b => flat_map(b.stmts, s => ntok_other_def(s, cands)))
+      each(cands, d => ntok_record(ctx, d, cands, others))
+    }
+  }
+}
+
+fn ntok_steal_def(s: KStmt) : [NTokDef] = match s {
+  KLet(n, _, KTokenSteal(_, k), _) -> [NTokDef(n, k)]
+  KRC(KArmTopReuse(_, k, _, _), _) -> [NTokDef(ntrmc_armru_reg(), k)]
+  _ -> []
+}
+
+fn ntok_other_def(s: KStmt, cands: [NTokDef]) : [String] = match s {
+  KLet(_, _, KTokenSteal(_, _), _) -> []
+  KLet(n, _, _, _) -> if ntok_has(cands, n) { [n] } else { [] }
+  KStore(n, _, _) -> if ntok_has(cands, n) { [n] } else { [] }
+  _ -> []
+}
+
+fn ntok_has(ds: [NTokDef], n: String) : Bool = any(
+  ds,
+  d => match d {
+    NTokDef(m, _) -> m == n
+  }
+)
+
+fn ntok_record(ctx: Handle, d: NTokDef, cands: [NTokDef], others: [String]) : Unit / Console =
+  match d {
+    NTokDef(n, k) ->
+      if contains(others, n)
+        or any(
+          cands,
+          e => match e {
+            NTokDef(m, j) -> m == n and j != k
+          }
+        ) {
+        ()
+      } else {
+        native_ctx_add_reg(ctx, ntok_key(n), llvm_const_null(native_ctx_ptrt(ctx)), k)
+      }
+  }
+
+fn ntok_key(n: String) : String = "tok:#{n}"
+
+#[doc("The capture arity recorded for reuse-token register `n`, or -1 when unknown.")]
+pub fn ntok_arity(ctx: Handle, n: String) : Int = native_ctx_reg_slot(ctx, ntok_key(n))
+
+#[doc("The capture arity of the reuse token `v` when it is a register, or -1.")]
+pub fn ntok_val_arity(ctx: Handle, v: KVal) : Int = match v {
+  KVar(n) -> ntok_arity(ctx, n)
+  _ -> -1
+}
+
 # `RkTokenVariant`: rebuild a ctor INTO a donated reuse token (fresh alloc when
 # the token is null).
 fn nemit_con_at(
@@ -409,7 +470,7 @@ fn nemit_con_at(
   inits: [KSlotInit]
 ) : Handle / Console {
   let tokv = nemit_atom(ctx, tok)
-  nemit_variant_at_masked_call(ctx, tag, nm, tokv, inits)
+  nemit_variant_into(ctx, tokv, ntok_val_arity(ctx, tok), tag, nm, nemit_slot_words(ctx, inits))
 }
 
 # `RkDonorVariant`: rebuild a ctor INTO the fn's cross-call donor token,
@@ -435,16 +496,20 @@ pub fn nemit_variant_at_masked_call(
   tok: Handle,
   inits: [KSlotInit]
 ) : Handle / Console =
-  nemit_variant_into(ctx, tok, tag, nm, map(inits, it => nemit_slot_word(ctx, it)))
+  nemit_variant_into(ctx, tok, -1, tag, nm, nemit_slot_words(ctx, inits))
+
+fn nemit_slot_words(ctx: Handle, inits: [KSlotInit]) : [Handle] / Console =
+  map(inits, it => nemit_slot_word(ctx, it))
 
 # A token that fits takes the slot words by direct stores. The word buffer is
 # built only on the fresh-alloc path: an alloca whose address reaches the
 # runtime on every path stays in memory, and the rebuild then copies it back
 # off the stack.
-#[doc("Rebuild a variant of slot `words` into the reuse token `tok`, in place when it fits, else freeing it and allocating fresh.")]
+#[doc("Rebuild a variant of slot `words` into the reuse token `tok` (captured at `arity`, -1 unknown), in place when it fits, else freeing it and allocating fresh.")]
 pub fn nemit_variant_into(
   ctx: Handle,
   tok: Handle,
+  arity: Int,
   tag: Int,
   nm: String,
   words: [Handle]
@@ -455,8 +520,7 @@ pub fn nemit_variant_into(
   let i32t = native_ctx_i32t(ctx)
   let res = llvm_build_alloca_entry(ctx, p, "into")
   let n = list_length(words)
-  let fits = ncall_sig2(ctx, "kaix_reuse_fits", i32t, p, i32t, tok, llvm_const_i32(i32t, n))
-  let c = llvm_build_icmp_ne_zero(b, fits, i32t)
+  let c = nemit_token_fits(ctx, tok, arity, n)
   let fnval = native_ctx_fnval(ctx)
   let fast = llvm_append_block(m, fnval, "into.fast")
   let slow = llvm_append_block(m, fnval, "into.slow")
@@ -473,6 +537,20 @@ pub fn nemit_variant_into(
   llvm_build_br(b, join)
   llvm_position_at_end(b, join)
   llvm_build_load(b, p, res)
+}
+
+# A token captured at the rebuild's arity is null or a cell of exactly that
+# shape, so presence alone decides.
+fn nemit_token_fits(ctx: Handle, tok: Handle, arity: Int, n: Int) : Handle / Console {
+  let b = native_ctx_b(ctx)
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  if arity == n {
+    llvm_build_icmp(b, 5, tok, llvm_const_null(p))
+  } else {
+    let fits = ncall_sig2(ctx, "kaix_reuse_fits", i32t, p, i32t, tok, llvm_const_i32(i32t, n))
+    llvm_build_icmp_ne_zero(b, fits, i32t)
+  }
 }
 
 fn nemit_store_into(ctx: Handle, tok: Handle, words: [Handle], i: Int) : Unit = match words {
