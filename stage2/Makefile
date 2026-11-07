@@ -10411,7 +10411,7 @@ test-exit-report-asan: $(TARGET) build
 # gate: inline guard reads, EXTRACTING an enum out of a slot into a
 # binding and passing it to other fns (the re-intern path), equality
 # over extracted enums, and rebuilding a node from a flipped enum value.
-PERCEUS_ENUM_SLOT_FIXTURES := enum_slot_repr
+PERCEUS_ENUM_SLOT_FIXTURES := enum_slot_repr enum_slot_reuse_shared
 
 test-perceus-enum-slot: $(TARGET) build
 	@set -e; \
