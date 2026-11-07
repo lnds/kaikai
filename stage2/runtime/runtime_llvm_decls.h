@@ -523,6 +523,8 @@ void kaix_register_one_reusable_tag(int32_t tag);
 void kaix_register_one_variant_head(int32_t variant_tag, int32_t head_tag);
 KaiValue *kaix_resume_frame_push(KaiValue *clo);
 KaiValue *kaix_resume_frames_run(KaiEvidence *node, KaiValue *v);
+static inline __attribute__((always_inline)) KaiValue *kaix_reuse_commit(KaiValue *at, int32_t tag);
+static inline __attribute__((always_inline)) int32_t kaix_reuse_fits(KaiValue *at, int32_t n);
 static inline void kaix_reuse_free(KaiReuse at);
 static inline KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t);
 static inline KaiValue *kaix_reuse_or_alloc_record(KaiValue *scr, int n, KaiValue **fields, const char **names, uint64_t kept_mask);
@@ -741,7 +743,7 @@ static inline KaiValue *kaix_bit_xor(KaiValue *a, KaiValue *b) {
     return r;
 }
 static inline KaiValue *kaix_bool(int b) {return kai_bool(b); }
-static inline int32_t kaix_bool_field(KaiValue *v) {return (int32_t) v->as.b; }
+static inline int32_t kaix_bool_field(KaiValue *v) {return (int32_t) (v == &kai_singleton_true); }
 static inline KaiValue *kaix_bool_of_i32(int32_t i) {return kai_bool(i != 0); }
 static inline KaiValue *kaix_bounce_post(KaiValue *post) {
     return kai_bounce_post(post);
@@ -917,6 +919,17 @@ static inline KaiValue *kaix_record(int n, KaiValue **fields, const char **names
 static inline void kaix_register_one_payload_ctor(int32_t tag, const char *name, int32_t mask) {
     kai_varname_register(tag, name);
     kai_slotmask_register(tag, (uint32_t) mask);
+}
+static inline __attribute__((always_inline)) KaiValue *kaix_reuse_commit(KaiValue *at, int32_t tag) {
+  at->variant_tag = tag;
+  at->rc = 1;
+#ifdef KAI_TRACE_RC
+  kai_rc_count_reuse();
+#endif
+  return at;
+}
+static inline __attribute__((always_inline)) int32_t kaix_reuse_fits(KaiValue *at, int32_t n) {
+  return at != NULL && at->tag == KAI_VARIANT && at->var_n_args == n;
 }
 static inline void kaix_reuse_free(KaiReuse at) {kai_reuse_free(at); }
 static inline KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t) {

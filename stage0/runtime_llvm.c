@@ -1153,6 +1153,21 @@ __attribute__((always_inline)) KaiValue *kaix_variant_reuse_move_i64(KaiValue *s
   return kai_variant_u(tag, name, n, (uint32_t) kai_slot_mask_of(tag), slots);
 }
 
+/* The reuse token can host the rebuild in place (kai_variant_at's test). */
+__attribute__((always_inline)) int32_t kaix_reuse_fits(KaiValue *at, int32_t n) {
+  return at != NULL && at->tag == KAI_VARIANT && at->var_n_args == n;
+}
+
+/* Retag a fitting token whose slots the caller already wrote. */
+__attribute__((always_inline)) KaiValue *kaix_reuse_commit(KaiValue *at, int32_t tag) {
+  at->variant_tag = tag;
+  at->rc = 1;
+#ifdef KAI_TRACE_RC
+  kai_rc_count_reuse();
+#endif
+  return at;
+}
+
 /* `kaix_variant_at_argv_i64` with the slot mask given by the caller. */
 KaiValue *kaix_variant_at_argv_k(int32_t tag, const char *name, int n,
                                    int32_t mask, KaiVarSlot *slots) {
@@ -1231,7 +1246,9 @@ int64_t kaix_take_enum(KaiValue *v)  { return kai_take_enum(v); }
 KaiValue *kaix_enum_slot_box(int64_t tag) { return kai_enum_slot_box(tag); }
 /* Borrow-read a boxed Bool's raw i32 payload (0/1) without decref'ing —
    the box→raw border for a boxed Bool reaching the raw i1 path. */
-int32_t kaix_bool_field(KaiValue *v) { return (int32_t) v->as.b; }
+/* Every boxed Bool is one of the two shared singletons, so the read is an
+ * identity test the optimiser folds through a join of literal Bools. */
+int32_t kaix_bool_field(KaiValue *v) { return (int32_t) (v == &kai_singleton_true); }
 /* Borrow-read a boxed Char's raw codepoint without decref'ing — the
    box→raw border for a boxed Char reaching the raw u32 path. */
 int32_t kaix_char_field(KaiValue *v) { return (int32_t) v->as.c; }
