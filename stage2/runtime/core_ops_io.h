@@ -383,8 +383,10 @@ static KaiValue *kai_op_boolnot(KaiValue *a) {
  * referenced downstream. The emitted-C path leaks the temporary
  * argument; tracked in issue #82 as future cleanup (predicate
  * consumes + emit-side incref before short-circuit). */
+/* Every boxed Bool is one of the two shared singletons, so truthiness is an
+ * identity test the optimiser folds through a `kai_bool(c)` select. */
 static int kai_op_truthy(KaiValue *v) {
-    return v && v->tag == KAI_BOOL && v->as.b;
+    return v == &kai_singleton_true;
 }
 
 /* ---------- range construction ---------- */
