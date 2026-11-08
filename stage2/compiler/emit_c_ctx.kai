@@ -1,6 +1,5 @@
 # EmitCtx, the emitter scope record, with its functional updates and the local-scope and binder queries every emitter shares.
 
-import compiler.arm_top_plan
 import compiler.ast
 import compiler.ast_decl
 import compiler.ast_ids
@@ -59,16 +58,6 @@ import compiler.written
 # load `slot[i].ptr->...` across the separate `if`-arms of a nested
 # match (balance_left/right's rotations), which clang cannot CSE across
 # branches. Empty outside a hoisting match. See emit_hoist_subderefs.
-# `reuse_donor` carries, while emitting an arm-top-reuse body, the donor
-# cell's constructor and its positional sub-pattern binders (`local_none()`
-# for a slot with no usable PBind). A TRMC step that rebuilds the SAME ctor into
-# `_arm_ru` (the donated scrutinee shell) can then SKIP the store of slot i
-# when its rebuild arg is exactly the binder bound off slot i of the donor:
-# the value is already in the cell (kai_drop_reuse_token hands back the
-# shell intact). Writes only the changed slots (the TRMC hole + any
-# permuted/transformed slot) — Koka's `_con->field = ...` single-store
-# shape. None outside an arm-top-reuse body → every slot is written, the
-# prior behaviour.
 
 # `kind1_raw` — i64-inline (Lane B): the set of binders currently in
 # scope that are bound to a kind-1 Int slot and emitted as the raw
@@ -89,7 +78,6 @@ pub(pkg) type EmitCtx = {
   in_region: Bool,
   borrowed: [LocalId],
   hoisted: [Int],
-  reuse_donor: Option[ReuseDonor],
   kind1_raw: [LocalId],
   # A const is a literal with a name. The emit catalogue
   # carries every top-level const so a const read
@@ -143,8 +131,8 @@ pub(pkg) type EmitCtx = {
   # rebuild cells through `_donor` — see emit_reuse_donate.kai.
   rd_active: Bool,
   # Every donation-capable top-level fn, pre-scanned once.
-  # A call site consults it (with a live arm token, i.e.
-  # `reuse_donor` set) to donate that token across the call.
+  # A call site consults it (with a live arm token) to donate
+  # that token across the call.
   rd_capable: [FnId],
   # Pending releases the tcrec goto-tail path must emit before
   # jumping: enclosing owned match scrutinee aliases plus
@@ -176,7 +164,6 @@ pub(pkg) fn emit_ctx_with_lcs(cx: EmitCtx, l: [LocalId]) : EmitCtx =
     in_region: cx.in_region,
     borrowed: cx.borrowed,
     hoisted: cx.hoisted,
-    reuse_donor: cx.reuse_donor,
     kind1_raw: cx.kind1_raw,
     consts: cx.consts,
     effs: cx.effs,
@@ -209,7 +196,6 @@ pub(pkg) fn emit_ctx_with_evf(cx: EmitCtx, evf: EvFrames) : EmitCtx =
     in_region: cx.in_region,
     borrowed: cx.borrowed,
     hoisted: cx.hoisted,
-    reuse_donor: cx.reuse_donor,
     kind1_raw: cx.kind1_raw,
     consts: cx.consts,
     effs: cx.effs,
@@ -245,7 +231,6 @@ pub(pkg) fn emit_ctx_with_enc_fn(cx: EmitCtx, ef: EncFn) : EmitCtx =
     in_region: cx.in_region,
     borrowed: cx.borrowed,
     hoisted: cx.hoisted,
-    reuse_donor: cx.reuse_donor,
     kind1_raw: cx.kind1_raw,
     consts: cx.consts,
     effs: cx.effs,
@@ -279,7 +264,6 @@ pub(pkg) fn emit_ctx_with_in_region(cx: EmitCtx, b: Bool) : EmitCtx =
     in_region: b,
     borrowed: cx.borrowed,
     hoisted: cx.hoisted,
-    reuse_donor: cx.reuse_donor,
     kind1_raw: cx.kind1_raw,
     consts: cx.consts,
     effs: cx.effs,
@@ -314,7 +298,6 @@ pub(pkg) fn emit_ctx_with_unw(cx: EmitCtx, u: UnwFrame) : EmitCtx =
     in_region: cx.in_region,
     borrowed: cx.borrowed,
     hoisted: cx.hoisted,
-    reuse_donor: cx.reuse_donor,
     kind1_raw: cx.kind1_raw,
     consts: cx.consts,
     effs: cx.effs,
@@ -406,7 +389,6 @@ pub(pkg) fn emit_ctx_with_tcpend(cx: EmitCtx, l: [TclEntry]) : EmitCtx =
     in_region: cx.in_region,
     borrowed: cx.borrowed,
     hoisted: cx.hoisted,
-    reuse_donor: cx.reuse_donor,
     kind1_raw: cx.kind1_raw,
     consts: cx.consts,
     effs: cx.effs,
@@ -452,41 +434,6 @@ pub(pkg) fn emit_ctx_with_hoisted(cx: EmitCtx, h: [Int]) : EmitCtx =
     in_region: cx.in_region,
     borrowed: cx.borrowed,
     hoisted: h,
-    reuse_donor: cx.reuse_donor,
-    kind1_raw: cx.kind1_raw,
-    consts: cx.consts,
-    effs: cx.effs,
-    ffi_reg: cx.ffi_reg,
-    cur_enc_fn: cx.cur_enc_fn,
-    recs: cx.recs,
-    stamps: cx.stamps,
-    core_ix: cx.core_ix,
-    ctor_ix: cx.ctor_ix,
-    evf: cx.evf,
-    rd_active: cx.rd_active,
-    rd_capable: cx.rd_capable,
-    tcpend: cx.tcpend,
-    unw: cx.unw,
-    root_mod: cx.root_mod,
-    tab: cx.tab,
-    specs: cx.specs,
-    locals: cx.locals
-  }
-
-# Set/clear the reuse-donor (entering/leaving an arm-top-reuse body).
-pub(pkg) fn emit_ctx_with_reuse_donor(cx: EmitCtx, d: Option[ReuseDonor]) : EmitCtx =
-  EmitCtx {
-    lcs: cx.lcs,
-    fns: cx.fns,
-    fx: cx.fx,
-    variants: cx.variants,
-    lams: cx.lams,
-    cls: cx.cls,
-    regions: cx.regions,
-    in_region: cx.in_region,
-    borrowed: cx.borrowed,
-    hoisted: cx.hoisted,
-    reuse_donor: d,
     kind1_raw: cx.kind1_raw,
     consts: cx.consts,
     effs: cx.effs,
@@ -524,7 +471,6 @@ pub(pkg) fn emit_ctx_with_kind1_raw(cx: EmitCtx, ks: [LocalId]) : EmitCtx =
     in_region: cx.in_region,
     borrowed: cx.borrowed,
     hoisted: cx.hoisted,
-    reuse_donor: cx.reuse_donor,
     kind1_raw: ks,
     consts: cx.consts,
     effs: cx.effs,

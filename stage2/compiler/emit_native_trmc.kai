@@ -68,25 +68,19 @@ pub fn nemit_trmc_allocas(ctx: Handle, blocks: [KBlock]) : Unit / Console =
     ()
   }
 
-# Arm-top reuse capture (#872, the C oracle's `emit_arm_top_reuse`). Steal the
-# consumed scrutinee `donor` as the reuse token `_arm_ru = kaix_drop_reuse_token
-# (donor, n)`: UNIQUE hands back the shell (kept children MOVED via the borrow
-# binds — no incref), SHARED returns null after a non-recursive rc-- and the
-# kept ptr children need their own ref. Each name in `bs` is a kept pointer
-# binder the rebuild embeds; incref it only on the shared (token-null) path. The
-# lowering neutralises the match-exit decref of `donor` (no `KDrop(sd)`), so the
-# token is the sole disposer — consumed by a TRMC step (`kaix_variant_at`) or
-# freed by `KArmTokenFree` on a non-step tail.
+# Arm-top reuse capture: steal the matched scrutinee `donor` as the reuse token.
+# UNIQUE hands back the shell (kept children MOVED via the borrow binds), SHARED
+# returns null after a non-recursive rc-- and each kept pointer binder in `bs`
+# takes its own ref. The lowering drops no `donor` at match exit, so the token
+# is its sole disposer: a TRMC step consumes it or `KArmTokenFree` frees it.
 pub fn nemit_arm_top_reuse(
   ctx: Handle,
   donor: Handle,
-  n: Int,
   bs: [String],
   unbound: [Int]
 ) : Unit / Console {
   let p = native_ctx_ptrt(ctx)
-  let i32t = native_ctx_i32t(ctx)
-  let token = ncall_sig2(ctx, "kaix_drop_reuse_token", p, p, i32t, donor, llvm_const_i32(i32t, n))
+  let token = ncall_sig1(ctx, "kaix_arm_top_token", p, p, donor)
   nemit_store_reg(ctx, ntrmc_armru_reg(), token)
   nemit_arm_top_incref_binders(ctx, token, bs)
   each(unbound, i => nemit_arm_top_drop_slot(ctx, token, i))
@@ -157,7 +151,7 @@ pub fn ntrmc_blocks_have_step(blocks: [KBlock]) : Bool = match blocks {
 }
 
 fn ntrmc_term_is_step(t: KTerm) : Bool = match t {
-  KTrmcStep(_, _, _, _, _, _, _, _, _, _) -> true
+  KTrmcStep(_, _, _, _, _, _, _, _, _, _, _) -> true
   _ -> false
 }
 
@@ -186,7 +180,8 @@ pub fn nemit_trmc_step(
   dropmask: Int,
   head_vals: [KVal],
   asg: [KAssign],
-  in_region: Bool
+  in_region: Bool,
+  kept: Option[[Int]]
 ) : Unit / Console =
   match spine {
     KSpineCons(_) -> ntrmc_cons_step(ctx, head_vals, asg, dropmask, in_region)
@@ -199,7 +194,18 @@ pub fn nemit_trmc_step(
     # by the arm's `dup` binds, so they outlive the scrutinee's recursive
     # decref — the same discipline the cons `_s` step uses.
     KSpineCtor(cname) ->
-      ntrmc_variant_step(ctx, hole_slot, cname, tag, slot_mask, head_vals, asg, dropmask, in_region)
+      ntrmc_variant_step(
+        ctx,
+        hole_slot,
+        cname,
+        tag,
+        slot_mask,
+        head_vals,
+        asg,
+        dropmask,
+        in_region,
+        kept
+      )
   }
 
 # Builtin-cons spine step: `kaix_cons(head, NULL)`, hole at the cdr. Under a
@@ -246,7 +252,8 @@ fn ntrmc_variant_step(
   head_vals: [KVal],
   asg: [KAssign],
   dropmask: Int,
-  in_region: Bool
+  in_region: Bool,
+  kept: Option[[Int]]
 ) : Unit / Console {
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
@@ -265,7 +272,7 @@ fn ntrmc_variant_step(
   let node = if in_region {
     ntrmc_variant_build_arena(ctx, tag, cname, slot_mask, hole_slot, head_vals)
   } else {
-    ntrmc_variant_build(ctx, tag, cname, slot_mask, hole_slot, head_vals)
+    ntrmc_variant_build(ctx, tag, cname, slot_mask, hole_slot, head_vals, kept)
   }
   llvm_build_store(native_ctx_b(ctx), node, nodeslot)
   let node1 = llvm_build_load(native_ctx_b(ctx), p, nodeslot)
@@ -346,19 +353,21 @@ fn ntrmc_store_arena_slots(
   }
 
 # The spine cell rebuilt into the arm-top token (moved out of `_arm_ru`),
-# the hole a NULL word and every other slot at its mask kind.
+# the hole a NULL word and every other slot at its mask kind; a unique token
+# skips the `kept` slots it already holds.
 fn ntrmc_variant_build(
   ctx: Handle,
   tag: Int,
   nm: String,
   slot_mask: Int,
   hole_slot: Int,
-  head_vals: [KVal]
+  head_vals: [KVal],
+  kept: Option[[Int]]
 ) : Handle / Console {
   let tok = nemit_load_reg(ctx, ntrmc_armru_reg())
   nemit_store_reg(ctx, ntrmc_armru_reg(), llvm_const_null(native_ctx_ptrt(ctx)))
   let words = ntrmc_variant_words(ctx, head_vals, hole_slot, slot_mask, 0, [])
-  nemit_variant_into(ctx, tok, ntok_arity(ctx, ntrmc_armru_reg()), tag, nm, words)
+  nemit_variant_into_kept(ctx, tok, ntok_arity(ctx, ntrmc_armru_reg()), tag, nm, words, kept)
 }
 
 fn ntrmc_variant_words(

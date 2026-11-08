@@ -19,6 +19,7 @@ static inline KaiValue *kaix_arena_variant_masked(int32_t tag, const char *name,
 KaiValue *kaix_args_thunk(KaiValue *s, KaiValue **a, int n);
 static inline void kaix_arm_share(int32_t took, KaiValue *child);
 static inline int32_t kaix_arm_take(KaiValue *v, int32_t unbound);
+static inline __attribute__((always_inline)) KaiReuse kaix_arm_top_token(KaiValue *v);
 KaiValue *kaix_array_empty_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_array_get_borrow_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_array_get_thunk(KaiValue *s, KaiValue **a, int n);
@@ -526,6 +527,7 @@ KaiValue *kaix_resume_frames_run(KaiEvidence *node, KaiValue *v);
 static inline __attribute__((always_inline)) KaiValue *kaix_reuse_commit(KaiValue *at, int32_t tag);
 static inline __attribute__((always_inline)) int32_t kaix_reuse_fits(KaiValue *at, int32_t n);
 static inline void kaix_reuse_free(KaiReuse at);
+static inline __attribute__((always_inline)) KaiValue *kaix_reuse_keep(KaiValue *at);
 static inline __attribute__((always_inline)) KaiValue *kaix_reuse_move_commit(KaiValue *scr, int32_t tag);
 static inline KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t);
 static inline KaiValue *kaix_reuse_or_alloc_record(KaiValue *scr, int n, KaiValue **fields, const char **names, uint64_t kept_mask);
@@ -679,6 +681,19 @@ static inline KaiValue *kaix_arena_variant_masked(int32_t tag, const char *name,
 }
 static inline void kaix_arm_share(int32_t took, KaiValue *child) {if (!took) kai_incref(child); }
 static inline int32_t kaix_arm_take(KaiValue *v, int32_t unbound) {return kai_arm_take(v, (uint32_t) unbound); }
+static inline __attribute__((always_inline)) KaiReuse kaix_arm_top_token(KaiValue *v) {
+  if (kai_check_unique(v)) {
+#ifdef KAI_TRACE_RC
+    kai_rc_tok_unique++;
+#endif
+    return v;
+  }
+  if (v->rc != INT32_MAX) v->rc -= 1;
+#ifdef KAI_TRACE_RC
+  kai_rc_tok_null_shared++;
+#endif
+  return kai_reuse_null;
+}
 static inline KaiValue *kaix_bit_and(KaiValue *a, KaiValue *b) {
     KaiValue *r = kai_int(kai_intf(a) & kai_intf(b));
     kai_decref(a); kai_decref(b);
@@ -932,6 +947,12 @@ static inline __attribute__((always_inline)) int32_t kaix_reuse_fits(KaiValue *a
   return at != NULL && at->tag == KAI_VARIANT && at->var_n_args == n;
 }
 static inline void kaix_reuse_free(KaiReuse at) {kai_reuse_free(at); }
+static inline __attribute__((always_inline)) KaiValue *kaix_reuse_keep(KaiValue *at) {
+#ifdef KAI_TRACE_RC
+  kai_rc_count_reuse();
+#endif
+  return at;
+}
 static inline __attribute__((always_inline)) KaiValue *kaix_reuse_move_commit(KaiValue *scr, int32_t tag) {
   scr->variant_tag = tag;
   kai_rc_count_reuse();

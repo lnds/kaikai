@@ -1023,6 +1023,22 @@ KaiValue *kaix_incref_if_shared(KaiValue *donor, KaiValue *child) {
 KaiReuse  kaix_drop_reuse_token(KaiValue *v, int n)      { return kai_drop_reuse_token(v, n); }
 void      kaix_reuse_free(KaiReuse at)                   { kai_reuse_free(at); }
 
+/* The arm-top capture of a scrutinee its pattern matched: the tag test already
+ * proved a variant cell of the rebuild's arity, so only uniqueness is tested. */
+__attribute__((always_inline)) KaiReuse kaix_arm_top_token(KaiValue *v) {
+  if (kai_check_unique(v)) {
+#ifdef KAI_TRACE_RC
+    kai_rc_tok_unique++;
+#endif
+    return v;
+  }
+  if (v->rc != INT32_MAX) v->rc -= 1;
+#ifdef KAI_TRACE_RC
+  kai_rc_tok_null_shared++;
+#endif
+  return kai_reuse_null;
+}
+
 /* Arm-top reuse token capture (#872). When `kaix_drop_reuse_token` returned
  * NULL the donor was SHARED — `kai_drop_reuse_token` already did the non-
  * recursive rc-- and the kept children did NOT move, so each kept pointer
@@ -1137,6 +1153,14 @@ __attribute__((always_inline)) KaiValue *kaix_variant_reuse_at_i64(KaiValue *scr
 /* The reuse token can host the rebuild in place (kai_variant_at's test). */
 __attribute__((always_inline)) int32_t kaix_reuse_fits(KaiValue *at, int32_t n) {
   return at != NULL && at->tag == KAI_VARIANT && at->var_n_args == n;
+}
+
+/* A unique token rebuilt as its own constructor keeps its tag and its rc of 1. */
+__attribute__((always_inline)) KaiValue *kaix_reuse_keep(KaiValue *at) {
+#ifdef KAI_TRACE_RC
+  kai_rc_count_reuse();
+#endif
+  return at;
 }
 
 /* Retag a fitting token whose slots the caller already wrote. */
