@@ -526,6 +526,7 @@ KaiValue *kaix_resume_frames_run(KaiEvidence *node, KaiValue *v);
 static inline __attribute__((always_inline)) KaiValue *kaix_reuse_commit(KaiValue *at, int32_t tag);
 static inline __attribute__((always_inline)) int32_t kaix_reuse_fits(KaiValue *at, int32_t n);
 static inline void kaix_reuse_free(KaiReuse at);
+static inline __attribute__((always_inline)) KaiValue *kaix_reuse_move_commit(KaiValue *scr, int32_t tag);
 static inline KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t);
 static inline KaiValue *kaix_reuse_or_alloc_record(KaiValue *scr, int n, KaiValue **fields, const char **names, uint64_t kept_mask);
 static inline KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag, const char *name, int n, KaiValue **args);
@@ -606,7 +607,6 @@ static inline __attribute__((always_inline)) KaiValue *kaix_variant_masked(int32
 static inline KaiValue *kaix_variant_reuse_at(KaiValue *scr, int32_t tag, const char *name, int n, KaiValue **args);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_reuse_at_i64(KaiValue *scr, int32_t tag, const char *name, int n, KaiVarSlot *slots);
 static inline KaiValue *kaix_variant_reuse_at_k(KaiValue *scr, int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots);
-static inline __attribute__((always_inline)) KaiValue *kaix_variant_reuse_move_i64(KaiValue *scr, int32_t tag, const char *name, int n, KaiVarSlot *slots);
 static inline KaiValue *kaix_variant_reuse_move_k(KaiValue *scr, int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots);
 static inline KaiValue **kaix_variant_slot_addr(KaiValue *node, int slot);
 static inline int32_t kaix_variant_tag_of(KaiValue *v);
@@ -932,6 +932,11 @@ static inline __attribute__((always_inline)) int32_t kaix_reuse_fits(KaiValue *a
   return at != NULL && at->tag == KAI_VARIANT && at->var_n_args == n;
 }
 static inline void kaix_reuse_free(KaiReuse at) {kai_reuse_free(at); }
+static inline __attribute__((always_inline)) KaiValue *kaix_reuse_move_commit(KaiValue *scr, int32_t tag) {
+  scr->variant_tag = tag;
+  kai_rc_count_reuse();
+  return scr;
+}
 static inline KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t) {
   return kai_reuse_or_alloc_cons(scr, h, t);
 }
@@ -1109,16 +1114,6 @@ static inline __attribute__((always_inline)) KaiValue *kaix_variant_reuse_at_i64
 static inline KaiValue *kaix_variant_reuse_at_k(KaiValue *scr, int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots) {
   if (n <= 0) return kai_variant_reuse_at(scr, tag, name, 0, 0, NULL);
   return kai_variant_reuse_at(scr, tag, name, n, (uint32_t) mask, slots);
-}
-static inline __attribute__((always_inline)) KaiValue *kaix_variant_reuse_move_i64(KaiValue *scr, int32_t tag, const char *name, int n, KaiVarSlot *slots) {
-  if (scr != NULL && !kai_is_value(scr) && scr->tag == KAI_VARIANT &&
-      scr->var_n_args == n && kai_check_unique(scr)) {
-    for (int i = 0; i < n; ++i) kai_var_slots(scr)[i] = slots[i];
-    scr->variant_tag = tag;
-    kai_rc_count_reuse();
-    return scr;
-  }
-  return kai_variant_u(tag, name, n, (uint32_t) kai_slot_mask_of(tag), slots);
 }
 static inline KaiValue *kaix_variant_reuse_move_k(KaiValue *scr, int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots) {
   if (scr != NULL && !kai_is_value(scr) && scr->tag == KAI_VARIANT &&

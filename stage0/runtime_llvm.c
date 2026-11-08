@@ -1134,25 +1134,6 @@ __attribute__((always_inline)) KaiValue *kaix_variant_reuse_at_i64(KaiValue *scr
                               (uint32_t) kai_slot_mask_of(tag), slots);
 }
 
-/* The MOVE twin of `kaix_variant_reuse_at_i64`, emitted only inside the
- * dual fork's UNIQUE branch where the lowering statically neutralised the
- * match-exit drop: overwrite in place and return the cell at rc==1 with NO
- * survive-the-drop incref — the C backend's `_r = _scr; _scr = NULL`. The
- * fresh-alloc fallback is a belt (uniqueness and arity are proven upstream
- * by `kaix_check_unique` and the lowering's arity gate); if it ever fires,
- * the neutralised exit drop leaks the donor rather than corrupting it. */
-__attribute__((always_inline)) KaiValue *kaix_variant_reuse_move_i64(KaiValue *scr, int32_t tag,
-                                    const char *name, int n, KaiVarSlot *slots) {
-  if (scr != NULL && !kai_is_value(scr) && scr->tag == KAI_VARIANT &&
-      scr->var_n_args == n && kai_check_unique(scr)) {
-    for (int i = 0; i < n; ++i) kai_var_slots(scr)[i] = slots[i];
-    scr->variant_tag = tag;
-    kai_rc_count_reuse();
-    return scr;
-  }
-  return kai_variant_u(tag, name, n, (uint32_t) kai_slot_mask_of(tag), slots);
-}
-
 /* The reuse token can host the rebuild in place (kai_variant_at's test). */
 __attribute__((always_inline)) int32_t kaix_reuse_fits(KaiValue *at, int32_t n) {
   return at != NULL && at->tag == KAI_VARIANT && at->var_n_args == n;
@@ -1166,6 +1147,14 @@ __attribute__((always_inline)) KaiValue *kaix_reuse_commit(KaiValue *at, int32_t
   kai_rc_count_reuse();
 #endif
   return at;
+}
+
+/* Retag the unique scrutinee of a same-arity rebuild whose slots the caller
+ * already wrote. */
+__attribute__((always_inline)) KaiValue *kaix_reuse_move_commit(KaiValue *scr, int32_t tag) {
+  scr->variant_tag = tag;
+  kai_rc_count_reuse();
+  return scr;
 }
 
 /* `kaix_variant_at_argv_i64` with the slot mask given by the caller. */
