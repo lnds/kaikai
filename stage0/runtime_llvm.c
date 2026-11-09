@@ -1150,6 +1150,15 @@ __attribute__((always_inline)) KaiValue *kaix_variant_reuse_at_i64(KaiValue *scr
                               (uint32_t) kai_slot_mask_of(tag), slots);
 }
 
+/* A rebuild whose token cannot host it, for a tag whose slot mask is
+ * registered at startup: the token's block is recycled, then a fresh cell is
+ * built inline, so the slot words never round-trip through the stack. */
+__attribute__((always_inline)) KaiValue *kaix_variant_fresh_at(KaiReuse at, int32_t tag, int32_t n,
+                                                                KaiVarSlot *slots) {
+  kai_reuse_free(at);
+  return kai_variant_u_fast(tag, n, slots);
+}
+
 /* The reuse token can host the rebuild in place (kai_variant_at's test). */
 __attribute__((always_inline)) int32_t kaix_reuse_fits(KaiValue *at, int32_t n) {
   return at != NULL && at->tag == KAI_VARIANT && at->var_n_args == n;

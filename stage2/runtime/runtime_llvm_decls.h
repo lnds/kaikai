@@ -605,6 +605,7 @@ static inline KaiValue *kaix_variant_at_argv(int32_t tag, const char *name, int 
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_at_argv_i64(int32_t tag, const char *name, int n, KaiVarSlot *slots);
 static inline KaiValue *kaix_variant_at_argv_k(int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_at_masked(KaiReuse at, int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots);
+static inline __attribute__((always_inline)) KaiValue *kaix_variant_fresh_at(KaiReuse at, int32_t tag, int32_t n, KaiVarSlot *slots);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_masked(int32_t tag, const char *name, int32_t n, KaiVarSlot *slots);
 static inline KaiValue *kaix_variant_reuse_at(KaiValue *scr, int32_t tag, const char *name, int n, KaiValue **args);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_reuse_at_i64(KaiValue *scr, int32_t tag, const char *name, int n, KaiVarSlot *slots);
@@ -1108,6 +1109,10 @@ static inline KaiValue *kaix_variant_at_argv_k(int32_t tag, const char *name, in
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_at_masked(KaiReuse at, int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots) {
   if (n <= 0) return kai_variant_at(at, tag, name, 0, 0, NULL);
   return kai_variant_at(at, tag, name, n, (uint32_t) mask, slots);
+}
+static inline __attribute__((always_inline)) KaiValue *kaix_variant_fresh_at(KaiReuse at, int32_t tag, int32_t n, KaiVarSlot *slots) {
+  kai_reuse_free(at);
+  return kai_variant_u_fast(tag, n, slots);
 }
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_masked(int32_t tag, const char *name, int32_t n, KaiVarSlot *slots) {
     if (n <= 0) return kai_variant_u(tag, name, 0, 0, NULL);
