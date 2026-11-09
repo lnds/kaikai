@@ -6,6 +6,7 @@ their reuse, and the indirect call of a function value.
 import compiler.kir
 import compiler.emit_native_fn
 import compiler.emit_native_ops_calls
+import compiler.emit_shared_syms
 
 #[doc("""
 `KTagOf` reads the raw `i32` variant tag (SInt32). The result feeds a
@@ -461,7 +462,15 @@ fn nemit_con_at(
   inits: [KSlotInit]
 ) : Handle / Console {
   let tokv = nemit_atom(ctx, tok)
-  nemit_variant_into(ctx, tokv, ntok_val_arity(ctx, tok), tag, nm, nemit_slot_words(ctx, inits))
+  nemit_variant_into(
+    ctx,
+    tokv,
+    ntok_val_arity(ctx, tok),
+    tag,
+    nm,
+    inits_registered(inits),
+    nemit_slot_words(ctx, inits)
+  )
 }
 
 # `RkDonorVariant`: rebuild a ctor INTO the fn's cross-call donor token,
@@ -487,7 +496,18 @@ pub fn nemit_variant_at_masked_call(
   tok: Handle,
   inits: [KSlotInit]
 ) : Handle / Console =
-  nemit_variant_into(ctx, tok, -1, tag, nm, nemit_slot_words(ctx, inits))
+  nemit_variant_into(ctx, tok, -1, tag, nm, inits_registered(inits), nemit_slot_words(ctx, inits))
+
+# The tag's slot mask is registered at startup exactly when it is nonzero.
+fn inits_registered(inits: [KSlotInit]) : Bool =
+  variant_slot_mask(map(inits, it => init_kind(it))) != 0
+
+fn init_kind(it: KSlotInit) : Int = match it {
+  SIInt64(_) -> 1
+  SIReal(_) -> 2
+  SIEnum(_) -> 3
+  SIBoxed(_) -> 0
+}
 
 fn nemit_slot_words(ctx: Handle, inits: [KSlotInit]) : [Handle] / Console =
   map(inits, it => nemit_slot_word(ctx, it))
@@ -496,15 +516,16 @@ fn nemit_slot_words(ctx: Handle, inits: [KSlotInit]) : [Handle] / Console =
 # built only on the fresh-alloc path: an alloca whose address reaches the
 # runtime on every path stays in memory, and the rebuild then copies it back
 # off the stack.
-#[doc("Rebuild a variant of slot `words` into the reuse token `tok` (captured at `arity`, -1 unknown), in place when it fits, else freeing it and allocating fresh.")]
+#[doc("Rebuild a variant of slot `words` into the reuse token `tok` (captured at `arity`, -1 unknown), in place when it fits, else freeing it and allocating fresh; `registered` says the tag's slot mask is registered at startup.")]
 pub fn nemit_variant_into(
   ctx: Handle,
   tok: Handle,
   arity: Int,
   tag: Int,
   nm: String,
+  registered: Bool,
   words: [Handle]
-) : Handle / Console = nemit_variant_into_kept(ctx, tok, arity, tag, nm, words, None)
+) : Handle / Console = nemit_variant_into_kept(ctx, tok, arity, tag, nm, registered, words, None)
 
 #[doc("`nemit_variant_into` where `Some(kept)` says a fitting token is this constructor's unique cell already holding the `kept` slots' words, so only the others are stored.")]
 pub fn nemit_variant_into_kept(
@@ -513,6 +534,7 @@ pub fn nemit_variant_into_kept(
   arity: Int,
   tag: Int,
   nm: String,
+  registered: Bool,
   words: [Handle],
   kept: Option[[Int]]
 ) : Handle / Console {
@@ -542,7 +564,11 @@ pub fn nemit_variant_into_kept(
   llvm_build_store(b, r1, res)
   llvm_build_br(b, join)
   llvm_position_at_end(b, slow)
-  let r2 = nemit_variant_at_words(ctx, tok, tag, nm, words)
+  let r2 = if registered {
+    nemit_variant_fresh(ctx, if arity == n { llvm_const_null(p) } else { tok }, tag, words)
+  } else {
+    nemit_variant_at_words(ctx, tok, tag, nm, words)
+  }
   llvm_build_store(b, r2, res)
   llvm_build_br(b, join)
   llvm_position_at_end(b, join)
@@ -612,6 +638,27 @@ fn nemit_variant_at_words(
   llvm_buf_push(ab, llvm_const_i32(i32t, n))
   llvm_buf_push(ab, arr)
   ncall_finish(ctx, "kaix_variant_at_argv_i64", p, ptb, ab)
+}
+
+# `tok` cannot host the cell: null when captured at the rebuild's arity.
+fn nemit_variant_fresh(ctx: Handle, tok: Handle, tag: Int, words: [Handle]) : Handle / Console {
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let n = list_length(words)
+  let arrty = llvm_array_type(native_ctx_i64t(ctx), n)
+  let arr = llvm_build_alloca_entry(ctx, arrty, "fresh")
+  nemit_store_words(ctx, arr, arrty, words, 0)
+  let ptb = llvm_buf_new()
+  llvm_buf_push(ptb, p)
+  llvm_buf_push(ptb, i32t)
+  llvm_buf_push(ptb, i32t)
+  llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new()
+  llvm_buf_push(ab, tok)
+  llvm_buf_push(ab, llvm_const_i32(i32t, tag))
+  llvm_buf_push(ab, llvm_const_i32(i32t, n))
+  llvm_buf_push(ab, arr)
+  ncall_finish(ctx, "kaix_variant_fresh_at", p, ptb, ab)
 }
 
 fn nemit_store_words(ctx: Handle, arr: Handle, arrty: Handle, words: [Handle], i: Int) : Unit =
