@@ -3,7 +3,6 @@
 import compiler.ast
 import compiler.ast_ids
 import compiler.ast_ids
-import compiler.ctor_ix
 import compiler.emit_shared_syms
 import compiler.infer_env
 import compiler.infer_glue
@@ -21,6 +20,7 @@ import compiler.rec_stamp
 import compiler.symtab
 import compiler.written
 import compiler.kir_lower_sig
+import compiler.kir_lower_slot_args
 
 # A reuse mark over (scr, rbld...): donor scrutinee + rebuild. The mark is
 # the authoritative reuse-kind tag — perceus stamped it from the pattern
@@ -192,6 +192,7 @@ fn lower_reuse_flat_fork(
       let plan = st0.rnested
       let uses = reuse_taken_uses(st0.locals, cargs, st0.reuse_gc)
       let held = rh_held(st0)
+      let kept = if held { [] } else { move_kept(st0, cargs) }
       let st_gc = if held {
         emit_reuse_gc_increfs(
           donor,
@@ -222,7 +223,7 @@ fn lower_reuse_flat_fork(
                       let st_paid = rn_flat_unique_drops(plan.flat, donor, uses, pos, st_fork)
                       let st_ub = match bind_op(
                         st_paid,
-                        KConReuse(RkVariantMove, donor, c.name, c.tag, typed_inits(avs, c)),
+                        KConReuse(RkVariantMove(kept), donor, c.name, c.tag, typed_inits(avs, c)),
                         pos
                       ) {
                         LRes(ru, st_u2) ->
@@ -356,8 +357,9 @@ fn lower_reuse_nested_dual(
     }
   }
 
-# A flat pattern (the recolor-wrap shape) has no inner cell: only the outer
-# overwrite applies, and the rebuild cell consumes the cross-call donor.
+# A flat pattern (the recolor-wrap shape) has no inner cell: the scrutinee is
+# overwritten in place by the cell that keeps the most of its slots, and the
+# other rebuild cell consumes the cross-call donor.
 fn lower_reuse_flat_unique(
   donor: KVal,
   c: CtorLay,
@@ -371,20 +373,31 @@ fn lower_reuse_flat_unique(
   st_fork: LowerSt
 ) : LowerSt / Console {
   let st_a = rn_direct_acct(directs, donor, uses, pos, st_fork)
-  match lower_reuse_args_donate(cargs, c.kinds, "", 0, true, false, st_a, []) {
-    LResDon(avs_u, _, st_d) ->
-      match bind_op(
-        st_d,
-        KConReuse(RkVariantMove, donor, c.name, c.tag, typed_inits(avs_u, c)),
-        pos
-      ) {
-        LRes(ru, st_u2) ->
-          ls_seal(
-            ls_emit(reuse_neutralise_exit_drop(st_u2, pos), KStore(rjoin, ru, pos)),
-            KBr(l_join, pos),
-            l_shared
-          )
-      }
+  let built = match flat_host(st_a, cargs) {
+    Some(j) -> lower_flat_hosted(donor, c, cargs, j, pos, st_a)
+    None -> lower_flat_outer_moved(donor, c, cargs, pos, st_a)
+  }
+  match built {
+    LRes(ru, st_u2) ->
+      ls_seal(
+        ls_emit(reuse_neutralise_exit_drop(st_u2, pos), KStore(rjoin, ru, pos)),
+        KBr(l_join, pos),
+        l_shared
+      )
+  }
+}
+
+fn lower_flat_outer_moved(
+  donor: KVal,
+  c: CtorLay,
+  cargs: [Expr],
+  pos: KPos,
+  st: LowerSt
+) : LRes / Console {
+  let kept = move_kept(st, cargs)
+  match lower_reuse_args_donate(cargs, c.kinds, "", 0, true, false, st, []) {
+    LResDon(avs, _, st1) ->
+      bind_op(st1, KConReuse(RkVariantMove(kept), donor, c.name, c.tag, typed_inits(avs, c)), pos)
   }
 }
 
@@ -427,7 +440,13 @@ fn lower_reuse_steal_unique(
                 if donated { st_d } else { ls_emit(st_d, KRC(KFreeToken(KVar(tokreg)), pos)) }
               match bind_op(
                 st_f,
-                KConReuse(RkVariantMove, donor, c.name, c.tag, typed_inits(avs_u, c)),
+                KConReuse(
+                  RkVariantMove(move_kept(st_fork, cargs)),
+                  donor,
+                  c.name,
+                  c.tag,
+                  typed_inits(avs_u, c)
+                ),
                 pos
               ) {
                 LRes(ru, st_u2) ->
@@ -560,23 +579,6 @@ fn lower_donate_plain(
       lower_reuse_args_donate(rest, ks, tokreg, n_inner, donated, ddone, st1, list_append(acc, [v]))
   }
 
-# Args lowered at their slot kinds `ks`: a kind-1 Int slot lowers raw, as
-# `lower_ctor_args` does, since the emitter reads that word without
-# consuming the box a boxed value would bring.
-# `ks` must come from the entry the rebuild's tag uses: its type's home here, arity in `lower_ctor_args`.
-pub(pkg) fn lower_kinds_vals(
-  es: [Expr],
-  ks: [Int],
-  i: Int,
-  st: LowerSt,
-  acc: [KVal]
-) : LResMany / Console = match es {
-  [] -> LResMany(acc, st)
-  [e, ...rest] -> match lower_at_kind(e, kind_at(ks, i), st) {
-    LRes(v, st1) -> lower_kinds_vals(rest, ks, i + 1, st1, list_append(acc, [v]))
-  }
-}
-
 # `lower_kinds_vals` that, under `held`, registers each operand value a
 # later operand could strand until the last one has run.
 fn lower_kinds_held(
@@ -604,15 +606,6 @@ fn lower_kinds_held(
     }
   }
 }
-
-fn lower_at_kind(e: Expr, k: Int, st: LowerSt) : LRes / Console =
-  if k == 1 {
-    lower_expr_raw_at(e, SInt64, st)
-  } else if k == 3 {
-    lower_enum_slot_arg(e, st)
-  } else {
-    lower_expr(e, st)
-  }
 
 # The genuine dual-branch reuse (mirrors emit_c's emit_match_arm_reuse_cons /
 # _variant). The single-body `kai_reuse_or_alloc_*` shim cannot mirror C's
@@ -792,19 +785,3 @@ fn lower_ctor_args(cargs: [Expr], ks: [Int], st: LowerSt, acc: [KSlotInit]) : LC
       }
     }
   }
-
-# An enum-slot ctor arg. A NULLARY user ctor lowers to its tag immediate
-# (`KIntV`); everything else lowers boxed (the emitter's `kaix_take_enum`
-# reads whatever tag it carries).
-fn lower_enum_slot_arg(e: Expr, st: LowerSt) : LRes / Console = match e.kind {
-  ESym(s, _) -> match ctor_ix_row(st.ctor_ix, s) {
-    Some(EV(ar, _, tag, _)) ->
-      if ar == 0 and tag >= user_variant_tag_base() {
-        LRes(KIntV(tag), st)
-      } else {
-        lower_expr(e, st)
-      }
-    None -> lower_expr(e, st)
-  }
-  _ -> lower_expr(e, st)
-}
