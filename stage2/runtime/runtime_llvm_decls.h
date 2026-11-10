@@ -529,6 +529,7 @@ static inline __attribute__((always_inline)) int32_t kaix_reuse_fits(KaiValue *a
 static inline void kaix_reuse_free(KaiReuse at);
 static inline __attribute__((always_inline)) KaiValue *kaix_reuse_keep(KaiValue *at);
 static inline __attribute__((always_inline)) KaiValue *kaix_reuse_move_commit(KaiValue *scr, int32_t tag);
+static inline __attribute__((always_inline)) KaiValue *kaix_reuse_move_keep(KaiValue *at);
 static inline KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t);
 static inline KaiValue *kaix_reuse_or_alloc_record(KaiValue *scr, int n, KaiValue **fields, const char **names, uint64_t kept_mask);
 static inline KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag, const char *name, int n, KaiValue **args);
@@ -958,6 +959,10 @@ static inline __attribute__((always_inline)) KaiValue *kaix_reuse_move_commit(Ka
   scr->variant_tag = tag;
   kai_rc_count_reuse();
   return scr;
+}
+static inline __attribute__((always_inline)) KaiValue *kaix_reuse_move_keep(KaiValue *at) {
+  kai_rc_count_reuse();
+  return at;
 }
 static inline KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t) {
   return kai_reuse_or_alloc_cons(scr, h, t);

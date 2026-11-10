@@ -4,6 +4,7 @@ their reuse, and the indirect call of a function value.
 """)]
 
 import compiler.kir
+import compiler.emit_native_arm_slots
 import compiler.emit_native_fn
 import compiler.emit_native_ops_calls
 import compiler.emit_shared_syms
@@ -351,12 +352,16 @@ pub fn nemit_con_reuse(
     # perceus pairs it only with a rebuild of the pattern's arity, so the words
     # go straight into its slots. No survive-the-exit-drop incref: the lowering
     # settled the exit-drop register.
-    RkVariantMove(kept) -> {
+    RkVariantMove(kept, same) -> {
       let scr = nemit_atom(ctx, d)
       nemit_store_into_but(ctx, scr, nemit_slot_words(ctx, inits), kept, 0)
       let i32t = native_ctx_i32t(ctx)
       let p = native_ctx_ptrt(ctx)
-      ncall_sig2(ctx, "kaix_reuse_move_commit", p, p, i32t, scr, llvm_const_i32(i32t, tag))
+      if same {
+        ncall_sig1(ctx, "kaix_reuse_move_keep", p, p, scr)
+      } else {
+        ncall_sig2(ctx, "kaix_reuse_move_commit", p, p, i32t, scr, llvm_const_i32(i32t, tag))
+      }
     }
   }
 
@@ -490,14 +495,15 @@ fn nemit_con_donor(
   } else {
     let t = nemit_load_reg(ctx, reg)
     nemit_store_reg(ctx, reg, llvm_const_null(p))
-    nemit_variant_into(
+    nemit_variant_into_skip(
       ctx,
       t,
       ntok_arity(ctx, reg),
       tag,
       nm,
       inits_registered(inits),
-      nemit_slot_words(ctx, inits)
+      nemit_slot_words(ctx, inits),
+      if reg == ntrmc_armru_reg() { nemit_arm_kept(ctx, inits) } else { [] }
     )
   }
 }
@@ -558,6 +564,35 @@ pub fn nemit_variant_into_kept(
   registered: Bool,
   words: [Handle],
   kept: Option[[Int]]
+) : Handle / Console = match kept {
+  Some(ks) -> nemit_variant_into_at(ctx, tok, arity, tag, nm, registered, words, ks, true)
+  None -> nemit_variant_into_at(ctx, tok, arity, tag, nm, registered, words, [], false)
+}
+
+#[doc("`nemit_variant_into` where a fitting token already holds the `skip` slots' words, so only the others are stored; its header is rewritten.")]
+pub fn nemit_variant_into_skip(
+  ctx: Handle,
+  tok: Handle,
+  arity: Int,
+  tag: Int,
+  nm: String,
+  registered: Bool,
+  words: [Handle],
+  skip: [Int]
+) : Handle / Console =
+  nemit_variant_into_at(ctx, tok, arity, tag, nm, registered, words, skip, false)
+
+# `same` says the token is this constructor's unique cell, so its header stays.
+fn nemit_variant_into_at(
+  ctx: Handle,
+  tok: Handle,
+  arity: Int,
+  tag: Int,
+  nm: String,
+  registered: Bool,
+  words: [Handle],
+  skip: [Int],
+  same: Bool
 ) : Handle / Console {
   let b = native_ctx_b(ctx)
   let m = native_ctx_m(ctx)
@@ -572,15 +607,11 @@ pub fn nemit_variant_into_kept(
   let join = llvm_append_block(m, fnval, "into.join")
   llvm_build_cond_br(b, c, fast, slow)
   llvm_position_at_end(b, fast)
-  let r1 = match kept {
-    Some(ks) -> {
-      nemit_store_into_but(ctx, tok, words, ks, 0)
-      ncall_sig1(ctx, "kaix_reuse_keep", p, p, tok)
-    }
-    None -> {
-      nemit_store_into(ctx, tok, words, 0)
-      ncall_sig2(ctx, "kaix_reuse_commit", p, p, i32t, tok, llvm_const_i32(i32t, tag))
-    }
+  nemit_store_into_but(ctx, tok, words, skip, 0)
+  let r1 = if same {
+    ncall_sig1(ctx, "kaix_reuse_keep", p, p, tok)
+  } else {
+    ncall_sig2(ctx, "kaix_reuse_commit", p, p, i32t, tok, llvm_const_i32(i32t, tag))
   }
   llvm_build_store(b, r1, res)
   llvm_build_br(b, join)
@@ -620,15 +651,6 @@ fn nemit_store_into_but(ctx: Handle, tok: Handle, words: [Handle], kept: [Int], 
       nemit_store_into_but(ctx, tok, rest, kept, i + 1)
     }
   }
-
-fn nemit_store_into(ctx: Handle, tok: Handle, words: [Handle], i: Int) : Unit = match words {
-  [] -> ()
-  [w, ...rest] -> {
-    let slot = nemit_slot_ptr(ctx, tok, i)
-    llvm_build_store(native_ctx_b(ctx), w, slot)
-    nemit_store_into(ctx, tok, rest, i + 1)
-  }
-}
 
 # `kaix_variant_at_argv_i64(i32 tag, i8* name, i32 n, i64* slots)` over a
 # `[1+n x i64]` buffer: `slots[0]` the token word, `slots[1..]` the words.
