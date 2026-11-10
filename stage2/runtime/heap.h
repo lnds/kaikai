@@ -253,13 +253,20 @@ static KAI_TLS int kai_cell_pool_n = 0;
  * no cap, because a block is slab memory that cannot go back to libc; a
  * capped pool would strand every block past the cap. The allocator
  * rewrites the whole header of a block it hands out. */
+/* The block free lists and the current slab's bump state share one
+ * thread-local record, so a take resolves a single TLS address. */
+typedef struct {
+    char *slab_cur;   /* current slab base */
+    size_t slab_off;  /* bump offset into the current slab */
+    KaiValue *free_head[KAI_VAR_BLOCK_POOL_MAXN + 1];
+} KaiBlockHeap;
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS KaiValue *kai_var_block_free_head[KAI_VAR_BLOCK_POOL_MAXN + 1];
+extern KAI_TLS KaiBlockHeap kai_bheap;
 #  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS KaiValue *kai_var_block_free_head[KAI_VAR_BLOCK_POOL_MAXN + 1];
+KAI_TLS KaiBlockHeap kai_bheap;
 #  endif
 #else
-static KAI_TLS KaiValue *kai_var_block_free_head[KAI_VAR_BLOCK_POOL_MAXN + 1];
+static KAI_TLS KaiBlockHeap kai_bheap;
 #endif
 
 /* Lazy backing-store materialisation for the free-list pools. Each pool's
@@ -356,14 +363,16 @@ KAI_RT_SHARED void kai_cell_pool_tick(void) {
 __attribute__((noinline))
 KAI_RT_SHARED KaiValue *kai_var_block_pool_pop(int n) {
     if (n < 0 || n > KAI_VAR_BLOCK_POOL_MAXN) return NULL;
-    KaiValue *v = kai_var_block_free_head[n];
-    if (v) kai_var_block_free_head[n] = *(KaiValue **) v;
+    KaiBlockHeap *h = &kai_bheap;
+    KaiValue *v = h->free_head[n];
+    if (v) h->free_head[n] = *(KaiValue **) v;
     return v;
 }
 __attribute__((noinline))
 KAI_RT_SHARED void kai_var_block_pool_push(KaiValue *v, int n) {
-    *(KaiValue **) v = kai_var_block_free_head[n];
-    kai_var_block_free_head[n] = v;
+    KaiBlockHeap *h = &kai_bheap;
+    *(KaiValue **) v = h->free_head[n];
+    h->free_head[n] = v;
 }
 
 /* ---------- variant-block slab allocator (issue: malloc 6.2% of bench) ----------
@@ -396,23 +405,17 @@ KAI_RT_SHARED void kai_var_block_pool_push(KaiValue *v, int n) {
  * state must be ONE instance (external, owner-defined) — a per-partition copy
  * would bump-allocate into disjoint slabs. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KAI_TLS char  *kai_slab_cur;
-extern KAI_TLS size_t kai_slab_off;
 extern KAI_TLS char **kai_slab_list;
 extern KAI_TLS int    kai_slab_count;
 extern KAI_TLS int    kai_slab_cap;
 extern KAI_TLS int    kai_slab_atexit;
 #  if defined(KAI_RUNTIME_OWNER)
-KAI_TLS char  *kai_slab_cur    = NULL;
-KAI_TLS size_t kai_slab_off    = 0;
 KAI_TLS char **kai_slab_list   = NULL;
 KAI_TLS int    kai_slab_count  = 0;
 KAI_TLS int    kai_slab_cap    = 0;
 KAI_TLS int    kai_slab_atexit = 0;
 #  endif
 #else
-static KAI_TLS char  *kai_slab_cur    = NULL;  /* current slab base */
-static KAI_TLS size_t kai_slab_off    = 0;     /* bump offset into current slab */
 static KAI_TLS char **kai_slab_list   = NULL;  /* all slabs, for teardown */
 static KAI_TLS int    kai_slab_count  = 0;
 static KAI_TLS int    kai_slab_cap    = 0;
@@ -429,7 +432,7 @@ KAI_RT_SHARED void kai_slab_teardown(void) {
     for (int i = 0; i < kai_slab_count; ++i) free(kai_slab_list[i]);
     free(kai_slab_list);
     kai_slab_list = NULL; kai_slab_count = 0; kai_slab_cap = 0;
-    kai_slab_cur = NULL; kai_slab_off = 0;
+    kai_bheap.slab_cur = NULL; kai_bheap.slab_off = 0;
 }
 
 /* The exit reports still read slab values, so the teardown must be the
@@ -442,7 +445,8 @@ __attribute__((noinline))
 KAI_RT_SHARED void *kai_slab_alloc(size_t sz) {
     sz = (sz + 7u) & ~(size_t) 7u;            /* 8-byte align */
     if (sz > KAI_SLAB_SIZE) return kai_heap_malloc(sz); /* oversized: standalone (never freed individually either) */
-    if (!kai_slab_cur || kai_slab_off + sz > KAI_SLAB_SIZE) {
+    KaiBlockHeap *h = &kai_bheap;
+    if (!h->slab_cur || h->slab_off + sz > KAI_SLAB_SIZE) {
         kai_heap_charge(KAI_SLAB_SIZE);
         char *slab = (char *) malloc(KAI_SLAB_SIZE);
         if (!slab) { kai_eprintf("kai: out of memory (slab)\n"); kai_exit(1); }
@@ -452,8 +456,8 @@ KAI_RT_SHARED void *kai_slab_alloc(size_t sz) {
             kai_slab_cap = ncap;
         }
         kai_slab_list[kai_slab_count++] = slab;
-        kai_slab_cur = slab;
-        kai_slab_off = 0;
+        h->slab_cur = slab;
+        h->slab_off = 0;
         /* At N>1 a variant block allocated on this thread's slab can
          * migrate (with a cross-thread message copy) into another
          * thread's block pool and be reused there, so a per-thread slab
@@ -463,8 +467,8 @@ KAI_RT_SHARED void *kai_slab_alloc(size_t sz) {
          * clean ASAN "0 still-reachable" at N=1) does nothing. */
         if (kai_nthreads <= 1) kai_slab_register_teardown();
     }
-    void *p = kai_slab_cur + kai_slab_off;
-    kai_slab_off += sz;
+    void *p = h->slab_cur + h->slab_off;
+    h->slab_off += sz;
     return p;
 }
 
@@ -532,6 +536,29 @@ static inline size_t kai_var_block_size(int n) {
     return sz;
 }
 
+#ifdef KAI_CELL_POOL_ACTIVE
+/* A block for `n` slots: the arity's free list, else a bump of the current
+ * slab, else a new slab. noinline for the same reason as the pool ops. */
+__attribute__((noinline))
+KAI_RT_SHARED KaiValue *kai_var_block_take(int n) {
+    KaiBlockHeap *h = &kai_bheap;
+    if (n >= 0 && n <= KAI_VAR_BLOCK_POOL_MAXN) {
+        KaiValue *v = h->free_head[n];
+        if (v) {
+            h->free_head[n] = *(KaiValue **) v;
+            return v;
+        }
+    }
+    size_t sz = (kai_var_block_size(n) + 7u) & ~(size_t) 7u;
+    if (h->slab_cur && h->slab_off + sz <= KAI_SLAB_SIZE) {
+        void *p = h->slab_cur + h->slab_off;
+        h->slab_off += sz;
+        return (KaiValue *) p;
+    }
+    return (KaiValue *) kai_slab_alloc(sz);
+}
+#endif
+
 /* FAM lane: allocate a KAI_VARIANT block with `n` payload slots stored
  * inline (one contiguous allocation). Mirrors kai_alloc's bookkeeping
  * but draws from / returns to the per-arity block pool instead of the
@@ -545,13 +572,8 @@ static KaiValue *kai_alloc_var(int n) {
     KaiValue *v;
     size_t bsz = kai_var_block_size(n);
 #ifdef KAI_CELL_POOL_ACTIVE
-    v = kai_var_block_pool_pop(n);
-    if (v) {
-        memset(v, 0, bsz);
-    } else {
-        v = (KaiValue *) kai_slab_alloc(bsz);
-        memset(v, 0, bsz);                 /* slab is uninit; this is the calloc-equivalent */
-    }
+    v = kai_var_block_take(n);
+    memset(v, 0, bsz);
 #else
     /* No cell pool (KAI_TRACE_RC / KAI_NO_CELL_POOL):
      * the slab allocator lives inside the cell-pool block, so fall back
@@ -597,11 +619,7 @@ static KaiValue *kai_alloc_var_nz(int n) {
 #endif
     KaiValue *v;
 #ifdef KAI_CELL_POOL_ACTIVE
-    v = kai_var_block_pool_pop(n);
-    if (!v) {
-        /* pool miss: fresh slab block, no memset — caller overwrites every slot */
-        v = (KaiValue *) kai_slab_alloc(kai_var_block_size(n));
-    }
+    v = kai_var_block_take(n);
 #else
     /* No cell pool: plain libc malloc (no-zero — caller fills slots);
      * kai_var_block_free's #else frees it. */
