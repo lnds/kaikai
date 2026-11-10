@@ -84,6 +84,14 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.192.7 (2026-11-10)
+
+### Fixed
+
+- **runtime**: park timer sleepers on a heap, not a sorted list (#3437)
+- **runtime**: give a released fiber or segment stack's pages back on macOS (#3436)
+- **pkg**: fail kai fetch when a dependency cannot be fetched (#3435)
+
 ## v0.192.6 (2026-11-10)
 
 ### Changed
