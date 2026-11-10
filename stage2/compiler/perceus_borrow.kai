@@ -17,6 +17,7 @@ import compiler.perceus_lend
 import compiler.fn_index
 import compiler.borrow_infer
 import compiler.perceus_reads
+import compiler.perceus_spread_move
 import compiler.core_builtins
 import compiler.name_report
 import compiler.symtab
@@ -494,8 +495,9 @@ pub(pkg) fn pcs_collect_move_last_lets(
   uses: UseIx,
   cmap: ConsumeIndex,
   skip: [Binder],
-  tab: SymTab
-) : [Binder] = match pcs_mll_expr(body, body, uses, cmap, skip, []) {
+  tab: SymTab,
+  lent: (Expr) -> [Int]
+) : [Binder] = match pcs_mll_expr(body, body, uses, cmap, skip, lent, []) {
   [] -> []
   cands -> {
     let roles = pbr_role_reads(body)
@@ -507,7 +509,7 @@ pub(pkg) fn pcs_collect_move_last_lets(
 fn pcs_mll_reached_once(nm: Binder, roles: NameIx[RoleRead], uses: UseIx, sites: MoveSites) : Bool =
   match pbr_roles_of(roles, nm) {
     (a, brc, blocked) ->
-      a == 1 and brc == 0 and (not blocked) and pcs_last_read_moves(nm.id, uses, sites)
+      a >= 1 and brc == 0 and (not blocked) and pcs_last_read_moves(nm.id, uses, sites)
   }
 
 pub(pkg) fn pcs_user_borrow_slots(bmap: BorrowMap, callee: Expr) : [Int] = match pcs_lending_form(
@@ -1049,13 +1051,14 @@ fn pcs_mll_expr(
   uses: UseIx,
   cmap: ConsumeIndex,
   skip: [Binder],
+  lent: (Expr) -> [Int],
   acc: [Binder]
 ) : [Binder] {
   let acc1 = match e.kind {
-    EBlock(ss, _) -> pcs_mll_scan(ss, body, uses, cmap, skip, acc)
+    EBlock(ss, tail) -> pcs_mll_scan(ss, tail, body, uses, cmap, skip, lent, acc)
     _ -> acc
   }
-  pcs_mll_ps(xp_positions(e), body, uses, cmap, skip, acc1)
+  pcs_mll_ps(xp_positions(e), body, uses, cmap, skip, lent, acc1)
 }
 
 fn pcs_mll_ps(
@@ -1064,25 +1067,28 @@ fn pcs_mll_ps(
   uses: UseIx,
   cmap: ConsumeIndex,
   skip: [Binder],
+  lent: (Expr) -> [Int],
   acc: [Binder]
 ) : [Binder] = match ps {
   [] -> acc
   [XP(r, c), ...rest] -> {
     let acc1 = if xrole_inline(r) {
-      pcs_mll_expr(c, body, uses, cmap, skip, acc)
+      pcs_mll_expr(c, body, uses, cmap, skip, lent, acc)
     } else {
       acc
     }
-    pcs_mll_ps(rest, body, uses, cmap, skip, acc1)
+    pcs_mll_ps(rest, body, uses, cmap, skip, lent, acc1)
   }
 }
 
 fn pcs_mll_scan(
   ss: [Stmt],
+  tail: Option[Expr],
   body: Expr,
   uses: UseIx,
   cmap: ConsumeIndex,
   skip: [Binder],
+  lent: (Expr) -> [Int],
   acc: [Binder]
 ) : [Binder] = match ss {
   [] -> acc
@@ -1092,7 +1098,9 @@ fn pcs_mll_scan(
         MUnboxed -> acc
         _ -> match pat.pkind {
           PBind(nm) ->
-            if pcs_mll_qualifies(nm, pat, rhs, body, uses, cmap, skip) {
+            if pcs_mll_qualifies(nm, pat, rhs, body, uses, cmap, skip)
+              and (pcs_read_once(nm.id, uses)
+                or psm_spread_moves(nm.id, rhs, rest, tail, uses, lent)) {
               [nm, ...acc]
             } else {
               acc
@@ -1102,7 +1110,7 @@ fn pcs_mll_scan(
       }
       _ -> acc
     }
-    pcs_mll_scan(rest, body, uses, cmap, skip, acc1)
+    pcs_mll_scan(rest, tail, body, uses, cmap, skip, lent, acc1)
   }
 }
 
@@ -1117,7 +1125,6 @@ fn pcs_mll_qualifies(
 ) : Bool =
   (not pcs_has(skip, nm.id))
     and pcs_has(prc_pat_bindings_skip_raw(pat, rhs, []), nm.id)
-    and pcs_read_once(nm.id, uses)
 
 # - hash index over Perceus' consume map. Answers "which parameter positions
 # does this callee consume". Perceus asks at every `ECall` node, from two
