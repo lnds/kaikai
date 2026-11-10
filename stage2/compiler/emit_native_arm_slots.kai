@@ -1,0 +1,121 @@
+#[doc("The slots of a fn's arm-top token that still hold the word a register carries: registers that read the captured scrutinee's slots, directly or through copies and an Int unbox.")]
+
+import compiler.kir
+
+# A register's definition: a `let` of an op, or a store of an atom.
+type ArmDef = AD(String, KOp) | AS(String, KVal)
+
+#[doc("Record, for each register that reads slot `i` of the scrutinee every arm-top capture of `blocks` takes, that slot. A register defined more than once records nothing.")]
+pub fn nemit_arm_slot_regs(ctx: Handle, blocks: [KBlock]) : Unit / Console {
+  let defs = flat_map(blocks, b => flat_map(b.stmts, ars_def))
+  match ars_base(blocks, defs) {
+    Some(base) -> ars_walk(ctx, defs, base, defs)
+    None -> ()
+  }
+}
+
+#[doc("The slots of `inits` whose register reads the same slot of the arm-top token's cell.")]
+pub fn nemit_arm_kept(ctx: Handle, inits: [KSlotInit]) : [Int] / Console =
+  ars_kept(ctx, inits, 0, [])
+
+fn ars_kept(ctx: Handle, inits: [KSlotInit], i: Int, acc: [Int]) : [Int] / Console = match inits {
+  [] -> list_reverse(acc)
+  [it, ...rest] ->
+    ars_kept(ctx, rest, i + 1, if ars_init_slot(ctx, it) == i { [i, ...acc] } else { acc })
+}
+
+fn ars_init_slot(ctx: Handle, it: KSlotInit) : Int / Console = match it {
+  SIBoxed(KVar(r)) -> ars_slot(ctx, r)
+  SIInt64(KVar(r)) -> ars_slot(ctx, r)
+  _ -> 0 - 1
+}
+
+fn ars_slot(ctx: Handle, r: String) : Int / Console = native_ctx_reg_slot(ctx, ars_key(r))
+
+fn ars_key(r: String) : String = "armslot:#{r}"
+
+fn ars_def(s: KStmt) : [ArmDef] = match s {
+  KLet(n, _, op, _) -> [AD(n, op)]
+  KStore(n, v, _) -> [AS(n, v)]
+  _ -> []
+}
+
+# The one cell every capture takes, through the aliases of its atom.
+fn ars_base(blocks: [KBlock], defs: [ArmDef]) : Option[String] {
+  let caps = flat_map(blocks, b => flat_map(b.stmts, ars_capture))
+  match caps {
+    [] -> None
+    [c, ...rest] -> {
+      let base = ars_alias(c, defs, 8)
+      if all(rest, r => ars_alias(r, defs, 8) == base) { Some(base) } else { None }
+    }
+  }
+}
+
+fn ars_capture(s: KStmt) : [String] = match s {
+  KRC(KArmTopReuse(KVar(d), _, _, _), _) -> [d]
+  _ -> []
+}
+
+# An alias may later be settled by a store of an immediate, never re-pointed.
+fn ars_alias(r: String, defs: [ArmDef], fuel: Int) : String =
+  if fuel <= 0 or ars_repointed(r, defs) {
+    r
+  } else {
+    match ars_lets(r, defs) {
+      [KLitOp(KVar(m))] -> ars_alias(m, defs, fuel - 1)
+      _ -> r
+    }
+  }
+
+fn ars_repointed(r: String, defs: [ArmDef]) : Bool = any(
+  defs,
+  d => match d {
+    AS(n, KVar(_)) -> n == r
+    _ -> false
+  }
+)
+
+fn ars_lets(r: String, defs: [ArmDef]) : [KOp] = flat_map(
+  defs,
+  d => match d {
+    AD(n, op) -> if n == r { [op] } else { [] }
+    AS(_, _) -> []
+  }
+)
+
+fn ars_single(r: String, defs: [ArmDef]) : Bool =
+  list_length(ars_lets(r, defs)) == 1
+    and (not any(
+      defs,
+      d => match d {
+        AS(n, _) -> n == r
+        _ -> false
+      }
+    ))
+
+fn ars_walk(ctx: Handle, defs: [ArmDef], base: String, todo: [ArmDef]) : Unit / Console =
+  match todo {
+    [] -> ()
+    [AD(n, op), ...rest] -> {
+      let i = ars_read_slot(ctx, op, base, defs)
+      if i >= 0 and ars_single(n, defs) {
+        native_ctx_add_reg(ctx, ars_key(n), llvm_const_null(native_ctx_ptrt(ctx)), i)
+      }
+      ars_walk(ctx, defs, base, rest)
+    }
+    [AS(_, _), ...rest] -> ars_walk(ctx, defs, base, rest)
+  }
+
+# Definitions arrive in program order, so a copy reads an already-recorded register.
+fn ars_read_slot(ctx: Handle, op: KOp, base: String, defs: [ArmDef]) : Int / Console = match op {
+  KProj(KVar(v), i) -> ars_of_base(v, base, defs, i)
+  KProjBorrow(KVar(v), i) -> ars_of_base(v, base, defs, i)
+  KProjKind(KVar(v), i, _) -> ars_of_base(v, base, defs, i)
+  KLitOp(KVar(m)) -> ars_slot(ctx, m)
+  KPrim(KpUnbox(RwInt), [KVar(m)]) -> ars_slot(ctx, m)
+  _ -> 0 - 1
+}
+
+fn ars_of_base(v: String, base: String, defs: [ArmDef], i: Int) : Int =
+  if ars_alias(v, defs, 8) == base { i } else { 0 - 1 }
