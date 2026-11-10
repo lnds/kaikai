@@ -1159,6 +1159,12 @@ __attribute__((always_inline)) KaiValue *kaix_variant_fresh_at(KaiReuse at, int3
   return kai_variant_u_fast(tag, n, slots);
 }
 
+/* Prefetch a cell the caller is about to visit; returns it unchanged. */
+__attribute__((always_inline)) KaiValue *kaix_prefetch(KaiValue *p) {
+  __builtin_prefetch(p, 0, 3);
+  return p;
+}
+
 /* The reuse token can host the rebuild in place (kai_variant_at's test). */
 __attribute__((always_inline)) int32_t kaix_reuse_fits(KaiValue *at, int32_t n) {
   return at != NULL && at->tag == KAI_VARIANT && at->var_n_args == n;

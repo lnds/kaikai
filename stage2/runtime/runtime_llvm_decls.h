@@ -474,6 +474,7 @@ static inline KaiValue *kaix_or(KaiValue *a, KaiValue *b);
 void kaix_panic_no_impl(const char *proto, const char *op, int32_t head);
 KaiValue *kaix_panic_thunk(KaiValue *s, KaiValue **a, int n);
 static inline KaiValue *kaix_pow_int(KaiValue *a, KaiValue *b);
+static inline __attribute__((always_inline)) KaiValue *kaix_prefetch(KaiValue *p);
 KaiValue *kaix_print_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_program_name_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_proto_dispatch1(int64_t pid, int64_t op, const char *pname, const char *opname, KaiValue *a0);
@@ -924,6 +925,10 @@ static inline KaiValue *kaix_or(KaiValue *a, KaiValue *b) {
     return kai_bool(r);
 }
 static inline KaiValue *kaix_pow_int(KaiValue *a, KaiValue *b) {return kai_op_pow_int(a, b); }
+static inline __attribute__((always_inline)) KaiValue *kaix_prefetch(KaiValue *p) {
+  __builtin_prefetch(p, 0, 3);
+  return p;
+}
 static inline KaiValue *kaix_range(KaiValue *from, KaiValue *to) {return kai_range(from, to); }
 static inline KaiValue *kaix_range_step(KaiValue *f, KaiValue *t, KaiValue *s) {return kai_range_step(f, t, s); }
 static inline KaiValue *kaix_real(double r) {return kai_real(r); }
