@@ -4,6 +4,7 @@ import compiler.util
 import compiler.kir
 import compiler.kir_syms
 import compiler.kir_inline_beta
+import compiler.kir_inline_donor
 import compiler.ast_ids
 import compiler.core_types
 
@@ -504,8 +505,10 @@ pub(pkg) fn kir_inline_program(kp: KProgram) : KProgram =
     kp
   } else {
     let nm = kp_names(kp)
-    let tmpls = kin_tmpls(kin_collect(kp.fns, nm, []))
-    let fns1 = if tmpls.n == 0 { kp.fns } else { kin_fn_loop(kp.fns, nm, tmpls, []) }
+    let all = kin_collect(kp.fns, nm, [])
+    let tmpls =
+      KinSets { all: kin_tmpls(all), plain: kin_tmpls(filter(all, t => not kin_tmpl_donor(t))) }
+    let fns1 = if tmpls.all.n == 0 { kp.fns } else { kin_fn_loop(kp.fns, nm, tmpls, []) }
     let lams = kin_tmpls(kin_lam_collect(fns1, nm, []))
     let fns2 = if lams.n == 0 { fns1 } else { kin_beta_loop(fns1, lams, []) }
     kvs_program(KProgram {
@@ -543,17 +546,13 @@ fn kin_collect(fs: [KFn], nm: KNames, acc: [KinTmpl]) : [KinTmpl] = match fs {
 
 fn kin_admit(f: KFn) : Bool = match f.kind {
   KFnNormal -> kin_shape_ok(f)
+    and (f.donor or (not kin_has_donor_rebuild(f.blocks)))
     and kin_size_ok(f.blocks)
     and kin_blocks_ok(f.blocks, kin_binders(f.blocks, []), false)
   _ -> false
 }
 
-# A donation-capable fn rides the hidden trailing donor-token param —
-# fn-wide state a paste cannot re-home (the `_arm_ru` argument again),
-# and its call sites carry the cross-call donation the inline would
-# silently drop. Both stay calls.
-fn kin_shape_ok(f: KFn) : Bool =
-  (not f.stateful) and (not kin_region_some(f.region_id)) and (not f.donor)
+fn kin_shape_ok(f: KFn) : Bool = (not f.stateful) and (not kin_region_some(f.region_id))
 
 # The ceiling of the template's class: loop templates (a pasted
 # self-loop) are tightest, reuse-carrying bodies widest.
@@ -606,7 +605,10 @@ fn kin_lam_admit(f: KFn) : Bool = match f.kind {
 }
 
 fn kin_lam_admissible(f: KFn) : Bool {
-  let sized = kin_shape_ok(f) and kin_within(f.blocks, kin_max_blocks(), kin_max_stmts())
+  let sized = kin_shape_ok(f)
+    and (not f.donor)
+    and (not kin_has_donor_rebuild(f.blocks))
+    and kin_within(f.blocks, kin_max_blocks(), kin_max_stmts())
   let shaped = (not kin_has_tcrec(f.blocks)) and kin_lam_origins_ok(f.params)
   let body = kin_blocks_ok(f.blocks, kin_binders(f.blocks, []), true) and kin_lam_alias_shape_ok(f)
   sized and shaped and body
@@ -713,7 +715,7 @@ fn kin_op_ok(op: KOp, performs: Bool) : Bool = match op {
   KProjKind(_, _, _) -> true
   KTagOf(_) -> true
   KLitOp(_) -> true
-  KConReuse(rk, _, _, _, _) -> kin_reuse_kind_ok(rk)
+  KConReuse(_, _, _, _, _) -> true
   KRecordReuse(_, _, _, _) -> true
   KTokenSteal(_, _) -> true
   KCall(sym, _) -> kin_call_ok(sym)
@@ -721,14 +723,6 @@ fn kin_op_ok(op: KOp, performs: Bool) : Bool = match op {
   KCallIndirectBorrow(_, _) -> true
   KPerform(_, _, _, _, _) -> performs
   _ -> false
-}
-
-# `RkDonorVariant` rebuilds into the enclosing fn's hidden donor slot —
-# fn-wide state, not a local atom (belt: a non-donor template should
-# never carry one anyway).
-fn kin_reuse_kind_ok(rk: KReuseKind) : Bool = match rk {
-  RkDonorVariant -> false
-  _ -> true
 }
 
 # Runtime RC/uniqueness helpers a reuse body calls directly. Leaf by
@@ -762,9 +756,12 @@ fn kin_term_ok(t: KTerm) : Bool = match t {
 
 # --- Caller walk ----------------------------------------------------------
 
-fn kin_fn_loop(fs: [KFn], nm: KNames, tmpls: KinTmpls, acc: [KFn]) : [KFn] = match fs {
+fn kin_fn_loop(fs: [KFn], nm: KNames, sets: KinSets, acc: [KFn]) : [KFn] = match fs {
   [] -> list_reverse(acc)
-  [f, ...rest] -> kin_fn_loop(rest, nm, tmpls, [kin_fn(f, kfn_sym(nm, f), tmpls), ...acc])
+  [f, ...rest] -> {
+    let tmpls = if kin_has_armtop(f.blocks) { sets.all } else { sets.plain }
+    kin_fn_loop(rest, nm, sets, [kin_fn(f, kfn_sym(nm, f), tmpls), ...acc])
+  }
 }
 
 fn kin_fn(f: KFn, sym: String, tmpls: KinTmpls) : KFn = match kin_fn_blocks(
@@ -856,7 +853,8 @@ fn kin_scan(
           term: KBr(kin_lbl(sub, kin_entry_label(t)), pos),
           region_id: None
         }
-        let cloned = kin_clone_blocks(t.blocks, sub, x, join, [])
+        let cloned0 = kin_clone_blocks(t.blocks, sub, x, join, [])
+        let cloned = if t.donor { kin_rehome_donor(cloned0) } else { cloned0 }
         kin_scan(
           join,
           rest,
@@ -864,7 +862,7 @@ fn kin_scan(
           tmpls,
           caller,
           c + 1,
-          [],
+          if t.donor { [KRC(KArmTokenFree, pos)] } else { [] },
           kin_prepend_rev([head, ...cloned], done_rev)
         )
       }

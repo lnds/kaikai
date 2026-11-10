@@ -725,7 +725,7 @@ KAI_RT_SHARED KaiValue *kaix_variant_arg_scalar(KaiValue *v, int i) {
     return kai_variant_slot_box(v, i);
 }
 
-KaiValue *kaix_variant_arg(KaiValue *v, int i) {
+__attribute__((always_inline)) KaiValue *kaix_variant_arg(KaiValue *v, int i) {
     /* The slot mask discriminates the read: a typed slot (Int / Real /
      * enum) re-boxes exactly as `kai_variant_slot_box` does — the boxed-view
      * accessor the C backend uses (`slot_read_for_test`) — so a raw word
@@ -1020,7 +1020,7 @@ KaiValue *kaix_incref_if_shared(KaiValue *donor, KaiValue *child) {
  *
  * These are thin forwarders over the stage2 statics; all the RC subtlety
  * lives there. `KaiReuse` is `KaiValue*` (runtime.h §reuse-token). */
-KaiReuse  kaix_drop_reuse_token(KaiValue *v, int n)      { return kai_drop_reuse_token(v, n); }
+__attribute__((always_inline)) KaiReuse kaix_drop_reuse_token(KaiValue *v, int n) { return kai_drop_reuse_token(v, n); }
 void      kaix_reuse_free(KaiReuse at)                   { kai_reuse_free(at); }
 
 /* The arm-top capture of a scrutinee its pattern matched: the tag test already
@@ -1046,7 +1046,7 @@ __attribute__((always_inline)) KaiReuse kaix_arm_top_token(KaiValue *v) {
  * other owners). When the token is non-null (unique) the children MOVED, so no
  * incref. Emitted once per kept ptr binder by the arm-top lowering; returns the
  * child so the LLVM emitter routes it through the boxed-call helper. */
-KaiValue *kaix_incref_if_token_null(KaiReuse token, KaiValue *child) {
+__attribute__((always_inline)) KaiValue *kaix_incref_if_token_null(KaiReuse token, KaiValue *child) {
   if (token == kai_reuse_null) kai_incref(child);
   return child;
 }
