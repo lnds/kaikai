@@ -723,19 +723,30 @@ int kai_reactor_signal_pipe[2]   = { -1, -1 };
 static int kai_reactor_signal_pipe[2]   = { -1, -1 };
 #endif
 
-/* Sorted timer-wheel head (intrusive list of parked fibers chained
- * through f->reactor_next, ordered by ascending deadline). Insertion
- * is O(n); for v1 with handfuls of concurrent sleepers this stays
- * well under the noise floor of poll() itself. A heap is queued for
- * Orongo if the wheel ever shows up on a profile. */
+/* Timer-parked fibers: a binary min-heap ordered by (deadline, insertion
+ * order), so equal deadlines wake first-in first-out. */
 #if defined(KAI_SEPARATE_COMPILATION)
-extern KaiFiber *kai_reactor_timer_head;
+extern KaiFiber **kai_reactor_timers;
+extern size_t     kai_reactor_timers_n;
+extern size_t     kai_reactor_timers_cap;
+extern uint64_t   kai_reactor_timers_seq;
 #  if defined(KAI_RUNTIME_OWNER)
-KaiFiber *kai_reactor_timer_head = NULL;
+KaiFiber **kai_reactor_timers     = NULL;
+size_t     kai_reactor_timers_n   = 0;
+size_t     kai_reactor_timers_cap = 0;
+uint64_t   kai_reactor_timers_seq = 0;
 #  endif
 #else
-static KaiFiber *kai_reactor_timer_head = NULL;
+static KaiFiber **kai_reactor_timers     = NULL;
+static size_t     kai_reactor_timers_n   = 0;
+static size_t     kai_reactor_timers_cap = 0;
+static uint64_t   kai_reactor_timers_seq = 0;
 #endif
+
+/* The timer-parked fiber with the earliest deadline, NULL when none. */
+static inline KaiFiber *kai_reactor_timer_first(void) {
+    return kai_reactor_timers_n ? kai_reactor_timers[0] : NULL;
+}
 
 /* Process-wait map and file-pool waiter list. Both are intrusive
  * single-linked through f->reactor_next, so a fiber can sit on at

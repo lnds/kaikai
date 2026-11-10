@@ -248,6 +248,10 @@ struct KaiFiber {
      * all four. */
     KaiFiber       *reactor_next;
     uint64_t        reactor_deadline_ns;
+    /* Timer parks: 1-based slot in the timer heap (0: not on it) and the
+     * insertion order that breaks deadline ties. */
+    size_t          reactor_timer_ix;
+    uint64_t        reactor_timer_seq;
     int             reactor_wait_pid;
     int             reactor_wait_status;
     void           *reactor_data;
