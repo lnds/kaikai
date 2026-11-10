@@ -11,7 +11,7 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT INT TERM
 fx="$ROOT/examples/runtime"
 
-for name in fiber_stack_many fiber_stack_100k fiber_stack_sized fiber_stack_sized_overflow fiber_stack_sized_handle_overflow; do
+for name in fiber_stack_many fiber_stack_100k fiber_stack_sized fiber_stack_sized_overflow fiber_stack_sized_handle_overflow seg_stack_release; do
   "$ROOT/bin/kai" build --backend="$backend" "$fx/$name.kai" -o "$work/$name" 2> "$work/build.err" \
     || { echo "fiber-stack FAIL ($backend: build of $name failed)"; cat "$work/build.err"; exit 1; }
 done
@@ -95,4 +95,19 @@ for n in 1 8; do
       || { echo "fiber-stack FAIL ($backend, KAI_THREADS=$n: $name not diagnosed, exit=$rc)"; cat "$work/overflow.err"; exit 1; }
   done
 done
-echo "fiber-stack OK ($backend: 20K deep completes on a fiber and in a kept-continuation handle, 50M deep diagnosed, at 1 and 8 threads; 20K live fibers at 1 and default; 100K where guards are VMA-free, a diagnosed failure past vm.max_map_count where not)"
+# A released stack gives its pages back: 2,000 live generator segments, each
+# touching a page or two, then dropped, peak under 56 MB (73 MB when released
+# stacks stayed resident).
+if [ "$(uname -s)" = Darwin ]; then
+  out="$(/usr/bin/time -l "$work/seg_stack_release" 2> "$work/time.err")"
+  rss_kb=$(( $(awk '/maximum resident/ {print $1}' "$work/time.err") / 1024 ))
+else
+  out="$(/usr/bin/time -f %M -o "$work/time.out" "$work/seg_stack_release")"
+  rss_kb=$(tail -n 1 "$work/time.out")
+fi
+[ "$out" = "$(cat "$fx/seg_stack_release.out.expected")" ] \
+  || { echo "fiber-stack DIFF ($backend, segment release)"; echo "$out"; exit 1; }
+[ "$rss_kb" -lt 57344 ] \
+  || { echo "fiber-stack FAIL ($backend: 2,000 released segments peak at ${rss_kb} KB RSS, limit 57344 KB)"; exit 1; }
+
+echo "fiber-stack OK ($backend: 20K deep completes on a fiber and in a kept-continuation handle, 50M deep diagnosed, at 1 and 8 threads; 20K live fibers at 1 and default; 100K where guards are VMA-free, a diagnosed failure past vm.max_map_count where not; released segment stacks return their pages)"

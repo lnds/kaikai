@@ -719,9 +719,14 @@ static void kai_stack_unmap(void *base, size_t stack_size) {
         pthread_mutex_unlock(&pl->mu);
         return;
     }
-    /* The guard page is left alone; only the stack proper is released. */
+    /* The guard page is left alone; only the stack proper is released.
+     * macOS keeps MADV_FREE pages resident until memory pressure, so a pooled
+     * slot would hold every page it ever touched: map fresh pages over it. */
 #if defined(__APPLE__)
-    madvise((char *) base + page, stack_size, MADV_FREE);
+    if (mmap((char *) base + page, stack_size, PROT_READ | PROT_WRITE,
+             kai_stack_map_flags() | MAP_FIXED, -1, 0) == MAP_FAILED) {
+        madvise((char *) base + page, stack_size, MADV_FREE);
+    }
 #else
     madvise((char *) base + page, stack_size, MADV_DONTNEED);
 #endif
