@@ -84,6 +84,29 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.192.6 (2026-11-10)
+
+### Changed
+
+- **native**: prefetch a child as it is read out of its cell (#3430)
+- **runtime**: free a fully bound arm-taken shell without the outer call (#3429)
+- **kir**: cancel a dup against its drop across other refcount ops (#3428)
+- **kir**: join a scalar match at a raw slot (#3427)
+- **perceus**: move a let read in several statements into its last reader (#3425)
+- **native**: skip the words and header a reused cell already holds (#3424)
+- **kir**: inline a donation-capable callee into a caller holding an arm token (#3423)
+- **runtime**: take a variant block through one thread-local record (#3422)
+- **perceus**: take an arm's scrutinee apart when its body matches on another value (#3421)
+- **kir**: move a flat rebuild's matching cell into its unique scrutinee (#3420)
+- **native**: build a rebuild's fresh cell inline when its token cannot host it (#3419)
+- **native**: skip the slots a unique TRMC descent already holds (#3418)
+- **kir**: settle a match's exit-drop register with an immediate (#3417)
+- **native**: rebuild a proven-unique scrutinee in place without rechecking it (#3416)
+- **runtime**: test a boxed Bool's truthiness by identity (#3415)
+- **native**: test a reuse token captured at the rebuild's arity by presence alone (#3414)
+- **native**: write reused cells in place and read a boxed Bool by identity (#3413)
+- **kir**: write an enum slot as its tag and skip its RC in reuse rebuilds (#3412)
+
 ## v0.192.5 (2026-11-04)
 
 ### Fixed
