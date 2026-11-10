@@ -356,7 +356,7 @@ static inline void *kaix_disp_enter(KaiFiber *f, void *node_v);
 static inline void kaix_disp_leave(KaiFiber *f, void *prev_v);
 static inline KaiFiber *kaix_dispatch_fiber(void);
 static inline KaiValue *kaix_div(KaiValue *a, KaiValue *b);
-static inline KaiReuse kaix_drop_reuse_token(KaiValue *v, int n);
+static inline __attribute__((always_inline)) KaiReuse kaix_drop_reuse_token(KaiValue *v, int n);
 static inline KaiReuse kaix_drop_slot_if_token(KaiReuse token, int32_t i);
 KaiValue *kaix_each_thunk(KaiValue *s, KaiValue **a, int n);
 const char *kaix_eff_label(const char **slot, const char *text);
@@ -408,7 +408,7 @@ static inline int64_t kaix_idiv_chk(int64_t a, int64_t b);
 static inline int64_t kaix_imod_chk(int64_t a, int64_t b);
 static inline KaiValue *kaix_incref(KaiValue *v);
 static inline KaiValue *kaix_incref_if_shared(KaiValue *donor, KaiValue *child);
-static inline KaiValue *kaix_incref_if_token_null(KaiReuse token, KaiValue *child);
+static inline __attribute__((always_inline)) KaiValue *kaix_incref_if_token_null(KaiReuse token, KaiValue *child);
 static inline KaiValue *kaix_int(int64_t i);
 static inline KaiValue *kaix_int128(__int128 v);
 static inline __int128 kaix_int128_field(KaiValue *v);
@@ -595,7 +595,7 @@ static inline void kaix_unw_pop(KaiFiber *f);
 KaiFiber *kaix_unw_push_ev_state_f(KaiFiber **cache, void *ev);
 static inline KaiFiber *kaix_unw_push_f(KaiFiber **cache, KaiValue **base, int64_t n);
 static inline KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, KaiValue **args);
-static inline KaiValue *kaix_variant_arg(KaiValue *v, int i);
+static inline __attribute__((always_inline)) KaiValue *kaix_variant_arg(KaiValue *v, int i);
 static inline KaiValue *kaix_variant_arg_borrow(KaiValue *v, int i);
 static inline double kaix_variant_arg_f64(KaiValue *v, int i);
 static inline int64_t kaix_variant_arg_i64(KaiValue *v, int i);
@@ -837,7 +837,7 @@ static inline void *kaix_disp_enter(KaiFiber *f, void *node_v) {
 static inline void kaix_disp_leave(KaiFiber *f, void *prev_v) {f->in_dispatch_node = (KaiEvidence *) prev_v; }
 static inline KaiFiber *kaix_dispatch_fiber(void) {return kai_current_fiber(); }
 static inline KaiValue *kaix_div(KaiValue *a, KaiValue *b) {return kai_op_div(a, b); }
-static inline KaiReuse kaix_drop_reuse_token(KaiValue *v, int n) {return kai_drop_reuse_token(v, n); }
+static inline __attribute__((always_inline)) KaiReuse kaix_drop_reuse_token(KaiValue *v, int n) {return kai_drop_reuse_token(v, n); }
 static inline KaiReuse kaix_drop_slot_if_token(KaiReuse token, int32_t i) {
   if (token != kai_reuse_null) kai_decref(kai_var_slots(token)[i].ptr);
   return token;
@@ -877,7 +877,7 @@ static inline KaiValue *kaix_incref_if_shared(KaiValue *donor, KaiValue *child) 
   kai_incref_if_shared(donor, child);
   return child;
 }
-static inline KaiValue *kaix_incref_if_token_null(KaiReuse token, KaiValue *child) {
+static inline __attribute__((always_inline)) KaiValue *kaix_incref_if_token_null(KaiReuse token, KaiValue *child) {
   if (token == kai_reuse_null) kai_incref(child);
   return child;
 }
@@ -1054,7 +1054,7 @@ static inline KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, K
     if (heap) free(heap);
     return r;
 }
-static inline KaiValue *kaix_variant_arg(KaiValue *v, int i) {
+static inline __attribute__((always_inline)) KaiValue *kaix_variant_arg(KaiValue *v, int i) {
     /* The slot mask discriminates the read: a typed slot (Int / Real /
      * enum) re-boxes exactly as `kai_variant_slot_box` does — the boxed-view
      * accessor the C backend uses (`slot_read_for_test`) — so a raw word
