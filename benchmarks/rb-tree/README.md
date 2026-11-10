@@ -12,8 +12,8 @@ languages — the only variable is the compiler/runtime.
   up; no deletion.
 - **Driver:** Numerical-Recipes `ranqd1` LCG keystream
   (`s' = (s*1664525 + 1013904223) mod 2^31-1`), N inserts, then print
-  the final `size`. Identical keystream across all three columns, so the
-  trees are bit-identical.
+  the final `size` and `height`, each a full traversal. Identical
+  keystream across all three columns, so the trees are bit-identical.
 - **N:** 1,000,000 by default (override: `./run.sh 100000`).
 
 ## The three sources
@@ -87,27 +87,17 @@ say which.
 ## Last recorded result
 
 **Wall-clock, Mac (Darwin arm64), `cc -O2`, N=1,000,000, median of 7
-(`run.sh`, warm-up + interleaved), kaikai 0.178.0:**
+(`run.sh`, warm-up + interleaved), kaikai main after 0.192.5 (3c6f08572):**
 
 | column | wall (median) | vs C | vs Koka | RSS (MB) |
 |---|---:|---:|---:|---:|
-| C            | 0.33s | 1.00x | 0.97x | 47.4 |
-| Koka         | 0.34s | 1.03x | 1.00x | 48.1 |
-| kaikai-c     | 0.49s | 1.48x | 1.44x | 49.6 |
-| **kaikai-native** | **0.50s** | **1.52x** | **1.47x** | **49.9** |
+| C            | 0.25s | 1.00x | 0.89x | 47.4 |
+| Koka         | 0.28s | 1.12x | 1.00x | 48.1 |
+| kaikai-c     | 0.33s | 1.32x | 1.18x | 48.3 |
+| **kaikai-native** | **0.28s** | **1.12x** | **1.00x** | **48.2** |
 
 `kaikai-native` is the *default* backend (`kai build` with no
 `--backend`); `kaikai-c` is the portable C-text backend (`--backend=c`).
-
-**Instructions retired, `/usr/bin/time -l`, Darwin arm64, N=1,000,000:**
-
-| column | instructions @ 1M | vs kaikai-c |
-|---|---:|---:|
-| kaikai-c     | ~2.53G | 1.00x |
-| **kaikai-native** | **~3.56G** | **~1.40x** |
-
-The gap to Koka is shared by both backends — a front-end / language cost
-(Perceus RC, the zipper descent, layout), not code generation.
 
 > Numbers drift as the runtime evolves. Re-run `run.sh` and update the
 > "Last recorded result" tables (and the version) when you take a new

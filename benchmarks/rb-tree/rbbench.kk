@@ -6,7 +6,8 @@
 //   - value : bool  ->  value : int
 //   - make-tree / main  ->  fill-loop(LCG) driver matching
 //     examples/perceus/rb_tree_bench.kai and rb_tree_bench_c.c
-//     (Numerical Recipes ranqd1 LCG, modulus 2^31-1, 1,000,000 inserts).
+//     (Numerical Recipes ranqd1 LCG, modulus 2^31-1, 1,000,000 inserts),
+//     which prints the final size and height as the other two columns do.
 
 import std/num/int64
 
@@ -99,7 +100,14 @@ fun size(t : tree) : int
     Node(_, l, _, _, r) -> 1 + size(l) + size(r)
 
 
+fun height(t : tree) : int
+  match t
+    Leaf -> 0
+    Node(_, l, _, _, r) -> 1 + max(height(l), height(r))
+
+
 pub fun main()
   val n = 1000000
   val t = fill-loop(Leaf, 1, n)
   println("size: " ++ t.size.show)
+  println("height: " ++ t.height.show)
