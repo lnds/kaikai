@@ -222,6 +222,7 @@ run_check_script "stale_cache_detect" "stale_cache_detect/check.sh"
 # the broader package surface still works.
 run_check_script "lockfile_repro"     "lockfile_reproducibility/check.sh"
 run_check_script "add_failure"        "add_failure/check.sh"
+run_check_script "fetch_failure"      "fetch_failure/check.sh"
 run_check_script "init_invalid_names" "init_invalid_names/check.sh"
 run_check_script "manifest_parse"     "manifest_parse_error/check.sh"
 
