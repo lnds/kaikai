@@ -1,0 +1,120 @@
+#[doc("A let binder read in several statements of its block moves at its last read when that read is the lone one of the last reading statement, an owned argument on a straight path of call arguments, and every earlier read is a call argument.")]
+
+import compiler.ast
+import compiler.ast_ids
+import compiler.expr_positions
+import compiler.perceus_reads
+
+#[doc("Whether binder `b`, bound to `rhs` and read in the statements `rest` and tail `tail` of its block, may move at its last read.")]
+pub(pkg) fn psm_spread_moves(
+  b: LocalId,
+  rhs: Expr,
+  rest: [Stmt],
+  tail: Option[Expr],
+  uses: UseIx,
+  lent: (Expr) -> [Int]
+) : Bool =
+  if psm_alias(rhs) or pcs_read_count(b, uses) < 2 or pcs_uses_have_in_lam(uses, b) {
+    false
+  } else {
+    match list_reverse(filter(psm_roots(rest, tail), e => psm_reads(b, e) > 0)) {
+      [last, prev, ...more] ->
+        psm_reads(b, last) == 1
+          and psm_direct_arg(b, last, lent)
+          and psm_at_last_use(b, last, uses)
+          and all([prev, ...more], e => psm_args_only(b, e))
+      _ -> false
+    }
+  }
+
+# An alias's reads are tracked through the local it copies, so its move sites are not its own.
+fn psm_alias(rhs: Expr) : Bool = match rhs.kind {
+  ELocal(_) -> true
+  _ -> false
+}
+
+# The use index must place the binder's last use at this read, or the rewrite
+# would dup it while the scope drops nothing.
+fn psm_at_last_use(b: LocalId, e: Expr, uses: UseIx) : Bool = match (
+  last_use_for(b, uses),
+  psm_find(b, e)
+) {
+  (LuAt(l, c), Some(r)) -> r.line == l and r.col == c
+  _ -> false
+}
+
+fn psm_find(b: LocalId, e: Expr) : Option[Expr] =
+  if psm_is(b, e) { Some(e) } else { psm_find_ps(b, xp_positions(e)) }
+
+fn psm_find_ps(b: LocalId, ps: [XPos]) : Option[Expr] = match ps {
+  [] -> None
+  [XP(_, c), ...rest] -> match psm_find(b, c) {
+    Some(r) -> Some(r)
+    None -> psm_find_ps(b, rest)
+  }
+}
+
+fn psm_roots(ss: [Stmt], tail: Option[Expr]) : [Expr] = list_append(
+  flat_map(
+    ss,
+    s => match s {
+      SLet(_, _, rhs) -> [rhs]
+      SExprStmt(e) -> [e]
+      SAssert(c, Some(m)) -> [c, m]
+      SAssert(c, None) -> [c]
+      _ -> []
+    }
+  ),
+  match tail {
+    Some(t) -> [t]
+    None -> []
+  }
+)
+
+fn psm_is(b: LocalId, e: Expr) : Bool = match e.kind {
+  ELocal(u) -> local_eq(u, b)
+  _ -> false
+}
+
+fn psm_reads(b: LocalId, e: Expr) : Int =
+  if psm_is(b, e) { 1 } else { psm_reads_ps(b, xp_positions(e), 0) }
+
+fn psm_reads_ps(b: LocalId, ps: [XPos], n: Int) : Int = match ps {
+  [] -> n
+  [XP(_, c), ...rest] -> psm_reads_ps(b, rest, n + psm_reads(b, c))
+}
+
+# The read sits under call arguments only, so it runs on every path through
+# the statement, and lands in a slot a named function owns: an effect
+# operation's argument keeps its dup.
+fn psm_direct_arg(b: LocalId, e: Expr, lent: (Expr) -> [Int]) : Bool = match e.kind {
+  ECall(f, xs) -> match f.kind {
+    ESym(_, _) -> psm_args_direct(b, xs, lent(f), 0, lent)
+    _ -> false
+  }
+  _ -> false
+}
+
+fn psm_args_direct(b: LocalId, xs: [Expr], borrowed: [Int], i: Int, lent: (Expr) -> [Int]) : Bool =
+  match xs {
+    [] -> false
+    [x, ...rest] ->
+      if psm_is(b, x) {
+        not any(borrowed, j => j == i)
+      } else {
+        psm_direct_arg(b, x, lent) or psm_args_direct(b, rest, borrowed, i + 1, lent)
+      }
+  }
+
+# Every read is a whole call argument: none is a scrutinee whose binders could
+# outlive the cell, nor a field read.
+fn psm_args_only(b: LocalId, e: Expr) : Bool = match e.kind {
+  ELocal(u) -> not local_eq(u, b)
+  ECall(f, xs) -> psm_args_only(b, f) and all(xs, x => psm_is(b, x) or psm_args_only(b, x))
+  _ -> all(
+    xp_positions(e),
+    p => match p {
+      XP(_, c) -> psm_args_only(b, c)
+    }
+  )
+}
