@@ -377,7 +377,16 @@ __attribute__((noinline)) KAI_RT_SHARED void kai_arm_take_shell(KaiValue *v, uin
 }
 
 static inline int kai_arm_take(KaiValue *v, uint32_t unbound) {
-    if (kai_check_unique(v)) { kai_arm_take_shell(v, unbound); return 1; }
+    if (kai_check_unique(v)) {
+        if (unbound != 0) { kai_arm_take_shell(v, unbound); return 1; }
+        /* Every slot went to a binder: the shell frees with no cascade. */
+        kai_var_block_free(v, v->var_n_args);
+        kai_rc_count_free();
+#ifdef KAI_TRACE_RC
+        kai_rc_free_by_tag[(int) KAI_VARIANT]++;
+#endif
+        return 1;
+    }
     if (kai_is_ptr(v) && v->rc != INT32_MAX) {
         KAI_RC_TRAFFIC_INC(kai_rc_decref_total);
         v->rc -= 1;
