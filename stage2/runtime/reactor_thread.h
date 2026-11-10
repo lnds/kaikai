@@ -55,8 +55,8 @@ static void kai_reactor_wait(void) {
      * deadline-armed socket-read waiter (recv_timeout), so a socket
      * deadline that precedes every timer still bounds the sleep. */
     uint64_t wake_dl = 0;
-    if (kai_reactor_timer_head) {
-        wake_dl = kai_reactor_timer_head->reactor_deadline_ns;
+    if (kai_reactor_timer_first()) {
+        wake_dl = kai_reactor_timer_first()->reactor_deadline_ns;
     }
     for (KaiFiber *f = kai_reactor_socket_read_waiters; f; f = f->reactor_next) {
         if (f->reactor_deadline_ns &&
@@ -241,7 +241,7 @@ static void kai_reactor_wait(void) {
      * unparked inline and the batch is empty. */
     kai_reactor_flush_ready();
 #elif KAI_HOST_JS
-    uint64_t wake_dl = kai_reactor_timer_head ? kai_reactor_timer_head->reactor_deadline_ns : 0;
+    uint64_t wake_dl = kai_reactor_timer_first() ? kai_reactor_timer_first()->reactor_deadline_ns : 0;
     kai_flush_stdout();
     kai_wctx_mark();
     double slack_ms = kai_wctx_host_wait(wake_dl ? (double) wake_dl / 1e6 : -1.0);
@@ -251,13 +251,13 @@ static void kai_reactor_wait(void) {
     }
     kai_reactor_timer_drain(kai_reactor_now_ns() + (uint64_t) (slack_ms * 1e6));
 #elif defined(__wasm__) && KAI_HOST_FIBERS
-    if (kai_reactor_timer_head == NULL) {
+    if (kai_reactor_timer_first() == NULL) {
         kai_eputs("kai: every fiber is parked and nothing can wake one\n");
         kai_exit(1);
     }
     kai_flush_stdout();
     uint64_t now = kai_reactor_now_ns();
-    uint64_t wake_dl = kai_reactor_timer_head->reactor_deadline_ns;
+    uint64_t wake_dl = kai_reactor_timer_first()->reactor_deadline_ns;
     if (wake_dl > now) {
         uint64_t ns = wake_dl - now;
         struct timespec nap = { (time_t) (ns / 1000000000), (long) (ns % 1000000000) };

@@ -787,12 +787,12 @@ static int kai_reactor_detach_fiber(KaiFiber *target) {
         &kai_reactor_socket_write_waiters,
         &kai_reactor_pid_waiters,
         &kai_reactor_filepool_waiters,
-        &kai_reactor_timer_head,
         &kai_reactor_stdin_waiter,
         &kai_reactor_signal_waiter,
     };
     const int n_heads = (int) (sizeof(heads) / sizeof(heads[0]));
-    int found = 0;
+    int found = kai_reactor_timer_remove(target);
+    if (found) target->reactor_fired = 1;
     for (int h = 0; h < n_heads && !found; ++h) {
         KaiFiber **link = heads[h];
         while (*link) {

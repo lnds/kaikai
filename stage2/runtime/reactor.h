@@ -252,35 +252,79 @@ static uint64_t kai_reactor_now_ns(void) {
     return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
 }
 
-/* Sorted-insert into the timer wheel. O(n) over concurrent
- * sleepers; expected n is small in v1. */
-static void kai_reactor_timer_insert(KaiFiber *f) {
-    f->reactor_next = NULL;
-    if (!kai_reactor_timer_head ||
-        f->reactor_deadline_ns < kai_reactor_timer_head->reactor_deadline_ns) {
-        f->reactor_next = kai_reactor_timer_head;
-        kai_reactor_timer_head = f;
-        return;
+static int kai_reactor_timer_before(const KaiFiber *a, const KaiFiber *b) {
+    if (a->reactor_deadline_ns != b->reactor_deadline_ns) {
+        return a->reactor_deadline_ns < b->reactor_deadline_ns;
     }
-    KaiFiber *c = kai_reactor_timer_head;
-    while (c->reactor_next &&
-           c->reactor_next->reactor_deadline_ns <= f->reactor_deadline_ns) {
-        c = c->reactor_next;
-    }
-    f->reactor_next = c->reactor_next;
-    c->reactor_next = f;
+    return a->reactor_timer_seq < b->reactor_timer_seq;
 }
 
-/* Pop every fiber whose deadline is <= `now` from the head and
- * promote it to READY. Returns the number woken. */
+static void kai_reactor_timer_put(size_t i, KaiFiber *f) {
+    kai_reactor_timers[i] = f;
+    f->reactor_timer_ix = i + 1;
+}
+
+static void kai_reactor_timer_up(size_t i) {
+    KaiFiber *f = kai_reactor_timers[i];
+    while (i > 0) {
+        size_t parent = (i - 1) / 2;
+        if (!kai_reactor_timer_before(f, kai_reactor_timers[parent])) break;
+        kai_reactor_timer_put(i, kai_reactor_timers[parent]);
+        i = parent;
+    }
+    kai_reactor_timer_put(i, f);
+}
+
+static void kai_reactor_timer_down(size_t i) {
+    size_t n = kai_reactor_timers_n;
+    KaiFiber *f = kai_reactor_timers[i];
+    for (;;) {
+        size_t c = 2 * i + 1;
+        if (c >= n) break;
+        if (c + 1 < n && kai_reactor_timer_before(kai_reactor_timers[c + 1], kai_reactor_timers[c])) c++;
+        if (!kai_reactor_timer_before(kai_reactor_timers[c], f)) break;
+        kai_reactor_timer_put(i, kai_reactor_timers[c]);
+        i = c;
+    }
+    kai_reactor_timer_put(i, f);
+}
+
+/* Take the fiber at heap slot `i` out of the heap. */
+static void kai_reactor_timer_cut(size_t i) {
+    KaiFiber *f = kai_reactor_timers[i];
+    size_t last = --kai_reactor_timers_n;
+    if (i < last) {
+        KaiFiber *moved = kai_reactor_timers[last];
+        kai_reactor_timer_put(i, moved);
+        kai_reactor_timer_up(i);
+        if (moved->reactor_timer_ix == i + 1) kai_reactor_timer_down(i);
+    }
+    f->reactor_timer_ix = 0;
+    f->reactor_deadline_ns = 0;
+}
+
+static void kai_reactor_timer_insert(KaiFiber *f) {
+    if (kai_reactor_timers_n == kai_reactor_timers_cap) {
+        size_t cap = kai_reactor_timers_cap ? kai_reactor_timers_cap * 2 : 64;
+        KaiFiber **grown = (KaiFiber **) realloc(kai_reactor_timers, cap * sizeof *grown);
+        if (!grown) { kai_eprintf("kai: timer heap realloc failed\n"); kai_exit(1); }
+        kai_reactor_timers = grown;
+        kai_reactor_timers_cap = cap;
+    }
+    f->reactor_next = NULL;
+    f->reactor_timer_seq = kai_reactor_timers_seq++;
+    kai_reactor_timer_put(kai_reactor_timers_n, f);
+    kai_reactor_timers_n++;
+    kai_reactor_timer_up(kai_reactor_timers_n - 1);
+}
+
+/* Wake every fiber whose deadline is <= `now`, earliest first. Returns the
+ * number woken. */
 static int kai_reactor_timer_drain(uint64_t now) {
     int woken = 0;
-    while (kai_reactor_timer_head &&
-           kai_reactor_timer_head->reactor_deadline_ns <= now) {
-        KaiFiber *f = kai_reactor_timer_head;
-        kai_reactor_timer_head = f->reactor_next;
-        f->reactor_next = NULL;
-        f->reactor_deadline_ns = 0;
+    KaiFiber *f;
+    while ((f = kai_reactor_timer_first()) != NULL && f->reactor_deadline_ns <= now) {
+        kai_reactor_timer_cut(0);
         kai_reactor_parked_count--;
         kai_reactor_mark_ready(f);
         woken++;
@@ -288,23 +332,15 @@ static int kai_reactor_timer_drain(uint64_t now) {
     return woken;
 }
 
-/* Splice `f` out of the timer wheel if present. Returns 1 if it was
- * found (and unparks accounting reconciled), 0 if absent. The dual-park
- * receive uses this to disarm its deadline timer once a message wakes
- * it first, so a later drain cannot wake a fiber that already returned. */
+/* Take `f` off the timer heap if it is on it. Returns 1 if it was (and
+ * unparks accounting reconciled), 0 if absent. The dual-park receive uses
+ * this to disarm its deadline timer once a message wakes it first, so a
+ * later drain cannot wake a fiber that already returned. */
 static int kai_reactor_timer_remove(KaiFiber *f) {
-    KaiFiber **link = &kai_reactor_timer_head;
-    while (*link) {
-        if (*link == f) {
-            *link = f->reactor_next;
-            f->reactor_next = NULL;
-            f->reactor_deadline_ns = 0;
-            kai_reactor_parked_count--;
-            return 1;
-        }
-        link = &(*link)->reactor_next;
-    }
-    return 0;
+    if (f->reactor_timer_ix == 0) return 0;
+    kai_reactor_timer_cut(f->reactor_timer_ix - 1);
+    kai_reactor_parked_count--;
+    return 1;
 }
 
 /* Splice the fiber parked on `pid` (if any) off the waiter list and
