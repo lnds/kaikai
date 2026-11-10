@@ -1172,6 +1172,13 @@ __attribute__((always_inline)) KaiValue *kaix_reuse_keep(KaiValue *at) {
   return at;
 }
 
+/* An in-place move of a unique cell rebuilt as its own constructor: the header
+ * stays, and the reuse is counted. */
+__attribute__((always_inline)) KaiValue *kaix_reuse_move_keep(KaiValue *at) {
+  kai_rc_count_reuse();
+  return at;
+}
+
 /* Retag a fitting token whose slots the caller already wrote. */
 __attribute__((always_inline)) KaiValue *kaix_reuse_commit(KaiValue *at, int32_t tag) {
   at->variant_tag = tag;
