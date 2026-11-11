@@ -3,7 +3,6 @@
 import compiler.util
 import compiler.diag
 import compiler.ast
-import compiler.ast_build
 import compiler.ast_decl
 import compiler.ast_ids
 import compiler.written
@@ -20,6 +19,8 @@ import compiler.type_home
 import compiler.desugar_record_lit
 import compiler.type_text
 import compiler.infer_glue
+import compiler.decl_bodies
+import compiler.expr_positions
 
 fn inf_head_owner_of(owners: [HeadOwnerEntry], s: SymId) : Option[SymId] =
   match owners {
@@ -70,12 +71,12 @@ fn check_field_privacy_loop(
 ) : [Diagnostic] / Console + File {
   match ds {
     [] -> acc
-    [d, ...rest] -> match d {
-      DFn(_, _, _, _, _, _, body, _, _, _, _, _) -> {
-        let acc1 = walk_field_priv_expr(decl_diag_file(d, df), cx, all_decls, body, acc)
-        check_field_privacy_loop(df, cx, all_decls, rest, acc1)
+    [d, ...rest] -> {
+      let acc1 = match decl_body(d) {
+        Some(body) -> walk_field_priv_expr(decl_diag_file(d, df), cx, all_decls, body, acc)
+        None -> acc
       }
-      _ -> check_field_privacy_loop(df, cx, all_decls, rest, acc)
+      check_field_privacy_loop(df, cx, all_decls, rest, acc1)
     }
   }
 }
@@ -106,250 +107,17 @@ fn walk_field_priv_expr(
     ERecordLit(_, fis) -> match record_carrier_of(e.ty) {
       None -> []
       Some(rsym) ->
-        walk_priv_field_inits(
-          file,
-          cx,
-          all_decls,
-          rsym,
-          fis,
-          e.line,
-          e.col,
-          []
-        )
+        walk_priv_field_inits(file, cx, all_decls, rsym, fis, e.line, e.col, [])
     }
     _ -> []
   }
-  walk_field_priv_children(file, cx, all_decls, e.kind, list_append(head_errs, acc))
-}
-
-fn walk_field_priv_children(
-  file: String,
-  cx: PrivCx,
-  all_decls: FieldRecs,
-  k: ExprKind,
-  acc: [Diagnostic]
-) : [Diagnostic] / Console + File = match k {
-  EInt(_, _) -> acc
-  EReal(_, _) -> acc
-  EIntLit(_) -> acc
-  EDecimalLit(_) -> acc
-  EFixed(_, _) -> acc
-  EBool(_) -> acc
-  EChar(_) -> acc
-  EStr(_, _) -> acc
-  EUnit -> acc
-  EName(_) -> acc
-  EMark(_) -> acc
-  ESym(_, _) -> acc
-  ELocal(_) -> acc
-  EOp(_) -> acc
-  EUnder -> acc
-  EPlaceholder -> acc
-  EHole(_) -> acc
-  ETodo(_) -> acc
-  EExternBody(_, _) -> acc
-  EVariantsOf(_, _) -> acc
-  EModCall(_, _) -> acc
-  EIntrinsic(_, args_) -> walk_field_priv_list(file, cx, all_decls, args_, acc)
-  ESurface(sf) -> walk_field_priv_list(file, cx, all_decls, surface_children(sf), acc)
-  ECall(callee, args_) -> {
-    let a1 = walk_field_priv_expr(file, cx, all_decls, callee, acc)
-    walk_field_priv_list(file, cx, all_decls, args_, a1)
-  }
-  EField(base, _) -> walk_field_priv_expr(file, cx, all_decls, base, acc)
-  EIndex(a, b) -> {
-    let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
-    walk_field_priv_expr(file, cx, all_decls, b, a1)
-  }
-  EBinop(_, a, b) -> {
-    let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
-    walk_field_priv_expr(file, cx, all_decls, b, a1)
-  }
-  EUnop(_, x) -> walk_field_priv_expr(file, cx, all_decls, x, acc)
-  EIf(c, t, eo) -> {
-    let a1 = walk_field_priv_expr(file, cx, all_decls, c, acc)
-    let a2 = walk_field_priv_expr(file, cx, all_decls, t, a1)
-    match eo {
-      Some(b) -> walk_field_priv_expr(file, cx, all_decls, b, a2)
-      None -> a2
+  foldl(
+    xp_positions(e),
+    list_append(head_errs, acc),
+    (a, p) => match p {
+      XP(_, c) -> walk_field_priv_expr(file, cx, all_decls, c, a)
     }
-  }
-  EMatch(scr, arms) -> {
-    let a1 = walk_field_priv_expr(file, cx, all_decls, scr, acc)
-    walk_field_priv_arms(file, cx, all_decls, arms, a1)
-  }
-  ELambda(_, _) -> acc
-  ERecordLit(_, fs) -> walk_field_priv_field_inits(file, cx, all_decls, fs, acc)
-  EList(els) -> walk_field_priv_elems(file, cx, all_decls, els, acc)
-  ERange(a, b, opt) -> {
-    let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
-    let a2 = walk_field_priv_expr(file, cx, all_decls, b, a1)
-    match opt {
-      Some(s) -> walk_field_priv_expr(file, cx, all_decls, s, a2)
-      None -> a2
-    }
-  }
-  EBlock(stmts, tail) -> {
-    let a1 = walk_field_priv_stmts(file, cx, all_decls, stmts, acc)
-    match tail {
-      Some(t) -> walk_field_priv_expr(file, cx, all_decls, t, a1)
-      None -> a1
-    }
-  }
-  EPipe(a, b) -> {
-    let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
-    walk_field_priv_expr(file, cx, all_decls, b, a1)
-  }
-  EDispatchPipe(_, a, b) -> {
-    let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
-    walk_field_priv_expr(file, cx, all_decls, b, a1)
-  }
-  EBang(inner) -> walk_field_priv_expr(file, cx, all_decls, inner, acc)
-  ELitUnit(inner, _) -> walk_field_priv_expr(file, cx, all_decls, inner, acc)
-  EHandle(body, _, _, init_opt, _, clauses, ret_opt) -> {
-    let a0 = match init_opt {
-      Some(i) -> walk_field_priv_expr(file, cx, all_decls, i, acc)
-      None -> acc
-    }
-    let a1 = walk_field_priv_clauses(file, cx, all_decls, clauses, a0)
-    let a2 = match ret_opt {
-      Some(r) -> match r {
-        HR(_, b, _, _) -> walk_field_priv_expr(file, cx, all_decls, b, a1)
-      }
-      None -> a1
-    }
-    walk_field_priv_expr(file, cx, all_decls, body, a2)
-  }
-}
-
-fn walk_field_priv_list(
-  file: String,
-  cx: PrivCx,
-  all_decls: FieldRecs,
-  es: [Expr],
-  acc: [Diagnostic]
-) : [Diagnostic] / Console + File = match es {
-  [] -> acc
-  [h, ...rest] -> {
-    let a1 = walk_field_priv_expr(file, cx, all_decls, h, acc)
-    walk_field_priv_list(file, cx, all_decls, rest, a1)
-  }
-}
-
-fn walk_field_priv_arms(
-  file: String,
-  cx: PrivCx,
-  all_decls: FieldRecs,
-  arms: [Arm],
-  acc: [Diagnostic]
-) : [Diagnostic] / Console + File = match arms {
-  [] -> acc
-  [a, ...rest] -> match a {
-    Arm(_, og, body) -> {
-      let a1 = match og {
-        Some(g) -> walk_field_priv_expr(file, cx, all_decls, g, acc)
-        None -> acc
-      }
-      let a2 = walk_field_priv_expr(file, cx, all_decls, body, a1)
-      walk_field_priv_arms(file, cx, all_decls, rest, a2)
-    }
-  }
-}
-
-fn walk_field_priv_field_inits(
-  file: String,
-  cx: PrivCx,
-  all_decls: FieldRecs,
-  fis: [FieldInit],
-  acc: [Diagnostic]
-) : [Diagnostic] / Console + File = match fis {
-  [] -> acc
-  [fi, ...rest] -> match fi {
-    FI(_, e) -> {
-      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
-      walk_field_priv_field_inits(file, cx, all_decls, rest, a1)
-    }
-  }
-}
-
-fn walk_field_priv_elems(
-  file: String,
-  cx: PrivCx,
-  all_decls: FieldRecs,
-  els: [ListElem],
-  acc: [Diagnostic]
-) : [Diagnostic] / Console + File = match els {
-  [] -> acc
-  [el, ...rest] -> match el {
-    ElPlain(e) -> {
-      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
-      walk_field_priv_elems(file, cx, all_decls, rest, a1)
-    }
-    ElSpread(e) -> {
-      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
-      walk_field_priv_elems(file, cx, all_decls, rest, a1)
-    }
-  }
-}
-
-fn walk_field_priv_stmts(
-  file: String,
-  cx: PrivCx,
-  all_decls: FieldRecs,
-  ss: [Stmt],
-  acc: [Diagnostic]
-) : [Diagnostic] / Console + File = match ss {
-  [] -> acc
-  [s, ...rest] -> match s {
-    SLet(_, _, e) -> {
-      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
-      walk_field_priv_stmts(file, cx, all_decls, rest, a1)
-    }
-    SVar(_, _, e, _, _) -> {
-      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
-      walk_field_priv_stmts(file, cx, all_decls, rest, a1)
-    }
-    SAssert(e, og) -> {
-      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
-      let a2 = match og {
-        Some(g) -> walk_field_priv_expr(file, cx, all_decls, g, a1)
-        None -> a1
-      }
-      walk_field_priv_stmts(file, cx, all_decls, rest, a2)
-    }
-    SExprStmt(e) -> {
-      let a1 = walk_field_priv_expr(file, cx, all_decls, e, acc)
-      walk_field_priv_stmts(file, cx, all_decls, rest, a1)
-    }
-    SIndexAssign(a, b, c, _, _) -> {
-      let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
-      let a2 = walk_field_priv_expr(file, cx, all_decls, b, a1)
-      let a3 = walk_field_priv_expr(file, cx, all_decls, c, a2)
-      walk_field_priv_stmts(file, cx, all_decls, rest, a3)
-    }
-    SAssign(a, c, _, _) -> {
-      let a1 = walk_field_priv_expr(file, cx, all_decls, a, acc)
-      let a3 = walk_field_priv_expr(file, cx, all_decls, c, a1)
-      walk_field_priv_stmts(file, cx, all_decls, rest, a3)
-    }
-    SUse(_, _, _) -> walk_field_priv_stmts(file, cx, all_decls, rest, acc)
-  }
-}
-
-fn walk_field_priv_clauses(
-  file: String,
-  cx: PrivCx,
-  all_decls: FieldRecs,
-  cs: [HClause],
-  acc: [Diagnostic]
-) : [Diagnostic] / Console + File = match cs {
-  [] -> acc
-  [c, ...rest] -> match c {
-    HC(_, _, body, _, _) -> {
-      let a1 = walk_field_priv_expr(file, cx, all_decls, body, acc)
-      walk_field_priv_clauses(file, cx, all_decls, rest, a1)
-    }
-  }
+  )
 }
 
 #[doc("Typer-internal helper `handle_clause_op_names` shared across the infer modules.")]
