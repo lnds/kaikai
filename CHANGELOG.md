@@ -84,6 +84,18 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.193.0 (2026-11-11)
+
+### BREAKING CHANGE
+
+- a partial handler inside a lambda, or in a `test`,
+`bench`, `check` or `const` body, is now the compile error it already
+was in a fn body. Add a clause for each missing op.
+
+### Fixed
+
+- **typer**: hold a handler in a lambda or a test body to the missing-clause rule (#3439)
+
 ## v0.192.7 (2026-11-10)
 
 ### Fixed
