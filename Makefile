@@ -233,7 +233,7 @@ tier0: selfhost tier0-gates
 # rather than in series. Locally `tier0` stays the single pre-commit gate.
 # Gates that read only sources and scripts: no compiler is built or run, so
 # CI reports them from a job that does not wait for the build.
-FAST_GATES := test-arena test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-timeout-shim test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-selfhost-gate-no-rebuild test-stage2-graph test-symid-survives test-decl-symid-survives test-symid-names-static test-respelling-confined test-light-partition test-native-probe test-bin-kai-prereq test-walker-catchall-audit test-diag-channel-audit test-canonical-aliases test-release-platforms test-kaic-boot test-runtime-decls
+FAST_GATES := test-arena test-runtime-global-audit test-wiring-audit test-perceus-position-audit test-perceus-read-audit test-timeout-shim test-demos-deadline test-p2-status test-header-deps test-llvm-force-guard test-parity-preserve-native test-namespace-matrix test-namespace-classes test-corrective-ratchet test-km-new-files test-posix-shell test-selfhost-gate-no-rebuild test-stage2-graph test-symid-survives test-decl-symid-survives test-symid-names-static test-respelling-confined test-light-partition test-native-probe test-bin-kai-prereq test-walker-catchall-audit test-diag-channel-audit test-canonical-aliases test-release-platforms test-kaic-boot test-runtime-decls
 
 # The tier0 gates that need a built kaic2, cheapest first so a break reports
 # before the slow demos and cache gates.
@@ -511,6 +511,11 @@ test-selfhost-gate-no-rebuild:
 # Linux, perl on macOS).
 test-timeout-shim:
 	@bash tools/test-timeout-shim.sh
+
+# The demo harness must report a hung demo by name and keep going.
+.PHONY: test-demos-deadline
+test-demos-deadline:
+	@sh tools/test-demos-deadline.sh
 
 # `gen-runtime-bc.sh --status` must tell "no clang 18 here" apart from
 # "clang 18 is here, the bitcode was never generated": the second is one

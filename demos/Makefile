@@ -46,6 +46,9 @@ CFLAGS    := -std=c99 -O2 -Wno-unused-function -Wno-unused-variable -DKAI_STDLIB
 # Linux glibc requires explicit `-lm` after the .c inputs; macOS
 # libSystem already exposes those symbols.
 LDLIBS_M  := -lm
+# A demo that hangs fails by name instead of burning the job's time limit.
+RUN_BUDGET := 60
+BOUNDED   := ../tools/kai-bounded.sh $(RUN_BUDGET)
 
 BUILD     := build
 DEMOS     := $(patsubst %/,%,$(dir $(wildcard */main.kai)))
@@ -74,7 +77,7 @@ verify:
 	  fi; \
 	  runenv=""; \
 	  if [ -f $$d/main.env ]; then runenv="env $$(tr '\n' ' ' < $$d/main.env)"; fi; \
-	  if ! $$runenv $(BUILD)/$$d-bin < /dev/null > $(BUILD)/$$d.out 2>> $(BUILD)/$$d.err; then \
+	  if ! $$runenv $(BOUNDED) $(BUILD)/$$d-bin < /dev/null > $(BUILD)/$$d.out 2>> $(BUILD)/$$d.err; then \
 	    err=$$(tail -1 $(BUILD)/$$d.err 2>/dev/null | sed 's/^[[:space:]]*//'); \
 	    [ -z "$$err" ] && err="runtime error"; \
 	    echo "FAIL runtime: $$err" > $(BUILD)/$$d.status; \
