@@ -18,10 +18,8 @@
 # surface reaches this one check.
 
 import compiler.ast
-import compiler.ast_build
 import compiler.ast_decl
 import compiler.ast_ids
-import compiler.ast_build
 import compiler.ast_decl
 import compiler.ast_ids
 import compiler.written
@@ -30,6 +28,7 @@ import compiler.diag
 import compiler.diag_file
 import compiler.spawn_capture
 import compiler.spawn_cross
+import compiler.decl_bodies
 import compiler.util
 import compiler.spawn_param
 import compiler.infer_env_exhaust
@@ -108,8 +107,8 @@ fn find_fn_decl(ds: [Decl], f: SymId) : Option[Decl] = match ds {
   }
 }
 
-# A thunk handed straight to a fiber is judged from its own typed row; only
-# the functions that contain such a read are walked.
+# A thunk handed straight to a fiber is judged from its own typed row; a
+# `fn` is walked only when a read in it hands one to a fiber.
 fn check_spawn_owners(
   df: DiagFiles,
   tab: SymTab,
@@ -118,20 +117,15 @@ fn check_spawn_owners(
   decls: [Decl],
   owners: [SymId]
 ) : [Diagnostic] / Console + File =
-  if list_is_empty(owners) {
+  check_owner_decls(
+    df,
+    tab,
+    carriers,
+    decls,
+    typed,
+    foldl(owners, idx_empty(), (ix, o) => idx_prepend_sym(ix, o, o)),
     []
-  } else {
-    check_owner_decls(
-      df,
-      tab,
-      carriers,
-      decls,
-      typed,
-      foldl(owners, idx_empty(), (ix, o) => idx_prepend_sym(ix, o, o)),
-      [],
-      typed
-    )
-  }
+  )
 
 fn check_owner_decls(
   df: DiagFiles,
@@ -140,46 +134,46 @@ fn check_owner_decls(
   all_decls: [Decl],
   ds: [Decl],
   owners: NameIndex[SymId],
-  acc: [Diagnostic],
-  typed_all: [Decl]
+  acc: [Diagnostic]
 ) : [Diagnostic] / Console + File = match ds {
   [] -> acc
-  [d, ...rest] -> match d {
-    DFn(_, fid, _, _, _, _, body, _, _, _, _, _) ->
-      if list_is_empty(idx_chain_sym(owners, fnid_sym(fid))) {
-        check_owner_decls(df, tab, carriers, all_decls, rest, owners, acc, typed_all)
+  [d0, ...rest] -> {
+    let acc1 = match decl_body(d0) {
+      Some(body) -> if decl_owns_spawn(d0, owners) {
+        list_append(acc, check_body_spawns(df, tab, carriers, all_decls, d0, body))
       } else {
-        let site = SpawnSite { file: decl_diag_file(d, df), tab: tab, owner: d }
-        let ds1 = foldl(
-          spawn_calls(body, []),
-          [],
-          (a, e) => match e.kind {
-            ECall(_, args_) ->
-              list_append(a, check_spawned_thunk(site, carriers, all_decls, e, args_))
-            _ -> a
-          }
-        )
-        check_owner_decls(
-          df,
-          tab,
-          carriers,
-          all_decls,
-          rest,
-          owners,
-          list_append(acc, ds1),
-          typed_all
-        )
+        acc
       }
-    DUnstable(inner, _, _) ->
-      check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc, typed_all)
-    DProtoLaws(_, inner, _, _, _) ->
-      check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc, typed_all)
-    DImplAxiom(_, inner, _, _, _) ->
-      check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc, typed_all)
-    DConstructor(inner, _, _) ->
-      check_owner_decls(df, tab, carriers, all_decls, [inner, ...rest], owners, acc, typed_all)
-    _ -> check_owner_decls(df, tab, carriers, all_decls, rest, owners, acc, typed_all)
+      None -> acc
+    }
+    check_owner_decls(df, tab, carriers, all_decls, rest, owners, acc1)
   }
+}
+
+# Every body other than a `fn` has no scheme to carry a spawn-reaching row, so it is always walked.
+fn decl_owns_spawn(d: Decl, owners: NameIndex[SymId]) : Bool = match decl_unwrap(d) {
+  DFn(_, fid, _, _, _, _, _, _, _, _, _, _) ->
+    not list_is_empty(idx_chain_sym(owners, fnid_sym(fid)))
+  _ -> true
+}
+
+fn check_body_spawns(
+  df: DiagFiles,
+  tab: SymTab,
+  carriers: [SymId],
+  all_decls: [Decl],
+  d: Decl,
+  body: Expr
+) : [Diagnostic] / Console + File {
+  let site = SpawnSite { file: decl_diag_file(d, df), tab: tab, owner: decl_unwrap(d) }
+  foldl(
+    spawn_calls(body, []),
+    [],
+    (a, e) => match e.kind {
+      ECall(_, args_) -> list_append(a, check_spawned_thunk(site, carriers, all_decls, e, args_))
+      _ -> a
+    }
+  )
 }
 
 fn spawn_calls(e: Expr, acc: [Expr]) : [Expr] {
@@ -210,84 +204,6 @@ fn check_spawned_thunk(
     None -> row_errs
     Some(thk) -> list_append(row_errs, check_thunk_captures(site, carriers, thk))
   }
-}
-
-# Sub-expressions to descend into. A spawn call can hide anywhere a
-# value can, so this stays exhaustive over the value-carrying forms;
-# a leaf yields none.
-pub(pkg) fn spawn_expr_children(e: Expr) : [Expr] {
-  match e.kind {
-    ECall(callee, args_) -> [callee, ...args_]
-    EField(base, _) -> [base]
-    EIndex(a, b) -> [a, b]
-    EBinop(_, a, b) -> [a, b]
-    EUnop(_, x) -> [x]
-    EBang(x) -> [x]
-    ELitUnit(x, _) -> [x]
-    ELambda(_, body) -> [body]
-    EPipe(a, b) -> [a, b]
-    EDispatchPipe(_, a, b) -> [a, b]
-    EIntrinsic(_, args_) -> args_
-    ESurface(sf) -> surface_children(sf)
-    EList(els) -> list_elem_exprs(els)
-    ERecordLit(_, fs) -> field_init_exprs(fs)
-    EIf(c, t, eo) -> [c, t, ...opt_expr(eo)]
-    ERange(a, b, os) -> [a, b, ...opt_expr(os)]
-    EMatch(scr, arms) -> [scr, ...arm_exprs(arms)]
-    EBlock(stmts, tail) -> cat_exprs(stmt_exprs(stmts), opt_expr(tail))
-    EHandle(body, _, _, io, _, cs, _) ->
-      [body, ...cat_exprs(opt_expr(io), clause_exprs(cs))]
-    _ -> []
-  }
-}
-
-fn cat_exprs(a: [Expr], b: [Expr]) : [Expr] = match a {
-  [] -> b
-  [h, ...rest] -> [h, ...cat_exprs(rest, b)]
-}
-
-fn opt_expr(o: Option[Expr]) : [Expr] = match o {
-  Some(x) -> [x]
-  None -> []
-}
-
-fn list_elem_exprs(els: [ListElem]) : [Expr] = match els {
-  [] -> []
-  [el, ...rest] -> match el {
-    ElPlain(e) -> [e, ...list_elem_exprs(rest)]
-    ElSpread(e) -> [e, ...list_elem_exprs(rest)]
-  }
-}
-
-fn field_init_exprs(fs: [FieldInit]) : [Expr] = match fs {
-  [] -> []
-  [f, ...rest] -> match f {
-    FI(_, e) -> [e, ...field_init_exprs(rest)]
-  }
-}
-
-fn arm_exprs(arms: [Arm]) : [Expr] = flat_map(
-  arms,
-  a => match a {
-    Arm(_, og, body) -> cat_exprs(opt_expr(og), [body])
-  }
-)
-
-fn clause_exprs(cs: [HClause]) : [Expr] = match cs {
-  [] -> []
-  [c, ...rest] -> match c {
-    HC(_, _, body, _, _) -> [body, ...clause_exprs(rest)]
-  }
-}
-
-fn stmt_exprs(ss: [Stmt]) : [Expr] = flat_map(ss, stmt_own_exprs)
-
-fn stmt_own_exprs(s: Stmt) : [Expr] = match s {
-  SLet(_, _, e) -> [e]
-  SVar(_, _, e, _, _) -> [e]
-  SExprStmt(e) -> [e]
-  SAssert(e, og) -> [e, ...opt_expr(og)]
-  _ -> []
 }
 
 # The thunk is the last argument on every spawn surface.
