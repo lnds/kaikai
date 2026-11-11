@@ -225,6 +225,7 @@ run_check_script "add_failure"        "add_failure/check.sh"
 run_check_script "fetch_failure"      "fetch_failure/check.sh"
 run_check_script "init_invalid_names" "init_invalid_names/check.sh"
 run_check_script "manifest_parse"     "manifest_parse_error/check.sh"
+run_check_script "invalid_package_name" "invalid_package_name/check.sh"
 
 # git/tag documented alias resolves; unrecognised dep table bails loudly.
 run_check_script "git_tag_alias"      "git_tag_alias/check.sh"
