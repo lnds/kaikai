@@ -846,7 +846,9 @@ Cases:
 
 A call site hands every op argument over as an OWNED reference, and the
 handler entry point consumes it. A compiler-emitted user clause does that
-through the ordinary function-parameter discipline; a `$extern_handler`
+through the ordinary function-parameter discipline, a kaikai-bodied
+default clause included (an inherited clause is copied into the handle
+before typing, so it goes through the same path); a `$extern_handler`
 bridge does it in the generated shim (`_kai_default_<eff>_<op>_shim` on the
 C backend, `kaix_default_<eff>_<op>` on the native one), which keeps the
 runtime C bodies free to borrow and to `incref` only what they retain.

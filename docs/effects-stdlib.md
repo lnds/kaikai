@@ -81,13 +81,11 @@ handler. Every other effect must be closed by the user before
 `main` returns, or the compiler refuses the build.
 
 The default-handler wiring is uniform: every builtin effect and every
-user-declared effect whose `default { }` block bridges its clauses via
-the `$extern_handler` intrinsic gets auto-installed at main entry; the
-codegen walks the declarations, with no per-builtin table. Practical
-consequence: a user effect can mirror a builtin's
-ergonomics by adding a `default { }` block whose clauses point at a
-runtime C entry (the bridge does not validate the C symbol exists —
-that's the FFI contract).
+user-declared effect with a `default { }` block gets auto-installed at
+the entry; the codegen walks the declarations, with no per-builtin
+table. A clause is either a `$extern_handler` bridge to a runtime C
+entry (which does not validate that the C symbol exists — that's the
+FFI contract) or a kaikai body; the builtins use the bridge.
 
 ## Three classes of builtin effect
 

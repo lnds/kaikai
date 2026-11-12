@@ -475,16 +475,39 @@ fn main() : Unit / MyLog = {
 }
 ```
 
-`$extern_handler("c_symbol")` is the compiler intrinsic that bridges
-a default clause to a runtime C entry, and the only clause body a
-default may use: a kaikai-bodied default clause parses, but a program
-that relies on it is rejected with `effect not handled: Eff.op`.
+A default clause is either a `$extern_handler("c_symbol")` bridge to a
+runtime C entry, or an ordinary clause body written in kaikai. A
+kaikai-bodied clause is type-checked like a `handle` clause (its
+parameters, `resume`, and the clause's own diagnostics), whether or not
+anything relies on it, and a block may mix both shapes:
+
+```kaikai
+effect Shout {
+  shout(msg: String) : Unit
+  default {
+    shout(msg, resume) -> {
+      println("in default: #{msg}")
+      resume(())
+    }
+  }
+}
+
+fn main() : Unit / Shout + Console {
+  Shout.shout("hello")
+}
+```
+
+The default is installed at the program root: `main` and the `test`,
+`bench` and `check` entries. A clause runs outside the entry, so the
+effects its body performs must themselves have a default, which is
+installed beside it; the entry's row need not list them. An effect
+without a default, or defaults that perform each other, is rejected at
+the clause. A default may declare `return(x) -> ...`: a `handle` that writes none inherits it. At the program root the `return` clause is not run.
 
 #### Coverage algorithm
 
 A `handle ... with Eff` must give a clause to every op of `Eff`,
-except an op the `default { }` block bridges with `$extern_handler`;
-otherwise the typer rejects the handle itself with `handler for Eff
+except an op the `default { }` block covers; otherwise the typer rejects the handle itself with `handler for Eff
 does not cover every op`, even when no call performs the missing op.
 
 For every directly-performed `Eff.op(...)` inside a function body,
@@ -492,19 +515,22 @@ the typer walks the lexical stack of enclosing handles:
 
 1. **Clause discharge** — the first `handle ... with Eff { clauses }`
    that lists `op` in its clauses absorbs the obligation.
-2. **Main absorption** — no enclosing `handle ... with Eff`, the
+2. **Clause merge** — that handle omits `op` and the `default { }`
+   block of `Eff` covers it → the default clause runs, as if the
+   handle had spelled it. The handle's `return` is the default's when
+   the handle writes none.
+3. **Main absorption** — no enclosing `handle ... with Eff`, the
    function is `main`, and the `default { }` block of the declaration
    the label names declares `op` → the auto-installed default at
    `main` discharges it. A homonym's default never stands in.
-3. **Reject** — otherwise the typer emits `effect not handled:
+4. **Reject** — otherwise the typer emits `effect not handled:
    Eff.op` with a diagnostic note describing the default-block
-   status (no block, partial block, kaikai-bodied clause, or
-   masked-by-enclosing-handle).
+   status (no block or partial block).
 
-An enclosing handle masks the default: a handle that omits `op` does
-not inherit the default clause for it, so performing `op` inside that
-handle is rejected (step 3) even when the `default { }` block declares
-it. List the op in the handle, or perform it outside the handle.
+An inherited clause is the handle's own: the effects its body performs
+join the handle's row and resolve to the handlers enclosing the
+`handle`, not to the root defaults. A `$extern_handler` clause inherits
+by running its runtime entry.
 
 #### Worked example — handle with a full default block
 
@@ -532,15 +558,6 @@ Inside `handle ... with MyLog`, the `info` clause discharges
 call site — its presence does not change the type-check outcome.
 The fixture in `examples/effects/default_block_full_user_handle.kai`
 covers this shape.
-
-#### Why partial handles get rejected
-
-A handle's evidence carries a clause only for the ops the user wrote,
-and it masks any enclosing default: dispatch inside the handle routes
-through it even when an outer handler carries the missing op.
-Accepting a partial handle plus a `default { }` block would type a
-call that has no clause to run, so the typer rejects it instead.
-
 
 ### `resume`: one-shot, explicit
 
@@ -991,7 +1008,7 @@ they first need to be acted on.
    exhaustiveness. An op without a clause is a compile error
    (`handler for Eff does not cover every op: missing op2`), whether
    or not anything performs it. The one exception is an op the
-   effect's `default { }` block bridges with `$extern_handler`.
+   effect's `default { }` block covers.
    Fixtures: `examples/negative/effects_phase2/partial_handle_*.kai`.
 
 4. **What does `main` look like?** `fn main() : Unit / Io` with

@@ -3,6 +3,8 @@
 import compiler.util
 import compiler.diag
 import compiler.ast
+import compiler.inherit_defaults
+import compiler.default_cycles
 import compiler.ast_build
 import compiler.ast_decl
 import compiler.ast_ids
@@ -65,25 +67,27 @@ fn check_default_coverage_loop(
   match ds {
     [] -> acc
     [d, ...rest] -> {
-      let acc1 = match cov_decl_body(d, homes) {
-        Some(b) -> {
-          let w = CovWalk { file: decl_diag_file(d, df), decls: all_decls, cx: cx, entry: b.entry }
-          cov_expr(w, b.body, [], acc)
-        }
-        None -> acc
+      let w0 = CovWalk {
+        file: decl_diag_file(d, df),
+        decls: all_decls,
+        cx: cx,
+        entry: cov_is_entry(decl_unwrap(d), homes)
       }
+      let acc1 = cov_bodies(w0, decl_body_exprs(d), acc)
       check_default_coverage_loop(df, all_decls, cx, homes, rest, acc1)
     }
   }
 }
 
-type CovBody = { body: Expr, entry: Bool }
-
-fn cov_decl_body(d: Decl, homes: TyHomes) : Option[CovBody] =
-  decl_body(d) | (body => CovBody { body: body, entry: cov_is_entry(decl_unwrap(d), homes) })
+fn cov_bodies(w: CovWalk, bodies: [Expr], acc: [Diagnostic]) : [Diagnostic] / Console + File =
+  match bodies {
+    [] -> acc
+    [b, ...rest] -> cov_bodies(w, rest, cov_expr(w, b, [], acc))
+  }
 
 fn cov_is_entry(d: Decl, homes: TyHomes) : Bool = match d {
   DFn(_, fid, _, _, _, _, _, _, _, _, _, _) -> decl_types_as_entry(homes, fid)
+  DEffect(_, _, _, _, _, _, _, _, _, _) -> true
   _ -> false
 }
 
@@ -296,9 +300,9 @@ fn check_op_call_coverage(
     []
   } else {
     match find_top_eff_frame(stack, esym) {
-      Some(HF(_, clause_ops, _, _, _)) ->
+      Some(HF(_, clause_ops, default_ops, _, _)) ->
         uncovered_op_unless(
-          list_has_string(clause_ops, op_name),
+          list_has_string(clause_ops, op_name) or list_has_string(default_ops, op_name),
           w,
           op_name,
           esym,
@@ -394,28 +398,9 @@ fn describe_default_status(
   }
 
 fn default_clause_status(eff_name: String, op_name: String, clauses: [HClause]) : String =
-  if list_has_string(extern_handler_op_names(clauses), op_name) {
-    concat_all([
-      "effect `", eff_name,
-      "`'s `default { }` block does declare `", op_name,
-      "` via `$extern_handler`, but the enclosing `handle ... with ",
-      eff_name,
-      "` masks the main-level default — Stage C will let the handle inherit unmissed default clauses; until then the partial handle must add `",
-      op_name, "`"
-    ])
-  } else if list_has_string(handle_clause_op_names(clauses), op_name) {
-    concat_all([
-      "effect `", eff_name,
-      "`'s `default { }` block declares `", op_name,
-      "` but its body is not an `$extern_handler(...)` bridge — Stage C will lower kaikai-bodied default clauses; for now the clause must use the intrinsic"
-    ])
-  } else {
-    concat_all([
-      "effect `", eff_name,
-      "`'s `default { }` block does not declare `",
-      op_name, "`"
-    ])
-  }
+  concat_all([
+    "effect `", eff_name, "`'s `default { }` block does not declare `", op_name, "`"
+  ])
 
 #[doc("infer: run HM + bidirectional inference over a program, returning the TypedProgram.")]
 pub fn infer_program(
@@ -734,6 +719,7 @@ pub fn module_bodies(
     },
     sh.homes
   )
+  let cycle_diags = default_cycle_diags(df, tab, tp.decls)
   let priv_diags = check_field_privacy(
     df,
     tab,
@@ -744,14 +730,23 @@ pub fn module_bodies(
   let union_diags = union_impl_diags(df, data.built.env, protos, data.decls_a)
   let typed = TypedProgram {
     decls: tp.decls,
-    errs: tp.errs + list_length(cov_diags) + list_length(priv_diags) + list_length(union_diags),
+    errs: tp.errs
+      + list_length(cov_diags)
+      + list_length(cycle_diags)
+      + list_length(priv_diags)
+      + list_length(union_diags),
     insts: tp.insts,
     holes: tp.holes,
     row_holes: tp.row_holes,
     core_len: tp.core_len,
     toplevel_len: n_inh + data.built.env.added,
     module_doc: doc_module_doc_text(data.decls_a),
-    diags: list_append(tp.diags, list_append(cov_diags, list_append(priv_diags, union_diags))),
+    diags: dedup_diags(
+      list_append(
+        tp.diags,
+        list_append(cov_diags, list_append(cycle_diags, list_append(priv_diags, union_diags)))
+      )
+    ),
     op_res: tp.op_res
   }
   TypecheckedModule { typed: typed, delta: fr.delta }
@@ -779,12 +774,15 @@ fn typecheck_program_with_head_owners(
   # `modules` so the per-module typechecker can still cross-reference
   # `DEffect default { ... }` blocks (and other program-wide
   # decl-shaped data) without seeing the partition boundary.
-  let all_program_decls = flatten_module_decls(modules, [])
+  let defaults_of = flatten_module_decls(modules, [])
+  let merged =
+    map(modules, m => ModuleDecls { ...m, decls: inherit_default_decls(m.decls, defaults_of) })
+  let all_program_decls = flatten_module_decls(merged, [])
   let sh = tc_shared(file, df, all_program_decls, tab, views, roots)
   typecheck_program_loop(
     file,
     df,
-    modules,
+    merged,
     module_env_delta_empty(),
     all_program_decls,
     protos,

@@ -7,8 +7,10 @@ import compiler.ast_ids
 import compiler.core_types
 import compiler.symtab
 import compiler.evidence_scan
+import compiler.expr_positions
 import compiler.fnreg
 import compiler.handler_alias
+import compiler.inherit_defaults
 import compiler.infer_handle_walk
 import compiler.infer_state
 import compiler.infer_unit_tables
@@ -17,15 +19,68 @@ import compiler.type_text
 import compiler.util
 import compiler.written
 
-#[doc("The effects whose default handlers the program installs: the entry fn's declared row and the rows of the fns exported to C.")]
+#[doc("The effects whose default handlers the program installs: the entry fn's declared row and the rows of the fns exported to C, closed under what the installed defaults perform.")]
 pub fn main_row_labels(decls: [Decl], entry: SymId, tab: SymTab) : [SymId] =
-  list_append(
-    entry_row_labels(decls, entry),
-    filter(
-      export_row_labels(decls, tab, []),
-      s => not any(entry_row_labels(decls, entry), e => sym_same(e, s))
+  root_row_closure(
+    decls,
+    list_append(
+      entry_row_labels(decls, entry),
+      filter(
+        export_row_labels(decls, tab, []),
+        s => not any(entry_row_labels(decls, entry), e => sym_same(e, s))
+      )
     )
   )
+
+# A default runs at the program root, so each effect its clause bodies perform
+# needs a default installed there too.
+pub fn root_row_closure(decls: [Decl], row: [SymId]) : [SymId] =
+  if any(decls, has_kaikai_default) { row_closure_step(decls, row) } else { row }
+
+fn row_closure_step(decls: [Decl], row: [SymId]) : [SymId] {
+  let wider = add_missing_effects(
+    filter(
+      flat_map(row, e => default_body_effects(decls, e)),
+      e => effect_default_block_present(e, decls)
+    ),
+    row
+  )
+  if list_length(wider) == list_length(row) { row } else { row_closure_step(decls, wider) }
+}
+
+#[doc("The effects the kaikai-bodied clauses of the default of `eff` perform, as their typed bodies record them.")]
+pub fn default_body_effects(decls: [Decl], eff: SymId) : [SymId] =
+  match effect_decl_default(effect_decl_of(eff, decls)) {
+    Some(DBlk(cs, _, _, _)) -> flat_map(
+      cs,
+      c => match c {
+        HC(_, _, body, _, _) -> expr_effects(body)
+      }
+    )
+    None -> []
+  }
+
+fn expr_effects(e: Expr) : [SymId] {
+  let here = match e.kind {
+    EOp(r) -> [r.eff]
+    ECall(callee, _) -> callee_row_effects(callee)
+    _ -> []
+  }
+  list_append(
+    here,
+    flat_map(
+      xp_positions(e),
+      p => match p {
+        XP(_, c) -> expr_effects(c)
+      }
+    )
+  )
+}
+
+fn callee_row_effects(callee: Expr) : [SymId] = match callee.ty {
+  Some(TyFnT(_, _, row)) -> map(row.labels, .sym)
+  _ -> []
+}
 
 fn export_row_labels(decls: [Decl], tab: SymTab, acc: [SymId]) : [SymId] = match decls {
   [] -> acc
@@ -103,28 +158,28 @@ pub fn unconditional_default_effects() : [SymId] = [core_effect_id(CeMutable)]
 pub fn ensure_unconditional_defaults(main_row: [SymId]) : [SymId] =
   add_missing_effects(unconditional_default_effects(), main_row)
 
-# An extern-default effect a lexical handler absorbed from main's row still
+# A defaulted effect a lexical handler absorbed from main's row still
 # needs its default node installed: a spawned fiber starts with an empty
 # evidence stack (the parent handler does not cross the spawn boundary) and
 # resolves the effect to that default, not to a zero-init node. Both backends
 # add these back to the default-install set.
-#[doc("Extern-default effects handled by some `handle` in the program — the set a lexical parent handler absorbs from main's row.")]
+#[doc("Defaulted effects handled by some `handle` in the program — the set a lexical parent handler absorbs from main's row.")]
 pub fn default_effects_absorbed_by_handler(decls: [Decl]) : [SymId] =
   effects_absorbed_loop(collect_effect_ids(decls), obl_handled_effects(decls), decls)
 
 fn effects_absorbed_loop(rem: [SymId], handled: [SymId], decls: [Decl]) : [SymId] = match rem {
   [] -> []
   [e, ...rest] ->
-    if effect_among(handled, e) and effect_default_block_all_extern(e, decls) {
+    if effect_among(handled, e) and effect_default_block_present(e, decls) {
       [e, ...effects_absorbed_loop(rest, handled, decls)]
     } else {
       effects_absorbed_loop(rest, handled, decls)
     }
 }
 
-#[doc("The effects a test, bench or check entry installs a default handler for: every effect whose default block is all-extern. A runner body has no row of its own, so it may perform any of them.")]
+#[doc("The effects a test, bench or check entry installs a default handler for: every effect that declares a default. A runner body has no row of its own, so it may perform any of them.")]
 pub fn runner_entry_row(decls: [Decl]) : [SymId] =
-  filter(collect_effect_ids(decls), e => effect_default_block_all_extern(e, decls))
+  filter(collect_effect_ids(decls), e => effect_default_block_present(e, decls))
 
 #[doc("Append each effect in `extra` not already present in `row`; preserves `row` as a set.")]
 pub fn add_missing_effects(extra: [SymId], row: [SymId]) : [SymId] = match extra {
@@ -168,18 +223,6 @@ fn effect_in_row(row: [SymId], e: SymId) : Bool = match row {
 # `-fsanitize=function`). Setup assigns the shim's address; no
 # cast required at the assignment, no UBSan diagnostic at the
 # dispatch site.
-# Issue #556: derive a default-handler shim from a user-declared
-# `default { }` block whose clause bodies are `$extern_handler("c_sym")`.
-# The shim shape mirrors the hardcoded family above:
-#     static KaiValue *_kai_default_<eff_lc>_<op>_shim(Ev<Eff> *self,
-#         KaiValue *kai_<arg>, ..., KaiCont *k) {
-#         return <c_sym>(self, kai_<arg>, ..., k);
-#     }
-# Returns "" when the effect has no default block, or when the block's
-# clauses do not all bridge to extern_handler (the latter case is a
-# user-declared effect with kaikai-bodied default; Stage C will lower
-# those, but Stage A's codegen scope is the extern_handler bridge only).
-
 #[doc("The `default { }` block the effect `eff` declares; None when it is not declared or declares none.")]
 pub fn find_effect_default_block(eff: SymId, decls: [Decl]) : Option[DefaultBlock] =
   effect_decl_default(effect_decl_of(eff, decls))
@@ -196,15 +239,9 @@ pub fn default_block_owner_mo(eff: SymId, decls: [Decl]) : Option[String] = matc
   _ -> None
 }
 
-# The strict test main absorption uses: every clause must bridge to an `extern_handler`
-# intrinsic. Stage A's codegen only knows how to lower those — a
-# kaikai-bodied clause has no emitter path yet (Stage C). Treating
-# effects with kaikai-bodied defaults as absorbed would type-check
-# clean and segfault at runtime, so the typer holds back until codegen
-# can match.
-#[doc("True when the effect `eff` declares a `default { }` block whose every clause bridges to `$extern_handler`, the only shape codegen installs.")]
-pub fn effect_default_block_all_extern(eff: SymId, decls: [Decl]) : Bool =
-  effect_decl_default_all_extern(effect_decl_of(eff, decls))
+#[doc("True when the effect `eff` declares a `default { }` block.")]
+pub fn effect_default_block_present(eff: SymId, decls: [Decl]) : Bool =
+  effect_decl_has_default(effect_decl_of(eff, decls))
 
 # Search the handle stack for the topmost frame matching `eff_name`.
 # Step 2 (clause-merge) and step 3 (handle-with-default) both require

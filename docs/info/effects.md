@@ -173,28 +173,28 @@ fn main() : Unit / MyConsole = {
 module's `main` gets no default installed and takes each effect from
 its caller, like any function.
 
-`$extern_handler("c_symbol")` is the compiler intrinsic that bridges
-a default clause to a runtime C entry, and the only clause `main`
-installs. A default clause with a kaikai body parses, but nothing
-installs it: a `main` that performs the op with no enclosing handler
-is rejected with `` `main` declares effect `Eff` but no default
-handler is installed for it``.
+A default clause is either `$extern_handler("c_symbol")`, which bridges
+to a runtime C entry, or an ordinary kaikai body, type-checked like a
+`handle` clause. A block may mix both shapes. The default is installed
+at `main` and at the `test`, `bench` and `check` entries; a clause body
+may perform only effects that have a default of their own, and the entry
+need not list them. A default may declare `return(x) -> ...`, inherited by a `handle` that writes none; at the program root it is not run.
 
 Coverage rules (typer):
 
 0. **Every op needs a clause** — a `handle ... with Eff` lists every
    op of `Eff`, even ones nothing performs, except an op the
-   `default { }` block bridges with `$extern_handler`. Otherwise:
+   `default { }` block covers. Otherwise:
    `handler for Eff does not cover every op: missing ...`.
 1. **Inside a `handle ... with Eff { clauses }`** — the listed
-   clauses discharge the op; the `default { }` block is unused at
-   that call site.
+   clauses discharge the op; an op the handle omits and the
+   `default { }` block covers runs the default clause, as if the
+   handle had spelled it (its `return` too, when the handle has none).
+   Effects an inherited clause performs join the handle's row.
 2. **At `main`, no enclosing `handle`** — the `default { }` block's
-   clause fires; the auto-installed handler runs `$extern_handler`.
-3. **Partial handle + missing op in default** — typer rejects with
-   `effect not handled: Eff.op`. Defaults are not merged into a
-   partial handle: list the op explicitly in the `handle`, or let it
-   fall through to the default at `main`.
+   clause fires.
+3. **Omitted op without a default** — the handle is rejected with
+   `handler for Eff does not cover every op: missing ...`.
 
 The stdlib effects carry their defaults the same way, as
 `$extern_handler` clauses on the declaration: Stdout, Stderr, Stdin,
