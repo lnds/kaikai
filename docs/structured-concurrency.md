@@ -43,6 +43,11 @@ inside a child), and a fiber-local effect (`Cancel`, `Link`,
 `Monitor`, `Spawn`, `Actor`), which binds the child's own disposition
 by construction.
 
+A default written in kaikai is not a supplier the scheduler installs:
+it is installed at the program root only, and does not cross a
+`spawn`. The spawned body inherits it by writing
+`handle { ... } with Eff {}`.
+
 The thunk's row `e` is part of the spawner's own row (`spawn`,
 `Spawn.spawn`, `spawn_actor` and `spawn_actor_policy` all return
 `/ Spawn + e`), so a child that may perform `Cancel` or `Clock` makes

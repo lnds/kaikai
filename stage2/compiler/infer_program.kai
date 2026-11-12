@@ -17,6 +17,9 @@ import compiler.spawn_param
 import compiler.kind_theory
 import compiler.resolve_names
 import compiler.symtab
+import compiler.infer_sig_respell
+import compiler.default_wrappers
+import compiler.infer_root_defaults
 import compiler.modules_paths
 import compiler.doc_attr
 import compiler.unit_walk
@@ -84,6 +87,9 @@ fn cov_decl_body(d: Decl, homes: TyHomes) : Option[CovBody] =
 
 fn cov_is_entry(d: Decl, homes: TyHomes) : Bool = match d {
   DFn(_, fid, _, _, _, _, _, _, _, _, _, _) -> decl_types_as_entry(homes, fid)
+  DTest(_, _, _, _, _) -> true
+  DBench(_, _, _, _, _) -> true
+  DCheck(_, _, _, _, _, _) -> true
   _ -> false
 }
 
@@ -264,10 +270,20 @@ fn cov_handle(
   let hsym = ref_sym(eff)
   let clause_ops = handle_clause_op_names(clauses)
   let default_ops = effect_default_op_map_get(w.cx.effs, hsym)
-  let frame = HF(hsym, clause_ops, default_ops, e.line, e.col)
   let missing = handler_missing_ops(effect_decl_of(hsym, w.decls), clause_ops, default_ops)
+  let frame = HF(hsym, clause_ops, list_append(default_ops, missing), e.line, e.col)
   let a0 = list_append(
-    report_partial_handler(w.file, ref_text(w.cx.tab, eff), missing, e.line, e.col),
+    report_partial_handler(
+      w.file,
+      ref_text(w.cx.tab, eff),
+      missing,
+      match effect_decl_of(hsym, w.decls) {
+        Some(d) -> any(missing, m => any(kaikai_default_ops(d), k => k == m))
+        None -> false
+      },
+      e.line,
+      e.col
+    ),
     acc
   )
   let a1 = cov_opt(w, init_opt, stack, a0)
@@ -292,13 +308,15 @@ fn check_op_call_coverage(
 ) : [Diagnostic] / Console + File {
   let esym = r.eff
   let op_name = written_text(r.op)
-  if not is_effect_declared(esym, w.decls) {
+  if (not is_effect_declared(esym, w.decls))
+    or is_default_wrapper(w.cx.tab, esym)
+    or is_partial_default(w.decls, esym) {
     []
   } else {
     match find_top_eff_frame(stack, esym) {
-      Some(HF(_, clause_ops, _, _, _)) ->
+      Some(HF(_, clause_ops, frame_defaults, _, _)) ->
         uncovered_op_unless(
-          list_has_string(clause_ops, op_name),
+          list_has_string(clause_ops, op_name) or list_has_string(frame_defaults, op_name),
           w,
           op_name,
           esym,
@@ -309,7 +327,7 @@ fn check_op_call_coverage(
       None ->
         if w.entry {
           uncovered_op_unless(
-            list_has_string(effect_default_op_map_get(w.cx.effs, esym), op_name),
+            list_has_string(entry_default_ops(w, esym), op_name),
             w,
             op_name,
             esym,
@@ -322,6 +340,12 @@ fn check_op_call_coverage(
         }
     }
   }
+}
+
+# The ops the entry installs a default for: every clause of the block.
+fn entry_default_ops(w: CovWalk, esym: SymId) : [String] = match effect_decl_of(esym, w.decls) {
+  Some(DEffect(_, _, _, _, Some(DBlk(cs, _, _, _)), _, _, _, _, _)) -> handle_clause_op_names(cs)
+  _ -> effect_default_op_map_get(w.cx.effs, esym)
 }
 
 fn uncovered_op_unless(
@@ -394,20 +418,11 @@ fn describe_default_status(
   }
 
 fn default_clause_status(eff_name: String, op_name: String, clauses: [HClause]) : String =
-  if list_has_string(extern_handler_op_names(clauses), op_name) {
-    concat_all([
-      "effect `", eff_name,
-      "`'s `default { }` block does declare `", op_name,
-      "` via `$extern_handler`, but the enclosing `handle ... with ",
-      eff_name,
-      "` masks the main-level default — Stage C will let the handle inherit unmissed default clauses; until then the partial handle must add `",
-      op_name, "`"
-    ])
-  } else if list_has_string(handle_clause_op_names(clauses), op_name) {
+  if list_has_string(handle_clause_op_names(clauses), op_name) {
     concat_all([
       "effect `", eff_name,
       "`'s `default { }` block declares `", op_name,
-      "` but its body is not an `$extern_handler(...)` bridge — Stage C will lower kaikai-bodied default clauses; for now the clause must use the intrinsic"
+      "`, which only a handle that inherits it or the program entry installs"
     ])
   } else {
     concat_all([
@@ -742,19 +757,35 @@ pub fn module_bodies(
     if not list_is_empty(all_program_decls) { sh.field_recs } else { field_recs_of(data.decls_a) }
   )
   let union_diags = union_impl_diags(df, data.built.env, protos, data.decls_a)
+  let root_diags = default_root_diags(df, tab, first.env.entries, all_decls_for_typer, data.decls_a)
   let typed = TypedProgram {
     decls: tp.decls,
-    errs: tp.errs + list_length(cov_diags) + list_length(priv_diags) + list_length(union_diags),
+    errs: tp.errs
+      + list_length(cov_diags)
+      + list_length(priv_diags)
+      + list_length(union_diags)
+      + list_length(root_diags),
     insts: tp.insts,
     holes: tp.holes,
     row_holes: tp.row_holes,
     core_len: tp.core_len,
     toplevel_len: n_inh + data.built.env.added,
     module_doc: doc_module_doc_text(data.decls_a),
-    diags: list_append(tp.diags, list_append(cov_diags, list_append(priv_diags, union_diags))),
+    diags: list_append(
+      tp.diags,
+      list_append(cov_diags, list_append(priv_diags, list_append(union_diags, root_diags)))
+    ),
     op_res: tp.op_res
   }
-  TypecheckedModule { typed: typed, delta: fr.delta }
+  let delta = if declares_kaikai_default(data.decls_a) {
+    ModuleEnvDelta {
+      ...fr.delta,
+      ty_entries: amend_wrapper_entries(tab, fr.delta.ty_entries, first.env.entries)
+    }
+  } else {
+    fr.delta
+  }
+  TypecheckedModule { typed: typed, delta: delta }
 }
 
 # Fold `typecheck_module` left-to-right across the per-module decl

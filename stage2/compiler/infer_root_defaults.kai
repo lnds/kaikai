@@ -1,0 +1,328 @@
+#[doc("The program root's install of kaikai-bodied defaults: an entry whose body performs a defaulted effect is typed again inside the wrapper that handles it.")]
+
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.core_types
+import compiler.decl_bodies
+import compiler.diag
+import compiler.diag_file
+import compiler.expr_positions
+import compiler.infer_apply
+import compiler.infer_row_kinds
+import compiler.infer_sig_respell
+import compiler.default_wrappers
+import compiler.handler_alias
+import compiler.infer_env
+import compiler.symtab
+import compiler.util
+import compiler.written
+
+fn effect_has_kaikai_default(decls: [Decl], eff: SymId) : Bool = match effect_decl_of(eff, decls) {
+  Some(d) -> declares_kaikai_default([d])
+  None -> false
+}
+
+fn push_distinct(acc: [SymId], s: SymId) : [SymId] =
+  if any(acc, x => sym_raw(x) == sym_raw(s)) { acc } else { [s, ...acc] }
+
+#[doc("The effects of `row` whose default carries kaikai clauses, each once.")]
+pub(pkg) fn rooted_effects(decls: [Decl], row: [Label]) : [SymId] =
+  foldl(
+    row,
+    [],
+    (acc, l) => if effect_has_kaikai_default(decls, l.sym) {
+      push_distinct(acc, l.sym)
+    } else {
+      acc
+    }
+  )
+
+fn root_sym(tab: SymTab, eff: SymId) : Option[SymId] =
+  st_lookup(tab, NCFn, dflt_root_name(written_text(decl_name(tab, eff))), sym_owner(tab, eff))
+
+fn wrap_one(tab: SymTab, eff: SymId, body: Expr) : Option[Expr] =
+  map(
+    root_sym(tab, eff),
+    r => mk_expr(
+      ECall(
+        mk_sym(r, body.line, body.col),
+        [mk_expr(ELambda([], body), body.line, body.col)]
+      ),
+      body.line,
+      body.col
+    )
+  )
+
+#[doc("`body` inside the root wrapper of each effect of `effs`, the last of them outermost; None when an effect has no wrapper.")]
+pub(pkg) fn wrap_roots(tab: SymTab, effs: [SymId], body: Expr) : Option[Expr] = match effs {
+  [] -> Some(body)
+  [e, ...rest] -> wrap_one(tab, e, body) || (b => wrap_roots(tab, rest, b))
+}
+
+#[doc("How many root wrappers enclose `body` at its head.")]
+pub(pkg) fn root_layers(tab: SymTab, body: Expr) : Int = match body.kind {
+  ECall(f, [lam]) -> match (f.kind, lam.kind) {
+    (ESym(s, _), ELambda([], inner)) ->
+      if is_default_root(tab, s) { 1 + root_layers(tab, inner) } else { 0 }
+    _ -> 0
+  }
+  _ -> 0
+}
+
+#[doc("Why the default of an effect cannot be installed at the program root.")]
+pub(pkg) type RootProblem = RpSelf | RpNoDefault(SymId)
+
+fn root_scheme(entries: [TyEntry], root: SymId) : Option[TyScheme] =
+  map(
+    find(
+      entries,
+      e => match e.key {
+        KSym(s) -> sym_raw(s) == sym_raw(root)
+        _ -> false
+      }
+    ),
+    .scheme
+  )
+
+fn scheme_row_syms(sc: TyScheme) : [SymId] = match sc {
+  Scheme(_, _, _, _, TyFnT(_, _, row)) -> map(row.labels, .sym)
+  _ -> []
+}
+
+fn performed_by_default(entries: [TyEntry], tab: SymTab, eff: SymId) : [SymId] =
+  match root_sym(tab, eff) {
+    Some(r) -> match root_scheme(entries, r) {
+      Some(sc) -> scheme_row_syms(sc)
+      None -> []
+    }
+    None -> []
+  }
+
+# An effect no declaration of the program holds is a builtin the runtime installs.
+fn has_default(decls: [Decl], eff: SymId) : Bool = match effect_decl_of(eff, decls) {
+  Some(d) -> effect_decl_default_all_extern(Some(d)) or declares_kaikai_default([d])
+  None -> true
+}
+
+fn problem_walk(
+  entries: [TyEntry],
+  tab: SymTab,
+  decls: [Decl],
+  origin: SymId,
+  here: SymId,
+  seen: [SymId]
+) : Option[RootProblem] =
+  first_some(
+    performed_by_default(entries, tab, here),
+    f => if sym_raw(f) == sym_raw(origin) {
+      Some(RpSelf)
+    } else if any(seen, s => sym_raw(s) == sym_raw(f)) {
+      None
+    } else if (not has_default(decls, f)) and (not effect_is_foreign(f)) {
+      Some(RpNoDefault(f))
+    } else if declares_kaikai_default_of(decls, f) {
+      problem_walk(entries, tab, decls, origin, f, [f, ...seen])
+    } else {
+      None
+    }
+  )
+
+fn declares_kaikai_default_of(decls: [Decl], eff: SymId) : Bool =
+  effect_has_kaikai_default(decls, eff)
+
+fn first_some(xs: [SymId], f: (SymId) -> Option[RootProblem]) : Option[RootProblem] = match xs {
+  [] -> None
+  [x, ...rest] -> match f(x) {
+    Some(p) -> Some(p)
+    None -> first_some(rest, f)
+  }
+}
+
+#[doc("The reason the default of `eff` cannot be installed at the program root, if any: it performs its own effect, directly or through other defaults, or an effect that has no default.")]
+pub(pkg) fn root_problem(entries: [TyEntry], tab: SymTab, decls: [Decl], eff: SymId) : Option[
+  RootProblem
+] =
+  problem_walk(entries, tab, decls, eff, eff, [eff])
+
+fn root_diag(
+  df: DiagFiles,
+  tab: SymTab,
+  d: Decl,
+  eff: SymId,
+  p: RootProblem,
+  line: Int,
+  col: Int
+) : Diagnostic =
+  mk_diag(
+    SevError,
+    decl_diag_file(d, df),
+    line,
+    col,
+    match p {
+      RpSelf -> concat_all([
+        "the `default { }` of effect `",
+        written_text(decl_name(tab, eff)),
+        "` performs itself"
+      ])
+      RpNoDefault(f) -> concat_all([
+        "effect not handled: ",
+        written_text(decl_name(tab, f)),
+        " (performed by the `default { }` of effect `",
+        written_text(decl_name(tab, eff)),
+        "`, which is installed at the program root where `",
+        written_text(decl_name(tab, f)),
+        "` has no default)"
+      ])
+    },
+    []
+  )
+
+#[doc("One error, at the `default { }` block, for each effect of `mine` whose kaikai default cannot be installed at the program root.")]
+pub(pkg) fn default_root_diags(
+  df: DiagFiles,
+  tab: SymTab,
+  entries: [TyEntry],
+  decls: [Decl],
+  mine: [Decl]
+) : [Diagnostic] =
+  if declares_kaikai_default(mine) {
+    flat_map(
+      mine,
+      d => match decl_unwrap(d) {
+        DEffect(_, s, _, _, Some(DBlk(_, _, bl, bc)), _, _, _, _, _) ->
+          if declares_kaikai_default([d]) {
+            match root_problem(entries, tab, decls, s) {
+              Some(p) -> [root_diag(df, tab, d, s, p, bl, bc)]
+              None -> []
+            }
+          } else {
+            []
+          }
+        _ -> []
+      }
+    )
+  } else {
+    []
+  }
+
+fn kaikai_performed(entries: [TyEntry], tab: SymTab, decls: [Decl], e: SymId) : [SymId] =
+  filter(performed_by_default(entries, tab, e), f => effect_has_kaikai_default(decls, f))
+
+fn close_over(
+  entries: [TyEntry],
+  tab: SymTab,
+  decls: [Decl],
+  todo: [SymId],
+  acc: [SymId]
+) : [SymId] =
+  match todo {
+    [] -> acc
+    [e, ...rest] -> if any(acc, x => sym_raw(x) == sym_raw(e)) {
+      close_over(entries, tab, decls, rest, acc)
+    } else {
+      close_over(entries, tab, decls, list_append(rest, kaikai_performed(entries, tab, decls, e)), [
+        e,
+        ...acc
+      ])
+    }
+  }
+
+fn larger(a: Int, b: Int) : Int = if b > a { b } else { a }
+
+# `fuel` bounds the walk: defaults that perform each other are reported at their
+# own blocks but typing goes on, and an unbounded walk would not end on them.
+fn default_depth(entries: [TyEntry], tab: SymTab, decls: [Decl], e: SymId, fuel: Int) : Int =
+  if fuel <= 0 {
+    0
+  } else {
+    1
+      + foldl(
+        kaikai_performed(entries, tab, decls, e),
+        0,
+        (m, f) => larger(m, default_depth(entries, tab, decls, f, fuel - 1))
+      )
+  }
+
+#[doc("The effects of `rooted` and of the defaults they perform, innermost first: an effect comes before every effect its default performs.")]
+pub(pkg) fn root_order(entries: [TyEntry], tab: SymTab, decls: [Decl], rooted: [SymId]) : [SymId] {
+  let all = close_over(entries, tab, decls, rooted, [])
+  let n = list_length(all)
+  sort_by(
+    all,
+    (a, b) => default_depth(entries, tab, decls, b, n + 1) -
+      default_depth(entries, tab, decls, a, n + 1)
+  )
+}
+
+#[doc("Per partially defaulted effect, the ops its default has a clause for.")]
+pub(pkg) fn partial_skip_table(decls: [Decl]) : [(SymId, [String])] =
+  flat_map(
+    decls,
+    d => match decl_unwrap(d) {
+      DEffect(_, s, _, _, Some(DBlk(cs, _, _, _)), _, _, _, _, _) ->
+        if is_partial_default(decls, s) { [(s, handle_clause_op_names(cs))] } else { [] }
+      _ -> []
+    }
+  )
+
+#[doc("The partially defaulted effects performed anonymously by `labels`: the uses of the default the entry cannot tell apart.")]
+pub(pkg) fn partial_in_row(decls: [Decl], labels: [Label]) : [SymId] =
+  filter(
+    map(partial_skip_table(decls), .fst),
+    e => any(labels, l => sym_raw(l.sym) == sym_raw(e) and local_raw(l.cell) == 0)
+  )
+
+#[doc("The ops of `eff` its default gives no clause for.")]
+pub(pkg) fn ops_missing_default(decls: [Decl], eff: SymId) : [String] =
+  match effect_decl_of(eff, decls) {
+    Some(d) -> ops_without_default(d)
+    None -> []
+  }
+
+fn row_syms_of(sub: Subst, t: Ty) : [SymId] = match apply_ty(sub, t) {
+  TyFnT(_, _, row) -> list_append(
+    map(apply_labels(sub, row.labels), .sym),
+    match row.tail {
+      Some(v) -> map(bound_labels(sub, v), .sym)
+      None -> []
+    }
+  )
+  _ -> []
+}
+
+fn wrapper_calls_in(sub: Subst, tab: SymTab, e: Expr, acc: [(Bool, [SymId])]) : [(Bool, [SymId])] =
+  foldl(
+    xp_positions(e),
+    wrapper_call_here(sub, tab, e, acc),
+    (a, p) => match p {
+      XP(_, x) -> wrapper_calls_in(sub, tab, x, a)
+    }
+  )
+
+fn wrapper_call_here(sub: Subst, tab: SymTab, e: Expr, acc: [(Bool, [SymId])]) : [(Bool, [SymId])] =
+  match e.kind {
+    ECall(f, _) -> match f.kind {
+      ESym(s, _) -> if is_default_wrapper(tab, s) {
+        [
+          (
+            is_default_root(tab, s),
+            match f.ty {
+              Some(t) -> row_syms_of(sub, t)
+              None -> []
+            }
+          ),
+          ...acc
+        ]
+      } else {
+        acc
+      }
+      _ -> acc
+    }
+    _ -> acc
+  }
+
+#[doc("The default wrappers `body` calls, each with the effects its settled type performs, for the notes of a row error.")]
+pub(pkg) fn wrapper_calls(sub: Subst, tab: SymTab, body: Expr) : [(Bool, [SymId])] =
+  wrapper_calls_in(sub, tab, body, [])

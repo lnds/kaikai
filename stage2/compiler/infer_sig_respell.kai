@@ -10,9 +10,23 @@ import compiler.infer_env
 import compiler.infer_state
 import compiler.infer_apply
 import compiler.infer_row_kinds
+import compiler.symtab
+import compiler.default_wrappers
 
 #[doc("infer: the labels a signature row variable names beyond what was written.")]
 pub(pkg) type SigExtra = SE(TLocalId, [RowLabel])
+
+#[doc("infer: `binds` with each type parameter that inference aliased to another variable named by that variable.")]
+pub(pkg) fn canon_binds(sub: Subst, binds: [TPBind]) : [TPBind] =
+  map(
+    binds,
+    b => match b {
+      TPB(n, i) -> match apply_ty(sub, TyVarT(i)) {
+        TyVarT(j) -> TPB(n, j)
+        _ -> b
+      }
+    }
+  )
 
 #[doc("infer: `ls` spelled as written row labels, or None when one names a type a row cannot spell.")]
 pub(pkg) fn spell_labels(ls: [Label], binds: [TPBind]) : Option[[RowLabel]] =
@@ -43,7 +57,8 @@ fn spell_ty(t: Ty, binds: [TPBind]) : Option[TypeExpr] = match t {
   _ -> map(scalar_ty_name(t), n => mk_ty(TyName(ref_written(n), []), 0, 0))
 }
 
-fn bound_labels(s: Subst, id: Int) : [Label] = match subst_row_lookup(s, id) {
+#[doc("infer: the labels row variable `id` is bound to, tails followed.")]
+pub(pkg) fn bound_labels(s: Subst, id: Int) : [Label] = match subst_row_lookup(s, id) {
   None -> []
   Some(r) -> list_append(apply_labels(s, r.labels), match r.tail {
     Some(v) -> bound_labels(s, v)
@@ -52,7 +67,8 @@ fn bound_labels(s: Subst, id: Int) : [Label] = match subst_row_lookup(s, id) {
 }
 
 #[doc("infer: what each signature row variable of the fn names after typing, or None when a label cannot be spelled.")]
-pub(pkg) fn sig_row_extras(sub: Subst, rbinds: [RVBind], binds: [TPBind]) : Option[[SigExtra]] =
+pub(pkg) fn sig_row_extras(sub: Subst, rbinds: [RVBind], binds0: [TPBind]) : Option[[SigExtra]] {
+  let binds = canon_binds(sub, binds0)
   all_some(
     map(
       rbinds,
@@ -68,6 +84,7 @@ pub(pkg) fn sig_row_extras(sub: Subst, rbinds: [RVBind], binds: [TPBind]) : Opti
       }
     )
   )
+}
 
 #[doc("infer: `te` with each signature row variable's extra labels added to the rows it tails.")]
 pub(pkg) fn respell_te(te: TypeExpr, extras: [SigExtra]) : TypeExpr =
@@ -107,3 +124,96 @@ fn respell_row(row: RowExpr, extras: [SigExtra]) : RowExpr = match row {
 fn rl_same_effect(a: RowLabel, b: RowLabel) : Bool = match (a, b) {
   (RL(ra, _), RL(rb, _)) -> sym_same(ref_sym(ra), ref_sym(rb))
 }
+
+#[doc("infer: the signature of a fn whose type parameters inference may bind: the parameters, the parameter types and the return type once its body is typed.")]
+pub(pkg) type FlexSig = FS([TBinder], [Param], TypeExpr)
+
+#[doc("infer: `sig` with each type parameter that inference bound to a type replaced by it and dropped; None when a type cannot be spelled.")]
+pub(pkg) fn flex_respell(
+  sub: Subst,
+  binds0: [TPBind],
+  tparams: [TBinder],
+  ps: [Param],
+  ret: Ty
+) : Option[FlexSig] {
+  let binds = canon_binds(sub, binds0)
+  flex_reps(sub, binds, [])
+    || (reps => map(
+      spell_ty(apply_ty(sub, ret), binds),
+      rt => FS(
+        filter(tparams, tb => not any(reps, r => tlocal_eq(r.fst.id, tb.id))),
+        map(ps, p => Param { ...p, ptype: map(p.ptype, te => flex_subst(te, reps)) }),
+        rt
+      )
+    ))
+}
+
+fn flex_reps(sub: Subst, binds: [TPBind], acc: [(TBinder, TypeExpr)]) : Option[
+  [(TBinder, TypeExpr)]
+] =
+  match binds {
+    [] -> Some(acc)
+    [TPB(n, i), ...rest] -> if tb_is_type(n) {
+      match apply_ty(sub, TyVarT(i)) {
+        TyVarT(_) -> flex_reps(sub, rest, acc)
+        t -> match spell_ty(t, binds) {
+          Some(te) -> flex_reps(sub, rest, [(n, te), ...acc])
+          None -> None
+        }
+      }
+    } else {
+      flex_reps(sub, rest, acc)
+    }
+  }
+
+fn flex_subst(te: TypeExpr, reps: [(TBinder, TypeExpr)]) : TypeExpr = match te.tkind {
+  TyParam(id, []) -> match find(reps, r => tlocal_eq(r.fst.id, id)) {
+    Some(r) -> r.snd
+    None -> te
+  }
+  TyParam(id, args) -> TypeExpr { ...te, tkind: TyParam(id, map(args, a => flex_subst(a, reps))) }
+  TyName(r, args) -> TypeExpr { ...te, tkind: TyName(r, map(args, a => flex_subst(a, reps))) }
+  TyList(x) -> TypeExpr { ...te, tkind: TyList(flex_subst(x, reps)) }
+  TyFn(ps, ret, row) -> TypeExpr {
+    ...te,
+    tkind: TyFn(map(ps, p => flex_subst(p, reps)), flex_subst(ret, reps), flex_row(row, reps))
+  }
+  _ -> te
+}
+
+fn flex_row(row: RowExpr, reps: [(TBinder, TypeExpr)]) : RowExpr = match row {
+  REmpty -> row
+  RClosed(ls) -> RClosed(map(ls, l => flex_label(l, reps)))
+  ROpen(t, ls) -> ROpen(t, map(ls, l => flex_label(l, reps)))
+}
+
+fn flex_label(l: RowLabel, reps: [(TBinder, TypeExpr)]) : RowLabel = match l {
+  RL(r, args) -> RL(r, map(args, a => flex_subst(a, reps)))
+}
+
+#[doc("infer: the entries of a module's delta with the scheme the typer settled for each synthetic default fn in place of the one its declared signature gave.")]
+pub(pkg) fn amend_wrapper_entries(
+  tab: SymTab,
+  delta: [TyEntry],
+  settled: [TyEntry]
+) : [TyEntry] =
+  map(
+    delta,
+    e => match e.key {
+      KSym(s) -> if is_default_wrapper(tab, s) {
+        match find(
+          settled,
+          x => match x.key {
+            KSym(t) -> sym_raw(t) == sym_raw(s)
+            _ -> false
+          }
+        ) {
+          Some(n) -> TyEntry { key: e.key, scheme: n.scheme }
+          None -> e
+        }
+      } else {
+        e
+      }
+      _ -> e
+    }
+  )
