@@ -84,6 +84,20 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.194.0 (2026-11-12)
+
+### BREAKING CHANGE
+
+- reading or building a `priv` field of another module
+in a lambda, a `const` or a `test` body, and spawning a thunk that
+captures per-fiber state or runs an unresolvable effect in a `test`
+body, are now the compile errors they already were in a fn body.
+
+### Fixed
+
+- **typer**: make the private-field and spawn-boundary checks see every body
+- **cli**: reject an invalid package name in kai.toml
+
 ## v0.193.0 (2026-11-11)
 
 ### BREAKING CHANGE
