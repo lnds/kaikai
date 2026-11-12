@@ -173,28 +173,44 @@ fn main() : Unit / MyConsole = {
 module's `main` gets no default installed and takes each effect from
 its caller, like any function.
 
-`$extern_handler("c_symbol")` is the compiler intrinsic that bridges
-a default clause to a runtime C entry, and the only clause `main`
-installs. A default clause with a kaikai body parses, but nothing
-installs it: a `main` that performs the op with no enclosing handler
-is rejected with `` `main` declares effect `Eff` but no default
-handler is installed for it``.
+A default clause body is `$extern_handler("c_symbol")`, which bridges
+the clause to a runtime C entry, or ordinary kaikai code typed once in
+the effect's module. A clause resumes or aborts as in a `handle`, and
+the block may carry `return(x) -> ...`.
 
 Coverage rules (typer):
 
 0. **Every op needs a clause** — a `handle ... with Eff` lists every
-   op of `Eff`, even ones nothing performs, except an op the
-   `default { }` block bridges with `$extern_handler`. Otherwise:
-   `handler for Eff does not cover every op: missing ...`.
+   op of `Eff` that the `default { }` block gives no clause for.
+   Otherwise: `handler for Eff does not cover every op: missing ...`.
 1. **Inside a `handle ... with Eff { clauses }`** — the listed
-   clauses discharge the op; the `default { }` block is unused at
-   that call site.
-2. **At `main`, no enclosing `handle`** — the `default { }` block's
-   clause fires; the auto-installed handler runs `$extern_handler`.
-3. **Partial handle + missing op in default** — typer rejects with
-   `effect not handled: Eff.op`. Defaults are not merged into a
-   partial handle: list the op explicitly in the `handle`, or let it
-   fall through to the default at `main`.
+   clauses discharge the op; an op the handle omits is inherited from
+   the default, and so is the default `return` when the handle writes
+   none.
+2. **At the entry (`main`, `test`, `bench`, `check`), no enclosing
+   `handle`** — the default is installed at the root and fires.
+3. **A kaikai default runs outside the handle that inherits it** — the
+   effects it performs belong to the row of the inheriting function or
+   entry, and it does not cross a `spawn`: write
+   `handle { ... } with Eff {}` in the spawned body.
+
+A default with no clause for some op is installed at the root only where
+the entry, or a default body the root installs, calls an op the default
+covers directly, in the code that runs it. Any other way the effect enters
+the row is rejected, because the row does not say which ops run: an op
+inside a lambda, a function value or a callee whose row holds the effect,
+an op the default has no clause for, or an op reached through a named
+instance (`handle ... with E as t`), which discharges nothing anonymous.
+A parametric effect is installed for one instantiation of its type
+arguments; an entry that uses another is rejected.
+
+> **v1 status (2026-11-12):** a handle that inherits a default clause
+> cannot hold a `!` in its body (the compiler rejects it; write a clause
+> for each omitted op, or move the `!` out of the `handle`), and a handle
+> in a module that is in an import cycle with the effect's module
+> inherits nothing: it lists a clause for every op. The same holds for a
+> handle written in a default body when the default it would inherit
+> writes a handle that leads back to the enclosing one. Tracked in #3459.
 
 The stdlib effects carry their defaults the same way, as
 `$extern_handler` clauses on the declaration: Stdout, Stderr, Stdin,

@@ -87,7 +87,10 @@ codegen walks the declarations, with no per-builtin table. Practical
 consequence: a user effect can mirror a builtin's
 ergonomics by adding a `default { }` block whose clauses point at a
 runtime C entry (the bridge does not validate the C symbol exists —
-that's the FFI contract).
+that's the FFI contract). A user effect may instead write its default
+clauses in kaikai; the program entry installs them around its body and a
+handle that omits an op inherits them (`docs/effects.md` §`default { }`
+blocks). No stdlib effect uses one.
 
 ## Three classes of builtin effect
 

@@ -1,0 +1,507 @@
+#[doc("Load-time synthesis of the functions that carry the kaikai-bodied clauses of a `default { }` block, so every clause body exists once, in an ordinary private function of the effect's module.")]
+
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.handler_alias
+import compiler.symtab
+import compiler.written
+import compiler.util
+import compiler.decl_bodies
+
+#[doc("The declarations of a module and their table rows, with the wrappers added.")]
+pub(pkg) type Wrapped = { decls: [Decl], rows: [NEnt] }
+
+type WCx = {
+  esym: SymId,
+  name: String,
+  home: String,
+  tps: [TBinder],
+  mo: Option[String],
+  ops: [EffectOp],
+  clauses: [HClause],
+  ret: Option[HReturn],
+  line: Int,
+  col: Int
+}
+
+#[doc("True when `c` is an operation clause whose body is kaikai code rather than an `$extern_handler` bridge.")]
+pub(pkg) fn is_kaikai_clause(c: HClause) : Bool = match c {
+  HC(ChOp(_), _, body, _, _) -> match extern_handler_c_symbol(body) {
+    Some(_) -> false
+    None -> true
+  }
+  _ -> false
+}
+
+fn has_kaikai_default(d: Decl) : Bool = match decl_unwrap(d) {
+  DEffect(_, _, _, _, Some(DBlk(cs, ret, _, _)), _, _, _, _, _) ->
+    any(cs, is_kaikai_clause)
+      or (match ret {
+        Some(_) -> true
+        None -> false
+      })
+  _ -> false
+}
+
+#[doc("The name of the shadow effect through which the wrappers of the effect `eff` are handled.")]
+pub(pkg) fn dflt_ops_name(eff: String) : String = string_concat("__dflt_ops_", eff)
+
+#[doc("The name of the function that handles the kaikai-bodied clauses of the effect `eff`.")]
+pub(pkg) fn dflt_handler_name(eff: String) : String = string_concat("__dflt_", eff)
+
+#[doc("The name of the function that runs the inherited `return` clause of the effect `eff`.")]
+pub(pkg) fn dflt_return_name(eff: String) : String = string_concat("__dflt_ret_", eff)
+
+#[doc("The name of the function that installs the default of the effect `eff` around a root body.")]
+pub(pkg) fn dflt_root_name(eff: String) : String = string_concat("__dflt_root_", eff)
+
+#[doc("The name of the shadow operation that forwards the defaulted operation `op`.")]
+pub(pkg) fn dflt_op_name(op: String) : String = string_concat("__", op)
+
+#[doc("True when `s` is one of the functions this module synthesises for a kaikai-bodied default.")]
+pub(pkg) fn is_default_wrapper(tab: SymTab, s: SymId) : Bool = match sym_mint(tab, s) {
+  NmDefault -> true
+  NmDefaultRoot -> true
+  _ -> false
+}
+
+#[doc("True when `s` is the function that installs the default of an effect around an entry body.")]
+pub(pkg) fn is_default_root(tab: SymTab, s: SymId) : Bool = match sym_mint(tab, s) {
+  NmDefaultRoot -> true
+  _ -> false
+}
+
+#[doc("True when a declaration of `ds` carries a kaikai-bodied default clause or a default `return`.")]
+pub(pkg) fn declares_kaikai_default(ds: [Decl]) : Bool = any(ds, has_kaikai_default)
+
+fn row_of_effect(rows: [NEnt], s: SymId) : Option[NEnt] = match rows {
+  [] -> None
+  [r, ...rest] -> match r {
+    NEnt(NCEffect, _, _, _, _) -> if sym_raw(nent_sym(r)) == sym_raw(s) {
+      Some(r)
+    } else {
+      row_of_effect(rest, s)
+    }
+    _ -> row_of_effect(rest, s)
+  }
+}
+
+fn private_row(cls: NCls, name: String, home: String) : NEnt =
+  NEnt(cls, name, home, false, NmDefault)
+
+fn ty_named(n: String, line: Int, col: Int) : TypeExpr =
+  mk_ty(TyName(ref_written(n), []), line, col)
+
+fn tp_args(cx: WCx) : [TypeExpr] =
+  map(enumerate(cx.tps), p => ty_named(tp_name(p.fst), cx.line, cx.col))
+
+fn tp_name(i: Int) : String = "dflt_p#{int_to_string(i)}"
+
+fn extra_tps(cx: WCx, names: [String]) : [TBinder] =
+  list_append(
+    map(enumerate(cx.tps), p => tbinder_written(tp_name(p.fst), KType, [], cx.line, cx.col)),
+    map(names, n => tbinder_written(n, KType, [], cx.line, cx.col))
+  )
+
+fn at(cx: WCx, k: ExprKind) : Expr = mk_expr(k, cx.line, cx.col)
+
+fn block_of(cx: WCx, e: Expr) : Expr = at(cx, EBlock([], Some(e)))
+
+fn plain_param(cx: WCx, b: Binder, ty: Option[TypeExpr]) : Param =
+  Param { binder: b, ptype: ty, pline: cx.line, pcol: cx.col, pborrow: false }
+
+fn local_call(cx: WCx, b: Binder) : Expr = at(cx, ECall(mk_local(b.id, cx.line, cx.col), []))
+
+fn body_param(cx: WCx, eff_row: RowLabel) : Param {
+  let fty = mk_ty(
+    TyFn([], ty_named("dflt_a", cx.line, cx.col), ROpen(TpWritten(written("dflt_r")), [eff_row])),
+    cx.line,
+    cx.col
+  )
+  plain_param(cx, binder_minted("__dflt_body"), Some(fty))
+}
+
+fn mk_fn(cx: WCx, s: SymId, tps: [TBinder], ps: [Param], body: Expr) : Decl =
+  DFn(
+    false,
+    fnid_decl(s),
+    tps,
+    ps,
+    None,
+    REmpty,
+    body,
+    cx.line,
+    cx.col,
+    cx.line,
+    cx.col,
+    cx.mo
+  )
+
+fn dflt_sym(cx: WCx, cls: NCls, name: String) : SymId =
+  sym_derive_word(ncls_word(cls), name, cx.home)
+
+fn shadow_sym(cx: WCx) : SymId = dflt_sym(cx, NCEffect, dflt_ops_name(cx.name))
+
+fn kaikai_clauses(cx: WCx) : [HClause] = filter(cx.clauses, is_kaikai_clause)
+
+fn clause_op(c: HClause) : String = match c {
+  HC(h, _, _, _, _) -> clause_head_word(h)
+}
+
+fn declares_op(cx: WCx, op: String) : Bool = any(cx.clauses, c => clause_op(c) == op)
+
+fn kaikai_op_decl(cx: WCx, o: EffectOp) : Bool = match o {
+  EffOp(n, _, _, _, _, _) -> any(kaikai_clauses(cx), c => clause_op(c) == n)
+}
+
+# ---- the shadow effect --------------------------------------------------
+
+fn shadow_op(o: EffectOp) : EffectOp = match o {
+  EffOp(n, tps, ps, ret, l, c) -> EffOp(dflt_op_name(n), tps, ps, ret, l, c)
+}
+
+fn shadow_effect(cx: WCx) : Decl =
+  DEffect(
+    false,
+    shadow_sym(cx),
+    cx.tps,
+    map(filter(cx.ops, o => kaikai_op_decl(cx, o)), shadow_op),
+    None,
+    cx.line,
+    cx.col,
+    cx.line,
+    cx.col,
+    cx.mo
+  )
+
+# ---- the handler of the kaikai clauses ----------------------------------
+
+fn shadow_clause(c: HClause) : HClause = match c {
+  HC(ChOp(n), ps, body, l, col) -> HC(ChOp(dflt_op_name(n)), ps, body, l, col)
+  _ -> c
+}
+
+fn handler_fn(cx: WCx) : Decl {
+  let sh = shadow_sym(cx)
+  let label = RL(DrSym(sh), tp_args(cx))
+  let bp = body_param(cx, label)
+  let call = local_call(cx, bp.binder)
+  let h = at(
+    cx,
+    EHandle(
+      block_of(cx, call),
+      DrSym(sh),
+      tp_args(cx),
+      None,
+      None,
+      map(kaikai_clauses(cx), shadow_clause),
+      None
+    )
+  )
+  mk_fn(
+    cx,
+    dflt_sym(cx, NCFn, dflt_handler_name(cx.name)),
+    extra_tps(cx, ["dflt_a", "dflt_r"]),
+    [bp],
+    h
+  )
+}
+
+# ---- the inherited `return` ---------------------------------------------
+
+fn return_fn(cx: WCx, r: HReturn) : Decl = match r {
+  HR(b, body, _, _) -> mk_fn(
+    cx,
+    dflt_sym(cx, NCFn, dflt_return_name(cx.name)),
+    extra_tps(cx, ["dflt_a"]),
+    [plain_param(cx, b, Some(ty_named("dflt_a", cx.line, cx.col)))],
+    body
+  )
+}
+
+# ---- the root installer -------------------------------------------------
+
+#[doc("`n` fresh clause parameters, named by position.")]
+pub(pkg) fn fresh_binders(n: Int) : [Binder] =
+  if n <= 0 {
+    []
+  } else {
+    [...fresh_binders(n - 1), binder_minted(string_concat("__dflt_p", int_to_string(n - 1)))]
+  }
+
+fn op_arity(o: EffectOp) : Int = match o {
+  EffOp(_, _, ps, _, _, _) -> list_length(ps)
+}
+
+fn op_name(o: EffectOp) : String = match o {
+  EffOp(n, _, _, _, _, _) -> n
+}
+
+# The clause of an op the default gives no clause for. A program that type-checks
+# never reaches it: an entry that could reach such an op is rejected.
+fn panic_clause(cx: WCx, o: EffectOp) : HClause {
+  let bs = fresh_binders(op_arity(o) + 1)
+  let k = match last(bs) {
+    Some(b) -> b
+    None -> binder_minted("__dflt_k")
+  }
+  let args = filter(bs, b => not local_eq(b.id, k.id))
+  let msg =
+    at(cx, EStr(string_concat_all(["\"no default for operation `", op_name(o), "`\""]), false))
+  let boom = at(cx, ECall(mk_name("panic", cx.line, cx.col), [msg]))
+  let drops = map(
+    args,
+    b => SExprStmt(
+      at(cx, ECall(mk_name("ignore", cx.line, cx.col), [mk_local(b.id, cx.line, cx.col)]))
+    )
+  )
+  let body = at(cx, EBlock(drops, Some(at(cx, ECall(mk_local(k.id, cx.line, cx.col), [boom])))))
+  HC(ChOp(op_name(o)), map(bs, b => plain_param(cx, b, None)), body, cx.line, cx.col)
+}
+
+#[doc("The clause of an op that performs the same op of the shadow effect `shadow` and resumes with its answer.")]
+pub(pkg) fn forwarder_clause(shadow: SymId, op: String, arity: Int, line: Int, col: Int) : HClause {
+  let bs = fresh_binders(arity)
+  let k = binder_minted("__dflt_k")
+  let perform = mk_expr(
+    ECall(
+      mk_expr(EField(mk_sym(shadow, line, col), dflt_op_name(op)), line, col),
+      map(bs, b => mk_local(b.id, line, col))
+    ),
+    line,
+    col
+  )
+  let ps = map(
+    list_append(bs, [k]),
+    b => Param { binder: b, ptype: None, pline: line, pcol: col, pborrow: false }
+  )
+  HC(ChOp(op), ps, mk_expr(ECall(mk_local(k.id, line, col), [perform]), line, col), line, col)
+}
+
+fn forward_clause(cx: WCx, o: EffectOp) : HClause =
+  forwarder_clause(shadow_sym(cx), op_name(o), op_arity(o), cx.line, cx.col)
+
+fn root_clause(cx: WCx, o: EffectOp) : Option[HClause] =
+  if kaikai_op_decl(cx, o) {
+    Some(forward_clause(cx, o))
+  } else if declares_op(cx, op_name(o)) {
+    None
+  } else {
+    Some(panic_clause(cx, o))
+  }
+
+fn root_clauses(cx: WCx) : [HClause] =
+  flat_map(
+    cx.ops,
+    o => match root_clause(cx, o) {
+      Some(c) -> [c]
+      None -> []
+    }
+  )
+
+fn let_stmt(cx: WCx, p: PatKind, rhs: Expr) : Stmt = SLet(mk_pat(p, cx.line, cx.col), None, rhs)
+
+fn root_inner(cx: WCx, call: Expr) : Expr {
+  let v = binder_minted("__dflt_v")
+  let value = if list_is_empty(kaikai_clauses(cx)) {
+    call
+  } else {
+    at(
+      cx,
+      EHandle(
+        block_of(cx, call),
+        DrSym(cx.esym),
+        tp_args(cx),
+        None,
+        None,
+        root_clauses(cx),
+        None
+      )
+    )
+  }
+  let ret_stmts = match cx.ret {
+    Some(_) -> [
+      let_stmt(
+        cx,
+        PWild,
+        at(
+          cx,
+          ECall(
+            mk_sym(dflt_sym(cx, NCFn, dflt_return_name(cx.name)), cx.line, cx.col),
+            [mk_local(v.id, cx.line, cx.col)]
+          )
+        )
+      )
+    ]
+    None -> []
+  }
+  at(
+    cx,
+    EBlock(
+      [let_stmt(cx, PBind(v), value), ...ret_stmts],
+      Some(mk_local(v.id, cx.line, cx.col))
+    )
+  )
+}
+
+fn root_fn(cx: WCx) : Decl {
+  let bp = body_param(cx, RL(DrSym(cx.esym), tp_args(cx)))
+  let inner = root_inner(cx, local_call(cx, bp.binder))
+  let body = if list_is_empty(kaikai_clauses(cx)) {
+    inner
+  } else {
+    at(
+      cx,
+      ECall(
+        mk_sym(dflt_sym(cx, NCFn, dflt_handler_name(cx.name)), cx.line, cx.col),
+        [at(cx, ELambda([], inner))]
+      )
+    )
+  }
+  mk_fn(
+    cx,
+    dflt_sym(cx, NCFn, dflt_root_name(cx.name)),
+    extra_tps(cx, ["dflt_a", "dflt_r"]),
+    [bp],
+    body
+  )
+}
+
+# ---- assembling ---------------------------------------------------------
+
+fn unit_body(c: HClause) : HClause = match c {
+  HC(h, ps, _, l, col) -> if is_kaikai_clause(c) {
+    HC(h, ps, mk_expr(EUnit, l, col), l, col)
+  } else {
+    c
+  }
+}
+
+fn unit_return(r: HReturn) : HReturn = match r {
+  HR(b, _, l, c) -> HR(b, mk_expr(EUnit, l, c), l, c)
+}
+
+fn stripped(d: Decl) : Decl = match d {
+  DEffect(p, s, tps, ops, Some(DBlk(cs, ret, bl, bc)), l, c, nl, nc, mo) -> DEffect(
+    p,
+    s,
+    tps,
+    ops,
+    Some(DBlk(map(cs, unit_body), map(ret, unit_return), bl, bc)),
+    l,
+    c,
+    nl,
+    nc,
+    mo
+  )
+  _ -> d
+}
+
+fn context_of(d: Decl, rows: [NEnt]) : Option[WCx] = match d {
+  DEffect(_, s, tps, ops, Some(DBlk(cs, ret, bl, bc)), _, _, _, _, mo) ->
+    match row_of_effect(rows, s) {
+      Some(NEnt(_, name, home, _, _)) -> Some(WCx {
+        esym: s,
+        name: name,
+        home: home,
+        tps: tps,
+        mo: mo,
+        ops: ops,
+        clauses: cs,
+        ret: ret,
+        line: bl,
+        col: bc
+      })
+      None -> None
+    }
+  _ -> None
+}
+
+fn wrappers_of(cx: WCx) : [Decl] {
+  let kaikai = not list_is_empty(kaikai_clauses(cx))
+  let shadow = if kaikai { [shadow_effect(cx), handler_fn(cx)] } else { [] }
+  let ret = match cx.ret {
+    Some(r) -> [return_fn(cx, r)]
+    None -> []
+  }
+  list_append(shadow, list_append(ret, [root_fn(cx)]))
+}
+
+fn wrapper_rows(cx: WCx) : [NEnt] {
+  let kaikai = not list_is_empty(kaikai_clauses(cx))
+  let shadow = if kaikai {
+    [
+      private_row(NCEffect, dflt_ops_name(cx.name), cx.home),
+      private_row(NCFn, dflt_handler_name(cx.name), cx.home)
+    ]
+  } else {
+    []
+  }
+  let ret = match cx.ret {
+    Some(_) -> [private_row(NCFn, dflt_return_name(cx.name), cx.home)]
+    None -> []
+  }
+  list_append(
+    shadow,
+    list_append(ret, [NEnt(NCFn, dflt_root_name(cx.name), cx.home, false, NmDefaultRoot)])
+  )
+}
+
+fn wrap_one(d: Decl, rows: [NEnt]) : Wrapped {
+  if has_kaikai_default(d) {
+    match context_of(decl_unwrap(d), rows) {
+      Some(cx) -> Wrapped {
+        decls: [stripped_wrapped(d), ...wrappers_of(cx)],
+        rows: wrapper_rows(cx)
+      }
+      None -> Wrapped { decls: [d], rows: [] }
+    }
+  } else {
+    Wrapped { decls: [d], rows: [] }
+  }
+}
+
+fn stripped_wrapped(d: Decl) : Decl = match d {
+  DUnstable(inner, a, b) -> DUnstable(stripped_wrapped(inner), a, b)
+  _ -> stripped(d)
+}
+
+#[doc("`ds` with the wrapper functions of every effect that declares a kaikai-bodied default clause or a default `return`, and `rows` with theirs; unchanged when no effect does.")]
+pub(pkg) fn default_wrapper_decls(ds: [Decl], rows: [NEnt]) : Wrapped =
+  if any(ds, has_kaikai_default) {
+    let parts = map(ds, d => wrap_one(d, rows))
+    Wrapped {
+      decls: flat_map(parts, .decls),
+      rows: list_append(rows, flat_map(parts, .rows))
+    }
+  } else {
+    Wrapped { decls: ds, rows: rows }
+  }
+
+#[doc("The operations of the effect declaration `d` whose default gives no clause, extern or kaikai.")]
+pub(pkg) fn ops_without_default(d: Decl) : [String] = match decl_unwrap(d) {
+  DEffect(_, _, _, ops, blk, _, _, _, _, _) -> {
+    let have = match blk {
+      Some(DBlk(cs, _, _, _)) -> map(cs, c => clause_op(c))
+      None -> []
+    }
+    filter(map(ops, o => op_name(o)), n => not any(have, h => h == n))
+  }
+  _ -> []
+}
+
+#[doc("The operations of the effect declaration `d` whose default clause is kaikai code.")]
+pub(pkg) fn kaikai_default_ops(d: Decl) : [String] = match decl_unwrap(d) {
+  DEffect(_, _, _, _, Some(DBlk(cs, _, _, _)), _, _, _, _, _) ->
+    map(filter(cs, is_kaikai_clause), c => clause_op(c))
+  _ -> []
+}
+
+#[doc("True when the default of `eff` gives kaikai clauses to some ops and none to others.")]
+pub(pkg) fn is_partial_default(decls: [Decl], eff: SymId) : Bool =
+  match effect_decl_of(eff, decls) {
+    Some(d) -> has_kaikai_default(d) and (not list_is_empty(ops_without_default(d)))
+    None -> false
+  }

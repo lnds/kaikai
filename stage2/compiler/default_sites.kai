@@ -1,0 +1,267 @@
+#[doc("Rewrite of the handles that omit an operation or the `return` of an effect whose default carries kaikai clauses, so the handle inherits them from the wrapper functions synthesised for that effect.")]
+
+import compiler.ast
+import compiler.ast_build
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.decl_bodies
+import compiler.default_wrappers
+import compiler.emit_shared_alias
+import compiler.expr_positions
+import compiler.handler_alias
+import compiler.symtab
+import compiler.util
+import compiler.resume_segment
+import compiler.written
+
+type DOp = { name: String, arity: Int }
+
+type DInfo = {
+  eff: SymId,
+  ops: [DOp],
+  has_ret: Bool,
+  handler: SymId,
+  retf: SymId,
+  shadow: SymId
+}
+
+fn op_arity_of(ops: [EffectOp], name: String) : Int = match ops {
+  [] -> 0
+  [EffOp(n, _, ps, _, _, _), ...rest] ->
+    if n == name { list_length(ps) } else { op_arity_of(rest, name) }
+}
+
+fn lookup_in(tab: SymTab, cls: NCls, name: String, owner: SymId) : SymId =
+  unwrap_or(st_lookup(tab, cls, name, owner), sym_none())
+
+fn info_of(tab: SymTab, d: Decl) : Option[DInfo] = match decl_unwrap(d) {
+  DEffect(_, s, _, ops, Some(DBlk(cs, ret, _, _)), _, _, _, _, _) -> {
+    let kcs = filter(cs, is_kaikai_clause)
+    let has_ret = is_some(ret)
+    if list_is_empty(kcs) and (not has_ret) {
+      None
+    } else {
+      let name = written_text(decl_name(tab, s))
+      let owner = sym_owner(tab, s)
+      Some(DInfo {
+        eff: s,
+        ops: map(
+          kcs,
+          c => DOp {
+            name: clause_head_word(clause_head(c)),
+            arity: op_arity_of(ops, clause_head_word(clause_head(c)))
+          }
+        ),
+        has_ret: has_ret,
+        handler: lookup_in(tab, NCFn, dflt_handler_name(name), owner),
+        retf: lookup_in(tab, NCFn, dflt_return_name(name), owner),
+        shadow: lookup_in(tab, NCEffect, dflt_ops_name(name), owner)
+      })
+    }
+  }
+  _ -> None
+}
+
+fn clause_head(c: HClause) : ClauseHead = match c {
+  HC(h, _, _, _, _) -> h
+}
+
+fn find_info(infos: [DInfo], s: SymId) : Option[DInfo] =
+  find(infos, i => sym_raw(i.eff) == sym_raw(s))
+
+fn forwarder(i: DInfo, o: DOp, line: Int, col: Int) : HClause =
+  forwarder_clause(i.shadow, o.name, o.arity, line, col)
+
+fn inherited_return(i: DInfo, line: Int, col: Int) : HReturn {
+  let x = binder_minted("__dflt_x")
+  HR(
+    x,
+    mk_expr(ECall(mk_sym(i.retf, line, col), [mk_local(x.id, line, col)]), line, col),
+    line,
+    col
+  )
+}
+
+fn omits(cs: [HClause], o: DOp) : Bool =
+  not any(cs, c => clause_head_word(clause_head(c)) == o.name)
+
+fn rewrite_handle(i: DInfo, e: Expr, h: HandleParts) : ExprKind {
+  let missing = filter(i.ops, o => omits(h.clauses, o))
+  let inherit_ret = i.has_ret and (not is_some(h.ret))
+  if list_is_empty(missing) and (not inherit_ret) {
+    EHandle(h.body, h.eff, h.tys, h.init, h.alias, h.clauses, h.ret)
+  } else {
+    let ret = if inherit_ret { Some(inherited_return(i, e.line, e.col)) } else { h.ret }
+    let inner = mk_expr(
+      EHandle(
+        h.body,
+        h.eff,
+        h.tys,
+        h.init,
+        h.alias,
+        list_append(h.clauses, map(missing, o => forwarder(i, o, e.line, e.col))),
+        ret
+      ),
+      e.line,
+      e.col
+    )
+    if list_is_empty(missing) {
+      inner.kind
+    } else {
+      ECall(
+        mk_sym(i.handler, e.line, e.col),
+        [mk_expr(ELambda([], inner), e.line, e.col)]
+      )
+    }
+  }
+}
+
+fn site_expr(infos: [DInfo], e: Expr) : Expr =
+  Expr { ...e, kind: site_kind(infos, e) }
+
+fn site_kind(infos: [DInfo], e: Expr) : ExprKind = match e.kind {
+  EHandle(body, eff, tys, init, alias, cs, ret) -> {
+    let h = HandleParts {
+      body: site_expr(infos, body),
+      eff: eff,
+      tys: tys,
+      init: map_opt_expr(init, x => site_expr(infos, x)),
+      alias: alias,
+      clauses: map(cs, c => site_clause(infos, c)),
+      ret: map_opt_return_exprs(ret, x => site_expr(infos, x))
+    }
+    match find_info(infos, ref_sym(eff)) {
+      Some(i) -> rewrite_handle(i, e, h)
+      None -> EHandle(h.body, h.eff, h.tys, h.init, h.alias, h.clauses, h.ret)
+    }
+  }
+  k -> map_expr_kind(k, x => site_expr(infos, x))
+}
+
+fn site_clause(infos: [DInfo], c: HClause) : HClause = match c {
+  HC(n, ps, body, l, col) -> HC(n, ps, site_expr(infos, body), l, col)
+}
+
+fn home_of(tab: SymTab, s: SymId) : String = written_text(sym_home(tab, s))
+
+fn same_cycle(cycles: [[String]], a: String, b: String) : Bool =
+  any(cycles, c => any(c, x => x == a) and any(c, x => x == b))
+
+# A module that imports one another with the effect's module is typed against
+# the wrappers' declared signatures, which do not say their answer type.
+fn inheriting_handles(infos: [DInfo], e: Expr, acc: [SymId]) : [SymId] {
+  let here = match e.kind {
+    EHandle(_, eff, _, _, _, cs, ret) -> match find_info(infos, ref_sym(eff)) {
+      Some(i) ->
+        if (not list_is_empty(filter(i.ops, o => omits(cs, o))))
+          or (i.has_ret and (not is_some(ret))) {
+          [ref_sym(eff), ...acc]
+        } else {
+          acc
+        }
+      None -> acc
+    }
+    _ -> acc
+  }
+  foldl(
+    xp_positions(e),
+    here,
+    (a, p) => match p {
+      XP(_, x) -> inheriting_handles(infos, x, a)
+    }
+  )
+}
+
+fn fn_body_of(all: [Decl], s: SymId) : Option[Expr] =
+  find_map(
+    all,
+    d => match decl_unwrap(d) {
+      DFn(_, id, _, _, _, _, body, _, _, _, _, _) ->
+        if sym_raw(fnid_sym(id)) == sym_raw(s) { Some(body) } else { None }
+      _ -> None
+    }
+  )
+
+# The effects whose defaults a handle written in the default body of `i` inherits.
+fn written_in_default(all: [Decl], infos: [DInfo], i: DInfo) : [SymId] =
+  flat_map(
+    [i.handler, i.retf],
+    f => match fn_body_of(all, f) {
+      Some(b) -> inheriting_handles(infos, b, [])
+      None -> []
+    }
+  )
+
+fn reaches(all: [Decl], infos: [DInfo], from: SymId, target: SymId, fuel: Int) : Bool =
+  sym_raw(from) == sym_raw(target)
+    or (fuel > 0
+      and any(
+        infos,
+        i => sym_raw(i.eff) == sym_raw(from)
+          and any(
+            written_in_default(all, infos, i),
+            n => reaches(all, infos, n, target, fuel - 1)
+          )
+      ))
+
+# A handle written in the default body of `E` inherits the default of `F` unless
+# the default of `F` writes a handle of `E` too: the wrappers would call each other.
+fn usable_infos(
+  tab: SymTab,
+  all: [Decl],
+  infos: [DInfo],
+  cycles: [[String]],
+  owner: FnId
+) : [DInfo] {
+  let own = fnid_sym(owner)
+  let home = find(infos, i => sym_raw(i.handler) == sym_raw(own) or sym_raw(i.retf) == sym_raw(own))
+  let outside = match home {
+    Some(h) -> filter(infos, i => not reaches(all, infos, i.eff, h.eff, list_length(infos)))
+    None -> infos
+  }
+  if list_is_empty(cycles) {
+    outside
+  } else {
+    filter(outside, i => not same_cycle(cycles, home_of(tab, own), home_of(tab, i.eff)))
+  }
+}
+
+fn site_body(
+  tab: SymTab,
+  all: [Decl],
+  infos: [DInfo],
+  cycles: [[String]],
+  owner: FnId,
+  body: Expr
+) : Expr =
+  if holds_handle(body) and (not is_default_root(tab, fnid_sym(owner))) {
+    site_expr(usable_infos(tab, all, infos, cycles, owner), body)
+  } else {
+    body
+  }
+
+#[doc("`ds` with every handle that omits an operation or the `return` of an effect with kaikai default clauses made to inherit them; unchanged when no effect has any.")]
+pub(pkg) fn inherit_default_sites(
+  ds: [Decl],
+  all: [Decl],
+  tab: SymTab,
+  cycles: [[String]]
+) : [Decl] =
+  if declares_kaikai_default(all) {
+    let infos = flat_map(
+      all,
+      d => match info_of(tab, d) {
+        Some(i) -> [i]
+        None -> []
+      }
+    )
+    map(
+      ds,
+      d => decl_map_named_bodies(
+        d,
+        (owner, body) => site_body(tab, all, infos, cycles, owner, body)
+      )
+    )
+  } else {
+    ds
+  }

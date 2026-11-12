@@ -636,11 +636,31 @@ What the split cannot express sends a stateless handle to a segment
 a span:
 
 - a second `resume` on one path;
-- a non-tail `resume` in a `default { }` clause — a default
-  handler has no handle exit to run the deferred code at;
 - in a stateful handle, any shape that would send it to a segment.
 
 The runtime status check stays as the backstop.
+
+### Kaikai-bodied `default { }` clauses
+
+A default clause written in kaikai is never lowered as a default
+node. At load, each effect whose default has a kaikai clause or a
+`return` gets private functions in its own module: a shadow effect
+with one op per kaikai clause, a function handling the shadow effect
+whose clauses are the written bodies, a function for the `return`, and
+a root function that installs the default around a body. Their
+signatures are inferred: a type parameter that a clause binds to a type
+is replaced by it, and the typed scheme replaces the declared one in the
+module's interface.
+
+A `handle ... with Eff` that omits kaikai ops, or the `return`, is
+rewritten before the resume split into `wrapper(() => handle ... with
+Eff { own; forwarders })`, each forwarder performing the shadow op, so
+the written bodies reach the ordinary split, Perceus and both
+backends as code. The program entry is typed once, and typed again
+inside the root functions of the defaults its row holds, a default
+another one performs outside it. Ops bridged with `$extern_handler`
+stay on the runtime default node; a handler that omits one is filled
+with the bridge, in declaration order, as before.
 
 ### Interaction with `Nothing`-returning ops
 

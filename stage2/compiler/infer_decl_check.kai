@@ -1,5 +1,7 @@
 #[doc("Per-declaration inference: the fn driver, body-row checks and hole resolution.")]
 
+import compiler.decl_bodies
+import compiler.handler_alias
 import compiler.infer_refine_coerce
 import compiler.util
 import compiler.diag
@@ -10,6 +12,8 @@ import compiler.written
 import compiler.symtab
 import compiler.type_text
 import compiler.infer_sig_respell
+import compiler.default_wrappers
+import compiler.infer_root_defaults
 import compiler.proto_ids
 import compiler.diag_file
 import compiler.kind_theory
@@ -189,13 +193,14 @@ type FnSite = {
   opt_ret: Option[TypeExpr],
   row: RowExpr,
   inferring: Bool,
+  flexible: Bool,
   line: Int,
   col: Int
 }
 
 type FnBody = { rb: Inferred, st: InferState, declared_ret: Ty, ret_site: Expr }
 
-type FnRows = { st: InferState, picks: [HomPick] }
+type FnRows = { st: InferState, picks: [HomPick], rooted: [SymId] }
 
 #[doc("infer: types one declaration against `env`.")]
 pub fn infer_decl(
@@ -238,6 +243,7 @@ pub fn infer_decl(
         opt_ret: opt_ret,
         row: row,
         inferring: row_inferable(is_pub, row, entry, fn_is_c_export_in(env.tab, fid)),
+        flexible: is_default_wrapper(env.tab, fnid_sym(fid)),
         line: line,
         col: col
       }
@@ -262,11 +268,46 @@ pub fn infer_decl(
         | (rty => resolve_ty_with_binds(rty, tpbinds, rbinds, env.row_kind, env_home_view(env, mo)))
       let st_ready = InferState {
         ...st_set_refine_ctx(st_set_ret_ty(added.st, opt_declared), nm),
-        decl_row: declared_row_labels(added.st, row)
+        decl_row: declared_row_labels(added.st, row),
+        skip_ops: if site.entry
+          or (site.flexible and (not is_default_root(env.tab, fnid_sym(site.fid)))) {
+          partial_skip_table(all_decls)
+        } else {
+          []
+        }
       }
       let fb = check_fn_body(st_ready, nm, body, opt_declared)
       let rows = check_fn_rows(file, env, sums, hcar, all_decls, site, nm, mo, fb, added.tys)
-      finalise_fn_decl(env, d, site, nm, mo, fb, rows, added.tys, verbose)
+      match entry_rooted_body(env, all_decls, rows.rooted, body0) {
+        RootNone -> finalise_fn_decl(env, d, site, nm, mo, fb, rows, added.tys, verbose)
+        RootBody(wrapped) -> infer_decl(
+          file,
+          env,
+          core_len,
+          recs,
+          op_eff_arities,
+          type_aliases,
+          op_to_eff,
+          sums,
+          hcar,
+          protos,
+          all_decls,
+          kind_theories,
+          DFn(is_pub, fid, tparams, ps, opt_ret, row, wrapped, line, col, line, col, mo),
+          verbose
+        )
+        RootCycle -> finalise_fn_decl(
+          env,
+          d,
+          site,
+          nm,
+          mo,
+          fb,
+          FnRows { ...rows, st: root_cycle_error(rows.st, site.line, site.col) },
+          added.tys,
+          verbose
+        )
+      }
     }
     DTest(_, body, line, col, _) ->
       infer_test_body(
@@ -442,12 +483,21 @@ fn fn_initial_state(
     st_set_sums(st_set_protos(st_set_home(st_set_walker(st_init0, walker()), mo), protos), sums)
   let phantom_extra = if elaborate_phantom_row(site.row, site.entry) { 1 } else { 0 }
   let st0 = advance_row_fresh(
-    InferState { ...st_init, sig_rows: site.rbinds, sig_open: site.inferring, sig_tps: site.tps },
+    InferState {
+      ...st_init,
+      sig_rows: site.rbinds,
+      sig_open: site.inferring,
+      sig_tps: site.tps,
+      flex_binds: if site.flexible { site.tpbinds } else { [] }
+    },
     list_length(site.rbinds) + phantom_extra
   )
   let st0a = st_set_env(st0, advance_fresh(st0.env, list_length(site.tpbinds)))
   let st0b = reserve_unit_tparams(st0a, site.tps)
-  let sub_r = subst_with_rigid(st0b.sub, rigid_tparams(site.tpbinds, nm))
+  let sub_r = subst_with_rigid(
+    st0b.sub,
+    if site.flexible { [] } else { rigid_tparams(site.tpbinds, nm) }
+  )
   st_set_sub(
     st0b,
     subst_with_rigid_rows(
@@ -553,11 +603,42 @@ fn check_fn_rows(
       hcar
     )
   )
+  let own_default = site.flexible and (not is_default_root(env.tab, fnid_sym(site.fid)))
+  let skipped = unique_syms(map(st1c.skipped_eff, .sym))
+  let rooted0 = if site.entry {
+    unique_syms(list_append(rooted_effects(all_decls, apply_labels(st1c.sub, st1c.row)), skipped))
+  } else {
+    []
+  }
+  let bad = if (site.entry and root_layers(env.tab, body) == 0) or own_default {
+    partial_in_row(all_decls, st_add_tail_labels(st1c, st1c.row_tails).row)
+  } else {
+    []
+  }
+  let left = if site.entry and root_layers(env.tab, body) > 0 {
+    filter(rooted0, x => is_parametric_effect(all_decls, x))
+  } else if own_default {
+    parametric_clash(
+      st1c,
+      all_decls,
+      list_append(st_add_tail_labels(st1c, st1c.row_tails).row, st1c.skipped_eff)
+    )
+  } else {
+    []
+  }
+  let rooted = filter(rooted0, e => not any(bad, b => sym_raw(b) == sym_raw(e)))
+  let st1a = report_leftover_roots(
+    report_partial_effects(drop_rooted_labels(st1c, rooted0), all_decls, bad, site.line, site.col),
+    left,
+    site.line,
+    site.col
+  )
+  let st1r = if own_default { readd_skipped(st1a, st1c.skipped_eff) } else { st1a }
   let st2pre = if site.inferring {
-    st1c
+    st1r
   } else {
     check_body_row(
-      st1c,
+      InferState { ...st1r, dflt_calls: wrapper_calls(st1r.sub, env.tab, body) },
       nm,
       site.entry,
       site.fid,
@@ -579,9 +660,182 @@ fn check_fn_rows(
   let st_end = report_stranded_ops(hd.st, st2f.deferred_homs, [fb.declared_ret, ...added_tys])
   FnRows {
     st: if site.inferring { check_inferred_row(st_end, nm, site) } else { st_end },
-    picks: hd.picks
+    picks: hd.picks,
+    rooted: rooted
   }
 }
+
+fn drop_rooted_labels(st: InferState, rooted: [SymId]) : InferState =
+  if list_is_empty(rooted) {
+    st
+  } else {
+    InferState {
+      ...st,
+      row: filter(st.row, l => not any(rooted, r => sym_raw(r) == sym_raw(l.sym)))
+    }
+  }
+
+# A partially defaulted effect left in an entry's or default body's row: some
+# use is not a direct call of an op the default covers.
+fn report_partial_effects(
+  st: InferState,
+  decls: [Decl],
+  bad: [SymId],
+  fline: Int,
+  fcol: Int
+) : InferState =
+  foldl(bad, st, (acc, e) => {
+    let shown = inf_tycon_display_ow(acc.env.tab, acc.env.head_owners, e)
+    let missing = join_with(map(ops_missing_default(decls, e), o => "`#{o}`"), ", ")
+    let at = find(
+      list_reverse(acc.eff_uses),
+      u => match u {
+        EU(l, _, _) -> sym_raw(l.sym) == sym_raw(e) and local_raw(l.cell) == 0
+      }
+    )
+    let line = match at {
+      Some(EU(_, ln, _)) -> ln
+      None -> fline
+    }
+    let col = match at {
+      Some(EU(_, _, c)) -> c
+      None -> fcol
+    }
+    st_bump_err(
+      st_push_diag(
+        acc,
+        mk_diag(
+          SevError,
+          acc.file,
+          line,
+          col,
+          "effect not handled: #{shown}",
+          [
+            ri_note(
+              acc.file,
+              line,
+              col,
+              "the `default { }` of `#{shown}` has no clause for #{missing}, so it is installed only where an op it covers is called directly in the code that runs it"
+            )
+          ]
+        )
+      )
+    )
+  })
+
+# The parametric effects with kaikai default clauses that the body of a default
+# uses at more than one instantiation. The wrapper's inferred row keeps one
+# label per effect, so the clash is read from the labels before it is spelled.
+fn parametric_clash(st: InferState, decls: [Decl], labs: [Label]) : [SymId] =
+  filter(
+    unique_syms(map(labs, .sym)),
+    e => is_parametric_effect(decls, e)
+      and declares_kaikai_default(unwrap_decls(effect_decl_of(e, decls)))
+      and differing_labels(st, filter(labs, l => sym_raw(l.sym) == sym_raw(e)))
+  )
+
+fn unwrap_decls(o: Option[Decl]) : [Decl] = match o {
+  Some(d) -> [d]
+  None -> []
+}
+
+fn differing_labels(st: InferState, ls: [Label]) : Bool =
+  any(ls, a => any(ls, b => not same_args(st, a.ty_args, b.ty_args)))
+
+fn same_args(st: InferState, xs: [Ty], ys: [Ty]) : Bool =
+  list_length(xs) == list_length(ys)
+    and all(zip(xs, ys), p => ty_eq_shape(apply_ty(st.sub, p.fst), apply_ty(st.sub, p.snd)))
+
+fn is_parametric_effect(decls: [Decl], eff: SymId) : Bool = match effect_decl_of(eff, decls) {
+  Some(d) -> match decl_unwrap(d) {
+    DEffect(_, _, tps, _, _, _, _, _, _, _) -> not list_is_empty(tps)
+    _ -> false
+  }
+  None -> false
+}
+
+# A defaulted effect still in the row of an entry the root installers already
+# wrap: the installer handles one instantiation of the effect, and the entry
+# uses another.
+fn report_leftover_roots(
+  st: InferState,
+  effs: [SymId],
+  fline: Int,
+  fcol: Int
+) : InferState =
+  foldl(effs, st, (acc, e) => {
+    let shown = inf_tycon_display_ow(acc.env.tab, acc.env.head_owners, e)
+    let at = find(
+      list_reverse(acc.eff_uses),
+      u => match u {
+        EU(l, _, _) -> sym_raw(l.sym) == sym_raw(e)
+      }
+    )
+    let line = match at {
+      Some(EU(_, ln, _)) -> ln
+      None -> fline
+    }
+    let col = match at {
+      Some(EU(_, _, c)) -> c
+      None -> fcol
+    }
+    st_bump_err(
+      st_push_diag(
+        acc,
+        mk_diag(
+          SevError,
+          acc.file,
+          line,
+          col,
+          "effect not handled: #{shown}",
+          [
+            ri_note(
+              acc.file,
+              line,
+              col,
+              "the program root installs the default of `#{shown}` for one instantiation of its type arguments, and the code that runs it uses another"
+            )
+          ]
+        )
+      )
+    )
+  })
+
+fn readd_skipped(st: InferState, labs: [Label]) : InferState / Mutable =
+  foldl(labs, st, (acc, l) => st_add_label(acc, l, 0, 0))
+
+type RootPlan = RootNone | RootBody(Expr) | RootCycle
+
+# An entry that performs an effect with kaikai default clauses is typed
+# again inside the wrapper that handles it, the wrapper of an effect another
+# default performs outside it.
+fn entry_rooted_body(env: TyEnv, decls: [Decl], rooted: [SymId], body: Expr) : RootPlan {
+  let tab = env.tab
+  let installable = filter(rooted, e => is_none(root_problem(env.entries, tab, decls, e)))
+  if list_is_empty(installable) or root_layers(tab, body) > 0 {
+    RootNone
+  } else {
+    match wrap_roots(tab, root_order(env.entries, tab, decls, installable), body) {
+      Some(b) -> RootBody(b)
+      None -> RootCycle
+    }
+  }
+}
+
+fn root_cycle_error(st: InferState, line: Int, col: Int) : InferState =
+  st_bump_err(
+    st_push_diag(
+      st,
+      mk_diag(
+        SevError,
+        st.file,
+        line,
+        col,
+        "the defaults installed at the program root perform each other's effects without end",
+        []
+      )
+    )
+  )
 
 # The final substitution is applied to every `Expr.ty` of the body, then the
 # body's and the call sites' ids are canonicalised back to the impl's bound
@@ -639,13 +893,14 @@ fn finalise_fn_decl(
     env.row_kind,
     env_home_view(env, mo)
   )
+  let flex = flex_signature(site, st2, fb, stamp)
   TypedDecl {
     decl: DFn(
       site.is_pub,
       site.fid,
-      site.tparams,
-      respell_params(site, st2, stamp_params(site.ps, stamp)),
-      respell_opt(site, st2, stamp_opt(site.opt_ret, stamp)),
+      flex.tparams,
+      flex.ps,
+      flex.ret,
       stamp_row_with(main_inferred_row(site, final_body, st2), stamp),
       final_body,
       site.line,
@@ -654,14 +909,56 @@ fn finalise_fn_decl(
       site.col,
       mo
     ),
-    errs: st2.errs,
+    errs: st2.errs + flex.errs,
     insts: resolved,
     holes: hole_reports,
     row_holes: row_holes,
-    diags: finalize_diags(st2.diags),
+    diags: list_append(finalize_diags(st2.diags), flex.diags),
     op_res: stamp_op_res_fn(list_reverse(st2.op_res), site.fid)
   }
 }
+
+type FlexOut = {
+  tparams: [TBinder],
+  ps: [Param],
+  ret: Option[TypeExpr],
+  errs: Int,
+  diags: [Diagnostic]
+}
+
+# A synthetic default fn has no written signature: its type parameters are
+# whatever its body leaves open and its return type is the body's.
+fn flex_signature(site: FnSite, st2: InferState, fb: FnBody, stamp: (TypeExpr) -> Ty) : FlexOut =
+  if not site.flexible {
+    FlexOut {
+      tparams: site.tparams,
+      ps: respell_params(site, st2, stamp_params(site.ps, stamp)),
+      ret: respell_opt(site, st2, stamp_opt(site.opt_ret, stamp)),
+      errs: 0,
+      diags: []
+    }
+  } else {
+    let ps0 = respell_params(site, st2, site.ps)
+    match flex_respell(st2.sub, site.tpbinds, site.tparams, ps0, fb.declared_ret) {
+      Some(FS(tps, ps, rt)) -> FlexOut { tparams: tps, ps: ps, ret: Some(rt), errs: 0, diags: [] }
+      None -> FlexOut {
+        tparams: site.tparams,
+        ps: site.ps,
+        ret: None,
+        errs: 1,
+        diags: [
+          mk_diag(
+            SevError,
+            st2.file,
+            site.line,
+            site.col,
+            "the answer type of this default cannot be written as a type",
+            []
+          )
+        ]
+      }
+    }
+  }
 
 # A `main` without a declared row takes the row its body performs, directly
 # and through the helpers it calls, so the wrapper installs the default
@@ -715,7 +1012,66 @@ fn infer_test_body(
     st_set_protos(st_set_home(st_set_walker(st_init0, walker()), decl_home_module(d)), protos)
   let st_init = st_set_sums(st_init1, sums)
   let added = add_infer_params_with_binds(st_set_refine_ctx(st_init, test_decl_desc(d)), ps, [], [])
-  let rb = synth(added.st, body)
+  let rb = synth(InferState { ...added.st, skip_ops: partial_skip_table(all_decls) }, body)
+  let skipped = unique_syms(map(rb.st.skipped_eff, .sym))
+  let rooted0 = unique_syms(
+    list_append(rooted_effects(all_decls, apply_labels(rb.st.sub, rb.st.row)), skipped)
+  )
+  let bad = if root_layers(env.tab, body) == 0 {
+    partial_in_row(all_decls, st_add_tail_labels(rb.st, rb.st.row_tails).row)
+  } else {
+    []
+  }
+  let left = if root_layers(env.tab, body) > 0 {
+    filter(rooted0, x => is_parametric_effect(all_decls, x))
+  } else {
+    []
+  }
+  let rooted = filter(rooted0, e => not any(bad, b => sym_raw(b) == sym_raw(e)))
+  let rb = Inferred {
+    ...rb,
+    st: report_leftover_roots(
+      report_partial_effects(drop_rooted_labels(rb.st, rooted0), all_decls, bad, line, col),
+      left,
+      line,
+      col
+    )
+  }
+  match entry_rooted_body(env, all_decls, rooted, body) {
+    RootBody(wrapped) -> infer_test_body(
+      file,
+      env,
+      core_len,
+      recs,
+      op_eff_arities,
+      type_aliases,
+      op_to_eff,
+      sums,
+      protos,
+      all_decls,
+      kind_theories,
+      ps,
+      wrapped,
+      test_decl_with_body(d, wrapped),
+      line,
+      col
+    )
+    _ -> finish_test_body(file, env, sums, all_decls, ps, body, d, line, col, rb)
+  }
+}
+
+fn finish_test_body(
+  file: String,
+  env: TyEnv,
+  sums: [SumInfo],
+  all_decls: [Decl],
+  ps: [Param],
+  body: Expr,
+  d: Decl,
+  line: Int,
+  col: Int,
+  rb: Inferred
+) : TypedDecl / Console + File + Mutable {
   # A test/bench/check body has no declared row; absorb exactly what
   # the program entry may carry: the default-handled effects `main`'s
   # REmpty row absorbs, plus the compiler-synthesised `Ffi` capability
@@ -723,7 +1079,7 @@ fn infer_test_body(
   # to declare a row on, so the opt-in set is granted outright; the
   # audit point for FFI stays on the wrappers' public `/ Ffi` rows.
   let st2pre = check_body_row_label_loop(
-    rb.st,
+    InferState { ...rb.st, dflt_calls: wrapper_calls(rb.st.sub, env.tab, rb.expr) },
     RowInBlock(test_block_kind(d)),
     test_non_absorbed_labels(rb.st, rb.st.row, all_decls),
     [],
@@ -951,7 +1307,7 @@ fn spell_inferred_row(st: InferState, site: FnSite) : RowSpell {
   let labs = list_reverse(append_labels(apply_labels(st.sub, st.row), []))
   match find(labs, l => local_raw(l.cell) != 0) {
     Some(_) -> Unspelled("it performs an effect on a named instance")
-    None -> match spell_labels(labs, site.tpbinds) {
+    None -> match spell_labels(labs, canon_binds(st.sub, site.tpbinds)) {
       None -> Unspelled("an effect it performs carries a type a row cannot name")
       Some(rls) -> match sig_row_tails(st, site.rbinds) {
         [] -> Spelled(if list_is_empty(rls) { REmpty } else { RClosed(rls) })
@@ -1173,6 +1529,20 @@ fn report_unhandled_label(
       let helps =
         [scope_row_help(sc, lab_str, any(applied.ty_args, t => ty_is_free_var(st.sub, t)))]
       let vias = blame_via_notes(blame)
+      let sources = flat_map(
+        st.dflt_calls,
+        w => if any(w.snd, x => sym_raw(x) == sym_raw(lab.sym)) {
+          [
+            if w.fst {
+              "performed by a `default { }` clause installed at the program root for this entry"
+            } else {
+              "performed by a `default { }` clause a `handle` in this body inherits"
+            }
+          ]
+        } else {
+          []
+        }
+      )
       let related = list_append(
         [
           ri_note(st.file, line, col, n1),
@@ -1184,7 +1554,8 @@ fn report_unhandled_label(
               SN(vl, vc, m) -> ri_note(st.file, vl, vc, m)
             }
           ),
-          ...map(extra, n => ri_note(st.file, line, col, n))
+          ...map(extra, n => ri_note(st.file, line, col, n)),
+          ...map(sources, n => ri_note(st.file, line, col, n))
         ],
         map(helps, h => ri_help(st.file, line, col, h))
       )
@@ -1414,3 +1785,6 @@ pub fn list_has_string(xs: [String], s: String) : Bool {
     [h, ...rest] -> if h == s { true } else { list_has_string(rest, s) }
   }
 }
+
+fn unique_syms(xs: [SymId]) : [SymId] =
+  foldl(xs, [], (acc, x) => if any(acc, y => sym_raw(y) == sym_raw(x)) { acc } else { [...acc, x] })

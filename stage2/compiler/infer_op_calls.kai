@@ -1,6 +1,7 @@
 #[doc("Typing of effect-op calls: direct, alias-bound and capability-provided ops, cell reads and writes, `Ref` ops and function-field method calls.")]
 
 import compiler.diag
+import compiler.default_wrappers
 import compiler.ast
 import compiler.ast_build
 import compiler.ast_ids
@@ -287,6 +288,20 @@ fn synth_op_call_provided(
   mk_inferred(st2, ty, root)
 }
 
+# A direct call of an op the default of its effect covers, in a body that
+# installs that default, performs nothing the body's row has to carry.
+fn op_stays_out_of_row(
+  st: InferState,
+  esym: SymId,
+  op: String,
+  via: OpVia,
+  row_alias: Option[LocalId]
+) : Bool = match (via, row_alias) {
+  (ViaAmbient, None) ->
+    any(st.skip_ops, t => sym_raw(t.fst) == sym_raw(esym) and any(t.snd, o => o == op))
+  _ -> false
+}
+
 fn synth_op_call_with_scheme_keys(
   st: InferState,
   sc: TyScheme,
@@ -311,7 +326,10 @@ fn synth_op_call_with_scheme_keys(
   let inst = note_spawn_op(st_instantiate_report(st, sc), esym, line, col)
   let eff_fresh = take_first(inst.fresh, eff_tparam_arity(st.op_eff_arities, esym))
   # Read before unifying: the substitution's slots mutate in place.
-  let pinned = map(eff_fresh, id => occurs(id, inst.ty, inst.st.sub))
+  let pinned = map(
+    eff_fresh,
+    id => is_default_wrapper(st.env.tab, esym) or occurs(id, inst.ty, inst.st.sub)
+  )
   let ra = synth_many_expecting(inst.st, args_, fn_param_tys(inst.st, inst.ty))
   let rv = st_fresh_ty(ra.st)
   let op_row = match inst.ty {
@@ -337,7 +355,11 @@ fn synth_op_call_with_scheme_keys(
   # The cell keeps distinct cells apart, so this only
   # threads ty_args between ops of the same cell (`cur.set` → `cur.get`).
   let st2u = st_unify_dedup_label(st2p, lab, line, col)
-  let st3 = st_add_label(st2u, lab, line, col)
+  let st3 = if op_stays_out_of_row(st2u, esym, op, via, row_alias) {
+    InferState { ...st2u, skipped_eff: [lab, ...st2u.skipped_eff] }
+  } else {
+    st_add_label(st2u, lab, line, col)
+  }
   let ty = apply_ty(st3.sub, rv.ty)
   # The callee carries the instance the perform resolved to, for evidence selection.
   let callee = with_ty(op_callee(esym, op, via, line, col), TyCon(esym, row_args))
