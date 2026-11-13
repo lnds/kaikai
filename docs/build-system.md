@@ -128,13 +128,13 @@ cache:
 Makefile            (root)   — façade: delegates to the stages via `$(MAKE) -C`
 ├── stage0/Makefile          — kaic0: minimal C compiler, zero deps
 ├── stage1/Makefile          — kaic1: intermediate compiler (kaikai-minimal)
-├── stage2/Makefile          — kaic2: the real compiler (147 targets) + all its tests
+├── stage2/Makefile          — kaic2: the real compiler + all its tests
 └── demos/Makefile           — demo programs
 ```
 
 **The root Makefile is a thin façade.** Almost every root target is `$(MAKE) -C <stage> <target>`. The real work for the compiler lives in `stage2/Makefile`. So:
 - Invoke from the **root** for the common verbs (`make kaic2`, `make tier0`, `make tier1`, `make selfhost`, `make clean`). The root wires the bootstrap order and delegates.
-- The **stage2** Makefile is where the compiler's own build + its ~147 test targets live (`test-tokens`, `test-ast`, `test-infer`, `test-dump-mono`, `test-run`, `test-perceus-*`, the parity ratchet, …). Reach into it directly only for a specific stage2 target: `make -C stage2 <target>`.
+- The **stage2** Makefile is where the compiler's own build + its hundreds of test targets live (`test-tokens`, `test-ast`, `test-infer`, `test-dump-mono`, `test-run`, `test-perceus-*`, the parity ratchet, …). Reach into it directly only for a specific stage2 target: `make -C stage2 <target>`.
 
 ### The bootstrap chain (root targets)
 
@@ -205,7 +205,7 @@ The `cc`-only route runs in three places. The daily `bootstrap-boot` jobs run on
 ## The package — why `main.kai` is a stub
 
 The stage 2 compiler is a kaikai package rooted at `stage2/`: `main.kai` is the
-entry point and the ~200 modules under `stage2/compiler/` are reached from it
+entry point and the hundreds of modules under `stage2/compiler/` are reached from it
 through `import compiler.<mod>`.
 
 - **Both kaic1 and kaic2 resolve imports.** kaic1 loads a module's dependencies
@@ -215,7 +215,7 @@ through `import compiler.<mod>`.
   identity and the `__list_rest_<line>_<col>__` sentinels are keyed on
   (line, col); shared ranges make two lambdas at the same position in different
   files collide.
-- `stage2/main.kai` is a 33-line entry stub, not the compiler. Compiling
+- `stage2/main.kai` is a short entry stub, not the compiler. Compiling
   `main.kai` is compiling the whole package.
 
 A NEW `stage2/compiler/*.kai` module needs only its own `import` lines and one
@@ -351,8 +351,8 @@ Each runs in seconds with a built kaic2. Run the ones a change can touch; a red 
 
 ## Verification targets (root)
 
-- `make tier0` — fast pre-commit sanity (`selfhost` + `demos-no-regression` + arena + heap-limit). Run before committing compiler changes.
-- `make tier1` — full suite, the CI merge gate (sharded as `tier1-shard-1` … `tier1-shard-8` in CI; `make test` + demos + fmt + negatives + stdlib-modules + audits + …).
+- `make tier0` — fast pre-commit sanity: `selfhost` + `tier0-gates` (the no-compiler audits, plus the gates that need a built `kaic2`: demos baseline, arena, heap ceiling, …). Run before committing compiler changes.
+- `make tier1` — full suite, the CI merge gate (sharded as the `tier1-shard-N` targets in CI; `make test` + demos + fmt + negatives + stdlib-modules + audits + …).
 - `make selfhost` — the byte-identity fixed point: `kaic2` compiles its own source to `kaic2b.c`, that compiles to `kaic2b`, which recompiles the source to `kaic2c.c`; asserts `kaic2b.c == kaic2c.c`. The definitive "did I break the compiler" check.
 - **Trust CI for the full battery.** Locally run the minimum gate (`make selfhost` + the smoke of your change); leave `tier1`/`tier1-native` to CI.
 
@@ -446,7 +446,7 @@ The layout follows 32-bit pointers through two rules: the evidence blob and node
 
 ## Traps (verified, recurring)
 
-- **`stage2/main.kai` is a stub**, not the compiler. The compiler is the ~200 modules it reaches through `import compiler.driver`.
+- **`stage2/main.kai` is a stub**, not the compiler. The compiler is the hundreds of modules it reaches through `import compiler.driver`.
 - **`kai fmt` is in-place destructive** — never run it on compiler/stdlib sources; redirect output to `/tmp`.
 - **`runtime.h` has TWO copies** (`stage0/runtime.h` + `stage2/runtime.h`). A runtime prim/handler added to one must be added to BOTH; they change together.
 - **`stage2/runtime.h` is an umbrella over `stage2/runtime/*.h`.** The parts are fragments with no guards of their own; anything that reads the runtime by path (tarball, bootstrap seed, bitcode staleness key, `runtime-global-audit`, build-cache keys) takes the umbrella and every part, and `cli_runtime_headers` is the one helper the `kai` caches key through. The compiler's own libLLVM C-API glue (`llvm_bridge.h` and the files it includes, plus `llvm_wasm_eh.cpp`) lives in `stage2/llvm/`, outside the user runtime: `runtime.h` includes the bridge only under `KAI_LLVM` or `-DKAI_LLVM_BRIDGE`, which `stage2/Makefile` passes (`COMPILER_DEFS`) to every build of kaic2 itself and no user build sets; the installed `share/kaikai/include` does not carry the directory. The bootstrap seed ships `llvm/` beside `runtime.h` because its C-only build of the compiler needs the stubs. Anything that reads the compiler's runtime text (bitcode staleness key, `runtime-global-audit`, the namespace gates, the seed) takes `stage2/llvm/*.h` too.

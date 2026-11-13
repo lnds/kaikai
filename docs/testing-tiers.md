@@ -32,50 +32,48 @@ baseline did not include the regressions.
 
 The fix is not "run more tests per commit" — that murders velocity
 when 510 commits land in 10 days. The fix is to **name three tiers
-explicitly, run each at its own cadence, and require the commit /
-PR description to declare which tier ran**.
+explicitly, run each at its own cadence, and let CI — not the prose of
+a commit message — record which tier ran**.
 
-## Tier 0 — pre-commit (every agent, every commit)
+## Tier 0 — pre-commit (local, fast)
 
-~30-60 seconds. Runs inside each worktree, before any commit.
+~30-60 seconds. Run inside the worktree before a commit while iterating
+on compiler code.
 
 ```
-make selfhost              # per-compiler determinism (C + LLVM)
-make demos-no-regression   # baseline N
+make tier0    # selfhost + tier0-gates
 ```
 
-If Tier 0 fails, the commit does not happen. This is what keeps `main`
-unbroken across parallel lanes — every commit lands on a green
-self-host with the demo baseline holding. `make selfhost` checks that
-`kaic2b` and `kaic2c` (stage 2 compiled by itself, twice) are
-byte-identical; stage 1's output (`kaic2a.c`) is not required to match
-stage 2's (see `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md`).
+`make selfhost` checks that `kaic2b` and `kaic2c` (stage 2 compiled by
+itself, twice) are byte-identical; stage 1's output (`kaic2a.c`) is not
+required to match stage 2's (see `docs/decisions/bootstrap-relax-byte-identical-2026-05-22.md`).
+`tier0-gates` is every other gate: `fast-gates` (the audits that need no
+compiler) and `kaic2-gates` (the ones that need a built `kaic2`, the demo
+baseline among them).
 
-**Disciplina**: agents never push commits that fail Tier 0. The
+Tier 0 is local feedback, not the merge gate: CI runs the same targets
+on every PR, so what a skipped local run misses is caught there. The
 3-level gate's "Level 1 mechanical" maps onto Tier 0.
 
-## Tier 1 — pre-PR (gate before merge)
+## Tier 1 — per-PR (the merge gate)
 
-~2-4 minutes. Runs once per PR before opening / before merge.
+Runs in CI on every PR. Green on the required checks is what merges.
 
 ```
-make test    # full target — see stage2/Makefile §test
+make tier1    # make test + demos baseline + fmt + negatives + stdlib modules + audits + …
 ```
 
-Includes test-tokens / test-ast / test-types / test-env / test-infer /
-test-infer-check / test-dump-typed / test-dump-mono / test-check /
-test-run / test-blocks / test-llvm / test-modules / test-modules-path /
-test-modules-qualified / test-modules-qualified-neg / test-holes /
-test-effects / test-effect-runtime / test-link-runtime / test-sugars /
-test-loop / test-reader / test-writer / test-time / test-intervals /
-test-stdlib / test-protocols / test-demos-core / test-aspirational
-+ test-m4c.
+CI does not run it as one job. `tier1.yml` builds the C `kaic2` once and
+partitions `make tier1` across the `tier1-shard-N` runners;
+`tier1-native.yml` builds the native `kaic2` once and gates that backend.
+The required checks are `tier1`, `tier1-native`, `tier1-tsan`,
+`tier1-mn-corpus`, `tier1-macos-mn` and `cost-ab`; the workflow structure
+is in `docs/ci-time-analysis.md`. Running `make tier1` locally is
+optional, for faster feedback.
 
-**Disciplina**: PR description includes the trailing line of `make
-test` output (or a link to a CI run on the PR branch). The reviewer
-verifies it before merging. **Without that line, the merge does not
-happen** — "make test clean" as prose is not the same as
-`make test exit 0` as fact.
+**Disciplina**: the evidence is the CI run on the PR's head commit —
+"make test clean" as prose is not the same as `make test exit 0` as
+fact.
 
 The 3-level gate's "Level 2 invariant verifier + audit" and most of
 "Level 3 demo gate" map onto Tier 1.
@@ -558,16 +556,16 @@ make daily-tail           # C selfhost + stress fixtures + coverage probe
 
 `make daily` runs both in series, locally. In CI
 (`.github/workflows/daily.yml`) one job builds `kaic2` and publishes it,
-then parallel jobs split the work: the eight `tier1-shard-N` targets,
+then parallel jobs split the work: the `tier1-shard-N` targets,
 `tier1-unsharded` (the `tier1` phases no shard runs, among them the
 Perceus RC leak ledger, which on a PR rides the tier0 job) and
 `daily-tail`. The union is `make daily`. A closing `daily`
 job fails unless every part succeeded and opens the `daily-failure`
 issue.
 
-If Tier 2 fails, **`main` is not broken** — Tier 0 / Tier 1 already
-gated every commit. Tier 2 produces a diagnostic that opens a lane
-the next morning. Velocity is preserved.
+If Tier 2 fails, **`main` is not broken** — Tier 1 already gated every
+PR. Tier 2 produces a diagnostic that opens a lane the next morning.
+Velocity is preserved.
 
 The 3-level gate's "Level 3 programa no contemplado" maps onto Tier 2:
 fixtures that were not anticipated when a feature shipped, exercised
@@ -618,9 +616,9 @@ stays balanced.
 
 | Tier | When it runs | Owner | Gate |
 |---|---|---|---|
-| 0 | Every commit | The committing agent / human | Commit blocked |
-| 1 | Pre-PR (and pre-merge if rebased) | The PR opener | Merge blocked |
-| 2 | End of day / cron | The maintainer | Diagnostic opens a lane next AM |
+| 0 | Before a commit, locally; on every PR in CI | The committing agent / human | Local feedback; red in CI blocks the merge |
+| 1 | Every PR, in CI | The lane that owns the PR | Merge blocked |
+| 2 | Daily cron on `main` | The maintainer | Diagnostic opens a lane next AM |
 | (Pre-release) | Before tag bump to a *.0 | Release captain | Release blocked |
 
 Pre-release adds nothing new yet — Tier 2 is the de-facto pre-release
@@ -628,12 +626,11 @@ gate until 1.0 puts a stricter floor in place.
 
 ## What this document is NOT
 
-- Not a CI configuration. The cadences above are the contract; CI
-  (`gh actions` etc.) implements them mechanically when the project
-  publishes a public repo. Today the work is done locally.
+- Not a CI configuration. The cadences above are the contract; the
+  workflows under `.github/workflows/` implement them, and
+  `docs/ci-time-analysis.md` describes their structure.
 - Not a list of all `make` targets — only the ones that map to a
   tier.
-- Not an excuse to skip Tier 1 on a PR because "the change is small".
-  The R2 / R3 regressions that surfaced today were each a 30-line
-  diff; both passed Tier 0 but broke Tier 1 silently because Tier 1
-  was not run.
+- Not an excuse to merge past a red or skipped check because "the
+  change is small". The R2 / R3 regressions were each a 30-line diff;
+  both passed Tier 0 and broke Tier 1, which had not run.

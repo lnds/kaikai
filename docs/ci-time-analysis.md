@@ -3,10 +3,10 @@
 ## Current state
 
 A PR that touches the compiler builds it twice: `tier1.yml` builds the C
-`kaic2` and runs against it tier0, eight tier1 shards, `tier1-tsan`,
+`kaic2` and runs against it tier0, the tier1 shards, `tier1-tsan`,
 `doc-blocks`, `cost-ab` (which also builds the base commit's compiler) and
 the path-gated `tier1-asan`, wasm, WASI and web jobs, with `fast-gates`
-beside the build; `tier1-native.yml` builds the
+riding the `selfhost-fixed-point` job; `tier1-native.yml` builds the
 native `kaic2` and runs its shards, the native self-host gate,
 `tier1-mn-corpus` and the path-gated `rc-detector`. The critical path is the
 slower of the two workflows.
@@ -167,7 +167,7 @@ green `main` runs (no outliers; tier1 spread 25m40s–28m00s):
 |---|---|---|---|---|
 | **tier1** | tier1.yml | **27m 26s** | **yes (the gate)** | **yes** |
 | tier1-native | tier1-native.yml | 20m 29s | no | no |
-| fast-gates | tier1.yml | see §1a | no (aggregated by `tier1`) | no (parallel runner) |
+| fast-gates | tier1.yml (a step of `selfhost-fixed-point`) | see §1a | no (aggregated by `tier1`) | no (parallel runner) |
 | tier0 | tier1.yml | 12m 35s | no | no (parallel runner) |
 | tier1-asan | tier1-asan.yml | 9m 21s¹ | no (path-gated) | no |
 
@@ -188,17 +188,19 @@ parallelism.
 
 ### 1a. Fail-fast split of tier0
 
-`make tier0-gates` is two halves, each its own job in `tier1.yml`:
+`make tier0-gates` is two halves, run by different jobs of `tier1.yml`:
 
 - **`fast-gates`** (`make fast-gates`, `FAST_GATES` in the Makefile) — the
   gates that read only sources and scripts: wiring, ledgers, audits, the
   symid census (`test-symid-names-static`), namespace matrix, hermetic
-  script tests, `km` new-file grades. No compiler is built or run, so the
-  job starts right after `changes`, beside `build`, and reports in minutes.
+  script tests, `km` new-file grades. No compiler is built or run. CI runs
+  them as a step of `selfhost-fixed-point`, which no other job waits for.
 - **`tier0`** (`make kaic2-gates`, `KAIC2_GATES`) — the gates that need the
   built kaic2: the compiled half of the symid names gate, builtin tables,
-  kaic1 rejections, then the slow cache/demos gates. CI runs them as three
-  matrix groups on three runners (`kaic2-gates-symid`, `-demos`, `-rest`).
+  kaic1 rejections, then the slow cache/demos gates. CI runs them as
+  two matrix groups (`kaic2-gates-symid` with `-rest`, and `-demos`); the
+  group that measures the compiler itself (`kaic2-gates-subject`) rides
+  `tier1-shard-1`.
   The fmt-corpus classification has no gate of its own: the fmt-property
   shards parse and classify the same corpus.
 
@@ -206,7 +208,8 @@ A gate lives in exactly one half; `tier0-gates` is their union and
 `make tier0` still runs everything plus the selfhost. A gate belongs in
 `FAST_GATES` only if it neither builds nor runs kaic1/kaic2 (a gate that
 SKIPs without a compiler must not go there: it would pass vacuously). The
-`tier1` aggregate requires `fast-gates` alongside `tier0` and the shards.
+`tier1` aggregate requires `selfhost-fixed-point`, and with it
+`fast-gates`, alongside `tier0` and the shards.
 
 ## 2. tier1 critical-path breakdown (from CI log timestamps)
 
