@@ -185,6 +185,7 @@ fn emit_modular(
   let emit = ["--emit=native-modular", "--native-obj-dir", objdir, ...kir_verify_flags()]
   let rc = cli_budget.run_threads(cli_plan.kaic2(p, emit, p.job.src), sp)
   let listed = if rc == 0 and cli_sys.size(objs_file) > 0 { cli_plan.listed(objs_file) } else { [] }
+  run_prehold_hook()
   let dir = if cached { hold_dir(p.job.tmp) } else { p.job.tmp }
   let held = if cached { hold_objects(dir, p.job.tmp, listed, 0) } else { Some(listed) }
   if held == None {
@@ -275,7 +276,8 @@ pub fn build_whole(p: Plan) : Result[Outcome, Int] / Stderr + Env + File + Ffi =
 
 # A cached core object the emit linked against can be trimmed before the
 # link sees it, and the core was pruned against it: the emit then runs once
-# more over the whole core, which needs nothing from the cache.
+# more over the whole core with its core cache inside the scratch dir, so
+# every object it lists is the build's own.
 fn emit_whole(p: Plan, pruned: Bool) : Result[Outcome, Int] / Stderr + Env + File + Ffi {
   let t = p.t
   let base = cli_fs.basename(p.job.src)
@@ -298,7 +300,7 @@ fn emit_whole(p: Plan, pruned: Bool) : Result[Outcome, Int] / Stderr + Env + Fil
     ]
     let rc = cli_budget.run_threads(
       cli_plan.kaic2(
-        p,
+        whole_plan(p, pruned),
         [
           "--emit=native",
           "--native-obj-dir",
@@ -312,7 +314,8 @@ fn emit_whole(p: Plan, pruned: Bool) : Result[Outcome, Int] / Stderr + Env + Fil
     )
     if rc != 0 and cli_plan.c_only(err) {
       Ok(NoLlvm(err))
-    } else if rc == 0 and pruned {
+    } else if rc == 0 {
+      run_prehold_hook()
       let dir = hold_dir(p.job.tmp)
       match hold_objects(dir, p.job.tmp, cli_plan.listed(objs_file), 0) {
         Some(held) -> {
@@ -323,21 +326,21 @@ fn emit_whole(p: Plan, pruned: Bool) : Result[Outcome, Int] / Stderr + Env + Fil
         }
         None -> {
           release_hold(dir, p.job.tmp)
-          emit_whole(p, false)
+          if pruned { emit_whole(p, false) } else { Err(1) }
         }
       }
     } else {
       cli_plan.replay(err)
-      if rc != 0 {
-        Err(1)
-      } else {
-        link_whole_objects(p, obj, objs_file, cli_plan.listed(objs_file))
-      }
+      Err(1)
     }
   }
 }
 
 fn whole_flags(pruned: Bool) : [String] = if pruned { [] } else { ["--full-core"] }
+
+# The plan's flags come after the emit's, so the scratch core cache is appended to win.
+fn whole_plan(p: Plan, pruned: Bool) : Plan =
+  if pruned { p } else { Plan { ...p, flags: [...p.flags, "--core-cache-dir", p.job.tmp] } }
 
 # A fresh per-build dir inside the shared cache, so linking an object into it
 # stays on the cache's filesystem; the build's scratch dir when none can be made.
@@ -396,9 +399,13 @@ fn hold_each(dir: String, tmp: String, objs: [String], i: Int, pin: Bool) : Opti
     }
   }
 
-# Test seam: a command run after the objects are held and before the link.
-fn run_prelink_hook() : Unit / Env + Ffi {
-  let cmd = cli_caches.env_or("KAI_PRELINK_HOOK", "")
+# Test seams: a command run before the objects are held, and one run after they are held and before the link.
+fn run_prehold_hook() : Unit / Env + Ffi = run_hook("KAI_PREHOLD_HOOK")
+
+fn run_prelink_hook() : Unit / Env + Ffi = run_hook("KAI_PRELINK_HOOK")
+
+fn run_hook(name: String) : Unit / Env + Ffi {
+  let cmd = cli_caches.env_or(name, "")
   if cmd != "" {
     let _ = cli_proc.run(["sh", "-c", cmd], cli_proc.inherit())
   }
