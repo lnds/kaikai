@@ -84,6 +84,24 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.195.0 (2026-11-14)
+
+### BREAKING CHANGE
+
+- a handle that omits an op its effect's default gives a clause
+for now inherits it instead of being rejected.
+
+### Added
+
+- **effects**: run kaikai-bodied default clauses through synthesised wrappers
+
+### Fixed
+
+- **kai**: hold every cached native object through the link
+- **typer**: print an in-scope type parameter by its name in the handle-escape diagnostic
+- **typer**: name the escaping type in the handle-escape diagnostic
+- **parser**: accept a lambda body on the line after =>
+
 ## v0.194.0 (2026-11-12)
 
 ### BREAKING CHANGE
