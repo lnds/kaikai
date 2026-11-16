@@ -94,11 +94,16 @@ typedef struct { char *label; void *bb; } KaiNBlk;
  * labels its row demands. Off-RC, strdup'd; resolved by symbol from the
  * signature, call site, and perform. */
 typedef struct { char *sym; char **slots; int nslots; } KaiNFrame;
+/* Open-addressing name index over a table's entries: each cell holds the
+ * entry's position plus one, 0 for empty. The first entry of a name wins,
+ * as in a front-to-back scan. */
+typedef struct { int *cells; int cap; } KaiNIdx;
+typedef const char *(*KaiNKey)(const void *table, int i);
 typedef struct {
     void *m, *b, *ptrt, *i64t, *i32t, *i128t, *voidt, *f64t, *fnval;
-    KaiNReg *regs; int nregs, regcap;
-    KaiNBlk *blks; int nblks, blkcap;
-    KaiNFrame *frames; int nframes, framecap;
+    KaiNReg *regs; int nregs, regcap; KaiNIdx regix;
+    KaiNBlk *blks; int nblks, blkcap; KaiNIdx blkix;
+    KaiNFrame *frames; int nframes, framecap; KaiNIdx frameix;
     int ok;
     int in_fn;   /* begin_fn/end_fn nesting guard (fail loud, not corrupt) */
     void *pad;   /* the landing block a call unwinds to; NULL for none */
@@ -110,6 +115,48 @@ typedef struct {
      * byte-identical to before this lane. */
     void *dib, *difile, *dicu, *disub;
 } KaiNativeCtx;
+
+static uint32_t kai_nidx_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    for (; *s; s++) h = (h ^ (uint8_t) *s) * 16777619u;
+    return h;
+}
+static int kai_nidx_find(const KaiNIdx *x, const void *table, KaiNKey key, const char *name) {
+    if (!x->cap) return -1;
+    uint32_t mask = (uint32_t) x->cap - 1;
+    for (uint32_t h = kai_nidx_hash(name) & mask; x->cells[h]; h = (h + 1) & mask) {
+        int i = x->cells[h] - 1;
+        if (strcmp(key(table, i), name) == 0) return i;
+    }
+    return -1;
+}
+static void kai_nidx_put(KaiNIdx *x, const void *table, KaiNKey key, int i) {
+    uint32_t mask = (uint32_t) x->cap - 1;
+    const char *name = key(table, i);
+    uint32_t h = kai_nidx_hash(name) & mask;
+    for (; x->cells[h]; h = (h + 1) & mask)
+        if (strcmp(key(table, x->cells[h] - 1), name) == 0) return;
+    x->cells[h] = i + 1;
+}
+/* Register entry `n - 1`, the table's newest, growing the index to keep it under half full. */
+static void kai_nidx_add(KaiNIdx *x, const void *table, KaiNKey key, int n) {
+    if ((int64_t) n * 2 > x->cap) {
+        int cap = x->cap ? x->cap : 32;
+        while ((int64_t) n * 2 > cap) cap *= 2;
+        free(x->cells);
+        x->cells = (int *) calloc((size_t) cap, sizeof(int));
+        x->cap = cap;
+        for (int i = 0; i < n; i++) kai_nidx_put(x, table, key, i);
+    } else {
+        kai_nidx_put(x, table, key, n - 1);
+    }
+}
+static void kai_nidx_clear(KaiNIdx *x) {
+    if (x->cap) memset(x->cells, 0, (size_t) x->cap * sizeof(int));
+}
+static const char *kai_nreg_key(const void *t, int i) { return ((const KaiNReg *) t)[i].name; }
+static const char *kai_nblk_key(const void *t, int i) { return ((const KaiNBlk *) t)[i].label; }
+static const char *kai_nframe_key(const void *t, int i) { return ((const KaiNFrame *) t)[i].sym; }
 
 static void *kai_native_ctx_new(void *m) {
     KaiNativeCtx *c = (KaiNativeCtx *) calloc(1, sizeof(KaiNativeCtx));
@@ -135,9 +182,8 @@ static KaiValue *kai_native_ctx_add_frame_slot(void *cv, KaiValue *symv, KaiValu
     KaiNativeCtx *c = (KaiNativeCtx *) cv;
     const char *sym = symv->as.s.bytes;
     const char *eff = effv->as.s.bytes;
-    KaiNFrame *fr = NULL;
-    for (int i = 0; i < c->nframes; i++)
-        if (strcmp(c->frames[i].sym, sym) == 0) { fr = &c->frames[i]; break; }
+    int fi = kai_nidx_find(&c->frameix, c->frames, kai_nframe_key, sym);
+    KaiNFrame *fr = fi >= 0 ? &c->frames[fi] : NULL;
     if (!fr) {
         if (c->nframes == c->framecap) {
             c->framecap = c->framecap ? c->framecap * 2 : 16;
@@ -145,6 +191,7 @@ static KaiValue *kai_native_ctx_add_frame_slot(void *cv, KaiValue *symv, KaiValu
         }
         fr = &c->frames[c->nframes++];
         fr->sym = strdup(sym); fr->slots = NULL; fr->nslots = 0;
+        kai_nidx_add(&c->frameix, c->frames, kai_nframe_key, c->nframes);
     }
     fr->slots = (char **) realloc(fr->slots, (size_t) (fr->nslots + 1) * sizeof(char *));
     fr->slots[fr->nslots++] = strdup(eff);
@@ -156,8 +203,8 @@ static int64_t kai_native_ctx_frame_slot_count(void *cv, KaiValue *symv) {
     KaiNativeCtx *c = (KaiNativeCtx *) cv;
     const char *sym = symv->as.s.bytes;
     int64_t r = 0;
-    for (int i = 0; i < c->nframes; i++)
-        if (strcmp(c->frames[i].sym, sym) == 0) { r = (int64_t) c->frames[i].nslots; break; }
+    int fi = kai_nidx_find(&c->frameix, c->frames, kai_nframe_key, sym);
+    if (fi >= 0) r = (int64_t) c->frames[fi].nslots;
     if (symv) kai_decref(symv);
     return r;
 }
@@ -165,11 +212,8 @@ static KaiValue *kai_native_ctx_frame_slot_eff(void *cv, KaiValue *symv, int64_t
     KaiNativeCtx *c = (KaiNativeCtx *) cv;
     const char *sym = symv->as.s.bytes;
     const char *r = "";
-    for (int i = 0; i < c->nframes; i++)
-        if (strcmp(c->frames[i].sym, sym) == 0) {
-            if (j >= 0 && j < c->frames[i].nslots) r = c->frames[i].slots[j];
-            break;
-        }
+    int fi = kai_nidx_find(&c->frameix, c->frames, kai_nframe_key, sym);
+    if (fi >= 0 && j >= 0 && j < c->frames[fi].nslots) r = c->frames[fi].slots[j];
     if (symv) kai_decref(symv);
     return kai_str(r);
 }
@@ -178,14 +222,13 @@ static int64_t kai_native_ctx_frame_slot_index(void *cv, KaiValue *symv, KaiValu
     const char *sym = symv->as.s.bytes;
     const char *eff = effv->as.s.bytes;
     int64_t r = -1;
-    for (int i = 0; i < c->nframes; i++)
-        if (strcmp(c->frames[i].sym, sym) == 0) {
-            for (int j = 0; j < c->frames[i].nslots; j++)
-                if (strcmp(c->frames[i].slots[j], eff) == 0) { r = (int64_t) j; break; }
-            for (int j = 0; r < 0 && j < c->frames[i].nslots; j++)
-                if (kai_eff_text_match(c->frames[i].slots[j], eff)) r = (int64_t) j;
-            break;
-        }
+    int i = kai_nidx_find(&c->frameix, c->frames, kai_nframe_key, sym);
+    if (i >= 0) {
+        for (int j = 0; j < c->frames[i].nslots; j++)
+            if (strcmp(c->frames[i].slots[j], eff) == 0) { r = (int64_t) j; break; }
+        for (int j = 0; r < 0 && j < c->frames[i].nslots; j++)
+            if (kai_eff_text_match(c->frames[i].slots[j], eff)) r = (int64_t) j;
+    }
     if (symv) kai_decref(symv);
     if (effv) kai_decref(effv);
     return r;
@@ -218,6 +261,7 @@ static KaiValue *kai_native_ctx_begin_fn(void *cv, void *fnval) {
     if (c->in_fn) { kai_eprintf("kai: native begin_fn nested (compiler bug)\n"); c->ok = 0; return kai_unit(); }
     for (int i = 0; i < c->nregs; i++) free(c->regs[i].name);
     for (int i = 0; i < c->nblks; i++) free(c->blks[i].label);
+    kai_nidx_clear(&c->regix); kai_nidx_clear(&c->blkix);
     c->nregs = 0; c->nblks = 0; c->fnval = fnval; c->in_fn = 1; c->pad = NULL;
     /* DWARF (#500): start each fn with NO subprogram + no current location.
      * Only a fn that calls `native_di_subprogram` (the user-fn walk) gets a
@@ -246,6 +290,7 @@ static KaiValue *kai_native_ctx_add_reg(void *cv, KaiValue *name, void *alloca, 
     c->regs[c->nregs].alloca = alloca;
     c->regs[c->nregs].slot = (int) slot;
     c->nregs++;
+    kai_nidx_add(&c->regix, c->regs, kai_nreg_key, c->nregs);
     if (name) kai_decref(name);
     return kai_unit();
 }
@@ -253,17 +298,15 @@ static KaiValue *kai_native_ctx_add_reg(void *cv, KaiValue *name, void *alloca, 
  * separately (`reg_slot`) so the two stay one source. */
 static void *kai_native_ctx_find_reg(void *cv, KaiValue *name) {
     KaiNativeCtx *c = (KaiNativeCtx *) cv;
-    void *r = NULL;
-    for (int i = 0; i < c->nregs; i++)
-        if (strcmp(c->regs[i].name, name->as.s.bytes) == 0) { r = c->regs[i].alloca; break; }
+    int i = kai_nidx_find(&c->regix, c->regs, kai_nreg_key, name->as.s.bytes);
+    void *r = i >= 0 ? c->regs[i].alloca : NULL;
     if (name) kai_decref(name);
     return r;
 }
 static int64_t kai_native_ctx_reg_slot(void *cv, KaiValue *name) {
     KaiNativeCtx *c = (KaiNativeCtx *) cv;
-    int64_t s = -1;
-    for (int i = 0; i < c->nregs; i++)
-        if (strcmp(c->regs[i].name, name->as.s.bytes) == 0) { s = c->regs[i].slot; break; }
+    int i = kai_nidx_find(&c->regix, c->regs, kai_nreg_key, name->as.s.bytes);
+    int64_t s = i >= 0 ? c->regs[i].slot : -1;
     if (name) kai_decref(name);
     return s;
 }
@@ -293,14 +336,14 @@ static KaiValue *kai_native_ctx_add_block(void *cv, KaiValue *label, void *bb) {
     c->blks[c->nblks].label = strdup(label->as.s.bytes);
     c->blks[c->nblks].bb = bb;
     c->nblks++;
+    kai_nidx_add(&c->blkix, c->blks, kai_nblk_key, c->nblks);
     if (label) kai_decref(label);
     return kai_unit();
 }
 static void *kai_native_ctx_find_block(void *cv, KaiValue *label) {
     KaiNativeCtx *c = (KaiNativeCtx *) cv;
-    void *r = NULL;
-    for (int i = 0; i < c->nblks; i++)
-        if (strcmp(c->blks[i].label, label->as.s.bytes) == 0) { r = c->blks[i].bb; break; }
+    int i = kai_nidx_find(&c->blkix, c->blks, kai_nblk_key, label->as.s.bytes);
+    void *r = i >= 0 ? c->blks[i].bb : NULL;
     if (label) kai_decref(label);
     return r;
 }
