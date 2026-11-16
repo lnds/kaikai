@@ -15,12 +15,11 @@
 # concatenated bundle and rejects triple-quoted attribute strings.
 
 import compiler.ast
-import compiler.ast_build
 import compiler.ast_decl
+import compiler.symtab
 import compiler.ast_ids
 import compiler.core_types
 import compiler.expr_positions
-import compiler.ast_build
 import compiler.ast_decl
 import compiler.ast_ids
 
@@ -48,32 +47,12 @@ fn obl_eff_has_default(decls: [Decl], eff: SymId) : Bool = match decls {
 }
 
 #[doc("evidence: the effects some fn in the program installs a `handle ... with <eff>` for, each once.")]
-pub fn obl_handled_effects(decls: [Decl]) : [SymId] = obl_decls_heads(decls, [])
+pub fn obl_handled_effects(decls: [Decl]) : [SymId] =
+  obl_heads(obl_handle_nodes(program_bodies(decls), []), [])
 
 #[doc("evidence: true when some fn in the program installs a `handle ... with <eff>`.")]
 pub fn obl_eff_handled_anywhere(decls: [Decl], eff: SymId) : Bool =
   sym_raw(eff) >= 0 and effect_among(obl_handled_effects(decls), eff)
-
-fn obl_decls_heads(ds: [Decl], acc: [SymId]) : [SymId] = match ds {
-  [] -> acc
-  [d, ...rest] -> match d {
-    DFn(_, _, _, _, _, _, body, _, _, _, _, _) -> obl_decls_heads(rest, obl_body_heads(body, acc))
-    _ -> obl_decls_heads(rest, acc)
-  }
-}
-
-# Every `handle ... with <eff>` under `e` adds its effect to `acc`; the
-# descent goes through the one enumeration of an expression's positions.
-fn obl_body_heads(e: Expr, acc: [SymId]) : [SymId] =
-  obl_pos_heads(xp_positions(e), match e.kind {
-    EHandle(_, head, _, _, _, _, _) -> obl_add_head(ref_sym(head), acc)
-    _ -> acc
-  })
-
-fn obl_pos_heads(ps: [XPos], acc: [SymId]) : [SymId] = match ps {
-  [] -> acc
-  [XP(_, c), ...rest] -> obl_pos_heads(rest, obl_body_heads(c, acc))
-}
 
 # An absent id names no effect.
 fn obl_add_head(s: SymId, acc: [SymId]) : [SymId] =
@@ -88,14 +67,33 @@ fn obl_add_head(s: SymId, acc: [SymId]) : [SymId] =
 
 #[doc("evidence: count distinct live instances of `eff` program-wide, keyed by handler alias (bare = one anonymous instance).")]
 pub fn obl_eff_instance_count(decls: [Decl], eff: SymId) : Int =
-  list_length(obl_collect_aliases_decls(decls, eff, []))
+  list_length(obl_aliases(obl_handle_nodes(program_bodies(decls), []), eff, []))
 
-fn obl_collect_aliases_decls(ds: [Decl], eff: SymId, seen: [LocalId]) : [LocalId] = match ds {
+# Every `handle` in the bodies `es`, lambdas and handler clauses included.
+fn obl_handle_nodes(es: [Expr], acc: [Expr]) : [Expr] = match es {
+  [] -> acc
+  [h, ...rest] -> obl_handle_nodes(rest, obl_handle_nodes(xp_children(h), obl_keep_handle(h, acc)))
+}
+
+fn obl_keep_handle(e: Expr, acc: [Expr]) : [Expr] = match e.kind {
+  EHandle(_, _, _, _, _, _, _) -> [e, ...acc]
+  _ -> acc
+}
+
+fn obl_heads(hs: [Expr], acc: [SymId]) : [SymId] = match hs {
+  [] -> acc
+  [h, ...rest] -> match h.kind {
+    EHandle(_, head, _, _, _, _, _) -> obl_heads(rest, obl_add_head(ref_sym(head), acc))
+    _ -> obl_heads(rest, acc)
+  }
+}
+
+fn obl_aliases(hs: [Expr], eff: SymId, seen: [LocalId]) : [LocalId] = match hs {
   [] -> seen
-  [d, ...rest] -> match d {
-    DFn(_, _, _, _, _, _, body, _, _, _, _, _) ->
-      obl_collect_aliases_decls(rest, eff, obl_collect_aliases(body, eff, seen))
-    _ -> obl_collect_aliases_decls(rest, eff, seen)
+  [h, ...rest] -> match h.kind {
+    EHandle(_, head, _, _, alias_opt, _, _) ->
+      obl_aliases(rest, eff, if obl_is_eff(ref_sym(head), eff) { obl_alias_add(seen, alias_opt) } else { seen })
+    _ -> obl_aliases(rest, eff, seen)
   }
 }
 
@@ -115,99 +113,3 @@ fn obl_alias_seen(seen: [LocalId], key: LocalId) : Bool = match seen {
   [h, ...rest] -> if local_raw(h) == local_raw(key) { true } else { obl_alias_seen(rest, key) }
 }
 
-fn obl_collect_aliases(e: Expr, eff: SymId, seen: [LocalId]) : [LocalId] = match e.kind {
-  EHandle(body, head, _, init_opt, alias_opt, clauses, ret_opt) -> {
-    let s1 = if obl_is_eff(ref_sym(head), eff) { obl_alias_add(seen, alias_opt) } else { seen }
-    let s2 = obl_collect_aliases(body, eff, s1)
-    let s3 = obl_alias_opt(init_opt, eff, s2)
-    let s4 = obl_alias_clauses(clauses, eff, s3)
-    obl_alias_ret(ret_opt, eff, s4)
-  }
-  ECall(callee, args_) -> obl_alias_list(args_, eff, obl_collect_aliases(callee, eff, seen))
-  EIntrinsic(_, args_) -> obl_alias_list(args_, eff, seen)
-  ESurface(sf) -> obl_alias_list(surface_children(sf), eff, seen)
-  EField(b, _) -> obl_collect_aliases(b, eff, seen)
-  EUnop(_, x) -> obl_collect_aliases(x, eff, seen)
-  EBang(x) -> obl_collect_aliases(x, eff, seen)
-  ELitUnit(x, _) -> obl_collect_aliases(x, eff, seen)
-  ELambda(_, b) -> obl_collect_aliases(b, eff, seen)
-  EIndex(a, b) -> obl_alias2(a, b, eff, seen)
-  EBinop(_, a, b) -> obl_alias2(a, b, eff, seen)
-  EPipe(a, b) -> obl_alias2(a, b, eff, seen)
-  EDispatchPipe(_, a, b) -> obl_alias2(a, b, eff, seen)
-  EIf(c, t, eo) -> obl_alias_opt(eo, eff, obl_alias2(c, t, eff, seen))
-  ERange(a, b, eo) -> obl_alias_opt(eo, eff, obl_alias2(a, b, eff, seen))
-  EMatch(scr, arms) -> obl_alias_arms(arms, eff, obl_collect_aliases(scr, eff, seen))
-  ERecordLit(_, fs) -> obl_alias_fields(fs, eff, seen)
-  EList(els) -> obl_alias_elems(els, eff, seen)
-  EBlock(stmts, tail) -> obl_alias_opt(tail, eff, obl_alias_stmts(stmts, eff, seen))
-  _ -> seen
-}
-
-fn obl_alias2(a: Expr, b: Expr, eff: SymId, seen: [LocalId]) : [LocalId] =
-  obl_collect_aliases(b, eff, obl_collect_aliases(a, eff, seen))
-
-fn obl_alias_opt(eo: Option[Expr], eff: SymId, seen: [LocalId]) : [LocalId] = match eo {
-  Some(e) -> obl_collect_aliases(e, eff, seen)
-  None -> seen
-}
-
-fn obl_alias_list(es: [Expr], eff: SymId, seen: [LocalId]) : [LocalId] = match es {
-  [] -> seen
-  [h, ...rest] -> obl_alias_list(rest, eff, obl_collect_aliases(h, eff, seen))
-}
-
-fn obl_alias_arms(arms: [Arm], eff: SymId, seen: [LocalId]) : [LocalId] = match arms {
-  [] -> seen
-  [a, ...rest] -> match a {
-    Arm(_, og, body) ->
-      obl_alias_arms(rest, eff, obl_collect_aliases(body, eff, obl_alias_opt(og, eff, seen)))
-  }
-}
-
-fn obl_alias_fields(fs: [FieldInit], eff: SymId, seen: [LocalId]) : [LocalId] = match fs {
-  [] -> seen
-  [f, ...rest] -> match f {
-    FI(_, e) -> obl_alias_fields(rest, eff, obl_collect_aliases(e, eff, seen))
-  }
-}
-
-fn obl_alias_elems(els: [ListElem], eff: SymId, seen: [LocalId]) : [LocalId] = match els {
-  [] -> seen
-  [el, ...rest] -> match el {
-    ElPlain(e) -> obl_alias_elems(rest, eff, obl_collect_aliases(e, eff, seen))
-    ElSpread(e) -> obl_alias_elems(rest, eff, obl_collect_aliases(e, eff, seen))
-  }
-}
-
-fn obl_alias_stmts(ss: [Stmt], eff: SymId, seen: [LocalId]) : [LocalId] = match ss {
-  [] -> seen
-  [s, ...rest] -> obl_alias_stmts(rest, eff, obl_alias_stmt(s, eff, seen))
-}
-
-fn obl_alias_stmt(s: Stmt, eff: SymId, seen: [LocalId]) : [LocalId] = match s {
-  SLet(_, _, e) -> obl_collect_aliases(e, eff, seen)
-  SVar(_, _, e, _, _) -> obl_collect_aliases(e, eff, seen)
-  SExprStmt(e) -> obl_collect_aliases(e, eff, seen)
-  SAssert(e, og) -> obl_alias_opt(og, eff, obl_collect_aliases(e, eff, seen))
-  SIndexAssign(a, b, c, _, _) ->
-    obl_collect_aliases(c, eff, obl_collect_aliases(b, eff, obl_collect_aliases(a, eff, seen)))
-  SAssign(a, c, _, _) ->
-    obl_collect_aliases(c, eff, obl_collect_aliases(a, eff, seen))
-  SUse(_, _, _) -> seen
-}
-
-fn obl_alias_clauses(cs: [HClause], eff: SymId, seen: [LocalId]) : [LocalId] = match cs {
-  [] -> seen
-  [c, ...rest] -> match c {
-    HC(_, _, b, _, _) -> obl_alias_clauses(rest, eff, obl_collect_aliases(b, eff, seen))
-  }
-}
-
-fn obl_alias_ret(ret_opt: Option[HReturn], eff: SymId, seen: [LocalId]) : [LocalId] =
-  match ret_opt {
-    Some(r) -> match r {
-      HR(_, b, _, _) -> obl_collect_aliases(b, eff, seen)
-    }
-    None -> seen
-  }
