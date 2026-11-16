@@ -122,7 +122,7 @@ keep the byte-identical baseline because the fold reduces to
 pre-typer passes — `qualtype_decls`, `rqc_decls`,
 `lower_pattern_narrow_decls`, `lower_consts`, `lower_axioms`,
 `inject_builtin_effects`, `expand_aliases_in_decls`, `expand_ta_decls`,
-`desugar_pos_records_decls`, `desugar_index_decls`,
+`desugar_pos_records_decls`,
 `desugar_var_decls`, `desugar_use_decls`, **`lower_protocols`**,
 `desugar_interp_decls`, `rename_proto_calls_decls`,
 `desugar_const_refs_decls`, `rewrite_nursery_caps_decls` — over
