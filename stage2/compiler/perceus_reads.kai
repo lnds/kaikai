@@ -14,11 +14,11 @@ import compiler.trmc_self_call
 #[doc("A function's reads, indexed by binder.")]
 pub type UseIx = NameIx[Read]
 
-#[doc("One read of a tracked binder: binder, line, column, inside a lambda, read raw.")]
-pub type Read = Rd(LocalId, Int, Int, Bool, Bool)
+#[doc("One read of a tracked binder: binder, execution ordinal, inside a lambda, read raw.")]
+pub type Read = Rd(LocalId, Int, Bool, Bool)
 
-#[doc("Where a binder is read last: at a position, behind a capture that blocks the last-use transfer, or nowhere.")]
-pub type LastUse = LuAt(Int, Int) | LuBlocked | LuUnused
+#[doc("Where a binder is read last: at an execution ordinal, behind a capture that blocks the last-use transfer, or nowhere.")]
+pub type LastUse = LuAt(Int) | LuBlocked | LuUnused
 
 pub(pkg) fn pcs_has(bs: [Binder], l: LocalId) : Bool = match bs {
   [] -> false
@@ -80,40 +80,34 @@ pub(pkg) fn last_use_for(b: LocalId, uses: UseIx) : LastUse {
   } else {
     match prt_latest(b, reads, None) {
       None -> LuUnused
-      Some((l, c)) -> LuAt(l, c)
+      Some(o) -> LuAt(o)
     }
   }
 }
 
 # A capture takes its own reference, so a plain read the walk meets after every
-# capture is free to move. The walk order is the execution order; positions are
-# not (a record literal evaluates its fields in declaration order).
+# capture is free to move.
 fn prt_after_capture(b: LocalId, reads: [Read]) : LastUse = match reads {
   [] -> LuBlocked
-  [Rd(u, ln, cl, in_lam, _), ...rest] ->
+  [Rd(u, o, in_lam, _), ...rest] ->
     if not local_eq(u, b) {
       prt_after_capture(b, rest)
     } else if in_lam {
       LuBlocked
     } else {
-      LuAt(ln, cl)
+      LuAt(o)
     }
 }
 
-fn prt_latest(b: LocalId, uses: [Read], best: Option[(Int, Int)]) : Option[(Int, Int)] =
-  match uses {
-    [] -> best
-    [Rd(u, ln, cl, _, _), ...rest] ->
-      prt_latest(b, rest, if local_eq(u, b) and prt_after(ln, cl, best) {
-        Some((ln, cl))
-      } else {
-        best
-      })
-  }
+fn prt_latest(b: LocalId, uses: [Read], best: Option[Int]) : Option[Int] = match uses {
+  [] -> best
+  [Rd(u, o, _, _), ...rest] ->
+    prt_latest(b, rest, if local_eq(u, b) and prt_after(o, best) { Some(o) } else { best })
+}
 
-fn prt_after(ln: Int, cl: Int, best: Option[(Int, Int)]) : Bool = match best {
+fn prt_after(o: Int, best: Option[Int]) : Bool = match best {
   None -> true
-  Some((l, c)) -> ln > l or (ln == l and cl > c)
+  Some(m) -> o > m
 }
 
 pub(pkg) fn pcs_read_count(b: LocalId, uses: UseIx) : Int =
@@ -121,7 +115,7 @@ pub(pkg) fn pcs_read_count(b: LocalId, uses: UseIx) : Int =
 
 fn prt_count(b: LocalId, uses: [Read], n: Int) : Int = match uses {
   [] -> n
-  [Rd(u, _, _, in_lam, _), ...rest] ->
+  [Rd(u, _, in_lam, _), ...rest] ->
     prt_count(b, rest, if local_eq(u, b) and (not in_lam) { n + 1 } else { n })
 }
 
@@ -130,16 +124,15 @@ pub(pkg) fn pcs_uses_have_in_lam(uses: UseIx, b: LocalId) : Bool =
 
 fn prt_any_in_lam(uses: [Read], b: LocalId) : Bool = match uses {
   [] -> false
-  [Rd(u, _, _, in_lam, _), ...rest] -> (in_lam and local_eq(u, b)) or prt_any_in_lam(rest, b)
+  [Rd(u, _, in_lam, _), ...rest] -> (in_lam and local_eq(u, b)) or prt_any_in_lam(rest, b)
 }
 
-pub(pkg) fn pcs_read_raw_at(b: LocalId, uses: UseIx, l: Int, c: Int) : Bool =
-  prt_raw_at(ni_bucket_id(uses, local_raw(b)), b, l, c)
+pub(pkg) fn pcs_read_raw_at(b: LocalId, uses: UseIx, o: Int) : Bool =
+  prt_raw_at(ni_bucket_id(uses, local_raw(b)), b, o)
 
-fn prt_raw_at(uses: [Read], b: LocalId, l: Int, c: Int) : Bool = match uses {
+fn prt_raw_at(uses: [Read], b: LocalId, o: Int) : Bool = match uses {
   [] -> false
-  [Rd(u, ln, cl, _, raw), ...rest] ->
-    (raw and local_eq(u, b) and ln == l and cl == c) or prt_raw_at(rest, b, l, c)
+  [Rd(u, ro, _, raw), ...rest] -> (raw and local_eq(u, b) and ro == o) or prt_raw_at(rest, b, o)
 }
 
 pub(pkg) fn pcs_read_once(b: LocalId, uses: UseIx) : Bool =
@@ -394,35 +387,34 @@ fn psr_inline_ps(ps: [XPos]) : [Expr] = match ps {
     if xrole_inline(r) { [c, ...psr_inline_ps(rest)] } else { psr_inline_ps(rest) }
 }
 
-#[doc("A bare local argument at a position, and whether its callee's slot consumes it.")]
-pub type ArgSlot = AS(LocalId, Int, Int, Bool)
+#[doc("A bare local argument at an ordinal, and whether its callee's slot consumes it.")]
+pub type ArgSlot = AS(LocalId, Int, Bool)
 
-#[doc("Where a body's last reads may move: nowhere when a lambda is reachable, never at the positions inside a guard, an intrinsic, a surface form or an assert message, and at a bare argument only into a consuming slot.")]
-pub type MoveSites = MoveSites(Bool, [(Int, Int)], NameIx[ArgSlot])
+#[doc("Where a body's last reads may move: nowhere when a lambda is reachable, never at the reads inside a guard, an intrinsic, a surface form or an assert message, and at a bare argument only into a consuming slot.")]
+pub type MoveSites = MoveSites(Bool, [Int], NameIx[ArgSlot])
 
-type MsAcc = MsA(Bool, [(Int, Int)], Array[[ArgSlot]])
+type MsAcc = MsA(Bool, [Int], Array[[ArgSlot]])
 
 pub(pkg) fn pms_move_sites(body: Expr, consumes: (Expr) -> ([Int], Bool)) : MoveSites =
   match pms_ms(body.kind, consumes, MsA(false, [], ni_buckets())) {
     MsA(blocked, held, slots) -> MoveSites(blocked, held, ni_wrap(slots))
   }
 
-pub(pkg) fn pms_moves_at(ms: MoveSites, b: LocalId, ll: Int, lc: Int) : Bool = match ms {
+pub(pkg) fn pms_moves_at(ms: MoveSites, b: LocalId, o: Int) : Bool = match ms {
   MoveSites(blocked, held, ix) ->
     (not blocked)
-      and (not pms_holds(held, ll, lc))
-      and pms_slots_ok(ni_bucket_id(ix, local_raw(b)), b, ll, lc)
+      and (not pms_holds(held, o))
+      and pms_slots_ok(ni_bucket_id(ix, local_raw(b)), b, o)
 }
 
-fn pms_holds(held: [(Int, Int)], ll: Int, lc: Int) : Bool = match held {
+fn pms_holds(held: [Int], o: Int) : Bool = match held {
   [] -> false
-  [(l, c), ...rest] -> (l == ll and c == lc) or pms_holds(rest, ll, lc)
+  [h, ...rest] -> h == o or pms_holds(rest, o)
 }
 
-fn pms_slots_ok(slots: [ArgSlot], b: LocalId, ll: Int, lc: Int) : Bool = match slots {
+fn pms_slots_ok(slots: [ArgSlot], b: LocalId, o: Int) : Bool = match slots {
   [] -> true
-  [AS(n, l, c, ok), ...rest] ->
-    (ok or (not local_eq(n, b)) or l != ll or c != lc) and pms_slots_ok(rest, b, ll, lc)
+  [AS(n, ro, ok), ...rest] -> (ok or (not local_eq(n, b)) or ro != o) and pms_slots_ok(rest, b, o)
 }
 
 fn pms_ms(k: ExprKind, consumes: (Expr) -> ([Int], Bool), acc: MsAcc) : MsAcc / Mutable = match k {
@@ -470,7 +462,7 @@ fn pms_ms_args(
         MsA(b, held, arr) -> MsA(
           b,
           held,
-          ni_add_id(arr, local_raw(u), AS(u, h.line, h.col, ctor or pms_has(slots, i)))
+          ni_add_id(arr, local_raw(u), AS(u, h.site, ctor or pms_has(slots, i)))
         )
       }
       _ -> pms_ms(h.kind, consumes, acc)
@@ -508,19 +500,21 @@ fn pms_hold_all(xs: [Expr], acc: MsAcc) : MsAcc = match xs {
   [x, ...rest] -> pms_hold_all(rest, pms_hold(x, acc))
 }
 
-# Every position in `e` outside lambdas, as `pcs_pos_in_expr` sees them.
+# Every read in `e` outside lambdas.
 fn pms_hold(e: Expr, acc: MsAcc) : MsAcc = match acc {
-  MsA(b, held, slots) -> MsA(b, pms_positions(e, held), slots)
+  MsA(b, held, slots) -> MsA(b, pms_ordinals(e, held), slots)
 }
 
-fn pms_positions(e: Expr, acc: [(Int, Int)]) : [(Int, Int)] =
-  pms_positions_ps(xp_positions(e), [(e.line, e.col), ...acc])
+fn pms_ordinals(e: Expr, acc: [Int]) : [Int] = match e.kind {
+  ELocal(_) -> [e.site, ...acc]
+  _ -> pms_ordinals_ps(xp_positions(e), acc)
+}
 
-fn pms_positions_ps(ps: [XPos], acc: [(Int, Int)]) : [(Int, Int)] = match ps {
+fn pms_ordinals_ps(ps: [XPos], acc: [Int]) : [Int] = match ps {
   [] -> acc
-  [XP(r, c), ...rest] -> pms_positions_ps(rest, match r {
+  [XP(r, c), ...rest] -> pms_ordinals_ps(rest, match r {
     XLam -> acc
-    _ -> pms_positions(c, acc)
+    _ -> pms_ordinals(c, acc)
   })
 }
 
@@ -570,99 +564,101 @@ fn pcs_lbn_arms(arms: [Arm], acc: [Binder]) : [Binder] = match arms {
   }
 }
 
-pub(pkg) fn pcs_pisc_kind(self_name: SelfRef, ll: Int, lc: Int, k: ExprKind) : Bool = match k {
+pub(pkg) fn pcs_pisc_kind(self_name: SelfRef, ord: Int, k: ExprKind) : Bool = match k {
   ECall(f, xs) ->
     if is_self_callee(f, self_name) {
-      pcs_pos_in_exprs(ll, lc, xs)
+      pcs_pos_in_exprs(ord, xs)
     } else {
-      pcs_pisc_kind(self_name, ll, lc, f.kind) or pcs_pisc_exprs(self_name, ll, lc, xs)
+      pcs_pisc_kind(self_name, ord, f.kind) or pcs_pisc_exprs(self_name, ord, xs)
     }
-  EIf(c, t, oe) -> pcs_pisc_kind(self_name, ll, lc, c.kind)
-    or pcs_pisc_kind(self_name, ll, lc, t.kind)
+  EIf(c, t, oe) -> pcs_pisc_kind(self_name, ord, c.kind)
+    or pcs_pisc_kind(self_name, ord, t.kind)
     or (match oe {
       None -> false
-      Some(e2) -> pcs_pisc_kind(self_name, ll, lc, e2.kind)
+      Some(e2) -> pcs_pisc_kind(self_name, ord, e2.kind)
     })
   EMatch(s, arms) ->
-    pcs_pisc_kind(self_name, ll, lc, s.kind) or pcs_pisc_arms(self_name, ll, lc, arms)
-  EBlock(stmts, tail) -> pcs_pisc_stmts(self_name, ll, lc, stmts)
+    pcs_pisc_kind(self_name, ord, s.kind) or pcs_pisc_arms(self_name, ord, arms)
+  EBlock(stmts, tail) -> pcs_pisc_stmts(self_name, ord, stmts)
     or (match tail {
       None -> false
-      Some(e) -> pcs_pisc_kind(self_name, ll, lc, e.kind)
+      Some(e) -> pcs_pisc_kind(self_name, ord, e.kind)
     })
   EBinop(_, a, b) ->
-    pcs_pisc_kind(self_name, ll, lc, a.kind) or pcs_pisc_kind(self_name, ll, lc, b.kind)
-  EUnop(_, x) -> pcs_pisc_kind(self_name, ll, lc, x.kind)
-  EField(x, _) -> pcs_pisc_kind(self_name, ll, lc, x.kind)
+    pcs_pisc_kind(self_name, ord, a.kind) or pcs_pisc_kind(self_name, ord, b.kind)
+  EUnop(_, x) -> pcs_pisc_kind(self_name, ord, x.kind)
+  EField(x, _) -> pcs_pisc_kind(self_name, ord, x.kind)
   EIndex(a, b) ->
-    pcs_pisc_kind(self_name, ll, lc, a.kind) or pcs_pisc_kind(self_name, ll, lc, b.kind)
-  ERecordLit(_, fis) -> pcs_pisc_fields(self_name, ll, lc, fis)
-  EList(els) -> pcs_pisc_elems(self_name, ll, lc, els)
-  EBang(x) -> pcs_pisc_kind(self_name, ll, lc, x.kind)
-  ELitUnit(x, _) -> pcs_pisc_kind(self_name, ll, lc, x.kind)
+    pcs_pisc_kind(self_name, ord, a.kind) or pcs_pisc_kind(self_name, ord, b.kind)
+  ERecordLit(_, fis) -> pcs_pisc_fields(self_name, ord, fis)
+  EList(els) -> pcs_pisc_elems(self_name, ord, els)
+  EBang(x) -> pcs_pisc_kind(self_name, ord, x.kind)
+  ELitUnit(x, _) -> pcs_pisc_kind(self_name, ord, x.kind)
   _ -> false
 }
 
-# True iff `(ll, lc)` appears anywhere within `xs` (the self-call's args).
-fn pcs_pos_in_exprs(ll: Int, lc: Int, xs: [Expr]) : Bool = match xs {
+# True iff the read of ordinal `ord` appears anywhere within `xs` (the self-call's args).
+fn pcs_pos_in_exprs(ord: Int, xs: [Expr]) : Bool = match xs {
   [] -> false
-  [h, ...rest] -> pcs_pos_in_expr(ll, lc, h) or pcs_pos_in_exprs(ll, lc, rest)
+  [h, ...rest] -> pcs_pos_in_expr(ord, h) or pcs_pos_in_exprs(ord, rest)
 }
 
 # A lambda body is a different frame: its reads are in_lam and never a
-# last-use candidate, so its positions stay invisible on purpose.
-fn pcs_pos_in_expr(ll: Int, lc: Int, e: Expr) : Bool =
-  (e.line == ll and e.col == lc) or pcs_pos_in_ps(ll, lc, xp_positions(e))
+# last-use candidate, so its reads stay invisible on purpose.
+fn pcs_pos_in_expr(ord: Int, e: Expr) : Bool = match e.kind {
+  ELocal(_) -> e.site == ord
+  _ -> pcs_pos_in_ps(ord, xp_positions(e))
+}
 
-fn pcs_pos_in_ps(ll: Int, lc: Int, ps: [XPos]) : Bool = match ps {
+fn pcs_pos_in_ps(ord: Int, ps: [XPos]) : Bool = match ps {
   [] -> false
   [XP(r, c), ...rest] ->
     (match r {
       XLam -> false
-      _ -> pcs_pos_in_expr(ll, lc, c)
+      _ -> pcs_pos_in_expr(ord, c)
     })
-      or pcs_pos_in_ps(ll, lc, rest)
+      or pcs_pos_in_ps(ord, rest)
 }
 
-# Whether `nm` is also read in an alternative the read at `(ll, lc)` does not
+# Whether `nm` is also read in an alternative the read of ordinal `ord` does not
 # sit in: the paths through that alternative never reach it, so it cannot pay
 # for them.
-pub(pkg) fn pcs_read_shares_branch(nm: Binder, e: Expr, ll: Int, lc: Int) : Bool = match e.kind {
+pub(pkg) fn pcs_read_shares_branch(nm: Binder, e: Expr, ord: Int) : Bool = match e.kind {
   EIf(c, t, oe) -> match oe {
-    None -> if pcs_pos_in_expr(ll, lc, t) {
-      pcs_read_shares_branch(nm, t, ll, lc)
+    None -> if pcs_pos_in_expr(ord, t) {
+      pcs_read_shares_branch(nm, t, ord)
     } else {
-      pcs_read_shares_branch(nm, c, ll, lc)
+      pcs_read_shares_branch(nm, c, ord)
     }
     Some(el) ->
-      if pcs_pos_in_expr(ll, lc, t) {
-        pcs_mentions(nm, el) or pcs_read_shares_branch(nm, t, ll, lc)
-      } else if pcs_pos_in_expr(ll, lc, el) {
-        pcs_mentions(nm, t) or pcs_read_shares_branch(nm, el, ll, lc)
+      if pcs_pos_in_expr(ord, t) {
+        pcs_mentions(nm, el) or pcs_read_shares_branch(nm, t, ord)
+      } else if pcs_pos_in_expr(ord, el) {
+        pcs_mentions(nm, t) or pcs_read_shares_branch(nm, el, ord)
       } else {
-        pcs_read_shares_branch(nm, c, ll, lc)
+        pcs_read_shares_branch(nm, c, ord)
       }
   }
   EMatch(s, arms) ->
-    if pcs_pos_in_expr(ll, lc, s) {
-      pcs_read_shares_branch(nm, s, ll, lc)
+    if pcs_pos_in_expr(ord, s) {
+      pcs_read_shares_branch(nm, s, ord)
     } else {
-      prt_arms_share(nm, arms, ll, lc)
+      prt_arms_share(nm, arms, ord)
     }
-  _ -> any(xp_positions(e), p => prt_child_shares(nm, p, ll, lc))
+  _ -> any(xp_positions(e), p => prt_child_shares(nm, p, ord))
 }
 
-fn prt_child_shares(nm: Binder, p: XPos, ll: Int, lc: Int) : Bool = match p {
+fn prt_child_shares(nm: Binder, p: XPos, ord: Int) : Bool = match p {
   XP(XLam, _) -> false
-  XP(_, c) -> pcs_pos_in_expr(ll, lc, c) and pcs_read_shares_branch(nm, c, ll, lc)
+  XP(_, c) -> pcs_pos_in_expr(ord, c) and pcs_read_shares_branch(nm, c, ord)
 }
 
-fn prt_arm_holds(a: Arm, ll: Int, lc: Int) : Bool = match a {
+fn prt_arm_holds(a: Arm, ord: Int) : Bool = match a {
   Arm(_, og, b) -> (match og {
-    Some(g) -> pcs_pos_in_expr(ll, lc, g)
+    Some(g) -> pcs_pos_in_expr(ord, g)
     None -> false
   })
-    or pcs_pos_in_expr(ll, lc, b)
+    or pcs_pos_in_expr(ord, b)
 }
 
 fn prt_arm_reads(nm: Binder, a: Arm) : Bool = match a {
@@ -673,61 +669,61 @@ fn prt_arm_reads(nm: Binder, a: Arm) : Bool = match a {
     or pcs_mentions(nm, b)
 }
 
-fn prt_arm_shares(nm: Binder, a: Arm, ll: Int, lc: Int) : Bool = match a {
+fn prt_arm_shares(nm: Binder, a: Arm, ord: Int) : Bool = match a {
   Arm(_, og, b) ->
     (match og {
-      Some(g) -> pcs_read_shares_branch(nm, g, ll, lc)
+      Some(g) -> pcs_read_shares_branch(nm, g, ord)
       None -> false
     })
-      or pcs_read_shares_branch(nm, b, ll, lc)
+      or pcs_read_shares_branch(nm, b, ord)
 }
 
-fn prt_arms_share(nm: Binder, arms: [Arm], ll: Int, lc: Int) : Bool =
+fn prt_arms_share(nm: Binder, arms: [Arm], ord: Int) : Bool =
   any(
     arms,
-    a => prt_arm_holds(a, ll, lc)
-      and (any(arms, o => (not prt_arm_holds(o, ll, lc)) and prt_arm_reads(nm, o))
-        or prt_arm_shares(nm, a, ll, lc))
+    a => prt_arm_holds(a, ord)
+      and (any(arms, o => (not prt_arm_holds(o, ord)) and prt_arm_reads(nm, o))
+        or prt_arm_shares(nm, a, ord))
   )
 
-fn pcs_pisc_exprs(self_name: SelfRef, ll: Int, lc: Int, xs: [Expr]) : Bool = match xs {
+fn pcs_pisc_exprs(self_name: SelfRef, ord: Int, xs: [Expr]) : Bool = match xs {
   [] -> false
   [h, ...rest] ->
-    pcs_pisc_kind(self_name, ll, lc, h.kind) or pcs_pisc_exprs(self_name, ll, lc, rest)
+    pcs_pisc_kind(self_name, ord, h.kind) or pcs_pisc_exprs(self_name, ord, rest)
 }
 
-fn pcs_pisc_arms(self_name: SelfRef, ll: Int, lc: Int, arms: [Arm]) : Bool = match arms {
+fn pcs_pisc_arms(self_name: SelfRef, ord: Int, arms: [Arm]) : Bool = match arms {
   [] -> false
   [Arm(_, _, b), ...rest] ->
-    pcs_pisc_kind(self_name, ll, lc, b.kind) or pcs_pisc_arms(self_name, ll, lc, rest)
+    pcs_pisc_kind(self_name, ord, b.kind) or pcs_pisc_arms(self_name, ord, rest)
 }
 
-fn pcs_pisc_stmts(self_name: SelfRef, ll: Int, lc: Int, stmts: [Stmt]) : Bool = match stmts {
+fn pcs_pisc_stmts(self_name: SelfRef, ord: Int, stmts: [Stmt]) : Bool = match stmts {
   [] -> false
   [s, ...rest] -> {
     let here = match s {
-      SLet(_, _, e) -> pcs_pisc_kind(self_name, ll, lc, e.kind)
-      SVar(_, _, e, _, _) -> pcs_pisc_kind(self_name, ll, lc, e.kind)
-      SExprStmt(e) -> pcs_pisc_kind(self_name, ll, lc, e.kind)
+      SLet(_, _, e) -> pcs_pisc_kind(self_name, ord, e.kind)
+      SVar(_, _, e, _, _) -> pcs_pisc_kind(self_name, ord, e.kind)
+      SExprStmt(e) -> pcs_pisc_kind(self_name, ord, e.kind)
       _ -> false
     }
-    here or pcs_pisc_stmts(self_name, ll, lc, rest)
+    here or pcs_pisc_stmts(self_name, ord, rest)
   }
 }
 
-fn pcs_pisc_fields(self_name: SelfRef, ll: Int, lc: Int, fis: [FieldInit]) : Bool = match fis {
+fn pcs_pisc_fields(self_name: SelfRef, ord: Int, fis: [FieldInit]) : Bool = match fis {
   [] -> false
   [FI(_, e), ...rest] ->
-    pcs_pisc_kind(self_name, ll, lc, e.kind) or pcs_pisc_fields(self_name, ll, lc, rest)
+    pcs_pisc_kind(self_name, ord, e.kind) or pcs_pisc_fields(self_name, ord, rest)
 }
 
-fn pcs_pisc_elems(self_name: SelfRef, ll: Int, lc: Int, els: [ListElem]) : Bool = match els {
+fn pcs_pisc_elems(self_name: SelfRef, ord: Int, els: [ListElem]) : Bool = match els {
   [] -> false
   [h, ...rest] -> {
     let inner = match h {
       ElPlain(e) -> e
       ElSpread(e) -> e
     }
-    pcs_pisc_kind(self_name, ll, lc, inner.kind) or pcs_pisc_elems(self_name, ll, lc, rest)
+    pcs_pisc_kind(self_name, ord, inner.kind) or pcs_pisc_elems(self_name, ord, rest)
   }
 }
