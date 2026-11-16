@@ -84,6 +84,29 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.196.0 (2026-11-16)
+
+### BREAKING CHANGE
+
+- an effect performed in a dispatching-pipe stage now
+appears in the enclosing row and must be handled or declared.
+
+### Fixed
+
+- **refinements**: never trap the compiler when folding a predicate
+- **lex**: keep the n-literal source lexeme in the AST and format the new fixtures
+- **lex**: range-check every Int literal position and mint Decimal exponents and radixes
+- **unbox**: give wide constructors one raw-slot layout on both sides
+- **monomorph**: reject polymorphic recursion at a growing type
+- **protocols**: give the dispatcher body its own node instead of a todo! marker
+- **effects**: pop open handler frames before the exit drops the frame's locals
+- **effects**: pop the handler frame on every exit from a handle body
+- **typer**: join a dispatching pipe stage's effect row into the enclosing row
+
+### Changed
+
+- **unbox**: make the single-slot kind private; format the fixture
+
 ## v0.195.0 (2026-11-14)
 
 ### BREAKING CHANGE
