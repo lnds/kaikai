@@ -25,6 +25,7 @@ import compiler.proto_resolve
 import compiler.monomorph
 import compiler.monomorph_subst
 import compiler.monomorph_discover
+import compiler.monomorph_growth
 import compiler.diag
 import compiler.diag_file
 import compiler.infer_state
@@ -70,7 +71,17 @@ pub(pkg) fn monomorphise(
   # those new tuples enter the worklist and produce additional specs.
   # Each spec also accumulates a per-spec leak record.
   let r =
-    generate_specs_iter(ps_tab(ps), polys, initial_tuples, insts_ix, [], initial_ts, [], reg, [])
+    generate_specs_iter(
+      ps_tab(ps),
+      polys,
+      map(initial_tuples, t => WI(t, [])),
+      insts_ix,
+      [],
+      initial_ts,
+      [],
+      reg,
+      []
+    )
   match r {
     GenSpecsOut(specs, all_items, leaks, op_viols) -> {
       # Every concrete instantiation (direct + transitive) surfaces as a
@@ -203,7 +214,7 @@ fn emit_spec(
 fn generate_specs_iter(
   tab: SymTab,
   polys: PolyIx,
-  worklist: [MonoTuple],
+  worklist: [WorkItem],
   insts: InstIndex,
   specs_acc: [Spec],
   all_tuples: TupleSet,
@@ -218,7 +229,7 @@ fn generate_specs_iter(
       list_reverse(leaks_acc),
       list_reverse(viols_acc)
     )
-    [t, ...rest] -> match lookup_poly_fn_sym(poly_ix_fns(polys), mt_sym(t)) {
+    [WI(t, chain), ...rest] -> match lookup_poly_fn_sym(poly_ix_fns(polys), mt_sym(t)) {
       None -> generate_specs_iter(
         tab,
         polys,
@@ -234,8 +245,11 @@ fn generate_specs_iter(
         let r = emit_spec(tab, d, t, insts, polys, all_tuples, reg)
         match r {
           SEO(spec, new_ts, new_leaks, new_viols) -> {
-            let next_worklist = list_append(rest, new_ts)
-            let next_all = ts_add_all(all_tuples, new_ts)
+            let chain1 = [t, ...chain]
+            let grown = growth_violations(tab, insts, d, t, chain1, new_ts)
+            let ok_ts = filter(new_ts, nt => is_none(growth_root(chain1, nt)))
+            let next_worklist = list_append(rest, map(ok_ts, nt => WI(nt, chain1)))
+            let next_all = ts_add_all(all_tuples, ok_ts)
             let next_leaks = prepend_leaks(new_leaks, leaks_acc)
             generate_specs_iter(
               tab,
@@ -246,7 +260,7 @@ fn generate_specs_iter(
               next_all,
               next_leaks,
               reg,
-              list_append(list_reverse(new_viols), viols_acc)
+              list_append(list_reverse(list_append(new_viols, grown)), viols_acc)
             )
           }
         }
@@ -254,6 +268,21 @@ fn generate_specs_iter(
     }
   }
 }
+
+fn growth_violations(
+  tab: SymTab,
+  insts: InstIndex,
+  d: Decl,
+  req: MonoTuple,
+  chain: [MonoTuple],
+  new_ts: [MonoTuple]
+) : [BoundViolation] = flat_map(
+  new_ts,
+  nt => match growth_root(chain, nt) {
+    Some(root) -> [growth_violation(tab, insts, d, req, root, nt)]
+    None -> []
+  }
+)
 
 fn spec_body_violations(
   tab: SymTab,
