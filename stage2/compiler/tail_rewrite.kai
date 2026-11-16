@@ -17,7 +17,6 @@ import compiler.trmc_self_call
 import compiler.site_ids
 import compiler.spec_names
 import compiler.symtab
-import compiler.tail_plan
 import compiler.trmc_exit_drops
 import compiler.written
 
@@ -42,8 +41,7 @@ pub fn tcrec_rewrite_decls(
   # callee never took ownership. The borrow map is what separates that
   # from an owned pass, which releases through the callee.
   let bmap = pcs_planned_borrow_map(decls)
-  let tt = tailplan_no_targets(bmap)
-  map(decls, d => tcrec_rewrite_decl(d, allow_trmc, cons_ok, bmap, tt, tab))
+  map(decls, d => tcrec_rewrite_decl(d, allow_trmc, cons_ok, bmap, tab))
 }
 
 # The body may arrive wrapped by perceus as `EBlock([entry..., SLet(__pcs_ret,
@@ -55,7 +53,6 @@ fn tcrec_rewrite_decl(
   allow_trmc: Bool,
   cons_ok: Bool,
   bmap: BorrowMap,
-  tt: TailTargets,
   tab: SymTab
 ) : Decl / Console + Mutable {
   match d {
@@ -83,14 +80,12 @@ fn tcrec_rewrite_decl(
               allow_trmc,
               cons_ok,
               bmap,
-              tt,
               tab
             )
           _ -> d
         }
       } else {
-        if (not tcrec_has_tail_self_call(body, SelfRef(fid), arity, cons_ok, tab))
-          and (not tailplan_has_target(body, SelfRef(fid), tt)) {
+        if not tcrec_has_tail_self_call(body, SelfRef(fid), arity, cons_ok, tab) {
           d
         } else {
           site_renumber_decl({
@@ -131,8 +126,7 @@ fn tcrec_rewrite_decl(
                 [],
                 [],
                 bmap,
-                base_mask,
-                tt
+                base_mask
               )
               # TRMC: when the fn is modulo-cons-eligible (a constructor
               # in tail position with a self-call slot) AND its effect row
@@ -142,7 +136,7 @@ fn tcrec_rewrite_decl(
               # ordinary tcrec rewrite handles fns whose tail is a direct
               # self-call; TRMC handles fns whose tail is `Ctor(.., self,..)`.
               # `allow_trmc` is false on the LLVM backend: it lowers the
-              # `__kai_tcrec|` sentinel (issue #706) but not the `__kai_trmc|`
+              # `__kai_tcrec|` sentinel but not the `__kai_trmc|`
               # cctx sentinel, so a TRMC-rewritten body would emit the raw
               # sentinel as a function name with illegal `|` chars. On LLVM
               # the fn falls back to ordinary recursion (correct, just
@@ -177,8 +171,7 @@ fn tcrec_rewrite_decl(
                     pnames,
                     uses,
                     dm_table,
-                    skip_set,
-                    tt
+                    skip_set
                   )
                 }
               DFn(is_pub, fid, tparams, params, opt_ret, row, new_body, ln, cl, nl, nc, mo)
@@ -227,7 +220,6 @@ fn tcrec_rewrite_pcs_ret_wrap(
   allow_trmc: Bool,
   cons_ok: Bool,
   bmap: BorrowMap,
-  tt: TailTargets,
   tab: SymTab
 ) : Decl / Console + Mutable {
   match tcrec_find_pcs_ret_let(stmts, []) {
@@ -243,8 +235,7 @@ fn tcrec_rewrite_pcs_ret_wrap(
           and trmc_row_is_affine(row)
           and trmc_body_has_modcons(inner, SelfRef(fid), arity, cons_ok, tab)
         let has_direct = tcrec_has_tail_self_call(inner, SelfRef(fid), arity, cons_ok, tab)
-        let has_target = tailplan_has_target(inner, SelfRef(fid), tt)
-        if (not has_direct) and (not has_target) and (not is_trmc_inner) {
+        if (not has_direct) and (not is_trmc_inner) {
           d
         } else {
           site_renumber_decl({
@@ -277,8 +268,7 @@ fn tcrec_rewrite_pcs_ret_wrap(
                 [],
                 [],
                 bmap,
-                base_mask,
-                tt
+                base_mask
               )
               # TRMC: a modulo-cons step `goto`s past the exit wrap and pays
               # its params through the dropmask; the wrap's exit drops move
@@ -316,8 +306,7 @@ fn tcrec_rewrite_pcs_ret_wrap(
                     pnames,
                     uses,
                     dm_table,
-                    skip_set,
-                    tt
+                    skip_set
                   )
                   tcrec_rebuild_pcs_ret_wrap(body, before, new_inner, after)
                 }
@@ -380,8 +369,7 @@ fn tcrec_rewrite_body(
   pnames: [String],
   uses: UseIx,
   dm_table: [TcrDm],
-  skip_set: [Binder],
-  tt: TailTargets
+  skip_set: [Binder]
 ) : Expr =
   Expr {
     kind: tcrec_rewrite_kind(
@@ -393,8 +381,7 @@ fn tcrec_rewrite_body(
       pnames,
       uses,
       dm_table,
-      skip_set,
-      tt
+      skip_set
     ),
     line: body.line,
     col: body.col,
@@ -887,8 +874,7 @@ fn tcrec_rewrite_kind(
   pnames: [String],
   uses: UseIx,
   dm_table: [TcrDm],
-  skip_set: [Binder],
-  tt: TailTargets
+  skip_set: [Binder]
 ) : ExprKind {
   let k = e.kind
   match k {
@@ -898,24 +884,11 @@ fn tcrec_rewrite_kind(
         # never re-adds a base bit, so OR == ADD.
         tcrec_make_step_site(f, xs, params, pnames, uses, dm_table, skip_set, self_fn)
       } else {
-        match tailplan_target(f, me, tt) {
-          Some(g) -> tail_make_step_site(
-            g,
-            f,
-            e,
-            tailplan_lends(f, tt),
-            params,
-            pnames,
-            uses,
-            dm_table,
-            skip_set
-          )
-          None -> k
-        }
+        k
       }
     EIf(c, t, opt_e) -> {
       let t1 =
-        tcrec_rewrite_body(t, me, arity, self_fn, params, pnames, uses, dm_table, skip_set, tt)
+        tcrec_rewrite_body(t, me, arity, self_fn, params, pnames, uses, dm_table, skip_set)
       let opt_e1 = opt_e
         | (e2 => tcrec_rewrite_body(
           e2,
@@ -926,8 +899,7 @@ fn tcrec_rewrite_kind(
           pnames,
           uses,
           dm_table,
-          skip_set,
-          tt
+          skip_set
         ))
       EIf(c, t1, opt_e1)
     }
@@ -944,7 +916,6 @@ fn tcrec_rewrite_kind(
           uses,
           dm_table,
           skip_set,
-          tt,
           []
         )
       )
@@ -964,8 +935,7 @@ fn tcrec_rewrite_kind(
                 pnames,
                 uses,
                 dm_table,
-                skip_set,
-                tt
+                skip_set
               )
             )
           )
@@ -1003,43 +973,6 @@ fn tcrec_make_step_site(
   )
 }
 
-# Wrap one tail call to another declared function in its jump: the caller's
-# parameters are released through the same mask a self call uses. The call
-# stays whole under the mark, so every pass still sees its callee.
-fn tail_make_step_site(
-  target: FnId,
-  f: Expr,
-  call: Expr,
-  lends: Bool,
-  params: [Param],
-  pnames: [String],
-  uses: UseIx,
-  dm_table: [TcrDm],
-  skip_set: [Binder]
-) : ExprKind {
-  let drops = drops_union(
-    tcrec_compute_site_dropmask(params, uses, skip_set, 0, drops_none()),
-    tcrec_lookup_dm(dm_table, f.site)
-  )
-  if lends and (not drops_empty(drops)) {
-    call.kind
-  } else {
-    ECall(
-      Expr {
-        kind: EMark(
-          MkTailStep(TailStep { fid: target, drops: drops, params: pnames, lends: lends })
-        ),
-        line: f.line,
-        col: f.col,
-        ty: f.ty,
-        mode: f.mode,
-        site: f.site
-      },
-      [call]
-    )
-  }
-}
-
 fn tcrec_rewrite_arms(
   arms: [Arm],
   me: SelfRef,
@@ -1050,7 +983,6 @@ fn tcrec_rewrite_arms(
   uses: UseIx,
   dm_table: [TcrDm],
   skip_set: [Binder],
-  tt: TailTargets,
   acc: [Arm]
 ) : [Arm] {
   match arms {
@@ -1066,8 +998,7 @@ fn tcrec_rewrite_arms(
           pnames,
           uses,
           dm_table,
-          skip_set,
-          tt
+          skip_set
         )
         tcrec_rewrite_arms(
           rest,
@@ -1079,7 +1010,6 @@ fn tcrec_rewrite_arms(
           uses,
           dm_table,
           skip_set,
-          tt,
           [Arm(pat, opt_g, new_body), ...acc]
         )
       }

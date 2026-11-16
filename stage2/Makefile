@@ -474,27 +474,6 @@ test-dump-typed: $(TARGET) build
 	  fi; \
 	done
 
-# Phase 1.B.0 — cons-head raw-safe use-analysis (--dump-rawsafe). The
-# golden pins only the USER fns' marks (grep by fn name), so a stdlib
-# edit cannot perturb the fixture. Verifies the two load-bearing shapes:
-# `bump` (head only feeds raw arithmetic) marks load+store `raw`, and
-# `show_heads` (head feeds a boxed call `int_to_string(h)`) marks load
-# `boxed` — the 4th-dead-end antidote. The pass changes no runtime and
-# no emitted text; this is a pure analysis golden.
-RAWSAFE_FIXTURES := rawsafe_bump:bump,main rawsafe_boxed:show_heads,keep_pos,main
-
-test-rawsafe: $(TARGET) build
-	@set -e; \
-	for spec in $(RAWSAFE_FIXTURES); do \
-	  name=$${spec%%:*}; fns=$${spec#*:}; \
-	  pat=$$(echo "$$fns" | sed 's/,/|/g'); \
-	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --dump-rawsafe ../examples/perceus/$$name.kai 2> build/$$name.rawsafe.err \
-	    | grep -E "^($$pat) (load|store)" > build/$$name.rawsafe || true; \
-	  diff -q ../examples/perceus/$$name.out.expected build/$$name.rawsafe > /dev/null \
-	    && echo "rawsafe OK $$name (use-analysis marks match golden)" \
-	    || { echo "rawsafe DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.rawsafe; exit 1; }; \
-	done
-
 # Issue #1139 — confirmed-purity analysis (--dump-purity). The golden
 # pins the root file's per-fn verdict (`<name> -> const|impure`); stdlib
 # marks are filtered by the dumper, so a stdlib edit cannot perturb it.
@@ -532,25 +511,6 @@ test-tycon-ids: $(TARGET) build
 	  diff -q ../examples/type-identity/$$f.ids.expected build/$$f.out > /dev/null \
 	    && echo "tycon-ids OK $$f (each nominal type names its declaration)" \
 	    || { echo "tycon-ids DIFF $$f"; diff ../examples/type-identity/$$f.ids.expected build/$$f.out; exit 1; }; \
-	done
-
-# Phase 1.B.1 — cons-head borrow-safe classifier (--dump-borrowsafe).
-# Pins the four discriminating shapes: sum_sq/bump raw (head only read
-# as scalar), first/show boxed (head pointer propagated via return /
-# call). The classifier changes no emitted text; this is a pure
-# analysis golden, the prerequisite for the perceus borrow consumer.
-BORROWSAFE_FIXTURES := borrowsafe_classify:sum_sq,first,bump,show
-
-test-borrowsafe: $(TARGET) build
-	@set -e; \
-	for spec in $(BORROWSAFE_FIXTURES); do \
-	  name=$${spec%%:*}; fns=$${spec#*:}; \
-	  pat=$$(echo "$$fns" | sed 's/,/|/g'); \
-	  $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib --dump-borrowsafe ../examples/perceus/$$name.kai 2> build/$$name.borrowsafe.err \
-	    | grep -E "^($$pat) borrow" > build/$$name.borrowsafe || true; \
-	  diff -q ../examples/perceus/$$name.out.expected build/$$name.borrowsafe > /dev/null \
-	    && echo "borrowsafe OK $$name (borrow classifier matches golden)" \
-	    || { echo "borrowsafe DIFF $$name"; diff ../examples/perceus/$$name.out.expected build/$$name.borrowsafe; exit 1; }; \
 	done
 
 # --check: name resolution + HM inference, with no --infer noise on stdout.
@@ -11462,7 +11422,7 @@ test: $(TARGET) build
 # smoke tests that actually catch regressions on minimal examples,
 # modules, and holes — covers the common feature-work cases.
 # Use `make test` for the end-of-block gate.
-test-fast: test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-rawsafe test-borrowsafe test-purity test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-holes test-driver-holes test-effects test-effect-runtime test-dir-sugars test-dir-pipes test-dir-pipes-collections test-match test-dir-literals test-dir-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-dir-protocols test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-region-1123 test-issue-1194-reassigned-record-field-in-interp test-issue-779 test-dir-unions test-aliases test-dir-sequence test-dir-methods test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-struct test-ffi-in-test-blocks test-ffi-cflags-shim test-ffi-cflags-shim-native test-ffi-cflags-include test-ffi-cflags-include-native test-issue-1556-main-thread-affinity test-issue-1556-main-thread-affinity-native test-native-modular test-issue-1706-runner-mode-key test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json-native test-native-core-obj test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-decimal-rational test-numeric-div-by-zero-traps test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1565-handler-alias-shadow-native test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-unused-bindings test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1852-cross-module-derive-json test-home-tu-partition test-kir test-packages test-issue-1588-main-exit-status test-issue-1588-main-exit-status-native test-issue-1590-isatty test-issue-1590-isatty-native test-issue-1682-user-symbol-namespace test-issue-1682-user-symbol-namespace-native test-issue-1875-success-diag-forwarded
+test-fast: test-infer test-infer-check test-lint test-dump-typed test-dump-mono test-purity test-run test-blocks test-modules test-modules-path test-modules-qualified test-modules-qualified-neg test-modules-collision test-modules-derive-export test-modules-const-export test-modules-const-export-native test-modules-transitive-privacy test-modules-uom-privacy test-modules-privacy-matrix test-issue-1723-import-diag-file test-holes test-driver-holes test-effects test-effect-runtime test-dir-sugars test-dir-pipes test-dir-pipes-collections test-match test-dir-literals test-dir-string test-loop test-diagnostics test-reader test-writer test-trace test-time test-intervals test-call-elision test-call-elision-neg test-stdlib test-dir-protocols test-demos-core test-aspirational test-tco test-tco-regression test-tco-zero-arg test-tco-309 test-tco-perceus-wrap test-tco-param-shadow test-foreign-prelude test-prelude-qualified-call test-issue-219-modcall test-issue-318 test-issue-746 test-issue-668 test-trmc-list-build test-region-1123 test-issue-1194-reassigned-record-field-in-interp test-issue-779 test-dir-unions test-aliases test-dir-sequence test-dir-methods test-ffi-scalar-char test-ffi-v2-struct test-ffi-v2-opaque test-ffi-v2-negatives test-ffi-v2-native-struct test-ffi-in-test-blocks test-ffi-cflags-shim test-ffi-cflags-shim-native test-ffi-cflags-include test-ffi-cflags-include-native test-issue-1556-main-thread-affinity test-issue-1556-main-thread-affinity-native test-native-modular test-issue-1706-runner-mode-key test-issue-1426-cross-module-derive-show-native test-issue-1852-cross-module-derive-json-native test-native-core-obj test-ffi-pub-axiom-cross-module test-issue-260-261-extern-c-fn test-numeric-fixed-width test-numeric-bigint test-numeric-decimal-rational test-numeric-div-by-zero-traps test-numeric-literal-mint test-issue-315-no-double-slash test-issue-248-loop-sugars test-issue-1179-var-slot-loop test-issue-1214-nonliteral-init test-tco-rule3-basic test-tco-rule3-no-misfire test-tco-issue-680 test-issue-678-stdout-buffered test-issue-679-cancel-parked test-issue-1539-select-races test-issue-682-cancel-sibling-handler test-issue-1533-remote-cancel-runs-handler test-issue-1565-handler-alias-shadow test-issue-1565-handler-alias-shadow-native test-issue-1537-finally-cancel-scope test-issue-978-spawn-parent-handled-effect test-issue-1051-spawn-parent-handled-builtin-default test-issue-1067-fiber-trap-isolation test-issue-1331-op-arg-release test-issue-1093-divzero-trap test-issue-997-spawn-cell-fiber-local test-unused-bindings test-issue-963-cross-module-mono test-issue-1426-cross-module-derive-show test-issue-1852-cross-module-derive-json test-home-tu-partition test-kir test-packages test-issue-1588-main-exit-status test-issue-1588-main-exit-status-native test-issue-1590-isatty test-issue-1590-isatty-native test-issue-1682-user-symbol-namespace test-issue-1682-user-symbol-namespace-native test-issue-1875-success-diag-forwarded
 
 # Package-mode harness (issue #569). Exercises kaikai as a package
 # consumer through tools/test-packages.sh; covers the 9-category
@@ -11601,7 +11561,7 @@ test-kir: $(TARGET) build
 # A report mode accepts what the build accepts: a bare call an imported
 # module settles through its own imports, and a protocol operation two
 # imported modules declare.
-REPORT_MODES := --infer --dump-typed --dump-typed-core --dump-last-use --dump-intervals --dump-rawsafe --dump-borrowsafe --dump-mono --dump-call-elision
+REPORT_MODES := --infer --dump-typed --dump-typed-core --dump-last-use --dump-intervals --dump-mono --dump-call-elision
 test-report-modes-imports: $(TARGET) build
 	@set -e; \
 	for m in $(REPORT_MODES); do \
