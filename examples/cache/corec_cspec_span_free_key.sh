@@ -2,8 +2,8 @@
 # Core translation units are independent of the user program's edits.
 #
 # `closure_spec_pass` appends per-call-site spec decls named
-# `<fn>__cspec__L<line>_<col>` with `mo=None` (root-homed). Their names carry
-# the lambda body's span, so a plain body edit that adds, removes, or moves a
+# `<fn>__cspec__L<node id>_<host>` with `mo=None` (root-homed). Their names carry
+# the lambda's node id within its host, so a plain body edit that adds, removes, or moves a
 # specialisable HOF call must not change any unit but the root one: the
 # per-unit object cache is keyed by each unit's text, and a core unit that
 # changed would recompile on every such edit.
