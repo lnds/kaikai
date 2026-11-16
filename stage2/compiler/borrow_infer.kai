@@ -5,6 +5,7 @@ Interprocedural borrow inference: escape analysis and back edges over the borrow
 import compiler.ast
 import compiler.ast_build
 import compiler.ast_ids
+import compiler.expr_positions
 import compiler.symtab
 import compiler.ctor_ix
 import compiler.trmc_self_call
@@ -99,44 +100,36 @@ fn binf_kind_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, k: ExprKin
     }
     EIntrinsic(_, xs) -> binf_args_ok(tab, self_name, nm, i, xs)
     ESurface(sf) -> binf_args_ok(tab, self_name, nm, i, surface_children(sf))
-    # A bare read that is NOT a scrutinee nor a callee = an owned use. Field
-    # read / index base / lambda capture of `nm` = owned. Disqualify.
+    # A bare read that is NOT a scrutinee nor a callee = an owned use.
     ELocal(u) -> not local_eq(u, nm)
-    EField(x, _) -> binf_absent(nm, x)
     EIndex(a, b) -> binf_absent(nm, a) and binf_uses_ok(tab, self_name, nm, i, b)
     EBlock(stmts, tail) ->
       binf_stmts_ok(tab, self_name, nm, i, stmts) and binf_opt_ok(tab, self_name, nm, i, tail)
-    # A lambda body must itself use `nm` borrowably. Stored in a ctor/record/list slot = owned.
+    _ -> binf_owned_ok(tab, self_name, nm, i, k)
+  }
+
+# Forms that store, capture or hand `nm` to a handler: a mention is an owned use.
+fn binf_owned_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, k: ExprKind) : Bool =
+  match k {
+    EField(x, _) -> binf_absent(nm, x)
+    # A lambda body must itself use `nm` borrowably.
     ELambda(_, b) -> binf_uses_ok(tab, self_name, nm, i, b)
-    ERecordLit(_, fis) -> binf_absent_fields(nm, fis)
-    EList(els) -> binf_absent_elems(nm, els)
+    ERecordLit(_, _) -> not binf_present_in_kind(nm, k)
+    EList(_) -> not binf_present_in_kind(nm, k)
     # Interpolation reads and handlers are owned (conservative).
     EStr(_, _) -> false
     EHandle(_, _, _, _, _, _, _) -> false
-    # Transparent forms: `nm` stays borrowable iff it does in every child.
     _ -> binf_transparent_ok(tab, self_name, nm, i, k)
   }
 
 # Forms that neither consume nor store `nm` — it stays borrowable iff every
-# sub-expression keeps it borrowable. Leaves (literals) never reference `nm`.
+# sub-expression keeps it borrowable. Leaves never reference `nm`.
 fn binf_transparent_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, k: ExprKind) : Bool =
-  match k {
-    EBinop(_, a, b) ->
-      binf_uses_ok(tab, self_name, nm, i, a) and binf_uses_ok(tab, self_name, nm, i, b)
-    EUnop(_, x) -> binf_uses_ok(tab, self_name, nm, i, x)
-    EIf(c, t, oe) -> binf_uses_ok(tab, self_name, nm, i, c)
-      and binf_uses_ok(tab, self_name, nm, i, t)
-      and binf_opt_ok(tab, self_name, nm, i, oe)
-    ERange(a, b, oe) -> binf_uses_ok(tab, self_name, nm, i, a)
-      and binf_uses_ok(tab, self_name, nm, i, b)
-      and binf_opt_ok(tab, self_name, nm, i, oe)
-    EPipe(a, b) -> binf_uses_ok(tab, self_name, nm, i, a) and binf_uses_ok(tab, self_name, nm, i, b)
-    EDispatchPipe(_, a, b) ->
-      binf_uses_ok(tab, self_name, nm, i, a) and binf_uses_ok(tab, self_name, nm, i, b)
-    EBang(x) -> binf_uses_ok(tab, self_name, nm, i, x)
-    ELitUnit(x, _) -> binf_uses_ok(tab, self_name, nm, i, x)
-    _ -> true
-  }
+  all(xp_positions_kind(k), px => binf_pos_ok(tab, self_name, nm, i, px))
+
+fn binf_pos_ok(tab: SymTab, self_name: SelfRef, nm: LocalId, i: Int, px: XPos) : Bool = match px {
+  XP(_, c) -> binf_uses_ok(tab, self_name, nm, i, c)
+}
 
 # `nm` as a bare scrutinee whose arms REBUILD a constructor (rb-tree
 # balance/insert reuse) or DECONSTRUCT a list with a rest-binder (map/filter
@@ -404,11 +397,6 @@ fn binf_escapes_k(self_name: SelfRef, i: Int, h: LocalId, tail: Bool, k: ExprKin
   match k {
     # Bare `h`: escapes only if it is the returned value (tail).
     ELocal(u) -> tail and local_eq(u, h)
-    # Stored in a slot / captured / field-projected: retains past the arm.
-    ERecordLit(_, fis) -> not binf_absent_fields(h, fis)
-    EList(els) -> not binf_absent_elems(h, els)
-    ELambda(_, b) -> not binf_absent(h, b)
-    EField(x, _) -> tail and (not binf_absent(h, x))
     # A ctor/user call storing `h` in an argument retains it; a call that only
     # inspects (`is_red(h)`) does not. A self-call carrying `h` at position `i`
     # (the enclosing param's borrow-through slot) is safe.
@@ -418,8 +406,6 @@ fn binf_escapes_k(self_name: SelfRef, i: Int, h: LocalId, tail: Bool, k: ExprKin
       ESym(_, _) -> binf_call_escapes(self_name, i, h, f, xs, tail)
       _ -> binf_escapes(self_name, i, h, false, f) or binf_any_arg_escapes(self_name, i, h, xs)
     }
-    EIntrinsic(_, xs) -> binf_any_arg_escapes(self_name, i, h, xs)
-    ESurface(sf) -> binf_any_arg_escapes(self_name, i, h, surface_children(sf))
     # Control-flow propagates `tail` to branches / block tail; the discriminant
     # / condition is a non-tail read.
     EIf(c, t, oe) -> binf_escapes(self_name, i, h, false, c)
@@ -431,14 +417,24 @@ fn binf_escapes_k(self_name: SelfRef, i: Int, h: LocalId, tail: Bool, k: ExprKin
       binf_escapes(self_name, i, h, false, s) or binf_arms_escape(self_name, i, h, tail, arms)
     EBang(x) -> binf_escapes(self_name, i, h, tail, x)
     EIndex(a, b) -> (tail and (not binf_absent(h, a))) or binf_escapes(self_name, i, h, false, b)
-    # Pure reads (operands inspected, not stored) and pipes / ranges (thread `h`
-    # owned into a callee) are grouped in `binf_escapes_other`.
+    _ -> binf_escapes_stored(self_name, i, h, tail, k)
+  }
+
+# Stored in a slot, captured, projected or passed to an intrinsic: retains past the arm.
+fn binf_escapes_stored(self_name: SelfRef, i: Int, h: LocalId, tail: Bool, k: ExprKind) : Bool =
+  match k {
+    ERecordLit(_, _) -> binf_present_in_kind(h, k)
+    EList(_) -> binf_present_in_kind(h, k)
+    ELambda(_, b) -> not binf_absent(h, b)
+    EField(x, _) -> tail and (not binf_absent(h, x))
+    EIntrinsic(_, xs) -> binf_any_arg_escapes(self_name, i, h, xs)
+    ESurface(sf) -> binf_any_arg_escapes(self_name, i, h, surface_children(sf))
     _ -> binf_escapes_other(self_name, i, h, k)
   }
 
 # The read-through and pipe forms. A binop/unop operand is a non-tail read
-# (no retention); a pipe/range carrying `h` threads it owned into a callee,
-# so any presence escapes. Split out to keep `binf_escapes_k` shallow.
+# (no retention); a pipe/range carrying `h` threads it owned into a callee, and
+# a handler clause captures it, so any presence escapes.
 fn binf_escapes_other(self_name: SelfRef, i: Int, h: LocalId, k: ExprKind) : Bool = match k {
   EBinop(_, a, b) ->
     binf_escapes(self_name, i, h, false, a) or binf_escapes(self_name, i, h, false, b)
@@ -447,7 +443,12 @@ fn binf_escapes_other(self_name: SelfRef, i: Int, h: LocalId, k: ExprKind) : Boo
   EPipe(a, b) -> binf_pipe_escapes(h, a, b)
   EDispatchPipe(_, a, b) -> binf_pipe_escapes(h, a, b)
   ERange(a, b, oe) -> binf_pipe_escapes(h, a, b) or (not binf_opt_absent(h, oe))
-  _ -> false
+  EHandle(_, _, _, _, _, _, _) -> binf_present_in_kind(h, k)
+  _ -> any(xp_positions_kind(k), px => binf_pos_escapes(self_name, i, h, px))
+}
+
+fn binf_pos_escapes(self_name: SelfRef, i: Int, h: LocalId, px: XPos) : Bool = match px {
+  XP(_, c) -> binf_escapes(self_name, i, h, false, c)
 }
 
 fn binf_pipe_escapes(h: LocalId, a: Expr, b: Expr) : Bool =
@@ -583,103 +584,19 @@ fn binf_fieldpats_binders(fps: [PField], acc: [LocalId]) : [LocalId] = match fps
 # above; kept here (the lower module) so neither forms an import cycle.
 fn binf_absent(nm: LocalId, e: Expr) : Bool = not binf_var_present(nm, e)
 
-fn binf_var_present(nm: LocalId, e: Expr) : Bool = binf_var_present_k(nm, e.kind)
+fn binf_var_present(nm: LocalId, e: Expr) : Bool = xp_exists(e, false, x => binf_is_local(nm, x))
 
-fn binf_var_present_k(nm: LocalId, k: ExprKind) : Bool = match k {
+fn binf_is_local(nm: LocalId, e: Expr) : Bool = match e.kind {
   ELocal(u) -> local_eq(u, nm)
-  ECall(f, xs) -> binf_var_present(nm, f) or binf_any_present(nm, xs)
-  EIntrinsic(_, xs) -> binf_any_present(nm, xs)
-  ESurface(sf) -> binf_any_present(nm, surface_children(sf))
-  EField(x, _) -> binf_var_present(nm, x)
-  EMatch(s, arms) -> binf_var_present(nm, s) or binf_present_arms(nm, arms)
-  EBlock(stmts, tail) -> binf_present_stmts(nm, stmts) or binf_present_opt(nm, tail)
-  ELambda(_, b) -> binf_var_present(nm, b)
-  ERecordLit(_, fis) -> binf_present_fields(nm, fis)
-  EList(els) -> binf_present_elems(nm, els)
-  _ -> binf_present_transparent(nm, k)
-}
-
-# The binary/unary transparent forms — `nm` present iff present in any child.
-fn binf_present_transparent(nm: LocalId, k: ExprKind) : Bool = match k {
-  EIndex(a, b) -> binf_var_present(nm, a) or binf_var_present(nm, b)
-  EBinop(_, a, b) -> binf_var_present(nm, a) or binf_var_present(nm, b)
-  EUnop(_, x) -> binf_var_present(nm, x)
-  EIf(c, t, oe) -> binf_var_present(nm, c) or binf_var_present(nm, t) or binf_present_opt(nm, oe)
-  ERange(a, b, oe) -> binf_var_present(nm, a) or binf_var_present(nm, b) or binf_present_opt(nm, oe)
-  EPipe(a, b) -> binf_var_present(nm, a) or binf_var_present(nm, b)
-  EDispatchPipe(_, a, b) -> binf_var_present(nm, a) or binf_var_present(nm, b)
-  EBang(x) -> binf_var_present(nm, x)
-  ELitUnit(x, _) -> binf_var_present(nm, x)
   _ -> false
 }
 
-fn binf_any_present(nm: LocalId, es: [Expr]) : Bool = match es {
-  [] -> false
-  [e, ...rest] -> binf_var_present(nm, e) or binf_any_present(nm, rest)
-}
+# `nm` appears in a direct child position of `k`, at any depth below it.
+fn binf_present_in_kind(nm: LocalId, k: ExprKind) : Bool =
+  any(xp_positions_kind(k), px => binf_pos_present(nm, px))
 
-fn binf_present_opt(nm: LocalId, oe: Option[Expr]) : Bool = match oe {
-  None -> false
-  Some(e) -> binf_var_present(nm, e)
-}
-
-fn binf_present_arms(nm: LocalId, arms: [Arm]) : Bool = match arms {
-  [] -> false
-  [a, ...rest] -> match a {
-    Arm(_, g, b) -> {
-      let g_here = match g {
-        None -> false
-        Some(gg) -> binf_var_present(nm, gg)
-      }
-      g_here or binf_var_present(nm, b) or binf_present_arms(nm, rest)
-    }
-  }
-}
-
-fn binf_present_stmts(nm: LocalId, stmts: [Stmt]) : Bool = match stmts {
-  [] -> false
-  [s, ...rest] -> binf_present_exprs(nm, stmt_exprs(s)) or binf_present_stmts(nm, rest)
-}
-
-fn binf_present_exprs(nm: LocalId, es: [Expr]) : Bool = match es {
-  [] -> false
-  [e, ...rest] -> binf_var_present(nm, e) or binf_present_exprs(nm, rest)
-}
-
-fn binf_absent_fields(nm: LocalId, fis: [FieldInit]) : Bool = match fis {
-  [] -> true
-  [f, ...rest] -> match f {
-    FI(_, v) -> binf_absent(nm, v) and binf_absent_fields(nm, rest)
-  }
-}
-
-fn binf_absent_elems(nm: LocalId, els: [ListElem]) : Bool = match els {
-  [] -> true
-  [el, ...rest] -> {
-    let ok = match el {
-      ElPlain(e) -> binf_absent(nm, e)
-      ElSpread(e) -> binf_absent(nm, e)
-    }
-    ok and binf_absent_elems(nm, rest)
-  }
-}
-
-fn binf_present_fields(nm: LocalId, fis: [FieldInit]) : Bool = match fis {
-  [] -> false
-  [f, ...rest] -> match f {
-    FI(_, v) -> binf_var_present(nm, v) or binf_present_fields(nm, rest)
-  }
-}
-
-fn binf_present_elems(nm: LocalId, els: [ListElem]) : Bool = match els {
-  [] -> false
-  [el, ...rest] -> {
-    let here = match el {
-      ElPlain(e) -> binf_var_present(nm, e)
-      ElSpread(e) -> binf_var_present(nm, e)
-    }
-    here or binf_present_elems(nm, rest)
-  }
+fn binf_pos_present(nm: LocalId, px: XPos) : Bool = match px {
+  XP(_, c) -> binf_var_present(nm, c)
 }
 
 pub(pkg) fn bbe_keep_borrowed(

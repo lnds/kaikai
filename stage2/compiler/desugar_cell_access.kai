@@ -32,115 +32,6 @@ pub(pkg) fn mk_cell_get(cell: LocalId, line: Int, col: Int) : ExprKind =
 pub(pkg) fn mk_cell_put(cell: LocalId, v: Expr, line: Int, col: Int) : ExprKind =
   ECall(mk_expr(EMark(MkCellPut), line, col), [mk_local(cell, line, col), v])
 
-fn contains_cell_access(e: Expr, cell: Binder) : Bool {
-  match e.kind {
-    ECall(callee, args_) -> {
-      let here = match cell_access_of(cell.id, callee, args_) {
-        Some(_) -> true
-        None -> false
-      }
-      here or contains_cell_access(callee, cell) or any_contains_cell_access(args_, cell)
-    }
-    ELambda(_, body) -> contains_cell_access(body, cell)
-    EField(base, _) -> contains_cell_access(base, cell)
-    EIndex(a, b) -> contains_cell_access(a, cell) or contains_cell_access(b, cell)
-    EBinop(_, a, b) -> contains_cell_access(a, cell) or contains_cell_access(b, cell)
-    EUnop(_, x) -> contains_cell_access(x, cell)
-    EIf(c, t_, eo) -> contains_cell_access(c, cell)
-      or contains_cell_access(t_, cell)
-      or (match eo {
-        Some(x) -> contains_cell_access(x, cell)
-        None -> false
-      })
-    EBlock(ss, t) -> stmts_contain_cell_access(ss, cell)
-      or (match t {
-        Some(x) -> contains_cell_access(x, cell)
-        None -> false
-      })
-    EMatch(scr, arms) -> contains_cell_access(scr, cell) or arms_contain_cell_access(arms, cell)
-    EList(elems) -> elems_contain_cell_access(elems, cell)
-    ERecordLit(_, fields) -> fields_contain_cell_access(fields, cell)
-    ERange(a, b, os) -> contains_cell_access(a, cell)
-      or contains_cell_access(b, cell)
-      or (match os {
-        Some(x) -> contains_cell_access(x, cell)
-        None -> false
-      })
-    EPipe(a, b) -> contains_cell_access(a, cell) or contains_cell_access(b, cell)
-    EDispatchPipe(_, a, b) -> contains_cell_access(a, cell) or contains_cell_access(b, cell)
-    EBang(inner) -> contains_cell_access(inner, cell)
-    ELitUnit(inner, _) -> contains_cell_access(inner, cell)
-    _ -> false
-  }
-}
-
-fn any_contains_cell_access(es: [Expr], cell: Binder) : Bool {
-  match es {
-    [] -> false
-    [h, ...rest] ->
-      if contains_cell_access(h, cell) { true } else { any_contains_cell_access(rest, cell) }
-  }
-}
-
-fn stmts_contain_cell_access(ss: [Stmt], cell: Binder) : Bool {
-  match ss {
-    [] -> false
-    [s, ...rest] -> {
-      let here = match s {
-        SLet(_, _, rhs) -> contains_cell_access(rhs, cell)
-        SExprStmt(x) -> contains_cell_access(x, cell)
-        SAssert(c, m) -> contains_cell_access(c, cell)
-          or (match m {
-            Some(x) -> contains_cell_access(x, cell)
-            None -> false
-          })
-        SIndexAssign(b, i, v, _, _) -> contains_cell_access(b, cell)
-          or contains_cell_access(i, cell)
-          or contains_cell_access(v, cell)
-        SAssign(b, v, _, _) -> contains_cell_access(b, cell) or contains_cell_access(v, cell)
-        SVar(_, _, rhs, _, _) -> contains_cell_access(rhs, cell)
-        SUse(_, _, _) -> false
-      }
-      if here { true } else { stmts_contain_cell_access(rest, cell) }
-    }
-  }
-}
-
-fn arms_contain_cell_access(arms: [Arm], cell: Binder) : Bool {
-  match arms {
-    [] -> false
-    [Arm(_, g, b), ...rest] -> {
-      let here = (match g {
-        Some(x) -> contains_cell_access(x, cell)
-        None -> false
-      })
-        or contains_cell_access(b, cell)
-      if here { true } else { arms_contain_cell_access(rest, cell) }
-    }
-  }
-}
-
-fn elems_contain_cell_access(es: [ListElem], cell: Binder) : Bool {
-  match es {
-    [] -> false
-    [el, ...rest] -> {
-      let here = match el {
-        ElPlain(x) -> contains_cell_access(x, cell)
-        ElSpread(x) -> contains_cell_access(x, cell)
-      }
-      if here { true } else { elems_contain_cell_access(rest, cell) }
-    }
-  }
-}
-
-fn fields_contain_cell_access(fs: [FieldInit], cell: Binder) : Bool {
-  match fs {
-    [] -> false
-    [FI(_, v), ...rest] ->
-      if contains_cell_access(v, cell) { true } else { fields_contain_cell_access(rest, cell) }
-  }
-}
-
 #[doc("The effect a rewritten cap call performs on: the core `Spawn`, already settled.")]
 pub(pkg) fn spawn_ref(line: Int, col: Int) : Expr =
   mk_sym(core_effect_id(CeSpawn), line, col)
@@ -314,136 +205,8 @@ fn escaping_closure_pos(e: Expr, cell: Binder, tainted: [LocalId]) : Option[Cell
     EField(base, _) -> escaping_closure_pos(base, cell, tainted)
     EBang(inner) -> escaping_closure_pos(inner, cell, tainted)
     ELitUnit(inner, _) -> escaping_closure_pos(inner, cell, tainted)
+    EHandle(_, _, _, _, _, _, _) -> handle_escaping_pos(xp_children(e), cell, tainted)
     _ -> None
-  }
-}
-
-# Walk a block's stmts + tail for a `spawn(task)` whose task touches the
-# `cell` in the child fiber. Unlike the value-reaching-exit check, this
-# follows into eager lambdas (a `nursery { cell -> ... }` body runs in place
-# but may itself spawn), so the whole block is scanned.
-fn spawn_block_escape_pos(
-  stmts: [Stmt],
-  tail: Option[Expr],
-  cell: Binder,
-  tainted: [LocalId]
-) : Option[CellPos] =
-  first_pos(
-    spawn_stmts_escape_pos(stmts, cell, tainted),
-    tail || (t => spawn_escape_pos(t, cell, tainted))
-  )
-
-fn spawn_stmts_escape_pos(stmts: [Stmt], cell: Binder, tainted: [LocalId]) : Option[CellPos] {
-  match stmts {
-    [] -> None
-    [s, ...rest] -> {
-      let here = match s {
-        SLet(_, _, rhs) -> spawn_escape_pos(rhs, cell, tainted)
-        SExprStmt(x) -> spawn_escape_pos(x, cell, tainted)
-        SVar(_, _, rhs, _, _) -> spawn_escape_pos(rhs, cell, tainted)
-        SIndexAssign(b, i, v, _, _) -> first_pos(
-          spawn_escape_pos(b, cell, tainted),
-          first_pos(spawn_escape_pos(i, cell, tainted), spawn_escape_pos(v, cell, tainted))
-        )
-        SAssign(b, v, _, _) -> first_pos(
-          spawn_escape_pos(b, cell, tainted),
-          spawn_escape_pos(v, cell, tainted)
-        )
-        SAssert(c, m) -> first_pos(
-          spawn_escape_pos(c, cell, tainted),
-          m || (x => spawn_escape_pos(x, cell, tainted))
-        )
-        _ -> None
-      }
-      match here {
-        Some(p) -> Some(p)
-        None -> spawn_stmts_escape_pos(rest, cell, tainted)
-      }
-    }
-  }
-}
-
-# A `<recv>.spawn(task)` defers `task` to another fiber, so a `task` that
-# touches the cell escapes its handler. Recurse the whole expression to
-# reach spawns nested under eager lambdas; at each spawn call, test its
-# arguments with `spawn_arg_escape_pos`.
-fn spawn_escape_pos(e: Expr, cell: Binder, tainted: [LocalId]) : Option[CellPos] =
-  match e.kind {
-    ECall(callee, args_) -> {
-      let at_spawn = match callee.kind {
-        EField(_, "spawn") -> spawn_args_escape_pos(args_, cell, tainted)
-        _ -> None
-      }
-      first_pos(
-        at_spawn,
-        first_pos(
-          spawn_escape_pos(callee, cell, tainted),
-          spawn_escape_args(args_, cell, tainted)
-        )
-      )
-    }
-    ELambda(_, body) -> spawn_escape_pos(body, cell, tainted)
-    EBlock(ss, t) -> spawn_block_escape_pos(ss, t, cell, tainted)
-    EIf(c, t_, eo) -> first_pos(
-      spawn_escape_pos(c, cell, tainted),
-      first_pos(
-        spawn_escape_pos(t_, cell, tainted),
-        match eo {
-          Some(x) -> spawn_escape_pos(x, cell, tainted)
-          None -> None
-        }
-      )
-    )
-    EMatch(scr, arms) ->
-      first_pos(spawn_escape_pos(scr, cell, tainted), spawn_escape_arms(arms, cell, tainted))
-    EField(base, _) -> spawn_escape_pos(base, cell, tainted)
-    EBang(inner) -> spawn_escape_pos(inner, cell, tainted)
-    ELitUnit(inner, _) -> spawn_escape_pos(inner, cell, tainted)
-    EList(elems) -> spawn_escape_elems(elems, cell, tainted)
-    EBinop(_, a, b) ->
-      first_pos(spawn_escape_pos(a, cell, tainted), spawn_escape_pos(b, cell, tainted))
-    EUnop(_, x) -> spawn_escape_pos(x, cell, tainted)
-    EPipe(a, b) -> first_pos(spawn_escape_pos(a, cell, tainted), spawn_escape_pos(b, cell, tainted))
-    EDispatchPipe(_, a, b) ->
-      first_pos(spawn_escape_pos(a, cell, tainted), spawn_escape_pos(b, cell, tainted))
-    _ -> None
-  }
-
-fn spawn_escape_args(es: [Expr], cell: Binder, tainted: [LocalId]) : Option[CellPos] {
-  match es {
-    [] -> None
-    [h, ...rest] ->
-      match spawn_escape_pos(h, cell, tainted) {
-        Some(p) -> Some(p)
-        None -> spawn_escape_args(rest, cell, tainted)
-      }
-  }
-}
-
-fn spawn_escape_arms(arms: [Arm], cell: Binder, tainted: [LocalId]) : Option[CellPos] {
-  match arms {
-    [] -> None
-    [Arm(_, _, b), ...rest] ->
-      match spawn_escape_pos(b, cell, tainted) {
-        Some(p) -> Some(p)
-        None -> spawn_escape_arms(rest, cell, tainted)
-      }
-  }
-}
-
-fn spawn_escape_elems(es: [ListElem], cell: Binder, tainted: [LocalId]) : Option[CellPos] {
-  match es {
-    [] -> None
-    [el, ...rest] -> {
-      let here = match el {
-        ElPlain(x) -> spawn_escape_pos(x, cell, tainted)
-        ElSpread(x) -> spawn_escape_pos(x, cell, tainted)
-      }
-      match here {
-        Some(p) -> Some(p)
-        None -> spawn_escape_elems(rest, cell, tainted)
-      }
-    }
   }
 }
 
@@ -573,3 +336,58 @@ fn ces_block(stmts: [Stmt], tail: Option[Expr], file: String, acc: [Diagnostic])
       ces_block(rest, tail, file, list_append(acc, lcr_escape_check(rest, tail, b, file)))
     [_, ...rest] -> ces_block(rest, tail, file, acc)
   }
+
+fn contains_cell_access(e: Expr, cell: Binder) : Bool =
+  xp_exists(e, false, x => cell_access_here(x, cell))
+
+fn cell_access_here(e: Expr, cell: Binder) : Bool = match e.kind {
+  ECall(callee, args_) -> match cell_access_of(cell.id, callee, args_) {
+    Some(_) -> true
+    None -> false
+  }
+  _ -> false
+}
+
+# Walk a block's stmts + tail for a `spawn(task)` whose task touches the
+# `cell` in the child fiber. Unlike the value-reaching-exit check, this
+# follows into eager lambdas (a `nursery { cell -> ... }` body runs in place
+# but may itself spawn), so the whole block is scanned.
+fn spawn_block_escape_pos(
+  stmts: [Stmt],
+  tail: Option[Expr],
+  cell: Binder,
+  tainted: [LocalId]
+) : Option[CellPos] =
+  spawn_escape_list(list_append(flat_map(stmts, stmt_exprs), opt_exprs(tail)), cell, tainted)
+
+fn opt_exprs(o: Option[Expr]) : [Expr] = match o {
+  Some(x) -> [x]
+  None -> []
+}
+
+# A `<recv>.spawn(task)` defers `task` to another fiber, so a `task` that
+# touches the cell escapes its handler. Recurse the whole expression to
+# reach spawns nested under eager lambdas; at each spawn call, test its
+# arguments with `spawn_arg_escape_pos`.
+fn spawn_escape_pos(e: Expr, cell: Binder, tainted: [LocalId]) : Option[CellPos] =
+  first_pos(spawn_at(e, cell, tainted), spawn_escape_list(xp_children(e), cell, tainted))
+
+fn spawn_at(e: Expr, cell: Binder, tainted: [LocalId]) : Option[CellPos] = match e.kind {
+  ECall(callee, args_) -> match callee.kind {
+    EField(_, "spawn") -> spawn_args_escape_pos(args_, cell, tainted)
+    _ -> None
+  }
+  _ -> None
+}
+
+fn spawn_escape_list(es: [Expr], cell: Binder, tainted: [LocalId]) : Option[CellPos] = match es {
+  [] -> None
+  [h, ...rest] ->
+    first_pos(spawn_escape_pos(h, cell, tainted), spawn_escape_list(rest, cell, tainted))
+}
+
+fn handle_escaping_pos(es: [Expr], cell: Binder, tainted: [LocalId]) : Option[CellPos] = match es {
+  [] -> None
+  [h, ...rest] ->
+    first_pos(escaping_closure_pos(h, cell, tainted), handle_escaping_pos(rest, cell, tainted))
+}

@@ -13,6 +13,7 @@ import compiler.operators
 import compiler.fn_index
 import compiler.kinds
 import compiler.expr_positions
+import compiler.tree_children
 import compiler.loop_lower
 import compiler.vec_raw
 import compiler.core_builtins
@@ -1023,108 +1024,34 @@ fn nab_stmt(nm: LocalId, s: Stmt, cis: CtorIntIx, fns: FnIndex) : Bool / Console
   _ -> not nab_stmt_mentions(nm, s)
 }
 
-# Exhaustive mention walk (every sub-Expr AND nested match patterns) — the
-# conservative catch-all for a form `nab_uses_ok` does not model. Unlike
-# `scan_uses_expr` this descends into arm patterns, so a binder read in a
-# nested match pattern still forces boxed.
-fn nab_mentions(nm: LocalId, e: Expr) : Bool / Console = match e.kind {
+# Every mention of `nm`, in an expression or in a pattern below it: the
+# conservative answer for a form `nab_uses_ok` does not model.
+fn nab_mentions(nm: LocalId, e: Expr) : Bool = xp_exists(e, false, x => nab_node_mentions(nm, x))
+
+fn nab_node_mentions(nm: LocalId, e: Expr) : Bool = match e.kind {
   ELocal(n) -> local_eq(n, nm)
-  ECall(f, xs) -> nab_mentions(nm, f) or nab_mentions_list(nm, xs)
-  EIntrinsic(_, xs) -> nab_mentions_list(nm, xs)
-  ESurface(sf) -> nab_mentions_list(nm, surface_children(sf))
-  EField(x, _) -> nab_mentions(nm, x)
-  EIndex(a, b) -> nab_mentions(nm, a) or nab_mentions(nm, b)
-  EBinop(_, a, b) -> nab_mentions(nm, a) or nab_mentions(nm, b)
-  EUnop(_, x) -> nab_mentions(nm, x)
-  EBang(x) -> nab_mentions(nm, x)
-  ELitUnit(x, _) -> nab_mentions(nm, x)
-  EIf(c, t, oe) -> nab_mentions(nm, c) or nab_mentions(nm, t) or nab_mentions_opt(nm, oe)
-  EMatch(s, arms) -> nab_mentions(nm, s) or nab_mentions_arms(nm, arms)
-  ELambda(_, b) -> nab_mentions(nm, b)
-  ERecordLit(_, fis) -> nab_mentions_fields(nm, fis)
-  EList(els) -> nab_mentions_elems(nm, els)
-  ERange(a, b, ob) -> nab_mentions(nm, a) or nab_mentions(nm, b) or nab_mentions_opt(nm, ob)
-  EBlock(ss, tl) -> nab_mentions_stmts(nm, ss) or nab_mentions_opt(nm, tl)
-  EPipe(a, b) -> nab_mentions(nm, a) or nab_mentions(nm, b)
-  EDispatchPipe(_, a, b) -> nab_mentions(nm, a) or nab_mentions(nm, b)
+  EMatch(_, arms) -> any(arms, a => nab_arm_binds(nm, a))
+  EBlock(ss, _) -> any(ss, s => nab_stmt_binds(nm, s))
   _ -> false
 }
 
-fn nab_mentions_list(nm: LocalId, es: [Expr]) : Bool / Console = match es {
-  [] -> false
-  [e, ...r] -> nab_mentions(nm, e) or nab_mentions_list(nm, r)
+fn nab_arm_binds(nm: LocalId, a: Arm) : Bool = match a {
+  Arm(p, _, _) -> nab_pat(nm, p)
 }
 
-fn nab_mentions_opt(nm: LocalId, oe: Option[Expr]) : Bool / Console = match oe {
-  None -> false
-  Some(e) -> nab_mentions(nm, e)
-}
-
-fn nab_mentions_arms(nm: LocalId, arms: [Arm]) : Bool / Console = match arms {
-  [] -> false
-  [a, ...r] -> (match a {
-    Arm(p, g, b) -> nab_pat(nm, p) or nab_mentions_opt(nm, g) or nab_mentions(nm, b)
-  })
-    or nab_mentions_arms(nm, r)
-}
-
-fn nab_mentions_fields(nm: LocalId, fis: [FieldInit]) : Bool / Console = match fis {
-  [] -> false
-  [f, ...r] -> (match f {
-    FI(_, e) -> nab_mentions(nm, e)
-  })
-    or nab_mentions_fields(nm, r)
-}
-
-fn nab_mentions_elems(nm: LocalId, els: [ListElem]) : Bool / Console = match els {
-  [] -> false
-  [el, ...r] -> (match el {
-    ElPlain(e) -> nab_mentions(nm, e)
-    ElSpread(e) -> nab_mentions(nm, e)
-  })
-    or nab_mentions_elems(nm, r)
-}
-
-fn nab_mentions_stmts(nm: LocalId, ss: [Stmt]) : Bool / Console = match ss {
-  [] -> false
-  [s, ...r] -> nab_stmt_mentions(nm, s) or nab_mentions_stmts(nm, r)
-}
-
-fn nab_stmt_mentions(nm: LocalId, s: Stmt) : Bool / Console = match s {
-  SExprStmt(e) -> nab_mentions(nm, e)
-  SLet(p, _, rhs) -> nab_pat(nm, p) or nab_mentions(nm, rhs)
-  SVar(_, _, rhs, _, _) -> nab_mentions(nm, rhs)
-  SAssert(e, oe) -> nab_mentions(nm, e) or nab_mentions_opt(nm, oe)
-  SIndexAssign(b, i, v, _, _) -> nab_mentions(nm, b) or nab_mentions(nm, i) or nab_mentions(nm, v)
-  SAssign(b, v, _, _) -> nab_mentions(nm, b) or nab_mentions(nm, v)
+fn nab_stmt_binds(nm: LocalId, s: Stmt) : Bool = match s {
+  SLet(p, _, _) -> nab_pat(nm, p)
   _ -> false
 }
 
-fn nab_pat(nm: LocalId, p: Pattern) : Bool / Console = match p.pkind {
-  PBind(n) -> local_eq(n.id, nm)
-  PLit(e) -> nab_mentions(nm, e)
-  PList(subs, orest) -> nab_pats(nm, subs)
-    or (match orest {
-      Some(n) -> local_eq(n.id, nm)
-      None -> false
-    })
-  PVariant(_, subs) -> nab_pats(nm, subs)
-  PVariantRecord(_, fs) -> nab_pfields(nm, fs)
-  PRecord(fs) -> nab_pfields(nm, fs)
-  PAs(n, inner) -> local_eq(n.id, nm) or nab_pat(nm, inner)
-  PNarrow(n, _) -> local_eq(n.id, nm)
-  _ -> false
+fn nab_stmt_mentions(nm: LocalId, s: Stmt) : Bool =
+  nab_stmt_binds(nm, s) or any(xp_stmt_positions(s), px => nab_pos_mentions(nm, px))
+
+fn nab_pos_mentions(nm: LocalId, px: XPos) : Bool = match px {
+  XP(_, x) -> nab_mentions(nm, x)
 }
 
-fn nab_pats(nm: LocalId, ps: [Pattern]) : Bool / Console = match ps {
-  [] -> false
-  [p, ...r] -> nab_pat(nm, p) or nab_pats(nm, r)
-}
+fn nab_pat(nm: LocalId, p: Pattern) : Bool = pat_exists(p, q => nab_pat_node(nm, q))
 
-fn nab_pfields(nm: LocalId, fs: [PField]) : Bool / Console = match fs {
-  [] -> false
-  [f, ...r] -> (match f {
-    PField(_, sub, _) -> nab_pat(nm, sub)
-  })
-    or nab_pfields(nm, r)
-}
+fn nab_pat_node(nm: LocalId, q: Pattern) : Bool =
+  any(pat_binders(q), b => local_eq(b.id, nm)) or any(pat_exprs(q), x => nab_mentions(nm, x))

@@ -328,31 +328,28 @@ fn lower_take_field(x: Expr, f: String, cargs: [Expr], st: LowerSt) : LRes / Con
       None -> lower_field_read(st1, KPrim(KpField, [bv, KStrV(f)]), bv, kpos_of(x))
     }
   }
-  _ -> LRes(KUnitV, st)
+  _ -> lower_unhandled(x, st)
 }
 
 fn lower_mark_call(x: Expr, m: Mark, cargs: [Expr], st: LowerSt) : LRes / Console =
   if mark_is_drop(m) {
-    lower_rc_unary(cargs, KDropMk, st)
+    lower_rc_unary(x, cargs, KDropMk, st)
   } else if mark_is_transparent(m) {
-    lower_borrow_through(cargs, st)
+    lower_borrow_through(x, cargs, st)
   } else {
     match m {
       MkApplyBorrow -> lower_apply_borrow(x, cargs, st)
       MkTcrecStep(s) -> lower_tcrec(x, s, cargs, st)
-      MkTailStep(_) -> lower_borrow_through(cargs, st)
+      MkTailStep(_) -> lower_borrow_through(x, cargs, st)
       MkTrmcStep(s) -> lower_trmc_step(x, s, cargs, st)
       MkTrmcApply -> lower_trmc_apply(x, cargs, st)
-      MkDup -> lower_rc_unary(cargs, KDupMk, st)
+      MkDup -> lower_rc_unary(x, cargs, KDupMk, st)
       MkTakeField(f) -> lower_take_field(x, f, cargs, st)
       MkTakeState -> bind_op(st, KPrim(KpStateTake, []), kpos_of(x))
       MkReuseCons -> lower_reuse(x, m, cargs, st)
       MkReuseVariant -> lower_reuse(x, m, cargs, st)
       MkReuseRecord -> lower_reuse(x, m, cargs, st)
-      _ -> {
-        eprint(concat_all(["kir: mark ", mark_name(m), " has no lowering"]))
-        LRes(KUnitV, st)
-      }
+      _ -> kir_unsupported(concat_all(["mark ", mark_name(m)]), x.line, x.col, st)
     }
   }
 
@@ -362,15 +359,15 @@ fn lower_sym_call(x: Expr, fid: FnId, cargs: [Expr], st: LowerSt) : LRes / Conso
     # `__strip_unit(e)` is a compile-time unit erasure — identity at
     # runtime, so lower the inner expr directly (like `__perceus_borrow`).
     CkStripUnit -> if kir_node_is_raw(x) {
-      lower_raw_through(cargs, st)
+      lower_raw_through(x, cargs, st)
     } else {
-      lower_borrow_through(cargs, st)
+      lower_borrow_through(x, cargs, st)
     }
     # `unit_name(e)` is COMPILE-TIME reflection (m12.8.x phase 2): the unit is
     # phantom (no runtime value carries it), so it CANNOT be a runtime call —
     # the C-direct oracle inlines the canonical unit symbol as a `kai_str`
     # literal read from the arg's `.ty` (emit_c's `unit_name` case).
-    CkUnitName -> lower_unit_name(cargs, st)
+    CkUnitName -> lower_unit_name(x, cargs, st)
     CkDirect -> lower_callee_dispatch(x, fid, cargs, st)
   }
 
@@ -389,7 +386,7 @@ fn lower_perform(x: Expr, r: OpRef, cargs: [Expr], st: LowerSt) : LRes / Console
   }
 }
 
-fn lower_rc_unary(cargs: [Expr], kind: RCKind, st: LowerSt) : LRes / Console = match cargs {
+fn lower_rc_unary(x: Expr, cargs: [Expr], kind: RCKind, st: LowerSt) : LRes / Console = match cargs {
   [a] -> match lower_expr(a, st) {
     LRes(v, st1) -> {
       let op = match kind {
@@ -404,13 +401,13 @@ fn lower_rc_unary(cargs: [Expr], kind: RCKind, st: LowerSt) : LRes / Console = m
       }
     }
   }
-  _ -> LRes(KUnitV, st)
+  _ -> lower_unhandled(x, st)
 }
 
 # `__perceus_borrow(e)` reads `e` without an RC op — transparent.
-fn lower_borrow_through(cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
+fn lower_borrow_through(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
   [a] -> lower_expr(a, st)
-  _ -> LRes(KUnitV, st)
+  _ -> lower_unhandled(x, st)
 }
 
 # `int_to_real` / `real_to_int` in raw position: one raw instruction; the operand crosses raw, borrowing a boxed binder.
@@ -423,13 +420,13 @@ pub(pkg) fn lower_scalar_conv_raw(x: Expr, f: Expr, cargs: [Expr], st: LowerSt) 
           _ -> bind_op_slot(st1, KPrim(KpRealToInt, [av]), SInt64, kpos_of(x))
         }
     }
-    _ -> LRes(KUnitV, st)
+    _ -> lower_unhandled(x, st)
   }
 
 # A raw coercion hands its raw argument through without a box round trip.
-fn lower_raw_through(cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
+fn lower_raw_through(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match cargs {
   [a] -> lower_expr_raw(a, st)
-  _ -> LRes(KUnitV, st)
+  _ -> lower_unhandled(x, st)
 }
 
 # A borrowing indirect call. The first arg is the closure value, invoked
@@ -442,7 +439,7 @@ fn lower_apply_borrow(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = ma
           LResMany(avs, st2) -> bind_op(st2, KCallIndirectBorrow(fv, avs), kpos_of(x))
         }
     }
-  _ -> LRes(KUnitV, st)
+  _ -> lower_unhandled(x, st)
 }
 
 # `sym` is the already-resolved mangled symbol and `sig` the callee's
@@ -569,7 +566,7 @@ fn lower_resume(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = match ca
       LRes(sv, st2) -> bind_op(st2, KResume2Op(KVar(kir_resume_reg()), av, sv), kpos_of(x))
     }
   }
-  _ -> LRes(KUnitV, st)
+  _ -> lower_unhandled(x, st)
 }
 
 # A `MkTcrecStep` call → KTcrecGoto (seals the block).
@@ -714,5 +711,5 @@ fn lower_trmc_apply(x: Expr, cargs: [Expr], st: LowerSt) : LRes / Console = matc
       )
     }
   }
-  _ -> LRes(KUnitV, st)
+  _ -> lower_unhandled(x, st)
 }
