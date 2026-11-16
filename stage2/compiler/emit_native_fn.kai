@@ -1006,91 +1006,70 @@ pub fn nemit_push_atoms(ctx: Handle, buf: Handle, vs: [KVal]) : Unit / Console =
 
 pub type RSpec = RS(String, KSlot)
 
-pub fn collect_fn_specs(f: KFn) : [RSpec] =
-  # The accumulator is built in REVERSE and flipped once here. Appending
-  # to a forward list copies the whole spine per registration, which is
-  # quadratic in a fn's register count; a prepend is O(1) and the single
-  # reverse restores first-appearance order — the order `nemit_allocas`
-  # emits in and `native_ctx_reg_at` indexes by.
-  list_reverse(collect_block_specs(f.blocks, collect_param_specs(f.params, [])))
+#[doc("The registers of `f` in order of first appearance: its params, then every binder and store destination, a name bound at two slots widening to boxed. A store onto a name with no binder seeds it boxed; one onto a bound name keeps the binder's slot.")]
+pub fn collect_fn_specs(f: KFn) : [RSpec] = specs_done(
+  specs_blocks(
+    f.blocks,
+    specs_params(f.params, Specs { acc: [], seen: idx_empty(), wide: idx_empty() })
+  )
+)
 
-# Register `name` at `slot`, merging on a name already present. A name that
-# legitimately reappears with a DIFFERENT slot (a `KLet n: i32` then a
-# `KStore n` of a boxed value, or two lowering paths reusing a join name)
-# must NOT keep the first slot seen: that under-sizes the alloca (an `i32`
-# alloca taking an 8-byte `ptr` store truncates / mis-types the load). The
-# widening rule promotes the conflicting register to `SBoxed` — the
-# universal slot every value fits — so the alloca is `ptr`-wide and the
-# walk's boxed store/load agree. A same-slot reappearance is a no-op. (The
-# `.t`-prefixed temporaries `ls_fresh_reg` now emit can no longer ALIAS a
-# surface binder, which was the common trigger; this stays as the soundness
-# floor for any other path that reassigns a name across slots.)
-fn rspec_add(acc: [RSpec], name: String, slot: KSlot) : [RSpec] = match rspec_slot(acc, name) {
-  None -> [RS(name, slot), ...acc]
-  Some(cur) -> if kslot_eq(cur, slot) { acc } else { rspec_set_boxed(acc, name) }
-}
+type Specs = { acc: [RSpec], seen: NameIndex[RSpec], wide: NameIndex[String] }
 
-fn rspec_slot(acc: [RSpec], name: String) : Option[KSlot] = match acc {
+fn specs_find(chain: [RSpec], n: String) : Option[RSpec] = match chain {
   [] -> None
-  [RS(n, s), ...rest] -> if n == name { Some(s) } else { rspec_slot(rest, name) }
+  [r, ...rest] -> match r {
+    RS(m, _) -> if m == n { Some(r) } else { specs_find(rest, n) }
+  }
 }
 
-# Register a `KStore` destination: keep the declared slot when the register
-# already exists (its `KLet` decided it — a raw `if`-join must stay raw), seed
-# `SBoxed` only for a store onto an un-declared name (the boxed default). Never
-# WIDENS a declared slot, unlike `rspec_add` — a store writes at the existing
-# type, it does not re-declare.
-fn rspec_add_store(acc: [RSpec], name: String) : [RSpec] = match rspec_slot(acc, name) {
-  None -> [RS(name, SBoxed), ...acc]
-  Some(_) -> acc
+fn specs_add(st: Specs, n: String, s: KSlot) : Specs = match specs_find(idx_chain(st.seen, n), n) {
+  None ->
+    Specs { acc: [RS(n, s), ...st.acc], seen: idx_prepend(st.seen, n, RS(n, s)), wide: st.wide }
+  Some(RS(_, cur)) -> if nslot_tag(cur) == nslot_tag(s) {
+    st
+  } else {
+    Specs { ...st, wide: idx_prepend(st.wide, n, n) }
+  }
 }
 
-# Re-register `name` as `SBoxed` (the slot-widening on a conflict), keeping
-# list order so the alloca-emit order — and the dump — stay deterministic.
-fn rspec_set_boxed(acc: [RSpec], name: String) : [RSpec] = match acc {
-  [] -> []
-  [RS(n, s), ...rest] ->
-    if n == name {
-      [RS(n, SBoxed), ...rest]
-    } else {
-      [RS(n, s), ...rspec_set_boxed(rest, name)]
-    }
+fn specs_store(st: Specs, n: String) : Specs = match specs_find(idx_chain(st.seen, n), n) {
+  None -> specs_add(st, n, SBoxed)
+  Some(_) -> st
 }
 
-fn kslot_eq(a: KSlot, b: KSlot) : Bool = nslot_tag(a) == nslot_tag(b)
-
-fn rspec_add_boxed_all(acc: [RSpec], names: [String]) : [RSpec] = match names {
-  [] -> acc
-  [nm, ...rest] -> rspec_add_boxed_all(rspec_add(acc, nm, SBoxed), rest)
+fn specs_boxed_all(st: Specs, ns: [String]) : Specs = match ns {
+  [] -> st
+  [n, ...rest] -> specs_boxed_all(specs_add(st, n, SBoxed), rest)
 }
 
-fn collect_param_specs(ps: [KParam], acc: [RSpec]) : [RSpec] = match ps {
-  [] -> acc
-  [p, ...rest] -> collect_param_specs(rest, rspec_add(acc, p.name, p.slot))
+fn specs_params(ps: [KParam], st: Specs) : Specs = match ps {
+  [] -> st
+  [p, ...rest] -> specs_params(rest, specs_add(st, p.name, p.slot))
 }
 
-fn collect_block_specs(bs: [KBlock], acc: [RSpec]) : [RSpec] = match bs {
-  [] -> acc
-  [b, ...rest] -> collect_block_specs(rest, collect_stmt_specs(b.stmts, acc))
+fn specs_blocks(bs: [KBlock], st: Specs) : Specs = match bs {
+  [] -> st
+  [b, ...rest] -> specs_blocks(rest, specs_stmts(b.stmts, st))
 }
 
-fn collect_stmt_specs(ss: [KStmt], acc: [RSpec]) : [RSpec] = match ss {
-  [] -> acc
-  [s, ...rest] -> collect_stmt_specs(rest, match s {
-    KLet(n, slot, _, _) -> rspec_add(acc, n, slot)
-    # A `KStore` does NOT decide its destination's slot — the `KLet` that
-    # declared the register does (a raw `if`-join is `KLet(.t, SInt64, ..)`
-    # then written by branch `KStore`s). Seeding the store `SBoxed` would
-    # CONFLICT with that `KLet` and widen the raw join back to `ptr` (an
-    # alloca-`ptr` / `store i64` mismatch). So a store only seeds a register
-    # with NO `KLet`; a store onto an already-declared register keeps the
-    # declared slot (`KStore` always follows its `KLet` in the same block).
-    KStore(n, _, _) -> rspec_add_store(acc, n)
-    KBindEvState(_, _, regs, _) -> rspec_add_boxed_all(acc, regs)
-    KBindSelfState(regs, _) -> rspec_add_boxed_all(acc, regs)
-    _ -> acc
+fn specs_stmts(ss: [KStmt], st: Specs) : Specs = match ss {
+  [] -> st
+  [s, ...rest] -> specs_stmts(rest, match s {
+    KLet(n, slot, _, _) -> specs_add(st, n, slot)
+    KStore(n, _, _) -> specs_store(st, n)
+    KBindEvState(_, _, regs, _) -> specs_boxed_all(st, regs)
+    KBindSelfState(regs, _) -> specs_boxed_all(st, regs)
+    _ -> st
   })
 }
+
+fn specs_done(st: Specs) : [RSpec] = map(
+  list_reverse(st.acc),
+  r => match r {
+    RS(n, s) -> if list_has(idx_chain(st.wide, n), n) { RS(n, SBoxed) } else { RS(n, s) }
+  }
+)
 
 # Emit every register's alloca at the entry head (the builder must be
 # positioned there) and record it in the ctx table.
@@ -1141,7 +1120,7 @@ pub fn nemit_store_reg(ctx: Handle, name: String, h: Handle) : Unit / Console {
 
 # Store a `KLet` handle materialised at its KIR-PLANNED slot into a register
 # whose alloca may have WIDENED to `SBoxed`. Two sibling match arms binding the
-# same name at different KSlots merge in `rspec_add`, widening the register to
+# same name at different KSlots merge in `specs_add`, widening the register to
 # `SBoxed` (ptr-wide); but the op was emitted at the arm's planned raw slot
 # (`nemit_op_fx_slot`). Storing that raw `i64`/`f64`/`i32` blind into the
 # ptr-wide alloca leaves a raw word that every boxed-border read then
