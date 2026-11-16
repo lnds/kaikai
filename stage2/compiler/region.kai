@@ -1,53 +1,19 @@
-# compiler/region.kai — opt-in Perceus regions: surface recognition +
-# the region side-table, plus the signature-brand predicate both backends
-# route ctors off. Drives arena lowering + deep-copy-out in the emitters.
+# compiler/region.kai — opt-in Perceus regions: surface recognition, plus
+# the signature-brand predicate both backends route ctors off.
 #
-# THE SHAPE. The parser lowers `region { ... }` to the marker
-# `ECall(EMark(MkRegion), [block])` where `block` is an `EBlock`
-# (parse.kai parse_region). `region` is not a fn, not an effect, and
-# not a lexer keyword — the marker exists ONLY between parse and this
-# pass. This pass:
-#   1. recognises the marker by its mark,
-#   2. records each region's (file,line,col,nth) in a side table so the
-#      emitters can bump-allocate the region's constructors into an
-#      arena, free the arena at block exit, and deep-copy-out any value
-#      that crosses the block boundary,
-#   3. UNWRAPS the marker back to the bare `block`, so the typer and
-#      both emitters see an ordinary block. The block keyed by its source
-#      position in the side table lowers to arena alloc; every other block
-#      is an ordinary RC block, so selfhost stays byte-identical for
-#      non-region code.
+# The parser lowers `region { ... }` to the marker
+# `ECall(EMark(MkRegion), [block])` where `block` is an `EBlock`. `region`
+# is not a fn, not an effect, and not a lexer keyword: the marker exists
+# only between parse and this pass, which rewrites it to `ERegionBlk(block)`.
+# The node is the region's identity, so the lowering finds a region by what
+# the tree says, never by a position: the block inside lowers to arena
+# allocation with deep-copy-out; every other block is an ordinary RC block.
 #
-# WHY A MARKER + UNWRAP, NOT A NEW AST NODE. A dedicated `ERegion`
-# variant would force a new arm at every exhaustive ExprKind-matcher site
-# across the modules that walk the AST. The marker reuses ECall/EMark/
-# EBlock — every matcher already handles those — so there is zero
-# non-exhaustive-match risk.
+# Escape semantics are deep-copy-out, not rejection. A value allocated in
+# the region's arena that crosses the block boundary is copied out with
+# rc = 1 by the emitters, so this pass emits no diagnostics.
 #
-# ESCAPE SEMANTICS: DEEP-COPY-OUT, not compile-time rejection. A value
-# allocated inside a `region { }` is bump-allocated in the region's arena.
-# When such a value crosses the block boundary — the block's final
-# expression value, a store into an outer binding, a closure capture, a
-# fn-arg — the emitter deep-copies it OUT of the arena with rc = 1 (NOT the
-# INT32_MAX arena sentinel; a sentinel-inheriting copy would never free =
-# leak). So `let x = region { [1, 2, 3] }` is legal: the list is built in
-# the arena and copied out as an ordinary rc=1 value when it leaves. For
-# pure LIFO scratch (a buffer consumed and discarded inside the block)
-# nothing crosses the border, so the copy never fires and the whole region
-# frees in one shot with zero RC traffic.
-#
-# Therefore THIS PASS does NO escape checking and emits NO diagnostics.
-# Its whole job is to mark which blocks are regions (the side table) and to
-# strip the surface marker. The border-crossing detection + deep-copy-out
-# lives in the emitters, where the lowering of each region constructor and
-# each block exit is generated.
-#
-# PIPELINE POSITION. Pre-typer, a sibling of the nursery rewrite in the
-# driver (just after the const-ref desugar, before inference). Lexical
-# only — no resolved binders needed, so it runs before the fused resolve/
-# infer. Perceus is NOT touched: the `rc = INT32_MAX` arena sentinel
-# already makes Perceus's reuse-in-place auto-disable on region values for
-# free (kai_check_unique returns 0).
+# Pre-typer, a sibling of the nursery rewrite, lexical only.
 
 import compiler.ast
 import compiler.ast_decl
@@ -57,153 +23,46 @@ import compiler.ast_ids
 import compiler.written
 import compiler.ast_map
 import compiler.core_types
-import compiler.diag_file
-import compiler.expr_positions
 import compiler.fnreg
 
-# ---- side table ----------------------------------------------------
+# ---- rewrite -------------------------------------------------------
 
-# One recorded region: the source position of its `region` keyword plus
-# an ordinal so two regions sharing (line,col) after a span-copying
-# desugar never collide (the indexed-by-position bug-class — same key
-# discipline as the other position-keyed marks).
-#[doc("A recorded `region { }` block: file, line, col, nth (ordinal disambiguator), and the region's binder name as written (empty for the bare form).")]
-pub type RegionMark = RM(String, Int, Int, Int, Written)
+#[doc("The declarations with every `region { }` marker rewritten to an `ERegionBlk` node.")]
+pub fn rewrite_regions_decls(decls: [Decl]) : [Decl] = map(decls, rw_decl)
 
-pub fn rmark_line(m: RegionMark) : Int = match m {
-  RM(_, l, _, _, _) -> l
+fn rw_decl(d: Decl) : Decl = match d {
+  DFn(p_, f, tps, ps, ret, row, body, l, c, nl, nc, mo) ->
+    DFn(p_, f, tps, ps, ret, row, rw_expr(body), l, c, nl, nc, mo)
+  DTest(desc, body, l, c, mo) -> DTest(desc, rw_expr(body), l, c, mo)
+  DBench(desc, body, l, c, mo) -> DBench(desc, rw_expr(body), l, c, mo)
+  DCheck(desc, ps, body, l, c, mo) -> DCheck(desc, ps, rw_expr(body), l, c, mo)
+  DImpl(pname, proto_args, target, ms, l, c, tps, isym) ->
+    DImpl(pname, proto_args, target, map(ms, rw_decl), l, c, tps, isym)
+  DDerive(names, inner, l, c) -> DDerive(names, rw_decl(inner), l, c)
+  DUnstable(inner, l, c) -> DUnstable(rw_decl(inner), l, c)
+  DProtoLaws(thy, inner, l, c, mo) -> DProtoLaws(thy, rw_decl(inner), l, c, mo)
+  DImplAxiom(thy, inner, l, c, mo) -> DImplAxiom(thy, rw_decl(inner), l, c, mo)
+  DConstructor(inner, l, c) -> DConstructor(rw_decl(inner), l, c)
+  _ -> d
 }
 
-pub fn rmark_col(m: RegionMark) : Int = match m {
-  RM(_, _, c, _, _) -> c
-}
-
-# Result of the region rewrite: the unwrapped decls plus the region
-# side table (consumed by the emitters for arena lowering).
-#[doc("Result of the region rewrite: unwrapped decls and the region side table.")]
-pub type RegionRwProgram = { decls: [Decl], regions: [RegionMark] }
-
-# ---- walk state ----------------------------------------------------
-
-# Threaded accumulator: the region side table plus a monotonic ordinal
-# so `nth` is deterministic across the whole program walk.
-type RWalk = { regions: [RegionMark], nth: Int }
-
-fn rw0() : RWalk = RWalk { regions: [], nth: 0 }
-
-# ---- entry point ---------------------------------------------------
-
-#[doc("Recognise `region { }` markers, record the region side table, and unwrap markers to bare blocks.")]
-pub fn rewrite_regions_decls(decls: [Decl], df: DiagFiles) : RegionRwProgram {
-  let r = rw_decls_loop(decls, df, rw0(), [])
-  RegionRwProgram { decls: r.decls, regions: list_reverse(r.w.regions) }
-}
-
-type RWDecls = { decls: [Decl], w: RWalk }
-
-fn rw_decls_loop(decls: [Decl], df: DiagFiles, w: RWalk, acc: [Decl]) : RWDecls {
-  match decls {
-    [] -> RWDecls { decls: list_reverse(acc), w: w }
-    [d, ...rest] -> {
-      let r = rw_decl(d, decl_diag_file(d, df), w)
-      rw_decls_loop(rest, df, r.w, [r.decl, ...acc])
-    }
-  }
-}
-
-# The `DImpl` arm re-enters the walk for the methods, which already
-# resolved their file from the enclosing decl.
-fn rw_sub_decls(decls: [Decl], file: String, w: RWalk, acc: [Decl]) : RWDecls {
-  match decls {
-    [] -> RWDecls { decls: list_reverse(acc), w: w }
-    [d, ...rest] -> {
-      let r = rw_decl(d, file, w)
-      rw_sub_decls(rest, file, r.w, [r.decl, ...acc])
-    }
-  }
-}
-
-type RWDecl = { decl: Decl, w: RWalk }
-
-fn rw_decl(d: Decl, file: String, w: RWalk) : RWDecl {
-  match d {
-    DFn(p_, f, tps, ps, ret, row, body, l, c, nl, nc, mo) -> {
-      let r = rw_expr(body, file, w)
-      RWDecl { decl: DFn(p_, f, tps, ps, ret, row, r.expr, l, c, nl, nc, mo), w: r.w }
-    }
-    DTest(desc, body, l, c, mo) -> {
-      let r = rw_expr(body, file, w)
-      RWDecl { decl: DTest(desc, r.expr, l, c, mo), w: r.w }
-    }
-    DBench(desc, body, l, c, mo) -> {
-      let r = rw_expr(body, file, w)
-      RWDecl { decl: DBench(desc, r.expr, l, c, mo), w: r.w }
-    }
-    DCheck(desc, ps, body, l, c, mo) -> {
-      let r = rw_expr(body, file, w)
-      RWDecl { decl: DCheck(desc, ps, r.expr, l, c, mo), w: r.w }
-    }
-    DImpl(pname, proto_args, target, ms, l, c, tps, isym) -> {
-      let r = rw_sub_decls(ms, file, w, [])
-      RWDecl { decl: DImpl(pname, proto_args, target, r.decls, l, c, tps, isym), w: r.w }
-    }
-    DDerive(names, inner, l, c) -> {
-      let r = rw_decl(inner, file, w)
-      RWDecl { decl: DDerive(names, r.decl, l, c), w: r.w }
-    }
-    DUnstable(inner, l, c) -> {
-      let r = rw_decl(inner, file, w)
-      RWDecl { decl: DUnstable(r.decl, l, c), w: r.w }
-    }
-    DProtoLaws(thy, inner, l, c, mo) -> {
-      let r = rw_decl(inner, file, w)
-      RWDecl { decl: DProtoLaws(thy, r.decl, l, c, mo), w: r.w }
-    }
-    DImplAxiom(thy, inner, l, c, mo) -> {
-      let r = rw_decl(inner, file, w)
-      RWDecl { decl: DImplAxiom(thy, r.decl, l, c, mo), w: r.w }
-    }
-    DConstructor(inner, l, c) -> {
-      let r = rw_decl(inner, file, w)
-      RWDecl { decl: DConstructor(r.decl, l, c), w: r.w }
-    }
-    _ -> RWDecl { decl: d, w: w }
-  }
-}
-
-type RWExpr = { expr: Expr, w: RWalk }
-
-# The marks are recorded and the markers unwrapped by two walks over the
-# same tree, so both must reach exactly the same positions: each descends
-# through the shared tables, never a hand-written list of variants.
-fn rw_expr(e: Expr, file: String, w: RWalk) : RWExpr =
-  RWExpr { expr: rw_unwrap(e), w: rw_marks(e, file, w) }
-
-fn rw_unwrap(e: Expr) : Expr = match region_marker_of(e) {
-  Some(rm) -> rw_unwrap(rm.block)
-  None -> Expr {
-    kind: prc_map_expr_kind(e.kind, rw_unwrap),
+fn rw_expr(e: Expr) : Expr = match region_marker_of(e) {
+  Some(rm) -> Expr {
+    kind: ERegionBlk(rw_expr(rm.block)),
     line: e.line,
     col: e.col,
     ty: e.ty,
     mode: e.mode,
     site: e.site
   }
-}
-
-# An inner region takes its ordinal before the region enclosing it.
-fn rw_marks(e: Expr, file: String, w: RWalk) : RWalk = match region_marker_of(e) {
-  Some(rm) -> {
-    let inner = rw_marks(rm.block, file, w)
-    let mark = RM(file, e.line, e.col, inner.nth, rm.name)
-    RWalk { regions: [mark, ...inner.regions], nth: inner.nth + 1 }
+  None -> Expr {
+    kind: prc_map_expr_kind(e.kind, rw_expr),
+    line: e.line,
+    col: e.col,
+    ty: e.ty,
+    mode: e.mode,
+    site: e.site
   }
-  None -> rw_marks_at(xp_positions(e), file, w)
-}
-
-fn rw_marks_at(ps: [XPos], file: String, w: RWalk) : RWalk = match ps {
-  [] -> w
-  [XP(_, x), ...rest] -> rw_marks_at(rest, file, rw_marks(x, file, w))
 }
 
 # The recognised region marker: the block body plus the region's binder
