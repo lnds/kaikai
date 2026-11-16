@@ -45,7 +45,7 @@ pub type MintResult
 #[doc("Coin a numeric literal `value` to the concrete carrier `target`, with `bh` the home of the module declaring `BigInt`, or report why it cannot. `MintNone` means the target is not a concrete numeric carrier -- fall back to shape-default inference.")]
 pub fn mint_literal(value: Expr, target: Ty, bh: String) : MintResult =
   match value.kind {
-    EInt(n, _) -> mint_int(n, value, target, bh)
+    EInt(n, span) -> mint_int(n, span, value, target, bh)
     EIntLit(span) -> mint_big_int(span, value, target, bh)
     EReal(_, span) -> mint_point(span, value, target, bh)
     EDecimalLit(span) -> mint_decimal_suffix(span, value)
@@ -86,26 +86,42 @@ fn negate_minted(m: Expr, value: Expr, target: Ty) : MintResult = match target {
 
 # An integer literal that fits i64. Every carrier in the lattice accepts
 # it; the fold is exact because `n` is the exact value.
-fn mint_int(n: Int, value: Expr, target: Ty, bh: String) : MintResult =
+fn mint_int(n: Int, span: String, value: Expr, target: Ty, bh: String) : MintResult {
+  let ds = int_digits_of(n, span)
   match target {
     TyInt -> MintOk(with_ty(value, TyInt))
-    TyInt32 -> MintOk(mk_fixed(int_to_dec_string(n), TyInt32, value))
-    TyUInt32 -> MintOk(mk_fixed(int_to_dec_string(n), TyUInt32, value))
-    TyUInt64 -> MintOk(mk_fixed(int_to_dec_string(n), TyUInt64, value))
-    TyInt128 -> MintOk(mk_fixed(int_to_dec_string(n), TyInt128, value))
+    TyInt32 -> MintOk(mk_fixed(ds, TyInt32, value))
+    TyUInt32 -> MintOk(mk_fixed(ds, TyUInt32, value))
+    TyUInt64 -> MintOk(mk_fixed(ds, TyUInt64, value))
+    TyInt128 -> MintOk(mk_fixed(ds, TyInt128, value))
     TyByte -> mint_byte(n, value)
-    TyReal -> MintOk(mk_real(int_to_real(n), int_to_dec_string(n), value))
-    TyCon(s, _) -> mint_int_carrier(n, core_decl_ty_of(s), value, bh)
+    TyReal -> MintOk(mk_real(real_of_digits(ds, n), ds, value))
+    TyCon(s, _) -> mint_int_carrier(ds, core_decl_ty_of(s), value, bh)
     _ -> MintNone
   }
-
-fn mint_int_carrier(n: Int, c: Option[CoreDeclTy], value: Expr, bh: String) : MintResult = match c {
-  Some(CdDecimal) -> MintOk(mk_decimal_lit(int_to_dec_string(n), 0, value))
-  Some(CdDecimalBig) -> MintOk(mk_decimal_big_lit(int_to_dec_string(n), 0, value, bh))
-  Some(CdBigInt) -> MintOk(mk_bigint_lit(int_to_dec_string(n), value, bh))
-  Some(CdSeq) -> MintNone
-  None -> MintNone
 }
+
+fn real_of_digits(ds: String, n: Int) : Real = match string_to_real(ds) {
+  Some(r) -> r
+  None -> int_to_real(n)
+}
+
+# The exact decimal digits of an integer literal; a hex or binary spelling past i64 has no `n` to read them from.
+fn int_digits_of(n: Int, span: String) : String =
+  if span_radix(span, 0) == 10 {
+    int_to_dec_string(n)
+  } else {
+    radix_span_digits(span, 0, string_length(span))
+  }
+
+fn mint_int_carrier(ds: String, c: Option[CoreDeclTy], value: Expr, bh: String) : MintResult =
+  match c {
+    Some(CdDecimal) -> mint_decimal_span(ds, 0, value)
+    Some(CdDecimalBig) -> MintOk(mk_decimal_big_lit(ds, 0, value, bh))
+    Some(CdBigInt) -> MintOk(mk_bigint_lit(ds, value, bh))
+    Some(CdSeq) -> MintNone
+    None -> MintNone
+  }
 
 fn mint_byte(n: Int, value: Expr) : MintResult =
   if n >= 0 and n <= 255 {
@@ -119,16 +135,16 @@ fn mint_byte(n: Int, value: Expr) : MintResult =
 # error keyed to the same escape hatch the parser used to name.
 fn mint_big_int(span: String, value: Expr, target: Ty, bh: String) : MintResult =
   match target {
-    TyInt128 -> mint_int128_span(span, value)
+    TyInt128 -> mint_int128_span(int_span_digits(span), value)
     TyCon(s, _) -> mint_big_carrier(span, core_decl_ty_of(s), value, bh)
     _ -> MintErr(lit_mint_int_range_error(span))
   }
 
 fn mint_big_carrier(span: String, c: Option[CoreDeclTy], value: Expr, bh: String) : MintResult =
   match c {
-    Some(CdBigInt) -> MintOk(mk_bigint_lit(span, value, bh))
-    Some(CdDecimalBig) -> MintOk(mk_decimal_big_lit(span, 0, value, bh))
-    Some(CdDecimal) -> mint_decimal_span(span, 0, value)
+    Some(CdBigInt) -> MintOk(mk_bigint_lit(int_span_digits(span), value, bh))
+    Some(CdDecimalBig) -> MintOk(mk_decimal_big_lit(int_span_digits(span), 0, value, bh))
+    Some(CdDecimal) -> mint_decimal_span(int_span_digits(span), 0, value)
     Some(CdSeq) -> MintErr(lit_mint_int_range_error(span))
     None -> MintErr(lit_mint_int_range_error(span))
   }
@@ -156,21 +172,27 @@ fn mint_point(span: String, value: Expr, target: Ty, bh: String) : MintResult =
     _ -> MintNone
   }
 
-fn mint_point_carrier(span: String, c: Option[CoreDeclTy], value: Expr, bh: String) : MintResult {
-  let parts = dec_parts_of_span(span)
+fn mint_point_carrier(span: String, c: Option[CoreDeclTy], value: Expr, bh: String) : MintResult =
   match c {
-    Some(CdDecimal) -> mint_decimal_span(parts.raw, parts.scale, value)
-    Some(CdDecimalBig) -> MintOk(mk_decimal_big_lit(parts.raw, parts.scale, value, bh))
+    Some(CdDecimal) ->
+      mint_with_parts(span, parts => mint_decimal_span(parts.raw, parts.scale, value))
+    Some(CdDecimalBig) -> mint_with_parts(
+      span,
+      parts => MintOk(mk_decimal_big_lit(parts.raw, parts.scale, value, bh))
+    )
     _ -> MintNone
   }
-}
+
+fn mint_with_parts(span: String, k: (DecSpanParts) -> MintResult) : MintResult =
+  match dec_parts_of_span(span) {
+    Some(parts) -> k(parts)
+    None -> MintErr(literal_exponent_error())
+  }
 
 # The `d` suffix (`19.99d`, `42d`) always targets `Decimal`: the suffix
 # supplies the carrier, whatever type is expected.
-fn mint_decimal_suffix(span: String, value: Expr) : MintResult {
-  let parts = dec_parts_of_span(span)
-  mint_decimal_span(parts.raw, parts.scale, value)
-}
+fn mint_decimal_suffix(span: String, value: Expr) : MintResult =
+  mint_with_parts(span, parts => mint_decimal_span(parts.raw, parts.scale, value))
 
 # Build a `Decimal { raw, scale }` from a raw-digit magnitude string,
 # erroring when the magnitude overflows the `Int128` carrier.
@@ -235,32 +257,148 @@ fn quote_digits(digits: String) : String =
 
 pub type DecSpanParts = { raw: String, scale: Int }
 
-# Decode a point/exponent-free real lexeme into (raw-digit magnitude,
-# scale). The lexeme's own fractional length is the scale, so `0.20`
-# yields scale 2 -- trailing zeros are preserved because the digits, not
-# a re-stringified f64, drive the result.
-fn dec_parts_of_span(span: String) : DecSpanParts {
+# Decode a decimal, radix or exponent-form lexeme into (raw-digit
+# magnitude, scale). The lexeme's own fractional length less its exponent
+# is the scale, floored at 0 by appending zeros, so `0.20` yields scale 2
+# and `1.5e3` yields raw 1500: the digits, not a re-stringified f64,
+# drive the result. `None` when the exponent is out of range.
+fn dec_parts_of_span(span: String) : Option[DecSpanParts] {
   let n = string_length(span)
   let neg = match char_at(span, 0) {
     Some(c) -> c == '-'
     None -> false
   }
   let start = if neg { 1 } else { 0 }
-  let dot = span_find_dot(span, start, n)
-  if dot < 0 {
-    let mag = strip_leading_zeros(collect_digits(span, start, n))
-    DecSpanParts { raw: with_sign(neg, mag), scale: 0 }
+  if span_radix(span, start) != 10 {
+    Some(DecSpanParts { raw: with_sign(neg, radix_span_digits(span, start, n)), scale: 0 })
   } else {
-    let int_digits = collect_digits(span, start, dot)
-    let frac_digits = collect_digits(span, dot + 1, n)
-    let scale = string_length(frac_digits)
-    let mag = strip_leading_zeros(string_concat(int_digits, frac_digits))
-    DecSpanParts { raw: with_sign(neg, mag), scale: scale }
+    let epos = span_find_exp(span, start, n)
+    let dot = span_find_dot(span, start, epos)
+    let int_end = if dot < 0 { epos } else { dot }
+    let frac_digits = if dot < 0 { "" } else { collect_digits(span, dot + 1, epos) }
+    let mag = strip_leading_zeros(string_concat(collect_digits(span, start, int_end), frac_digits))
+    apply_exponent(neg, mag, string_length(frac_digits), exp_value(span, epos, n))
   }
 }
 
+fn exp_limit() : Int = 4096
+
+fn apply_exponent(neg: Bool, mag: String, frac_len: Int, exp: Int) : Option[DecSpanParts] =
+  if exp > exp_limit() or exp < 0 - exp_limit() {
+    None
+  } else if exp >= frac_len and (not mag_is_zero(mag)) {
+    Some(DecSpanParts { raw: with_sign(neg, string_concat(mag, zeros(exp - frac_len))), scale: 0 })
+  } else if exp >= frac_len {
+    Some(DecSpanParts { raw: "0", scale: 0 })
+  } else {
+    Some(DecSpanParts { raw: with_sign(neg, mag), scale: frac_len - exp })
+  }
+
+fn mag_is_zero(mag: String) : Bool = string_length(mag) == 1 and digit_at(mag, 0) == 0
+
+fn zeros(k: Int) : String = if k <= 0 { "" } else { string_concat("0", zeros(k - 1)) }
+
+fn span_find_exp(s: String, i: Int, n: Int) : Int =
+  if i >= n {
+    n
+  } else {
+    match char_at(s, i) {
+      None -> n
+      Some(c) -> if c == 'e' or c == 'E' { i } else { span_find_exp(s, i + 1, n) }
+    }
+  }
+
+# The signed exponent written after the `e` at `epos`; 0 when there is none.
+fn exp_value(s: String, epos: Int, n: Int) : Int =
+  if epos >= n {
+    0
+  } else {
+    match char_at(s, epos + 1) {
+      Some('-') -> 0 - exp_digits(s, epos + 2, n, 0)
+      Some('+') -> exp_digits(s, epos + 2, n, 0)
+      _ -> exp_digits(s, epos + 1, n, 0)
+    }
+  }
+
+# Saturates past the limit so an absurd exponent cannot overflow the accumulator.
+fn exp_digits(s: String, i: Int, n: Int, acc: Int) : Int =
+  if i >= n or acc > exp_limit() {
+    acc
+  } else {
+    match char_at(s, i) {
+      Some(c) -> if c >= '0' and c <= '9' {
+        exp_digits(s, i + 1, n, acc * 10 + (char_to_int(c) - char_to_int('0')))
+      } else {
+        exp_digits(s, i + 1, n, acc)
+      }
+      None -> acc
+    }
+  }
+
+# 16 for a `0x`/`0X` prefix at `i`, 2 for `0b`/`0B`, else 10.
+fn span_radix(s: String, i: Int) : Int =
+  match char_at(s, i) {
+    Some('0') -> match char_at(s, i + 1) {
+      Some('x') -> 16
+      Some('X') -> 16
+      Some('b') -> 2
+      Some('B') -> 2
+      _ -> 10
+    }
+    _ -> 10
+  }
+
+fn radix_digit(c: Char) : Int =
+  if c >= '0' and c <= '9' {
+    char_to_int(c) - char_to_int('0')
+  } else if c >= 'a' and c <= 'f' {
+    char_to_int(c) - char_to_int('a') + 10
+  } else {
+    char_to_int(c) - char_to_int('A') + 10
+  }
+
+# Exact decimal digits of the magnitude of a `0x`/`0b` literal over `[i, n)`, however wide.
+fn radix_span_digits(s: String, i: Int, n: Int) : String =
+  strip_leading_zeros(radix_digits_loop(s, i + 2, n, span_radix(s, i), "0"))
+
+fn radix_digits_loop(s: String, i: Int, n: Int, base: Int, acc: String) : String =
+  if i >= n {
+    acc
+  } else {
+    match char_at(s, i) {
+      None -> acc
+      Some('_') -> radix_digits_loop(s, i + 1, n, base, acc)
+      Some(c) -> radix_digits_loop(s, i + 1, n, base, dec_mul_add(acc, base, radix_digit(c)))
+    }
+  }
+
+# `s * base + d` over a decimal digit string.
+fn dec_mul_add(s: String, base: Int, d: Int) : String =
+  dec_mul_add_loop(s, string_length(s), base, d, "")
+
+fn dec_mul_add_loop(s: String, i: Int, base: Int, carry: Int, acc: String) : String =
+  if i <= 0 {
+    if carry == 0 { acc } else { string_concat(int_to_dec_string(carry), acc) }
+  } else {
+    let v = digit_at(s, i - 1) * base + carry
+    dec_mul_add_loop(s, i - 1, base, v / 10, string_concat(int_to_dec_string(v % 10), acc))
+  }
+
+fn digit_at(s: String, i: Int) : Int = match char_at(s, i) {
+  Some(c) -> char_to_int(c) - char_to_int('0')
+  None -> 0
+}
+
+#[doc("The exact decimal digits of an integer literal span of any width, whatever its base; `_` separators and leading zeros dropped.")]
+pub(pkg) fn int_span_digits(span: String) : String =
+  if span_radix(span, 0) == 10 {
+    strip_leading_zeros(collect_digits(span, 0, string_length(span)))
+  } else {
+    radix_span_digits(span, 0, string_length(span))
+  }
+
 fn with_sign(neg: Bool, mag: String) : String =
-  if neg and (not (mag == "0")) { string_concat("-", mag) } else { mag }
+  if neg and (not mag_is_zero(mag)) { string_concat("-", mag) } else { mag }
 
 fn span_find_dot(s: String, i: Int, n: Int) : Int =
   if i >= n {
@@ -365,10 +503,16 @@ fn int_to_dec_string(n: Int) : String = int_to_string(n)
 
 #[doc("The out-of-Int-range diagnostic for a bare past-i64 integer literal, naming the `n` / `bigint.from_string` escape hatch.")]
 pub fn lit_mint_int_range_error(span: String) : String =
-  string_concat(
-    "integer literal out of Int range; use a BigInt literal ",
-    string_concat(span, "n or bigint.from_string")
-  )
+  if span_radix(span, 0) != 10 {
+    "hex/binary literal exceeds 64 bits; Int is 64-bit — use bigint.from_string"
+  } else {
+    string_concat(
+      "integer literal out of Int range; use a BigInt literal ",
+      string_concat(span, "n or bigint.from_string")
+    )
+  }
+
+fn literal_exponent_error() : String = "literal exponent out of range"
 
 fn int128_range_error() : String =
   "integer literal exceeds Int128 range; annotate `: BigInt` or `: DecimalBig`"
