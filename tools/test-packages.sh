@@ -291,6 +291,7 @@ run_positive "build_module_qualified" "build_module_qualified" "build_module_qua
 run_positive "nursery_imported_module" "nursery_imported_module/app" "nursery_imported_module/app/main.out.expected"
 run_positive "nursery_same_package" "nursery_same_package" "nursery_same_package/main.out.expected"
 run_negative "nursery_imported_module_mismatch" "nursery_imported_module_mismatch/app" "nursery_imported_module_mismatch/app/main.err.expected"
+run_check_script "nursery_same_position_two_files" "nursery_same_position_two_files/check.sh"
 
 # A library that spawns its argument is held to the spawn rule the same way
 # for a one-file and a many-file caller, as a file or as a package.

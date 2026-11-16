@@ -28,7 +28,7 @@ pub(pkg) type BrandCall = BC(String, Int, Int, Int, String)
 
 # Lookup: did this call get rewritten by the cap-binding pass?
 # Returns `Some((bid, op_name))` keyed on (file, line, col).
-fn brand_call_lookup(
+pub(pkg) fn brand_call_lookup(
   calls: [BrandCall],
   file: String,
   line: Int,
@@ -106,7 +106,7 @@ fn benv_lookup_loop(xs: [BrandBinding], l: LocalId) : Option[Int] {
 #[doc("""
 Look up the brand attribution of an expression. Recognises:
   - A rewritten `Spawn.spawn(args)` call (looks the call up in
-    the registry by line:col).
+    the registry by file:line:col).
   - A bare `EName(name)` binding (looks `name` up in the env).
   - Otherwise the expression has no brand attribution.
 
@@ -115,19 +115,16 @@ The `None` case is intentionally permissive — a fiber that lost
 its brand through a non-let path (e.g., a list element retrieved
 by index, a record field) is treated as unbranded.
 """)]
-pub(pkg) fn expr_brand(e: Expr, env: BrandEnv, calls: [BrandCall]) : Option[Int] {
+pub(pkg) fn expr_brand(e: Expr, env: BrandEnv, file: String, calls: [BrandCall]) : Option[Int] {
   match e.kind {
     ELocal(l) -> benv_lookup(env, l)
     ECall(callee, args_) -> match callee.kind {
       EField(base, op_name) -> match base.kind {
         ESym(eff_sym, _) ->
           if effect_is(eff_sym, CeSpawn) and op_name == "spawn" {
-            match brand_call_lookup(calls, "", e.line, e.col) {
+            match brand_call_lookup(calls, file, e.line, e.col) {
               Some(BC(_, _, _, bid, _)) -> Some(bid)
-              # The registry stores file as recorded at rewrite. Try
-              # without filtering on file (the brand check runs per
-              # decl, all from the same source file).
-              None -> brand_call_first_at(calls, e.line, e.col)
+              None -> None
             }
           } else {
             None
@@ -136,7 +133,7 @@ pub(pkg) fn expr_brand(e: Expr, env: BrandEnv, calls: [BrandCall]) : Option[Int]
       }
       # A call to a brand-transparent helper carries the brand of the
       # argument it returns, so `let g = id(f)` keeps `f`'s brand.
-      ESym(f, _) -> transp_call_brand(f, args_, env, calls)
+      ESym(f, _) -> transp_call_brand(f, args_, env, file, calls)
       _ -> None
     }
     _ -> None
@@ -147,28 +144,11 @@ fn transp_call_brand(
   fname: SymId,
   args_: [Expr],
   env: BrandEnv,
+  file: String,
   calls: [BrandCall]
 ) : Option[Int] {
   brand_transp_lookup(benv_transp(env), fname)
-    || (t => (transp_passthrough_arg(t, args_) || (arg => expr_brand(arg, env, calls))))
-}
-
-#[doc("""
-Match a call by (line, col) regardless of file — every call in
-the registry comes from the file currently being checked.
-""")]
-pub(pkg) fn brand_call_first_at(calls: [BrandCall], line: Int, col: Int) : Option[Int] {
-  match calls {
-    [] -> None
-    [c, ...rest] -> match c {
-      BC(_, cl, cc, bid, _) ->
-        if cl == line and cc == col {
-          Some(bid)
-        } else {
-          brand_call_first_at(rest, line, col)
-        }
-    }
-  }
+    || (t => (transp_passthrough_arg(t, args_) || (arg => expr_brand(arg, env, file, calls))))
 }
 
 # `--dump-brands`: print the brand registry plus per-call
@@ -279,7 +259,7 @@ fn warn_branded_args(
   match args_ {
     [] -> acc
     [a, ...rest] -> {
-      let acc1 = match expr_brand(a, env, calls) {
+      let acc1 = match expr_brand(a, env, file, calls) {
         Some(bid) -> [emit_brand_opaque_warning(file, a.line, a.col, bid, fname, brs), ...acc]
         None -> acc
       }
@@ -338,17 +318,6 @@ fn emit_brand_opaque_warning(
   d
 }
 
-#[doc("The operation of the call recorded at `line:col`, empty when none is.")]
-pub(pkg) fn call_op_name(calls: [BrandCall], line: Int, col: Int) : String {
-  match calls {
-    [] -> ""
-    [c, ...rest] -> match c {
-      BC(_, cl, cc, _, op) ->
-        if cl == line and cc == col { op } else { call_op_name(rest, line, col) }
-    }
-  }
-}
-
 #[doc("""
 Statement walk. SLet propagates brand attribution from RHS to
 the bound name when the RHS expression has a brand. Other
@@ -366,10 +335,11 @@ pub(pkg) fn bind_brand_pat(
   pat: Pattern,
   rhs: Expr,
   env: BrandEnv,
+  file: String,
   calls: [BrandCall]
 ) : BrandEnv {
   match pat.pkind {
-    PBind(n) -> match expr_brand(rhs, env, calls) {
+    PBind(n) -> match expr_brand(rhs, env, file, calls) {
       Some(bid) -> benv_push(env, n.id, bid)
       None -> env
     }

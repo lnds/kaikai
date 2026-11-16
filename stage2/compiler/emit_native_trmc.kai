@@ -28,6 +28,7 @@
 #  4. i64-inline — N/A: the native walk is all-boxed; the cons cell is a
 #     real `kai_cons` with boxed head/tail, no kind-1 slot layout.
 
+import compiler.ast_ids
 import compiler.tcrec_plan
 import compiler.emit_native_fn
 import compiler.emit_native_ops_calls
@@ -166,7 +167,7 @@ fn ntrmc_term_is_step(t: KTerm) : Bool = match t {
 # return a value into an LLVM `select` that EVALUATES BOTH arms, emitting two
 # ctor calls + an invalid `select ptr %c, null, @kaix_cons`. Keeping each
 # whole step on its own path is what avoids that.)
-# The `dropmask` (the lowering's per-param "dead after this back-edge"
+# The `drops` (the lowering's per-param "dead after this back-edge"
 # bitfield) is emitted in `ntrmc_extend_and_loop` between eval and store via
 # the shared `nemit_drop_assigns_masked` (issue #860), mirroring `nemit_tcrec`
 # and the C oracle's `tcrec_emit_drops_masked`: a BOXED param marked dead is
@@ -177,14 +178,14 @@ pub fn nemit_trmc_step(
   spine: KSpine,
   tag: Int,
   slot_mask: Int,
-  dropmask: Int,
+  drops: DropSet,
   head_vals: [KVal],
   asg: [KAssign],
   in_region: Bool,
   kept: Option[[Int]]
 ) : Unit / Console =
   match spine {
-    KSpineCons(_) -> ntrmc_cons_step(ctx, head_vals, asg, dropmask, in_region)
+    KSpineCons(_) -> ntrmc_cons_step(ctx, head_vals, asg, drops, in_region)
     # native variant reuse leak (#872): a self-modulo-cons variant step
     # (`Node(c, insert_loop(l,..), ..)`) CONSUMES the matched scrutinee but the
     # back-edge jumps over the match-exit drop. The C oracle reclaims it via an
@@ -202,7 +203,7 @@ pub fn nemit_trmc_step(
         slot_mask,
         head_vals,
         asg,
-        dropmask,
+        drops,
         in_region,
         kept
       )
@@ -215,7 +216,7 @@ fn ntrmc_cons_step(
   ctx: Handle,
   head_vals: [KVal],
   asg: [KAssign],
-  dropmask: Int,
+  drops: DropSet,
   in_region: Bool
 ) : Unit / Console {
   let p = native_ctx_ptrt(ctx)
@@ -235,7 +236,7 @@ fn ntrmc_cons_step(
     node,
     ncall_sig1(ctx, "kaix_cons_tail_addr", p, p, node),
     asg,
-    dropmask
+    drops
   )
 }
 
@@ -251,7 +252,7 @@ fn ntrmc_variant_step(
   slot_mask: Int,
   head_vals: [KVal],
   asg: [KAssign],
-  dropmask: Int,
+  drops: DropSet,
   in_region: Bool,
   kept: Option[[Int]]
 ) : Unit / Console {
@@ -279,7 +280,7 @@ fn ntrmc_variant_step(
   let hole =
     ncall_sig2(ctx, "kaix_variant_slot_addr", p, p, i32t, node1, llvm_const_i32(i32t, hole_slot))
   let node2 = llvm_build_load(native_ctx_b(ctx), p, nodeslot)
-  ntrmc_extend_and_loop(ctx, node2, hole, asg, dropmask)
+  ntrmc_extend_and_loop(ctx, node2, hole, asg, drops)
 }
 
 # The region spine cell: bump-allocate a fresh variant in the current arena via
@@ -410,7 +411,7 @@ fn ntrmc_extend_and_loop(
   node: Handle,
   hole_new: Handle,
   asg: [KAssign],
-  dropmask: Int
+  drops: DropSet
 ) : Unit / Console {
   let p = native_ctx_ptrt(ctx)
   let res_old = nemit_load_reg(ctx, ntrmc_res_reg())
@@ -420,7 +421,7 @@ fn ntrmc_extend_and_loop(
   nemit_store_reg(ctx, ntrmc_hole_reg(), hole_new)
   let valbuf = llvm_buf_new()
   ntrmc_eval_assigns(ctx, asg, valbuf)
-  nemit_drop_assigns_masked(ctx, asg, dropmask)
+  nemit_drop_assigns_masked(ctx, asg, drops)
   ntrmc_store_assigns(ctx, asg, valbuf, 0)
   llvm_buf_free(valbuf)
   llvm_build_br(native_ctx_b(ctx), native_ctx_first_block(ctx))
@@ -454,7 +455,7 @@ fn ntrmc_head_val(ctx: Handle, head_vals: [KVal]) : Handle / Console = match hea
 fn ntrmc_eval_assigns(ctx: Handle, asg: [KAssign], valbuf: Handle) : Unit / Console = match asg {
   [] -> ()
   [KAsg(idx, v), ...rest] -> {
-    llvm_buf_push(valbuf, nemit_reloop_value(ctx, v, native_ctx_reg_slot_at(ctx, idx)))
+    llvm_buf_push(valbuf, nemit_reloop_value(ctx, v, nreg_slot_at(ctx, idx)))
     ntrmc_eval_assigns(ctx, rest, valbuf)
   }
 }
