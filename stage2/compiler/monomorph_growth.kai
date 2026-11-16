@@ -1,0 +1,119 @@
+#[doc("Detection of polymorphic recursion at a growing type: a generic that reaches itself through its own request chain at a type strictly containing the one it started from.")]
+
+import compiler.ast
+import compiler.diag_type_text
+import compiler.monomorph
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.infer_handle_walk
+import compiler.infer_env_exhaust
+import compiler.monomorph_mangle
+import compiler.monomorph_polys
+import compiler.monomorph_subst
+import compiler.symtab
+import compiler.written
+import compiler.util
+
+#[doc("A tuple awaiting emission with the chain of tuples that requested it, nearest first.")]
+pub(pkg) type WorkItem = WI(MonoTuple, [MonoTuple])
+
+fn ty_children(t: Ty) : [Ty] = match t {
+  TyListT(a) -> [a]
+  TyFnT(ps, r, _) -> [r, ...ps]
+  TyCon(_, as_) -> as_
+  TyDimT(b, _) -> [b]
+  TyRefineT(b, _, _) -> [b]
+  TyShapeApp(_, a) -> [a]
+  TyUnion(ps) -> ps
+  TyVarT(_) -> []
+  TyInt -> []
+  TyReal -> []
+  TyBool -> []
+  TyChar -> []
+  TyString -> []
+  TyUnit -> []
+  TyByte -> []
+  TyInt32 -> []
+  TyUInt32 -> []
+  TyUInt64 -> []
+  TyInt128 -> []
+  TyHandle -> []
+  TyAny -> []
+  TyNothing -> []
+}
+
+fn ty_has_proper_sub(big: Ty, small: Ty) : Bool =
+  any(ty_children(big), c => ty_list_eq([c], [small]) or ty_has_proper_sub(c, small))
+
+fn tys_grow(old: [Ty], new_: [Ty]) : Bool = match old {
+  [] -> false
+  [o, ...orest] -> match new_ {
+    [] -> false
+    [n, ...nrest] -> ty_has_proper_sub(n, o) or tys_grow(orest, nrest)
+  }
+}
+
+fn grows_from(anc: MonoTuple, nt: MonoTuple) : Bool = match anc {
+  MT(as_, atys, _) -> match nt {
+    MT(ns, ntys, _) -> sym_same(as_, ns) and tys_grow(atys, ntys)
+  }
+}
+
+#[doc("The tuple of `chain` that `nt` strictly grows from, when it is one.")]
+pub(pkg) fn growth_root(chain: [MonoTuple], nt: MonoTuple) : Option[MonoTuple] = match chain {
+  [] -> None
+  [a, ...rest] -> if grows_from(a, nt) { Some(a) } else { growth_root(rest, nt) }
+}
+
+fn call_loc(insts: InstIndex, sm: SubstMap, nt: MonoTuple, d: Decl) : LineCol = match nt {
+  MT(s, ntys, _) -> match d {
+    DFn(_, _, _, _, _, _, _, ln, cl, _, _, _) ->
+      call_loc_loop(iix_chain(insts, s), sm, ntys, ln, cl)
+    _ -> MoLC(0, 0)
+  }
+}
+
+fn call_loc_loop(cs: [ResolvedCS], sm: SubstMap, ntys: [Ty], ln: Int, cl: Int) : LineCol =
+  match cs {
+    [] -> MoLC(ln, cl)
+    [RCS(_, line, col, itys, _, _, _, _), ...rest] ->
+      if ty_list_eq(map(itys, t => subst_ty(t, sm)), ntys) {
+        MoLC(line, col)
+      } else {
+        call_loc_loop(rest, sm, ntys, ln, cl)
+      }
+  }
+
+fn tuple_text(tab: SymTab, t: MonoTuple) : String = match t {
+  MT(s, tys, _) ->
+    concat_all([
+      written_text(decl_name(tab, s)),
+      "[",
+      join_with(map(tys, ty => inf_ty_to_string(tab, ty)), ", "),
+      "]"
+    ])
+}
+
+#[doc("The violation for `nt`, requested by `req` (declared by `d`), growing from `root`: it names the function and both instantiations, at the recursive call.")]
+pub(pkg) fn growth_violation(
+  tab: SymTab,
+  insts: InstIndex,
+  d: Decl,
+  req: MonoTuple,
+  root: MonoTuple,
+  nt: MonoTuple
+) : BoundViolation {
+  let sm = match req {
+    MT(_, tys, units) -> build_subst_map(d, tys, units)
+  }
+  let msg = concat_all([
+    "polymorphic recursion at a growing type: `",
+    tuple_text(tab, root),
+    "` reaches `",
+    tuple_text(tab, nt),
+    "`, so its instantiations never end"
+  ])
+  match call_loc(insts, sm, nt, d) {
+    MoLC(l, c) -> BV(msg, l, c)
+  }
+}
