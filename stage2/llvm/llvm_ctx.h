@@ -9,6 +9,7 @@
 #include <llvm-c/IRReader.h>
 #include <llvm-c/Support.h>
 #include <llvm-c/DebugInfo.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 /* The native backend keeps one context + builder per compilation unit.
@@ -801,11 +802,27 @@ static KaiValue *kai_llvm_add_uwtable(void *fn) {
 /* --- function lookup / declaration ---
  * Resolve a function by name; declare it (no body) if absent. The walk
  * uses this for runtime externs (`kaix_*`) and forward references to
- * user fns the module defines later. `LLVMGetNamedFunction` returns NULL
- * when absent, so a miss adds the declaration with the given type. */
+ * user fns the module defines later. A miss adds the declaration with the
+ * given type; a hit must carry that same type, since two symbols spelled
+ * alike would otherwise be called through the wrong signature. A null
+ * type looks up a function the module already declares. */
 static void *kai_llvm_get_or_declare_fn(void *m, KaiValue *name, void *fnty) {
     LLVMValueRef fn = LLVMGetNamedFunction((LLVMModuleRef) m, name->as.s.bytes);
-    if (fn == NULL) fn = LLVMAddFunction((LLVMModuleRef) m, name->as.s.bytes, (LLVMTypeRef) fnty);
+    if (fnty == NULL) {
+        if (fn == NULL) {
+            fprintf(stderr, "native: symbol `%s` is not defined\n", name->as.s.bytes);
+            exit(1);
+        }
+    } else if (fn == NULL) {
+        fn = LLVMAddFunction((LLVMModuleRef) m, name->as.s.bytes, (LLVMTypeRef) fnty);
+    } else if (LLVMGlobalGetValueType(fn) != (LLVMTypeRef) fnty) {
+        char *have = LLVMPrintTypeToString(LLVMGlobalGetValueType(fn));
+        char *want = LLVMPrintTypeToString((LLVMTypeRef) fnty);
+        fprintf(stderr, "native: symbol `%s` is declared with two different types: %s vs %s\n", name->as.s.bytes, have, want);
+        LLVMDisposeMessage(have);
+        LLVMDisposeMessage(want);
+        exit(1);
+    }
     if (name) kai_decref(name);
     return (void *) fn;
 }

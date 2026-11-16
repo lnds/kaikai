@@ -57,8 +57,8 @@ same "$PROJ/plain.c" "$PROJ/warm.c" "warm C differs from plain C"
   cat "$PROJ/err"
   exit 1
 }
-grep -q '^fn kaiu_a__util__twice' "$PROJ/warm.kir" && grep -q '^fn kaiu_b__util__twice' "$PROJ/warm.kir" || {
-  echo "userb_home_and_edition: FAIL — a byte-identical module lost its own home (expected a__util__twice and b__util__twice)"
+grep -q '^fn kaiu_a[$]u[$]uutil__twice' "$PROJ/warm.kir" && grep -q '^fn kaiu_b[$]u[$]uutil__twice' "$PROJ/warm.kir" || {
+  echo "userb_home_and_edition: FAIL — a byte-identical module lost its own home (expected a.util and b.util twice)"
   exit 1
 }
 

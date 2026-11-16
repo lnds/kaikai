@@ -691,7 +691,7 @@ fn nemit_do(
 # register read, not the call. A raw-slot register (tag >= 1) or a literal /
 # non-register atom (`KUnitV`, an inlined constant) owns nothing.
 fn ndo_discards_owned_box(ctx: Handle, op: KOp) : Bool = match op {
-  KLitOp(KVar(n)) -> native_ctx_reg_slot(ctx, n) == 0
+  KLitOp(KVar(n)) -> nreg_is(ctx, n, SBoxed)
   _ -> false
 }
 
@@ -744,7 +744,7 @@ fn nemit_void_call(ctx: Handle, sym: String) : Handle / Console {
 #     boxed `slot` re-boxes (the discarded-result / boxed-use path). The
 #     slot is the box decision, symmetric with the load side.
 # Every other shape delegates unchanged; the load/store side is already
-# slot-driven via `nslot_type_of_tag`.
+# slot-driven via `nslot_type`.
 fn nemit_op_fx_slot(
   ctx: Handle,
   cur_fn: String,
@@ -824,13 +824,7 @@ fn nemit_proj_slot(ctx: Handle, v: KVal, i: Int, slot: KSlot) : Handle / Console
 # an ephemeral box (`kaix_int(raw)`) and dup/drop THAT — a phantom box (leak)
 # plus an RC desync. Skip it, as `nemit_drop_assigns_masked` does for raw
 # back-edge params. Only a `KVar` names a register.
-fn kval_is_raw_scalar(ctx: Handle, v: KVal) : Bool = match v {
-  KVar(n) -> {
-    let s = native_ctx_reg_slot(ctx, n)
-    s == 1 or s == 2 or s == 3 or s == 5 or s == 6 or s == 7 or s == 8 or s == 9 or s == 10
-  }
-  _ -> false
-}
+fn kval_is_raw_scalar(ctx: Handle, v: KVal) : Bool = nval_is_raw_scalar(ctx, v)
 
 # A Perceus RC op → the runtime dup/drop. The call result is captured in a
 # `let` (see `nemit_stmt`'s KDo note) so the discarded Handle is not
@@ -905,9 +899,9 @@ fn nemit_term(ctx: Handle, t: KTerm, ret: KSlot) : Unit / Console = match t {
     llvm_build_unreachable(native_ctx_b(ctx))
     ()
   }
-  KTcrecGoto(l, asg, dropmask, _) -> nemit_tcrec(ctx, l, asg, dropmask)
-  KTrmcStep(_, hole, spine, tag, slot_mask, dropmask, heads, asg, in_region, kept, _) ->
-    nemit_trmc_step(ctx, hole, spine, tag, slot_mask, dropmask, heads, asg, in_region, kept)
+  KTcrecGoto(l, asg, drops, _) -> nemit_tcrec(ctx, l, asg, drops)
+  KTrmcStep(_, hole, spine, tag, slot_mask, drops, heads, asg, in_region, kept, _) ->
+    nemit_trmc_step(ctx, hole, spine, tag, slot_mask, drops, heads, asg, in_region, kept)
   KTrmcApply(leaf, _) -> nemit_trmc_apply(ctx, leaf)
 }
 
@@ -953,10 +947,7 @@ fn nemit_condbr(ctx: Handle, c: KVal, tl: String, el: String) : Unit / Console {
 # unboxed (guard #3); the condbr reads its i32 directly. A `KVar` of a boxed
 # register (slot `SBoxed`), or any other atom, is NOT raw.
 fn ncond_is_raw_bool(ctx: Handle, c: KVal) : Bool = match c {
-  KVar(n) -> {
-    let s = native_ctx_reg_slot(ctx, n)
-    s == 3 or s == 4
-  }
+  KVar(n) -> nreg_is(ctx, n, SBool) or nreg_is(ctx, n, SInt32)
   KBoolV(_) -> true
   _ -> false
 }
@@ -995,7 +986,7 @@ fn nemit_cell_test_slot(
 # case per `KC(tag, label)`; the default block holds the catch-all arm or
 # is unreachable (the lowering decided this).
 fn nemit_switch(ctx: Handle, v: KVal, cs: [KCase], def: String) : Unit / Console {
-  let tag = nemit_atom(ctx, v)
+  let tag = nemit_atom_raw(ctx, v, SInt32)
   let sw =
     llvm_build_switch(native_ctx_b(ctx), tag, native_ctx_find_block(ctx, def), list_length(cs))
   nemit_switch_cases(ctx, sw, cs)
@@ -1015,10 +1006,10 @@ fn nemit_switch_cases(ctx: Handle, sw: Handle, cs: [KCase]) : Unit / Console = m
 # block. Values are evaluated BEFORE the stores (they read the OLD param
 # values), so collect handles first.
 #
-# The `dropmask` (the lowering's per-param "dead after this back-edge"
+# The `drops` (the lowering's per-param "dead after this back-edge"
 # bitfield) is emitted between eval and store, mirroring the C oracle's
 # `tcrec_emit_drops_masked` (emit_c.kai): the OLD value of a param that is
-# (a) BOXED and (b) marked dead by the dropmask is `kaix_internal_drop`ed
+# (a) BOXED and (b) marked dead by the drops is `kaix_internal_drop`ed
 # before the alloca is overwritten with the reloop value (issue #860 — the
 # `build`/accumulator self-tail leaked one cons per iteration without it).
 # The raw/boxed distinction the C oracle reads from `pmask` is read here from
@@ -1029,14 +1020,14 @@ fn nemit_switch_cases(ctx: Handle, sw: Handle, cs: [KCase]) : Unit / Console = m
 # value (reading the OLD params) into `valbuf`, so dropping the old params
 # next is safe — a value the new cell captured was already incref'd by the
 # arm's own `dup` (e.g. `kai_cons(h, acc)` over a `dup acc`).
-fn nemit_tcrec(ctx: Handle, loop_label: String, asg: [KAssign], dropmask: Int) : Unit / Console {
+fn nemit_tcrec(ctx: Handle, loop_label: String, asg: [KAssign], drops: DropSet) : Unit / Console {
   # Evaluate ALL reloop values FIRST (they read the OLD param values),
   # into a C buffer — handles never ride a kaikai list (asu "risk #1").
   # The `[KAssign]` carries the param indices (plain Ints, safe in a
   # list); the materialised value handles go into `valbuf` in parallel.
   let valbuf = llvm_buf_new()
   nemit_eval_assigns(ctx, asg, valbuf)
-  nemit_drop_assigns_masked(ctx, asg, dropmask)
+  nemit_drop_assigns_masked(ctx, asg, drops)
   nemit_store_assigns(ctx, asg, valbuf, 0)
   llvm_buf_free(valbuf)
   llvm_build_br(native_ctx_b(ctx), native_ctx_first_block(ctx))
@@ -1055,7 +1046,7 @@ fn nemit_tcrec(ctx: Handle, loop_label: String, asg: [KAssign], dropmask: Int) :
 fn nemit_eval_assigns(ctx: Handle, asg: [KAssign], valbuf: Handle) : Unit / Console = match asg {
   [] -> ()
   [KAsg(idx, v), ...rest] -> {
-    llvm_buf_push(valbuf, nemit_reloop_value(ctx, v, native_ctx_reg_slot_at(ctx, idx)))
+    llvm_buf_push(valbuf, nemit_reloop_value(ctx, v, nreg_slot_at(ctx, idx)))
     nemit_eval_assigns(ctx, rest, valbuf)
   }
 }
@@ -1265,7 +1256,7 @@ fn nemit_unw_push_reg(ctx: Handle, cargs: [KVal]) : Handle / Console = match car
   [KStrV(reg), fib] -> {
     let p = native_ctx_ptrt(ctx)
     let i64t = native_ctx_i64t(ctx)
-    let boxed = native_ctx_reg_slot(ctx, reg) == 0
+    let boxed = nreg_is(ctx, reg, SBoxed)
     let slot = if boxed { native_ctx_find_reg(ctx, reg) } else { llvm_const_null(p) }
     ncall_sig3(
       ctx,
