@@ -21,6 +21,7 @@ import compiler.protos_impls
 import compiler.infer_index
 import compiler.layout_derive
 import compiler.json_shape
+import compiler.protos_derive_binser
 import compiler.expr_positions
 import compiler.operators
 
@@ -625,7 +626,91 @@ pub(pkg) fn validate_derive_json(
   decls: [Decl],
   df: DiagFiles
 ) : [Diagnostic] / Console =
-  list_reverse(validate_derive_json_loop(ps, decls, df, []))
+  list_reverse(
+    json_shim_collisions(
+      json_derived_types(ps, decls, df, []),
+      [],
+      validate_derive_json_loop(
+        ps,
+        decls,
+        df,
+        []
+      )
+    )
+  )
+
+#[doc("A type deriving `Json`: the file that holds it, its name and its position.")]
+type JsonDerived = JD(String, String, Int, Int)
+
+fn json_derived_types(
+  ps: PScope,
+  decls: [Decl],
+  df: DiagFiles,
+  acc: [JsonDerived]
+) : [JsonDerived] = match decls {
+  [] -> list_reverse(acc)
+  [d, ...rest] -> match d {
+    DDerive(names, inner, _, _) -> match inner {
+      DType(_, tsym, _, _, line, col, _, _, _, _) ->
+        if derives_core(ps, names, derive_from(ps, inner), CpJson) {
+          json_derived_types(
+            ps,
+            rest,
+            df,
+            [JD(decl_diag_file(d, df), vdv_type_name(ps, tsym), line, col), ...acc]
+          )
+        } else {
+          json_derived_types(ps, rest, df, acc)
+        }
+      _ -> json_derived_types(ps, rest, df, acc)
+    }
+    DUnstable(inner, _, _) -> json_derived_types(ps, [inner, ...rest], df, acc)
+    DProtoLaws(_, inner, _, _, _) -> json_derived_types(ps, [inner, ...rest], df, acc)
+    DImplAxiom(_, inner, _, _, _) -> json_derived_types(ps, [inner, ...rest], df, acc)
+    DConstructor(inner, _, _) -> json_derived_types(ps, [inner, ...rest], df, acc)
+    _ -> json_derived_types(ps, rest, df, acc)
+  }
+}
+
+# The decoder of a type is named after the lowercased type name, so two types
+# of one file that differ only in case would define one symbol twice.
+fn json_shim_collisions(
+  types: [JsonDerived],
+  seen: [JsonDerived],
+  errs: [Diagnostic]
+) : [Diagnostic] / Console = match types {
+  [] -> errs
+  [JD(file, tname, line, col), ...rest] -> match json_shim_twin(seen, file, tname) {
+    Some(other) -> json_shim_collisions(rest, seen, [
+      derive_error(
+        file,
+        line,
+        col,
+        concat_all([
+          "cannot `#[derive(Json)]` for `",
+          tname,
+          "`: `",
+          other,
+          "` already derives `",
+          string_to_lower_ascii(tname),
+          "_of_json`, the same decoder name once lowercased"
+        ])
+      ),
+      ...errs
+    ])
+    None -> json_shim_collisions(rest, [JD(file, tname, line, col), ...seen], errs)
+  }
+}
+
+fn json_shim_twin(seen: [JsonDerived], file: String, tname: String) : Option[String] = match seen {
+  [] -> None
+  [JD(f, n, _, _), ...rest] ->
+    if f == file and n != tname and string_to_lower_ascii(n) == string_to_lower_ascii(tname) {
+      Some(n)
+    } else {
+      json_shim_twin(rest, file, tname)
+    }
+}
 
 fn validate_derive_json_loop(
   ps: PScope,
