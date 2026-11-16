@@ -64,7 +64,7 @@ leak. **The re-derivation to close is TCO reading raw `[Use]`, not a
 backend-wide contamination.**
 
 Seven modules outside Perceus take `[Use]`: `emit_c`, `emit_shared`,
-`fnreg`, `kir_lower_walk`, `infer`, `unbox`, `rawsafe`.
+`fnreg`, `kir_lower_walk`, `infer`, `unbox`.
 
 The backends are independent — native mirrors emit_c's *rules*, never its
 code — so the three-hop chain can collapse to `perceus → {emit_c, native}`.
