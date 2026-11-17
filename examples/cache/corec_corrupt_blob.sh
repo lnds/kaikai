@@ -17,30 +17,31 @@ KAI="$ROOT/bin/kai"
 CACHE_TID="$("$KAI" env KAI_TOOLCHAIN_ID)"
 PROJ="$(mktemp -d)"
 trap 'rm -rf "$PROJ"' EXIT INT TERM
+export KAI_CORE_CACHE_DIR="$PROJ/core" KAI_CACHE_TRIM=0
 
 cat > "$PROJ/main.kai" <<'EOF'
 fn main() : Unit / Console = print(int_to_string(list.sum([7, 8])))
 EOF
 
-out1="$(KAI_CACHE=1 KAI_CORE_CACHE=0 "$KAI" run "$PROJ/main.kai" 2>/dev/null || true)"
+out1="$(KAI_CACHE=1 "$KAI" run "$PROJ/main.kai" 2>/dev/null || true)"
 if [ "$out1" != "15" ]; then
   echo "corec_corrupt_blob FAIL — warm run did not print 15 (got '$out1')"
   exit 1
 fi
 
-# Truncate the largest core blob to just past the 76-byte header. The
+# Truncate the largest core blob to just past the 92-byte header. The
 # header still validates but the AST payload is gone, so the decoder
 # returns None and the loader re-parses that module. The worst case: a
 # corruption the header alone cannot catch.
-blob="$(ls -S "$PROJ/.kai-cache/$CACHE_TID/core-"*.kab 2>/dev/null | head -1)"
+blob="$(ls -S "$PROJ/core/$CACHE_TID/core-"*.kab 2>/dev/null | head -1)"
 if [ -z "$blob" ] || [ ! -f "$blob" ]; then
   echo "corec_corrupt_blob FAIL — no core blob was written"
   exit 1
 fi
-head -c 80 "$blob" > "$blob.trunc"
+head -c 100 "$blob" > "$blob.trunc"
 mv "$blob.trunc" "$blob"
 
-out2="$(KAI_CACHE=1 KAI_CORE_CACHE=0 "$KAI" run "$PROJ/main.kai" 2>/dev/null || true)"
+out2="$(KAI_CACHE=1 "$KAI" run "$PROJ/main.kai" 2>/dev/null || true)"
 if [ "$out2" != "15" ]; then
   echo "corec_corrupt_blob FAIL — truncated core blob not rejected (got '$out2')"
   exit 1

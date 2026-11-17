@@ -16,7 +16,7 @@ Run one alone with `sh examples/cache/<name>.sh`.
 
 ## User parse cache (`userb_*.sh`)
 
-The per-project cache (`<project>/.kai-cache/<toolchain-id>/`, written by
+The per-project cache (`<core cache>/<toolchain-id>/pkg/<hash of the project path>/`, written by
 `stage2/compiler/user_cache.kai`). `bin/kai` passes `--user-cache` when
 `KAI_CACHE` is `1`, or `auto` (the default) in a package; the fixtures
 set `KAI_CACHE=1`.
@@ -34,6 +34,9 @@ Negative — an edit must not serve stale decls:
   from the cache (counted hit/miss) and follows the file's text.
 - `userb_version_bump.sh` — flip the blob's kaikai-version byte.
 - `userb_corrupt_blob.sh` — truncate the blob past the header.
+- `userb_renamed_blob.sh` — a blob copied onto another module's key is a miss.
+- `userb_flipped_payload.sh` — a byte changed inside the payload is a miss.
+- `userb_planted_kai_cache.sh` — a `.kai-cache/` shipped in a package is never read.
 
 Positive — the emitted C is byte-identical across cold-cache, warm-cache
 (hit path) and no-cache (oracle) builds. Self-host byte-identity does not
@@ -84,7 +87,8 @@ stats through the wrapper, c-modular routing and shared-cache soundness,
 ThinLTO under `--release`, read-only caches, the cached native core
 object (build mode, closure specialisations, the inline-bitcode
 fallback), and native-modular object caching (toolchain identity, the
-C compiler's identity, shared test roots, dotted-import routing).
+C compiler's identity, shared test roots, dotted-import routing, a planted
+object rebuilt, the optimisation level in the key).
 
 `stress_nmodular_cold_pool.sh` builds cold native-modular projects under
 CPU load; it runs from `make stress-nmodular-pool`, not tier 1.

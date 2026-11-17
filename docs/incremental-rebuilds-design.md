@@ -23,7 +23,7 @@ building on:
 
 - **Content-addressed cache keying** (`stage2/compiler/user_cache.kai`,
   `core_cache.kai`). The user cache already keys each root file by
-  `content_hex = uc_content_hex(src)` (FNV-1a 64-bit over the source bytes, 16
+  `content_hex = ck_hex(src)` (FNV-1a 64-bit over the source bytes, 16
   hex chars) **plus** `dep_hex`, a `string_hash` over the concatenated
   `content_hex` of every transitive import in discovery order. The blob filename
   embeds both, so any edit to the source, a direct import, or a transitive
@@ -59,7 +59,7 @@ typed_key(M) = ( content_hex(source(M)),
 ```
 
 - `content_hex(source(M))` — FNV-1a over `M`'s own source bytes, via the existing
-  `uc_content_hex`.
+  `ck_hex`.
 - `iface_dep_hex(M)` — `string_hash` over the concatenation, in stable
   discovery order, of each **direct** import's **interface hash** (see below).
   This replaces the post-parse cache's `dep_hex` (which hashes imports'

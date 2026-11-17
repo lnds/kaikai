@@ -202,7 +202,7 @@ semantic refactor will likely change the delta's shape.
 | Layer | What it caches | Where it lives | When it invalidates |
 |---|---|---|---|
 | **Phase A** | Stdlib core modules (immutable from user POV) | `~/.cache/kaikai/core modules-v<N>/<sha>.kab` | stdlib file changes OR kaikai version bump OR cache format bump |
-| **Phase B** | User-side files (mutable) | `<project>/.kai-cache/<toolchain-id>/<content_hash>-<dep_hash>.kab` | source changes OR any transitive import changes OR a different compiler binary OR cache format bump |
+| **Phase B** | User-side files (mutable) | `<core cache>/<toolchain-id>/pkg/<hash of the project path>/<content_hash>-<dep_hash>.kab` | source changes OR any transitive import changes OR a different compiler binary OR cache format bump |
 
 Both use the same on-disk format (KAB1, defined below). What
 varies across the three sub-phases is the *payload schema*:
@@ -380,7 +380,7 @@ magic/checksum/version mismatch in header
 
 Subcommand explicit:
 
-- `kai clean` — purges `<project>/.kai-cache/` (Phase B).
+- `kai clean` — purges the project's bucket in the shared core cache (Phase B), and any `.kai-cache/` an older kai left in the project.
 - `kai clean --global` — also purges `~/.cache/kaikai/core modules-v*/`
   (Phase A).
 - `kai clean --older-than 30d` — optional, post-1.0, garbage-collect
@@ -515,24 +515,34 @@ The user-file analogue of A.0: a per-project, content-addressable cache
 of post-parse `[Decl]` for user modules, with correct transitive
 invalidation. New module `stage2/compiler/user_cache.kai`; the driver's
 import resolver consults it before lexing each imported module. The
-`kai` driver creates `<project>/.kai-cache/<toolchain-id>/` and passes it
-as `--user-cache-dir` with `--user-cache` automatically when the entry sits
-under a `kai.toml`. The toolchain id is the compiler binary's mtime and
-size, so a rebuilt or swapped compiler never reads another's entries; the
-driver removes every other toolchain's directory, and turns the cache off
-when the id cannot be read. Both the post-parse and the typed blobs live
-in that directory;
-`KAI_CACHE=0` disables it. A loose file (no `kai.toml`) keeps its blobs
-in the shared core cache, in `loose/<hash of its absolute source
-directory>`, so no file lands beside the source and two `main.kai` in
-different directories never share a bucket; `KAI_CACHE=1` keeps them in
-`.kai-cache` beside the source instead. A loose file is one root, but
+`kai` driver creates the project's bucket,
+`<core cache>/<toolchain-id>/pkg/<hash of the project's absolute path>/`, and
+passes it as `--user-cache-dir` with `--user-cache` automatically when the
+entry sits under a `kai.toml`. The toolchain id is the compiler binary's
+mtime and size, so a rebuilt or swapped compiler never reads another's
+entries; the shared cache's recency trim removes a toolchain directory that
+stops being used, and the cache is off when the id cannot be read or the
+shared core cache is off. Both the post-parse and the typed blobs live in
+that directory; `KAI_CACHE=0` disables it. A loose file keeps its blobs in
+`loose/<hash of its absolute source directory>` of the same directory. No
+cache is ever read from the project: a `.kai-cache/` that arrives with a
+checkout is ignored, since a blob is trusted by where it lives and what its
+header says, and a checkout supplies both. A loose file is one root, but
 its imports still partition, so the typed cut serves hits for them.
 Measured on the compiler's own source (a loose file; front end only,
 `KAI_THREADS=1`, leaf edit, n=5): the first build costs +3.4 s (+15 %),
 a body edit is 14 % faster (22.6 s to 19.4 s) and a signature edit 12 %
 faster (22.9 s to 20.2 s). A one-module `hello` builds in 106 ms with the
 cache on or off.
+
+Every blob is checked on read: the header echoes the key the blob was written
+under, and a reader compares it with the key it looked up; it also carries a
+checksum of the payload. A mismatch of either is a miss. A native object is
+trusted only while the checksum recorded beside it (`<object>.sum`) matches
+its bytes, and its key is 128 bits wide and folds the toolchain, the edition,
+the backend tag (triple, optimisation level, bitcode ids) and the `KAI_*`
+environment that shapes an object. `stage2/compiler/cache_key.kai` owns how a
+key is composed and hashed and how a blob or object is checked.
 
 - **The key is the file's own content, materialised as the blob
   filename** (`<content_hex>-<no-dep>.kab`). A parse blob is what the
@@ -568,9 +578,8 @@ cache on or off.
 > invalidation infrastructure** — the durable piece #447 (LSP) builds
 > on and A.1 reuses — **not** a wall-time win. The ≤ 150 ms target lives
 > in A.1 (cache the core *post-typecheck*); see below. Phase A's
-> core cache is also currently dead on the `kai build` path (loaded
-> with `caches=[]`); wiring it in or retiring `--emit-core-cache` is
-> a separate follow-up, deliberately not coupled to #455.
+> core cache was a per-file cache path that the driver never wired in; it is
+> retired in favour of the shared core cache.
 
 ### Phase A.1 — post-typecheck cache
 

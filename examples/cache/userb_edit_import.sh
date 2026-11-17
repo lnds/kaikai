@@ -12,6 +12,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAI="$ROOT/bin/kai"
 PROJ="$(mktemp -d)"
 trap 'rm -rf "$PROJ"' EXIT INT TERM
+export XDG_CACHE_HOME="$PROJ/xdg" KAI_CACHE_TRIM=0
 
 cat > "$PROJ/dep.kai" <<'EOF'
 pub fn base() : Int = 10

@@ -119,7 +119,7 @@ cache:
   process removed first is skipped.
 - `KAI_CACHE_TRIM=0` disables the trim; `KAI_CACHE_TRIM_DAYS=<n>` changes
   the age (default 5).
-- `kai clean` deletes the cwd package's `.kai-cache`; `kai clean --cache`
+- `kai clean` deletes the cwd package's bucket of the shared core cache (and any `.kai-cache` an older kai left in it); `kai clean --cache`
   deletes the shared caches. Both print what they freed.
 
 ## The five Makefiles — recursive delegation
