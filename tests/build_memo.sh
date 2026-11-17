@@ -184,10 +184,10 @@ scenario truncated-entries 1 "$solo" "$app" -- main.kai -o "$app"
 
 # The first build in a package builds the package tools it reports on.
 build pkg-warmup 0 "$pkg" "$pkg/buildmemo" -- main.kai
-rm -rf "$pkg/.kai-cache"
+(cd "$pkg" && env KAI_CORE_CACHE_DIR="$work/core" "$lay/bin/kai" clean > /dev/null)
 scenario pkg-cold 1 "$pkg" "$pkg/buildmemo" --
 scenario pkg-warm 0 "$pkg" "$pkg/buildmemo" --
-ls -d "$pkg"/.kai-cache/*/bins/* > /dev/null 2>&1 \
+ls -d "$work"/core/*/pkg/*/bins/* > /dev/null 2>&1 \
   || { echo "  FAIL pkg: no entry in the package's user cache"; fail=$((fail + 1)); }
 
 # The manifest is a link input whose digest is kept under its state on
