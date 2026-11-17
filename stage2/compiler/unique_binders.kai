@@ -25,16 +25,17 @@ import compiler.util
 # A binder in scope: the id it was declared with, and the binder it is now.
 type UbBind = UbBind(LocalId, Binder)
 
-# `dups` holds the ids bound at more than one site.
-type UbCx = { env: [UbBind], dups: [LocalId] }
+# `dups` holds the ids bound at more than one site; `ord` is the body's
+# counter of renumbered binders.
+type UbCx = { env: [UbBind], dups: [LocalId], ord: Array[Int] }
 
 #[doc("Renumber the binders of every function, test, bench and check body so no two binding sites share an id.")]
-pub fn unique_binders_decls(ds: [Decl]) : [Decl] = match ds {
+pub fn unique_binders_decls(ds: [Decl]) : [Decl] / Mutable = match ds {
   [] -> []
   [d, ...rest] -> [ub_decl(d), ...unique_binders_decls(rest)]
 }
 
-fn ub_decl(d: Decl) : Decl = match d {
+fn ub_decl(d: Decl) : Decl / Mutable = match d {
   DFn(p, fid, tps, ps, r, row, body, ln, cl, nl, nc, mo) ->
     DFn(p, fid, tps, ps, r, row, ub_body(body, map(ps, .binder)), ln, cl, nl, nc, mo)
   DTest(desc, body, ln, cl, mo) -> DTest(desc, ub_body(body, []), ln, cl, mo)
@@ -44,13 +45,16 @@ fn ub_decl(d: Decl) : Decl = match d {
   _ -> d
 }
 
-fn ub_body(body: Expr, params: [Binder]) : Expr {
+fn ub_body(body: Expr, params: [Binder]) : Expr / Mutable {
   let binders = list_append(params, ub_binders(body, []))
   let dups = ub_repeated_ids(map(binders, .id), [], [])
   if list_is_empty(dups) {
     body
   } else {
-    ub_expr(body, UbCx { env: map(params, b => UbBind(b.id, b)), dups: dups })
+    ub_expr(
+      body,
+      UbCx { env: map(params, b => UbBind(b.id, b)), dups: dups, ord: array_make(1, 0) }
+    )
   }
 }
 
@@ -184,29 +188,28 @@ fn ub_lookup_id(env: [UbBind], l: LocalId) : LocalId = match env {
   [UbBind(id, to), ...rest] -> if local_eq(id, l) { to.id } else { ub_lookup_id(rest, l) }
 }
 
-# The binder a binding site at `(line, col)` declares: renumbered when its
-# id is bound at more than one site.
-fn ub_rebound(b: Binder, line: Int, col: Int, cx: UbCx) : Binder =
+# The binder a binding site declares: renumbered when its id is bound at
+# more than one site.
+fn ub_rebound(b: Binder, cx: UbCx) : Binder / Mutable =
   if ub_has_id(cx.dups, b.id) {
-    Binder { id: ub_site_id(b.id, line, col), name: b.name }
+    Binder { id: ub_site_id(b.id, cx), name: b.name }
   } else {
     b
   }
 
-# The id a binder takes at one of the sites its id is bound at.
-fn ub_site_id(l: LocalId, line: Int, col: Int) : LocalId =
-  local_minted(
-    concat_all(
-      ["#", int_to_string(local_raw(l)), "@", int_to_string(line), ":", int_to_string(col)]
-    )
-  )
+# A fresh id for one of the sites `l` is bound at.
+fn ub_site_id(l: LocalId, cx: UbCx) : LocalId / Mutable {
+  let n = cx.ord[0] + 1
+  let _ = array_set(cx.ord, 0, n)
+  local_minted(concat_all(["#", int_to_string(local_raw(l)), "@", int_to_string(n)]))
+}
 
 fn ub_bind(cx: UbCx, b: Binder, to: Binder) : UbCx =
-  UbCx { env: [UbBind(b.id, to), ...cx.env], dups: cx.dups }
+  UbCx { ...cx, env: [UbBind(b.id, to), ...cx.env] }
 
 fn ub_param(p: Param, cx: UbCx) : Param =
   Param {
-    binder: ub_rebound(p.binder, p.pline, p.pcol, cx),
+    binder: ub_rebound(p.binder, cx),
     ptype: p.ptype,
     pline: p.pline,
     pcol: p.pcol,
@@ -237,7 +240,7 @@ fn ub_block(ss: [Stmt], ot: Option[Expr], cx: UbCx, acc: [Stmt]) : ExprKind = ma
       ub_block(rest, ot, pr.cx, [SLet(pr.pat, ann, ub_expr(rhs, cx)), ...acc])
     }
     SVar(b, ann, rhs, ln, cl) -> {
-      let to = ub_rebound(b, ln, cl, cx)
+      let to = ub_rebound(b, cx)
       ub_block(rest, ot, ub_bind(cx, b, to), [SVar(to, ann, ub_expr(rhs, cx), ln, cl), ...acc])
     }
     _ -> ub_block(rest, ot, cx, [prc_map_stmt_exprs(s, x => ub_expr(x, cx)), ...acc])
@@ -261,7 +264,7 @@ fn ub_clause(c: HClause, cx: UbCx) : HClause = match c {
 fn ub_return(oret: Option[HReturn], cx: UbCx) : Option[HReturn] = match oret {
   None -> None
   Some(HR(b, body, ln, cl)) -> {
-    let to = ub_rebound(b, ln, cl, cx)
+    let to = ub_rebound(b, cx)
     Some(HR(to, ub_expr(body, ub_bind(cx, b, to)), ln, cl))
   }
 }
@@ -271,31 +274,31 @@ fn ub_return(oret: Option[HReturn], cx: UbCx) : Option[HReturn] = match oret {
 type UbPat = { pat: Pattern, cx: UbCx }
 
 fn ub_pat(p: Pattern, cx: UbCx) : UbPat {
-  let r = ub_pat_kind(p.pkind, p.line, p.col, cx)
+  let r = ub_pat_kind(p.pkind, cx)
   UbPat { pat: Pattern { pkind: r.kind, line: p.line, col: p.col }, cx: r.cx }
 }
 
 type UbPk = { kind: PatKind, cx: UbCx }
 
-fn ub_pat_kind(k: PatKind, line: Int, col: Int, cx: UbCx) : UbPk = match k {
+fn ub_pat_kind(k: PatKind, cx: UbCx) : UbPk = match k {
   PBind(b) -> {
-    let to = ub_rebound(b, line, col, cx)
+    let to = ub_rebound(b, cx)
     UbPk { kind: PBind(to), cx: ub_bind(cx, b, to) }
   }
   PAs(b, inner) -> {
-    let to = ub_rebound(b, line, col, cx)
+    let to = ub_rebound(b, cx)
     let r = ub_pat(inner, ub_bind(cx, b, to))
     UbPk { kind: PAs(to, r.pat), cx: r.cx }
   }
   PNarrow(b, t) -> {
-    let to = ub_rebound(b, line, col, cx)
+    let to = ub_rebound(b, cx)
     UbPk { kind: PNarrow(to, t), cx: ub_bind(cx, b, to) }
   }
   PList(ps, rest) -> {
     let r = ub_pats(ps, cx, [])
     match rest {
       Some(b) -> {
-        let to = ub_rebound(b, line, col, r.cx)
+        let to = ub_rebound(b, r.cx)
         UbPk { kind: PList(r.pats, Some(to)), cx: ub_bind(r.cx, b, to) }
       }
       None -> UbPk { kind: PList(r.pats, None), cx: r.cx }
