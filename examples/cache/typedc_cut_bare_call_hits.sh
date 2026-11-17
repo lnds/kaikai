@@ -69,7 +69,7 @@ same() {
 }
 
 build "$PROJ/plain.c"
-build "$PROJ/cold.c" --user-cache
+build "$PROJ/cold.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 
 blobs="$(blob_count)"
 if [ "$blobs" -lt "$N" ]; then
@@ -81,7 +81,7 @@ blob_stamp > "$PROJ/stamp_cold"
 # The filesystem timestamp is the evidence, so the second build must be
 # distinguishable in time from the first.
 sleep 2
-build "$PROJ/warm.c" --user-cache
+build "$PROJ/warm.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 blob_stamp > "$PROJ/stamp_warm"
 
 same "$PROJ/plain.c" "$PROJ/cold.c" "cold --user-cache C differs from plain C"
@@ -101,7 +101,7 @@ fn step$((last - 1))(n: Int) : Int = 100
 pub fn step${last}(n: Int) : Int = step$((last - 1))(n) + $last
 EOF
 
-build "$PROJ/shadow.c" --user-cache
+build "$PROJ/shadow.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 build "$PROJ/shadow_plain.c"
 same "$PROJ/shadow_plain.c" "$PROJ/shadow.c" "shadowed bare call served a stale resolution from cache"
 

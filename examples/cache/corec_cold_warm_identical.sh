@@ -51,10 +51,10 @@ mkdir -p "$PROJ/.kai-cache"
 
 # Cold: cache enabled, empty cache -> all core misses, 12 blobs written.
 rm -f "$PROJ/.kai-cache/core-"*.kab 2>/dev/null || true
-"$KAIC2" $EDITION_FLAG --user-cache --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/cold.c" 2>/dev/null
+"$KAIC2" $EDITION_FLAG --user-cache --user-cache-dir "$PROJ/.kai-cache" --core-cache-dir "$PROJ/.kai-cache" --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/cold.c" 2>/dev/null
 
 # Warm: cache enabled, blobs present -> all core hits, lex+parse skipped.
-"$KAIC2" $EDITION_FLAG --user-cache --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/warm.c" 2>/dev/null
+"$KAIC2" $EDITION_FLAG --user-cache --user-cache-dir "$PROJ/.kai-cache" --core-cache-dir "$PROJ/.kai-cache" --path "$STDLIB" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/warm.c" 2>/dev/null
 
 if ! cmp -s "$PROJ/cold.c" "$PROJ/oracle.c"; then
   echo "corec_cold_warm_identical FAIL — cold-cache C differs from no-cache oracle"

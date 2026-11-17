@@ -73,8 +73,8 @@ user_keys() {
 }
 
 build "$PROJ/plain.c"
-build "$PROJ/cold.c" --user-cache
-build "$PROJ/warm.c" --user-cache
+build "$PROJ/cold.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
+build "$PROJ/warm.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 
 same "$PROJ/plain.c" "$PROJ/cold.c" "cold --user-cache C differs from plain C"
 same "$PROJ/plain.c" "$PROJ/warm.c" "warm --user-cache C differs from plain C"
@@ -83,7 +83,7 @@ same "$PROJ/plain.c" "$PROJ/warm.c" "warm --user-cache C differs from plain C"
 keys_run1="$(user_keys)"
 rm -rf "$PROJ/.kai-cache"
 mkdir -p "$PROJ/.kai-cache"
-build "$PROJ/cold2.c" --user-cache
+build "$PROJ/cold2.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 keys_run2="$(user_keys)"
 
 if [ "$keys_run1" != "$keys_run2" ]; then
@@ -99,7 +99,7 @@ pub fn m0_step(n: Int) : Int = n + 0 + 0
 EOF2
 
 echo "$keys_run2" > "$PROJ/keys_before"
-build "$PROJ/edit.c" --user-cache
+build "$PROJ/edit.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 build "$PROJ/edit_plain.c"
 same "$PROJ/edit_plain.c" "$PROJ/edit.c" "deep-edit --user-cache C differs from plain C"
 user_keys > "$PROJ/keys_after"
@@ -115,7 +115,7 @@ cat > "$PROJ/m0.kai" <<'EOF2'
 pub fn m0_step(n: Int, k: Int) : Int = n + k
 EOF2
 
-if "$KAIC2" $EDITION_FLAG --user-cache --path "$PROJ" "$PROJ/main.kai" > /dev/null 2> "$PROJ/iface_cached.err"; then
+if "$KAIC2" $EDITION_FLAG --user-cache --user-cache-dir "$PROJ/.kai-cache" --path "$PROJ" "$PROJ/main.kai" > /dev/null 2> "$PROJ/iface_cached.err"; then
   echo "userb_chain_edit_isolated: FAIL — the cached build accepted a call with the old arity"
   exit 1
 fi

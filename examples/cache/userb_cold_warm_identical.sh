@@ -60,10 +60,10 @@ mkdir -p "$PROJ/.kai-cache"
 
 # Cold: cache enabled, empty cache -> all misses, blobs written.
 rm -f "$PROJ/.kai-cache/"*.kab 2>/dev/null || true
-"$KAIC2" $EDITION_FLAG --user-cache --path "$PROJ" "$PROJ/main.kai" > "$PROJ/cold.c" 2>/dev/null
+"$KAIC2" $EDITION_FLAG --user-cache --user-cache-dir "$PROJ/.kai-cache" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/cold.c" 2>/dev/null
 
 # Warm: cache enabled, blobs present -> all hits, parse skipped.
-"$KAIC2" $EDITION_FLAG --user-cache --path "$PROJ" "$PROJ/main.kai" > "$PROJ/warm.c" 2>/dev/null
+"$KAIC2" $EDITION_FLAG --user-cache --user-cache-dir "$PROJ/.kai-cache" --path "$PROJ" "$PROJ/main.kai" > "$PROJ/warm.c" 2>/dev/null
 
 if ! cmp -s "$PROJ/cold.c" "$PROJ/oracle.c"; then
   echo "userb_cold_warm_identical FAIL — cold-cache C differs from no-cache oracle"

@@ -39,7 +39,7 @@ done
 mkdir -p "$PROJ/.kai-cache"
 
 check() {
-  if ! "$KAIC2" $EDITION_FLAG --user-cache --path "$PROJ" --test --check "$PROJ/$1.kai" > /dev/null 2>"$PROJ/err"; then
+  if ! "$KAIC2" $EDITION_FLAG --user-cache --user-cache-dir "$PROJ/.kai-cache" --path "$PROJ" --test --check "$PROJ/$1.kai" > /dev/null 2>"$PROJ/err"; then
     echo "typedc_cut_root_tests_own_bucket: FAIL — $1 did not check"
     cat "$PROJ/err"
     exit 1

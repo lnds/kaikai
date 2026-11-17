@@ -14,6 +14,7 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT INT TERM
+export XDG_CACHE_HOME="$work/xdg"
 
 lay="$work/root"
 mkdir -p "$lay/stage2" "$lay/bin"
@@ -132,11 +133,11 @@ printf '\n#[doc("Probe.")]\npub fn memo_probe() : Int = 1\n' >> "$work/stdlib/co
 scenario stdlib-edited 1 KAI_STDLIB="$work/stdlib"
 
 # A corrupt memo entry is a miss, never a verdict.
-for f in "$pkg"/.kai-cache/*/guards/* "$pkg"/.kai-cache/*/imports/*; do
+for f in "$work"/xdg/kai/core/*/pkg/*/guards/* "$work"/xdg/kai/core/*/pkg/*/imports/*; do
   [ -f "$f" ] && printf 'garbage' > "$f"
 done
 scenario corrupt-entries 2
-for f in "$pkg"/.kai-cache/*/guards/* "$pkg"/.kai-cache/*/imports/*; do
+for f in "$work"/xdg/kai/core/*/pkg/*/guards/* "$work"/xdg/kai/core/*/pkg/*/imports/*; do
   [ -f "$f" ] && head -c 20 "$f" > "$f.cut" && mv "$f.cut" "$f"
 done
 scenario truncated-entries 2
