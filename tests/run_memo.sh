@@ -148,18 +148,22 @@ while [ "$i" -lt 25 ]; do
   printf 'fn main() : Unit / Stdout = Stdout.print("v%s")\n' "$i" > "$many/main.kai"
   run "many-$i" on "$many" -- main.kai
 done
-bins="$(echo "$many"/.kai-cache/*/bins)"
-kept="$(find "$bins" -mindepth 2 -maxdepth 2 -name meta | wc -l | tr -d ' ')"
+bins=""
+kept=0
+for b in "$work"/core/*/pkg/*/bins; do
+  n="$(find "$b" -mindepth 2 -maxdepth 2 -name meta | wc -l | tr -d ' ')"
+  if [ "$n" -gt "$kept" ]; then kept="$n"; bins="$b"; fi
+done
 [ "$kept" -eq 24 ] || { echo "  FAIL many: $kept entries kept, expected 24"; fail=$((fail + 1)); }
 [ -f "$bins/files" ] && [ -f "$bins/core-sources" ] \
   || { echo "  FAIL many: the kept digests were evicted with the entries"; fail=$((fail + 1)); }
 
 # The first run in a package builds the package tools it reports on.
 run pkg-warmup 0 "$pkg" -- main.kai
-rm -rf "$pkg/.kai-cache"
+(cd "$pkg" && env KAI_CORE_CACHE_DIR="$work/core" "$lay/bin/kai" clean > /dev/null)
 scenario pkg-cold 1 "$pkg" -- main.kai
 scenario pkg-warm 0 "$pkg" -- main.kai
-ls -d "$pkg"/.kai-cache/*/bins/* > /dev/null 2>&1 \
+ls -d "$work"/core/*/pkg/*/bins/* > /dev/null 2>&1 \
   || { echo "  FAIL pkg: no entry in the package's user cache"; fail=$((fail + 1)); }
 
 # The manifest and the runtime header are link inputs whose digests are

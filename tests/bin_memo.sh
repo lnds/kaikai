@@ -13,6 +13,7 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT INT TERM
+export XDG_CACHE_HOME="$work/xdg"
 
 lay="$work/root"
 mkdir -p "$lay/stage2" "$lay/bin"
@@ -85,7 +86,7 @@ scenario() {
 
 # The first run in a fresh layout builds the package tools it reports on.
 run warmup 0
-rm -rf "$pkg/.kai-cache"
+(cd "$pkg" && "$lay/bin/kai" clean > /dev/null)
 
 scenario cold 2
 if ! grep -q 'adds' "$work/cold-off.out" || ! grep -q 'counts' "$work/cold-off.out"; then
@@ -109,11 +110,11 @@ scenario manifest-edited 1
 scenario env-changed 1 KAI_MEMO_PROBE=1
 
 # A damaged entry is a miss, never a binary.
-for f in "$pkg"/.kai-cache/*/bins/*/bin; do
+for f in "$work"/xdg/kai/core/*/pkg/*/bins/*/bin; do
   [ -f "$f" ] && head -c 100 "$f" > "$f.cut" && mv "$f.cut" "$f"
 done
 scenario truncated-entries 2
-for f in "$pkg"/.kai-cache/*/bins/*/meta; do
+for f in "$work"/xdg/kai/core/*/pkg/*/bins/*/meta; do
   [ -f "$f" ] && printf 'garbage' > "$f"
 done
 scenario corrupt-meta 2

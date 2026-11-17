@@ -69,8 +69,8 @@ same() {
 }
 
 build "$PROJ/plain.c"
-build "$PROJ/cold.c" --user-cache
-build "$PROJ/warm.c" --user-cache
+build "$PROJ/cold.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
+build "$PROJ/warm.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 
 same "$PROJ/plain.c" "$PROJ/cold.c" "cold --user-cache C differs from plain C"
 same "$PROJ/plain.c" "$PROJ/warm.c" "warm --user-cache C differs from plain C"
@@ -86,7 +86,7 @@ cat > "$PROJ/b.kai" <<'EOF'
 import a
 pub fn twice(s: String) : Unit / Stdout = { a.shout(s); a.shout(s); a.shout(s) }
 EOF
-build "$PROJ/edit.c" --user-cache
+build "$PROJ/edit.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 build "$PROJ/edit_plain.c"
 same "$PROJ/edit_plain.c" "$PROJ/edit.c" "body-edit --user-cache C differs from plain C"
 
@@ -105,7 +105,7 @@ cat > "$PROJ/b.kai" <<'EOF'
 import a
 pub fn twice(s: String) : Unit / Stdout = { a.shout(s, 1); a.shout(s, 2) }
 EOF
-build "$PROJ/sig.c" --user-cache
+build "$PROJ/sig.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 build "$PROJ/sig_plain.c"
 same "$PROJ/sig_plain.c" "$PROJ/sig.c" "signature-change --user-cache C differs from plain C"
 

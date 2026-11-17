@@ -33,7 +33,7 @@ EOF
 mkdir -p "$PROJ/.kai-cache"
 
 # Warm the cache against the pristine copy.
-KAIKAI_STDLIB_PATH="$TMPSTD" "$KAIC2" $EDITION_FLAG --user-cache --path "$TMPSTD" --path "$PROJ" \
+KAIKAI_STDLIB_PATH="$TMPSTD" "$KAIC2" $EDITION_FLAG --user-cache --user-cache-dir "$PROJ/.kai-cache" --core-cache-dir "$PROJ/.kai-cache" --path "$TMPSTD" --path "$PROJ" \
   "$PROJ/main.kai" > "$PROJ/warm_before.c" 2>/dev/null
 before="$(ls "$PROJ/.kai-cache/core-"*.kab 2>/dev/null | wc -l | tr -d ' ')"
 if [ "$before" = "0" ]; then
@@ -46,7 +46,7 @@ printf '\n# issue #825 invalidation probe\n' >> "$TMPSTD/core/list.kai"
 
 # Build again with the cache on. The edited list.kai must miss (new
 # hash, new blob name) and re-parse; everything else stays a hit.
-KAIKAI_STDLIB_PATH="$TMPSTD" "$KAIC2" $EDITION_FLAG --user-cache --path "$TMPSTD" --path "$PROJ" \
+KAIKAI_STDLIB_PATH="$TMPSTD" "$KAIC2" $EDITION_FLAG --user-cache --user-cache-dir "$PROJ/.kai-cache" --core-cache-dir "$PROJ/.kai-cache" --path "$TMPSTD" --path "$PROJ" \
   "$PROJ/main.kai" > "$PROJ/after.c" 2>/dev/null
 
 # Oracle: a fresh no-cache build of the EDITED stdlib.

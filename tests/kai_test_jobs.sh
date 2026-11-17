@@ -59,7 +59,7 @@ run() {
   label="$1"; want="$2"; shift 2
   : > "$log"
   rc=0
-  (cd "$pkg" && rm -rf .kai-cache && KAI_BACKEND=c "$lay/bin/kai" test "$@") >"$work/out" 2>&1 || rc=$?
+  (cd "$pkg" && "$lay/bin/kai" clean > /dev/null 2>&1; KAI_BACKEND=c "$lay/bin/kai" test "$@") >"$work/out" 2>&1 || rc=$?
   got=$(peak)
   if [ "$rc" -ne 0 ]; then
     echo "  FAIL $label: kai test exited $rc"; tail -5 "$work/out"; fail=$((fail + 1)); return

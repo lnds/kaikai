@@ -71,8 +71,8 @@ same() {
 }
 
 build "$PROJ/plain.c"
-build "$PROJ/cold.c" --user-cache
-build "$PROJ/warm.c" --user-cache
+build "$PROJ/cold.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
+build "$PROJ/warm.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 
 same "$PROJ/plain.c" "$PROJ/cold.c" "cold --user-cache C differs from plain C"
 same "$PROJ/plain.c" "$PROJ/warm.c" "warm --user-cache C differs from plain C"
@@ -93,7 +93,7 @@ pub fn m5_use(r: M5Rec) : Int = r.a + string_length(r.b)
 pub fn m5_step(n: Int) : Int = m5_use(m5_mk(n)) + 5 + 0
 EOF
 
-build "$PROJ/edit.c" --user-cache
+build "$PROJ/edit.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 build "$PROJ/edit_plain.c"
 same "$PROJ/edit_plain.c" "$PROJ/edit.c" "body-edit --user-cache C differs from plain C"
 
