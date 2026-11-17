@@ -63,13 +63,13 @@ same() {
 
 write_effect abc
 build "$PROJ/plain.c"
-build "$PROJ/cold.c" --user-cache
-build "$PROJ/warm.c" --user-cache
+build "$PROJ/cold.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
+build "$PROJ/warm.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 same "$PROJ/plain.c" "$PROJ/cold.c" "cold --user-cache C differs from plain C"
 same "$PROJ/plain.c" "$PROJ/warm.c" "warm --user-cache C differs from plain C"
 
 write_effect abcd
-build "$PROJ/edit.c" --user-cache
+build "$PROJ/edit.c" --user-cache --user-cache-dir "$PROJ/.kai-cache"
 build "$PROJ/edit_plain.c"
 same "$PROJ/edit_plain.c" "$PROJ/edit.c" "edited default: --user-cache C differs from plain C"
 if cmp -s "$PROJ/plain.c" "$PROJ/edit.c"; then
