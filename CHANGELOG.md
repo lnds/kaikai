@@ -84,6 +84,32 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.196.1 (2026-11-17)
+
+### Fixed
+
+- **emit**: emit a run-time abort for FFI shims instead of failing the C printer
+- **derive**: reject Json types sharing a lowercased decoder name; key raw arm binders by id
+- **compiler**: key lifted lambdas by node id and keep mono names injective
+- **compiler**: carry released params as a set, scope resume by lets, key brands by file, keep symbols injective
+- **compiler**: build the loaded-file set with a tail-recursive fold
+- **compiler**: tail-safe list walks in the new enumerations and drop the stale walker baseline entry
+- **compiler**: lower a marker with no operand to unit and name every unsupported kind
+- **compiler**: one exhaustive tree enumeration for every analysis, and a failing lowering channel
+
+### Changed
+
+- **compiler**: thread the binder counter through accumulators in unique_binders
+- **compiler**: number cloned binders by a per-body ordinal, not their position
+- **compiler**: key a closure specialisation by the lambda's node id
+- **perceus**: identify reads by execution order, not source position
+- **compiler**: carry a region block in the tree as ERegionBlk
+- **effects**: name handler clauses by handler identity, not position
+- delete the dead AST-to-C chain and dead planners, and clear stale comments
+- **compiler**: hash the native register tables and share one register collection between backends
+- **compiler**: index the loaded set, the ffi set and the builtin ids; drop the identity index pass
+- **compiler**: index the poly fns, the package map, the prelude and the discarded evidence walk
+
 ## v0.196.0 (2026-11-16)
 
 ### BREAKING CHANGE
