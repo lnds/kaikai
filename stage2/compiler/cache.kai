@@ -1,10 +1,11 @@
 #[doc("Cache blob primitives and the AST (de)serialiser the module entries ride on.")]
 
 import compiler.util
+import compiler.cache_key
 import compiler.ast_decl
 import compiler.symtab
 
-fn cache_format_version() : Int = 23
+fn cache_format_version() : Int = 24
 
 fn cache_magic() : String = "KAB2"
 
@@ -12,24 +13,27 @@ fn cache_magic() : String = "KAB2"
 # field is defense-in-depth against blobs copied between caches.
 fn cache_kaikai_version_hash() : Int = 2
 
-fn cache_header_len() : Int = 76
+fn cache_sum_at() : Int = 76
+
+fn cache_header_len() : Int = 92
 
 #[doc("A validated blob header: the echoed key sha and the payload offset.")]
 pub(pkg) type CacheHdr = CHdr(String, Int)
 
-#[doc("Frame `payload` as a KAB2 blob under the 64-char key `sha`.")]
+#[doc("Frame `payload` as a KAB2 blob under the 64-char key `sha`, with the payload's checksum in the header.")]
 pub(pkg) fn cache_blob(sha: String, payload: Array[Byte]) : Array[Byte] =
-  array_concat_bytes(cache_header(sha), payload)
+  array_concat_bytes(cache_header(sha, ck_sum_hex(payload, 0)), payload)
 
-fn cache_header(sha: String) : Array[Byte] {
+fn cache_header(sha: String, sum: String) : Array[Byte] {
   let buf = array_make(cache_header_len(), bin_byte(0))
   let _ = cache_put_text(buf, 0, cache_magic(), 0)
   let _ = bin_write_len4(buf, 4, cache_format_version())
   let _ = bin_write_len4(buf, 8, cache_kaikai_version_hash())
-  cache_put_text(buf, 12, sha, 0)
+  let _ = cache_put_text(buf, 12, sha, 0)
+  cache_put_text(buf, cache_sum_at(), sum, 0)
 }
 
-# Writes at most the 64 header bytes the sha slot has.
+# Writes `s` at `off`, never past the header.
 fn cache_put_text(buf: Array[Byte], off: Int, s: String, i: Int) : Array[Byte] / Mutable =
   if i >= string_length(s) or off + i >= cache_header_len() {
     buf
@@ -38,8 +42,8 @@ fn cache_put_text(buf: Array[Byte], off: Int, s: String, i: Int) : Array[Byte] /
     cache_put_text(buf, off, s, i + 1)
   }
 
-#[doc("Validate a KAB2 blob header, returning the echoed sha plus the payload offset; `None` on magic, format, version, or length drift.")]
-pub(pkg) fn cache_read_header(buf: Array[Byte]) : Option[CacheHdr] =
+#[doc("Check a KAB2 blob against the key `want_sha` the caller looked up and against its own payload checksum, returning the payload offset; `None` on magic, format, version, length, key or checksum drift. Every blob reader goes through here.")]
+pub(pkg) fn cache_read_header(buf: Array[Byte], want_sha: String) : Option[CacheHdr] =
   if array_length(buf) < cache_header_len() {
     None
   } else if cache_bytes_text(buf, 0, 4) != cache_magic() {
@@ -48,8 +52,12 @@ pub(pkg) fn cache_read_header(buf: Array[Byte]) : Option[CacheHdr] =
     None
   } else if not cache_u32_is(buf, 8, cache_kaikai_version_hash()) {
     None
+  } else if cache_bytes_text(buf, 12, 64) != want_sha {
+    None
+  } else if cache_bytes_text(buf, cache_sum_at(), 16) != ck_sum_hex(buf, cache_header_len()) {
+    None
   } else {
-    Some(CHdr(cache_bytes_text(buf, 12, 64), cache_header_len()))
+    Some(CHdr(want_sha, cache_header_len()))
   }
 
 fn cache_u32_is(buf: Array[Byte], pos: Int, want: Int) : Bool = match bin_get_uint_le(buf, pos, 4) {
@@ -100,9 +108,12 @@ pub(pkg) fn cache_serialize_module(decls: [Decl], rows: [NEnt], source_sha: Stri
     array_concat_bytes(cache_decls_bytes(decls), bin_list_to_bytes(rows, cache_row_bytes))
   )
 
-#[doc("Deserialise a KAB2 blob back into decls + rows + sha; `None` on any header or payload mismatch, which the caller treats as a miss.")]
-pub(pkg) fn cache_deserialize_module(buf: Array[Byte]) : Option[CacheDeserialized] =
-  cache_read_header(buf)
+#[doc("Deserialise a KAB2 blob back into decls + rows + sha; `None` on any header, key, checksum or payload mismatch, which the caller treats as a miss.")]
+pub(pkg) fn cache_deserialize_module(
+  buf: Array[Byte],
+  want_sha: String
+) : Option[CacheDeserialized] =
+  cache_read_header(buf, want_sha)
     || (hdr => match hdr {
       CHdr(sha, pos) -> match cache_decls_from_bytes(buf, pos) {
         Ok(c) -> match bin_list_from_bytes(buf, c.pos, nent_from_bytes) {
@@ -117,7 +128,7 @@ pub(pkg) fn cache_deserialize_module(buf: Array[Byte]) : Option[CacheDeserialize
 pub(pkg) fn cache_roundtrip_check(decls: [Decl], rows: [NEnt]) : String {
   let sha = "0000000000000000000000000000000000000000000000000000000000000000"
   let blob1 = cache_serialize_module(decls, rows, sha)
-  match cache_deserialize_module(blob1) {
+  match cache_deserialize_module(blob1, sha) {
     None -> "FAIL: deserialize returned None"
     Some(cds) -> match cds {
       CDs(restored, rows2, sha2) -> {

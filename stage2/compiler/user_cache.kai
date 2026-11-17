@@ -24,12 +24,13 @@
 # string_hash is the runtime FNV-1a 64-bit digest over the raw bytes,
 # cast to a signed Int64, so it may be negative; the hex
 # conversion below normalises the sign with arithmetic only (see the
-# note at uc_hash_hex16). The digest is not cryptographic - it only
+# note at ck_hex16). The digest is not cryptographic - it only
 # needs to change when content changes, which FNV-1a guarantees for
 # any byte edit.
 
 import compiler.ast_decl
 import compiler.cache
+import compiler.cache_key
 import compiler.symtab
 import compiler.lex
 import compiler.modules_paths
@@ -39,52 +40,10 @@ import compiler.util
 #[doc("The per-project cache directory name, created on first write under the project root (the root file's directory).")]
 pub fn uc_cache_dir_name() : String = ".kai-cache"
 
-# ---- hex encoding of a 64-bit hash -----------------------------------
-#
-# Bit operators (bit_and / bit_ushr) are deliberately avoided: the
-# stage1 bootstrap compiler that builds this module's bundle does not
-# know them. Nibbles are extracted with arithmetic only (% and /),
-# which stage1 supports. The result is not the canonical unsigned bit
-# pattern of the digest, but it is a deterministic, injective-per-value
-# encoding - all the cache key needs. The digest is a signed Int64
-# (string_hash casts FNV-1a's uint64 through int64_t), so the low
-# nibble uses ((h % 16) + 16) % 16 to stay in [0,15] for negatives,
-# and / 16 truncates toward zero each step; 16 steps cover the range.
-
-# One lowercase hex digit for a nibble in [0,15]. Built with
-# int_to_byte_string so the byte is exact and never routes through
-# Show for Char escaping.
-fn uc_nibble_hex(n: Int) : String {
-  let d = if n < 0 { 0 } else if n > 15 { 15 } else { n }
-  if d < 10 {
-    int_to_byte_string(48 + d)  # '0'..'9'
-  } else {
-    int_to_byte_string(87 + d)  # 'a'..'f' (97 - 10)
-  }
-}
-
-#[doc("A 64-bit hash as 16 lowercase hex chars (least-significant nibble last), the form every cache key takes.")]
-pub fn uc_hash_hex16(h: Int) : String = uc_hash_hex16_loop(h, 16, "")
-
-fn uc_hash_hex16_loop(h: Int, steps: Int, acc: String) : String {
-  if steps <= 0 {
-    acc
-  } else {
-    let nib = (h % 16 + 16) % 16
-    let rest = h / 16
-    uc_hash_hex16_loop(rest, steps - 1, string_concat(uc_nibble_hex(nib), acc))
-  }
-}
-
-#[doc("Content hash of a source string as 16 lowercase hex chars. Changes on any single-byte edit.")]
-pub fn uc_content_hex(src: String) : String = uc_hash_hex16(string_hash(src))
-
 # ---- composite key + blob path ---------------------------------------
 
-# The 64-char source_sha field the KAB2 header validates by length. We
-# pack both halves of the composite key into it (content ++ dep ++
-# zero-padding) so the header is a second line of defense: a blob whose
-# filename was renamed onto a different key still fails this check.
+# The header's key field: both halves of the composite key plus zero-padding.
+# The reader checks it against the key it looked up.
 fn uc_header_sha(content_hex: String, dep_hex: String) : String =
   concat_all([
     content_hex, dep_hex,
@@ -177,12 +136,12 @@ pub fn uc_no_dep() : String = "0000000000000000"
 #[doc("Look up the cache for a file from its source. The key is the content over a key version, `home` and src; a hit hands back the deserialised decls and rows, a miss (absent, version or format drift, corruption) the key to write the blob under after parsing. Never parses.")]
 pub fn uc_lookup(cache_dir: String, home: String, src: String) : UcLookup / Console + File {
   # The blob holds ids derived from the home the file was parsed under.
-  let content_hex = uc_content_hex(concat_all(["parse-v2\n", home, "\n", src]))
+  let content_hex = ck_hex(concat_all(["parse-v2\n", home, "\n", src]))
   let dep_hex = uc_no_dep()
   let blob_path = uc_blob_path(cache_dir, content_hex, dep_hex)
   match __file_read_bytes(blob_path) {
     Err(_) -> UcMiss(content_hex, dep_hex)
-    Ok(blob) -> match cache_deserialize_module(blob) {
+    Ok(blob) -> match cache_deserialize_module(blob, uc_header_sha(content_hex, dep_hex)) {
       None -> UcMiss(content_hex, dep_hex)
       Some(cds) -> match cds {
         CDs(decls, rows, _) -> UcHit(decls, rows)
@@ -314,7 +273,7 @@ fn uif_visit(
 fn uif_imports_of(w: UifWalk, src: String) : [String] / Console + File = match w {
   UIW(_, "") -> uc_import_paths(src, tokenize(src))
   UIW(_, dir) -> {
-    let f = concat_all([dir, "/", uc_content_hex(src), "-", int_to_string(string_length(src))])
+    let f = concat_all([dir, "/", ck_hex(src), "-", int_to_string(string_length(src))])
     match __file_read(f) {
       Ok(text) if string_length(text) >= 2
         and string_slice(text, string_length(text) - 2, 2) == "\n." ->

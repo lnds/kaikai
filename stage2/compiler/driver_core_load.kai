@@ -315,60 +315,6 @@ pub(pkg) fn cache_roundtrip_file(source_path: String) : Int / Console + File =
     }
   }
 
-#[doc("""
-Lex+parse a single core source, strip its tests, tag every DFn
-with module_origin, then emit the KAB1 cache blob to stdout. The
-driver (bin/kai) captures stdout,
-writes it to a `.tmp` file, fsyncs, and renames atomically into the
-cache directory. `sha_arg` is the 64-char hex sha256 of the source
-(caller-supplied); empty string emits the all-zero placeholder.
-""")]
-pub(pkg) fn emit_core_cache_for(source_path: String, sha_arg: String) : Int / Console + File {
-  match __file_read(source_path) {
-    Err(msg) -> {
-      eprint("kaic2: #{source_path}: #{msg}")
-      1
-    }
-    Ok(src) -> {
-      let tokens = tokenize(src)
-      let errs = report_errors(source_path, src, tokens)
-      if errs != 0 {
-        1
-      } else {
-        let mod_name = module_name_of_path(source_path)
-        let parsed = parse_program_unchecked(source_path, src, tokens, mod_name)
-        match parsed.decls {
-          None -> 1
-          Some(ds_raw) -> {
-            # Cache blobs never carry doc wrappers — strip them exactly
-            # like the non-cached `load_core_file` path so both loaders
-            # produce the same decl stream.
-            let pre_docs = doc_strip_all(source_path, src, ds_raw)
-            if pre_docs.errs > 0 {
-              1
-            } else {
-              let ds = pre_docs.decls
-              let kept = strip_core_tests(ds, [])
-              let w = default_wrapper_decls(tag_decls_module_origin(kept, mod_name), parsed.names)
-              let tagged = w.decls
-              let sha = if sha_arg == "" {
-                "0000000000000000000000000000000000000000000000000000000000000000"
-              } else if string_length(sha_arg) != 64 {
-                "0000000000000000000000000000000000000000000000000000000000000000"
-              } else {
-                sha_arg
-              }
-              let blob = cache_serialize_module(tagged, w.rows, sha)
-              print(cache_bytes_text(blob, 0, array_length(blob)))
-              0
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
 # Load the core module set: every program gets `core/*` + protocols +
 # effects + array, no negotiation. Mirrors load_core_files' return
 # shape so downstream callers (`PLS`, segments, module entries)
@@ -390,7 +336,7 @@ pub(pkg) fn load_core(
     load_core_cached(paths, cache_dir, stats, 0, 0, [], [], [], [])
   } else {
     let _s = if stats { eprint("kaic2: core-parse-cache: off") } else { () }
-    load_core_files(paths, [], [], [], [], [])
+    load_core_files(paths, [], [], [], [])
   }
   match loaded {
     Some(PLS(ds, mods, segs, rows)) if list_length(paths) < list_length(core_module_paths()) ->
@@ -459,84 +405,25 @@ fn report_core_parse_cache(stats: Bool, n_hit: Int, n_miss: Int) : Unit / Consol
 
 pub(pkg) fn load_core_files(
   paths: [String],
-  caches: [String],
   acc_decls: [Decl],
   acc_mods: [ModuleEntry],
   acc_segs: [CoreSegment],
   acc_rows: [NEnt]
 ) : Option[CoresLoaded] / Console + File = match paths {
   [] -> Some(PLS(acc_decls, acc_mods, acc_segs, acc_rows))
-  [p, ...rest] -> match caches {
-    [] -> match load_core_file(p) {
-      None -> None
-      Some(CoreL(ds, me, rows)) -> {
-        let mod_name = match me {
-          ME(m, _, _, _, _) -> m
-        }
-        load_core_files(
-          rest,
-          [],
-          list_append(acc_decls, ds),
-          list_append(acc_mods, [me]),
-          list_append(acc_segs, [PSeg(mod_name, ds)]),
-          list_append(acc_rows, rows)
-        )
+  [p, ...rest] -> match load_core_file(p) {
+    None -> None
+    Some(CoreL(ds, me, rows)) -> {
+      let mod_name = match me {
+        ME(m, _, _, _, _) -> m
       }
-    }
-    [c, ...rest_caches] -> match load_core_file_cached(p, c) {
-      None -> None
-      Some(CoreL(ds, me, rows)) -> {
-        let mod_name = match me {
-          ME(m, _, _, _, _) -> m
-        }
-        load_core_files(
-          rest,
-          rest_caches,
-          list_append(acc_decls, ds),
-          list_append(acc_mods, [me]),
-          list_append(acc_segs, [PSeg(mod_name, ds)]),
-          list_append(acc_rows, rows)
-        )
-      }
-    }
-  }
-}
-
-# Try the cache file `cache_path` first; on any failure (empty path,
-# missing file, header mismatch,
-# truncated payload) fall back to the full parse via `load_core_file`.
-# The cache stores already-tagged decls with core tests stripped,
-# so reconstructing the `ModuleEntry` only needs `module_name_of_path`
-# + `collect_pub_exports` over the deserialised decls.
-fn load_core_file_cached(
-  source_path: String,
-  cache_path: String
-) : Option[CoreLoaded] / Console + File {
-  if cache_path == "" {
-    load_core_file(source_path)
-  } else {
-    match __file_read_bytes(cache_path) {
-      Err(_) -> load_core_file(source_path)
-      Ok(blob) -> match cache_deserialize_module(blob) {
-        None -> {
-          eprint(
-            "kaic2: cache miss (header/payload mismatch): #{cache_path} — re-parsing #{source_path}"
-          )
-          load_core_file(source_path)
-        }
-        Some(cds) -> match cds {
-          CDs(decls, rows, _) -> {
-            let mod_name = module_name_of_path(source_path)
-            let ftab = st_of_entries(rows)
-            let kept = strip_core_tests(decls, [])
-            let exports = collect_pub_exports(kept, ftab, [])
-            let unstable_exports = collect_unstable_exports(kept, ftab, [])
-            Some(
-              CoreL(kept, ME(mod_name, exports, source_path, unstable_exports, pkg_stdlib()), rows)
-            )
-          }
-        }
-      }
+      load_core_files(
+        rest,
+        list_append(acc_decls, ds),
+        list_append(acc_mods, [me]),
+        list_append(acc_segs, [PSeg(mod_name, ds)]),
+        list_append(acc_rows, rows)
+      )
     }
   }
 }

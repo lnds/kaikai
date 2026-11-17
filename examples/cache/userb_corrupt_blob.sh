@@ -12,10 +12,9 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 KAI="$ROOT/bin/kai"
-# bin/kai keys a project's cache by the compiler it runs.
-CACHE_TID="$("$KAI" env KAI_TOOLCHAIN_ID)"
 PROJ="$(mktemp -d)"
 trap 'rm -rf "$PROJ"' EXIT INT TERM
+export XDG_CACHE_HOME="$PROJ/xdg" KAI_CACHE_TRIM=0
 
 cat > "$PROJ/dep.kai" <<'EOF'
 pub fn base() : Int = 9
@@ -31,17 +30,17 @@ if [ "$out1" != "9" ]; then
   exit 1
 fi
 
-blob="$(ls "$PROJ/.kai-cache/$CACHE_TID/"*.kab 2>/dev/null | head -1)"
+blob="$(ls "$XDG_CACHE_HOME"/kai/core/*/loose/*/*.kab 2>/dev/null | head -1)"
 if [ -z "$blob" ] || [ ! -f "$blob" ]; then
   echo "userb_corrupt_blob FAIL — no cache blob was written"
   exit 1
 fi
 
-# Truncate the blob to just past the 76-byte header. The header still
+# Truncate the blob to just past the 92-byte header. The header still
 # validates (magic/format/version intact) but the AST payload is gone,
 # so the decoder returns None and the loader falls back to a re-parse.
 # This is the worst case: a corruption the header alone cannot catch.
-head -c 80 "$blob" > "$blob.trunc"
+head -c 100 "$blob" > "$blob.trunc"
 mv "$blob.trunc" "$blob"
 
 out2="$(KAI_CACHE=1 "$KAI" run "$PROJ/main.kai" 2>/dev/null || true)"

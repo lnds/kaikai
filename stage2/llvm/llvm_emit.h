@@ -444,6 +444,41 @@ static void kai_llvm_wasm_prepare(LLVMModuleRef m) {
  * using the host target machine. Returns 0 on success, non-zero on a
  * verify or codegen failure (the driver surfaces the error and aborts).
  * One process: no `.ll` text, no `clang` subprocess. */
+/* Record the FNV-1a digest of the object at `obj` (decimal) in `<dest>.sum`,
+ * published by rename before the object itself so a reader that sees the new
+ * record with the old object, or the reverse, finds a mismatch. A cached
+ * object is trusted only while its bytes match this record. */
+static void kai_obj_seal(const char *obj, const char *dest) {
+    FILE *fp = fopen(obj, "rb");
+    if (!fp) return;
+    unsigned char *all = NULL;
+    size_t len = 0, cap = 0, n;
+    char buf[65536];
+    while ((n = fread(buf, 1, sizeof buf, fp)) > 0) {
+        if (len + n > cap) {
+            cap = (len + n) * 2;
+            unsigned char *g = (unsigned char *) realloc(all, cap);
+            if (!g) { free(all); fclose(fp); return; }
+            all = g;
+        }
+        memcpy(all + len, buf, n);
+        len += n;
+    }
+    int bad = ferror(fp);
+    fclose(fp);
+    int64_t h = (int64_t) kai_fnv1a64((const char *) all, len);
+    free(all);
+    if (bad) return;
+    char sum[4096], tmp[4096];
+    snprintf(sum, sizeof sum, "%s.sum", dest);
+    snprintf(tmp, sizeof tmp, "%s.tmp%ld", sum, (long) getpid());
+    FILE *out = fopen(tmp, "wb");
+    if (!out) return;
+    int wrote = fprintf(out, "%lld", (long long) h) > 0;
+    if (fclose(out) != 0) wrote = 0;
+    if (!wrote || rename(tmp, sum) != 0) unlink(tmp);
+}
+
 static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runtime) {
     int64_t rc = 0;
     char *err = NULL;
@@ -555,10 +590,13 @@ static int64_t kai_llvm_emit_object_impl(void *m, const char *out, int link_runt
             if (err) LLVMDisposeMessage(err);
             unlink(tmp_out);
             rc = 1;
-        } else if (rename(tmp_out, out) != 0) {
-            kai_eprintf("kai: native object publish failed: %s -> %s\n", tmp_out, out);
-            unlink(tmp_out);
-            rc = 1;
+        } else {
+            if (link_runtime == 2) kai_obj_seal(tmp_out, out);
+            if (rename(tmp_out, out) != 0) {
+                kai_eprintf("kai: native object publish failed: %s -> %s\n", tmp_out, out);
+                unlink(tmp_out);
+                rc = 1;
+            }
         }
     }
 
