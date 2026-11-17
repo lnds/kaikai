@@ -7,6 +7,7 @@ import compiler.diag
 import compiler.ast
 import compiler.ast_build
 import compiler.ast_ids
+import compiler.default_wrappers
 import compiler.written
 import compiler.kinds
 import compiler.symtab
@@ -902,6 +903,52 @@ fn handle_walk_body(
   }
 }
 
+# A diagnostic raised while an inherited clause is typed says where the clause comes from,
+# and so does one raised later about an effect the clause performed.
+fn note_inherited(st: InferState, before_diags: Int, before_uses: Int, body: Expr) : InferState =
+  match marked_note(body) {
+    None -> st
+    Some(note) -> {
+      let fresh = list_length(st.diags) - before_diags
+      let uses = list_length(st.eff_uses) - before_uses
+      InferState {
+        ...st,
+        diags: list_append(
+          map(
+            take(st.diags, fresh),
+            d => match d {
+              D(sev, file, line, col, m, related, rule) ->
+                D(
+                  sev,
+                  file,
+                  line,
+                  col,
+                  m,
+                  list_append(related, [ri_note(file, line, col, note)]),
+                  rule
+                )
+            }
+          ),
+          drop(st.diags, fresh)
+        ),
+        inherited_uses: list_append(
+          map(
+            take(st.eff_uses, uses),
+            u => match u {
+              EU(_, line, col) -> (line, col, note)
+            }
+          ),
+          st.inherited_uses
+        )
+      }
+    }
+  }
+
+fn clause_home(body: Expr, outer: Option[String]) : Option[String] = match marked_home(body) {
+  Some(m) -> Some(m)
+  None -> outer
+}
+
 fn check_return_clause_opt(
   st: InferState,
   ret_opt: Option[HReturn],
@@ -921,8 +968,16 @@ fn check_return_clause_opt(
         let sty = state_ty ?? TyAny
         let env2 = if stateful { add_state_aliases(env1, sty) } else { env1 }
         let st1 = st_set_env(st, env2)
-        let rr = synth(st_clause_alias_tags(st1), rexpr)
-        let st_out = st_restore_entries(outer, rr.st)
+        let rr = synth(
+          InferState { ...st_clause_alias_tags(st1), home: clause_home(rexpr, st.home) },
+          rexpr
+        )
+        let st_out = note_inherited(
+          InferState { ...st_restore_entries(outer, rr.st), home: st.home },
+          list_length(st1.diags),
+          list_length(st1.eff_uses),
+          rexpr
+        )
         let ty = apply_ty(st_out.sub, rr.ty)
         RetTyped { st: st_out, ty: ty, ret_opt: Some(HR(b, rr.expr, line, col)) }
       }
@@ -1010,8 +1065,26 @@ fn check_op_clause(
     result_ty
   )
   let st_clause_in = clause_entry_state(bind_res, stateful, state_ty, result_ty, params)
-  let rb = synth(st_set_ret_ty(st_clause_in, Some(result_ty)), body)
-  let st_res = st_unify_flow(rb.st, result_ty, rb.ty, "handler clause result", line, col)
+  let rb = synth(
+    InferState {
+      ...st_set_ret_ty(st_clause_in, Some(result_ty)),
+      home: clause_home(body, st.home)
+    },
+    body
+  )
+  let st_res = note_inherited(
+    st_unify_flow(
+      InferState { ...rb.st, home: st.home },
+      result_ty,
+      rb.ty,
+      "handler clause result",
+      line,
+      col
+    ),
+    list_length(st_clause_in.diags),
+    list_length(st_clause_in.eff_uses),
+    body
+  )
   let st_esc = check_op_tparam_escape(
     st_res,
     bind_res.op_rigid,
