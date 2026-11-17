@@ -559,13 +559,9 @@ instance (`handle ... with E as t`), which discharges nothing anonymous.
 A parametric effect is installed for one instantiation of its type
 arguments; an entry that uses another is rejected.
 
-> **v1 status (2026-11-12):** a handle that inherits a default clause
-> cannot hold a `!` in its body (the compiler rejects it; write a clause
-> for each omitted op, or move the `!` out of the `handle`), and a handle
-> in a module that is in an import cycle with the effect's module
-> inherits nothing: it lists a clause for every op. The same holds for a
-> handle written in a default body when the default it would inherit
-> writes a handle that leads back to the enclosing one. Tracked in #3459.
+A default whose clauses write a handle that leads back to the effect
+itself is not inherited: cloning its clauses into a handle would never end,
+so the handle lists a clause for every op.
 
 #### Worked example — handle with a full default block
 

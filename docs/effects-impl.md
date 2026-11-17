@@ -653,12 +653,17 @@ is replaced by it, and the typed scheme replaces the declared one in the
 module's interface.
 
 A `handle ... with Eff` that omits kaikai ops, or the `return`, is
-rewritten before the resume split into `wrapper(() => handle ... with
-Eff { own; forwarders })`, each forwarder performing the shadow op, so
-the written bodies reach the ordinary split, Perceus and both
-backends as code. The program entry is typed once, and typed again
-inside the root functions of the defaults its row holds, a default
-another one performs outside it. Ops bridged with `$extern_handler`
+rewritten before the resume split: the default's clauses are cloned into
+the handle with fresh binders, each marked with the module they were
+written in so privacy is judged there, and handles written inside a clone
+inherit in turn. The handle is then the one a user would have written, so
+`!`, nested handles and importers in a cycle behave as in any handle. The
+clones are part of the importing module's declarations, so its cache key
+moves with the default's body. A default
+that writes a handle leading back to its own effect is not cloned. The
+program entry is typed once, and typed again inside the root functions of
+the defaults its row holds, a default another one performs outside it.
+Ops bridged with `$extern_handler`
 stay on the runtime default node; a handler that omits one is filled
 with the bridge, in declaration order, as before.
 
