@@ -214,12 +214,12 @@ static void kai_reactor_sigchld_handler(int sig) {
      * pipe is O_NONBLOCK, so EAGAIN simply means "byte already
      * pending, the reactor will drain on next wake". */
     unsigned char b = 1;
-    int saved = errno;
+    int saved = kai_errno();
     if (kai_reactor_sigchld_pipe[1] >= 0) {
         ssize_t w = write(kai_reactor_sigchld_pipe[1], &b, 1);
         (void) w;
     }
-    errno = saved;
+    kai_set_errno(saved);
 }
 
 /* Issue #671 — Phase R4: Signal-effect handler. Writes the signo
@@ -229,13 +229,13 @@ static void kai_reactor_sigchld_handler(int sig) {
  * ≤ SIGUSR2 == 31 on every POSIX system we target). write(2) and
  * the cast to unsigned char are async-signal-safe. */
 static void kai_reactor_signal_handler(int sig) {
-    int saved = errno;
+    int saved = kai_errno();
     if (kai_reactor_signal_pipe[1] >= 0 && sig > 0 && sig <= 255) {
         unsigned char b = (unsigned char) sig;
         ssize_t w = write(kai_reactor_signal_pipe[1], &b, 1);
         (void) w;
     }
-    errno = saved;
+    kai_set_errno(saved);
 }
 
 /* Monotonic clock helper. Used by the timer wheel for sleep
@@ -608,7 +608,7 @@ static void kai_reactor_init(void) {
     if (pipe(kai_reactor_sigchld_pipe)  != 0 ||
         pipe(kai_reactor_filepool_pipe) != 0 ||
         pipe(kai_reactor_signal_pipe)   != 0) {
-        kai_eprintf("kai: reactor pipe() failed: %s\n", strerror(errno));
+        kai_eprintf("kai: reactor pipe() failed: %s\n", strerror(kai_errno()));
         kai_exit(1);
     }
     for (int i = 0; i < 3; i++) {
@@ -676,7 +676,7 @@ static void kai_reactor_init_filepool(void) {
         if (pthread_create(&kai_filepool_threads[i], NULL,
                            kai_filepool_worker, NULL) != 0) {
             kai_eprintf("kai: reactor pthread_create failed: %s\n",
-                    strerror(errno));
+                    strerror(kai_errno()));
             kai_exit(1);
         }
         pthread_detach(kai_filepool_threads[i]);

@@ -178,8 +178,9 @@ static void kai_reactor_wait(void) {
     if (grace && rc == 0) kai_cell_pool_trim();
 #endif
     if (kai_nthreads > 1) atomic_store(&kai_reactor_idle, 0);
-    if (rc < 0 && errno != EINTR) {
-        kai_eprintf("kai: reactor poll() failed: %s\n", strerror(errno));
+    int poll_errno = rc < 0 ? kai_errno() : 0;
+    if (rc < 0 && poll_errno != EINTR) {
+        kai_eprintf("kai: reactor poll() failed: %s\n", strerror(poll_errno));
         kai_exit(1);
     }
 
@@ -261,7 +262,7 @@ static void kai_reactor_wait(void) {
     if (wake_dl > now) {
         uint64_t ns = wake_dl - now;
         struct timespec nap = { (time_t) (ns / 1000000000), (long) (ns % 1000000000) };
-        while (nanosleep(&nap, &nap) != 0 && errno == EINTR) {}
+        while (nanosleep(&nap, &nap) != 0 && kai_errno() == EINTR) {}
     }
     kai_reactor_timer_drain(kai_reactor_now_ns());
 #else

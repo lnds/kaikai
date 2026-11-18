@@ -813,7 +813,7 @@ static KaiValue *kai_core_file_append(KaiValue *path, KaiValue *content) {
             while (left > 0) {
                 ssize_t w = write(fd, p, left);
                 if (w < 0) {
-                    if (errno == EINTR) continue;
+                    if (kai_errno() == EINTR) continue;
                     ok = 0;
                     break;
                 }

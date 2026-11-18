@@ -519,13 +519,13 @@ static ssize_t _kai_proc_write_once(int fd, const char *buf, size_t len) {
     sigaddset(&pipe_set, SIGPIPE);
     pthread_sigmask(SIG_BLOCK, &pipe_set, &prev_set);
     ssize_t w = write(fd, buf, len);
-    int e = errno;
+    int e = kai_errno();
     if (w < 0 && e == EPIPE) {
         struct timespec zero = { 0, 0 };
         while (sigtimedwait(&pipe_set, NULL, &zero) >= 0) {}
     }
     pthread_sigmask(SIG_SETMASK, &prev_set, NULL);
-    errno = e;
+    kai_set_errno(e);
     return w;
 #endif
 }
@@ -558,7 +558,7 @@ static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *
 
     pid_t pid = fork();
     if (pid < 0) {
-        int e = errno;
+        int e = kai_errno();
         _kai_process_free_argv(argv, argc);
         kai_eprintf("kai: Process.start: fork: %s\n", strerror(e));
         kai_exit(1);
@@ -572,7 +572,7 @@ static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *
         /* execvp only returns on failure. Async-signal-safe writers
          * only — keep the message minimal. */
         const char *prefix = "kai: Process.start: execvp: ";
-        const char *msg    = strerror(errno);
+        const char *msg    = strerror(kai_errno());
         ssize_t w;
         w = write(2, prefix, strlen(prefix)); (void) w;
         if (msg) { w = write(2, msg, strlen(msg)); (void) w; }
@@ -633,7 +633,7 @@ KAI_SCHED_FN KaiValue *kai_default_process_wait(void *self, KaiValue *child, Kai
             me->reactor_wait_pid    = 0;
             me->reactor_wait_status = 0;
         } else if (rc < 0) {
-            int e = errno;
+            int e = kai_errno();
             if (!kai_reactor_take_child_exit(pid, &status)) {
                 return _kai_process_err(k, e);
             }
@@ -662,7 +662,7 @@ static KaiValue *kai_default_process_kill(void *self, KaiValue *child, KaiValue 
     }
     int signo = (kai_is_int(sig)) ? (int) kai_intf(sig) : 0;
     if (kill((pid_t) pid, signo) < 0) {
-        return _kai_process_err(k, errno);
+        return _kai_process_err(k, kai_errno());
     }
     return _kai_process_ok(k, kai_unit());
 }
@@ -681,7 +681,7 @@ static KaiValue *kai_default_process_kill_group(void *self, KaiValue *child, Kai
     }
     int signo = (kai_is_int(sig)) ? (int) kai_intf(sig) : 0;
     if (kill(-(pid_t) pid, signo) < 0) {
-        return _kai_process_err(k, errno);
+        return _kai_process_err(k, kai_errno());
     }
     return _kai_process_ok(k, kai_unit());
 }
@@ -728,7 +728,7 @@ static KaiValue *kai_default_process_exit(void *self, KaiValue *code, KaiCont *k
  * write end open and starve a sibling reader of EOF. */
 static int _kai_proc_pipe_open(int want, int p[2]) {
     if (!want || pipe(p) == 0) return 0;
-    int e = errno;
+    int e = kai_errno();
     p[0] = p[1] = -1;
     return e;
 }
@@ -782,7 +782,7 @@ static KaiValue *_kai_process_spawn(KaiValue *cmd, KaiValue *args, KaiValue *pip
     kai_reactor_init();
     pid_t pid = fork();
     if (pid < 0) {
-        e = errno;
+        e = kai_errno();
         _kai_process_free_argv(argv, argc);
         _kai_proc_pipe_close_pair(in_p);
         _kai_proc_pipe_close_pair(out_p);
@@ -798,7 +798,7 @@ static KaiValue *_kai_process_spawn(KaiValue *cmd, KaiValue *args, KaiValue *pip
         execvp(cmd_cstr, argv);
         /* Async-signal-safe writers only. 127 = command not found. */
         const char *prefix = "kai: Process.start_piped: execvp: ";
-        const char *msg    = strerror(errno);
+        const char *msg    = strerror(kai_errno());
         ssize_t w;
         w = write(2, prefix, strlen(prefix)); (void) w;
         if (msg) { w = write(2, msg, strlen(msg)); (void) w; }
@@ -867,8 +867,9 @@ KAI_SCHED_FN KaiValue *kai_default_process_write_stdin(void *self, KaiValue *chi
     while (off < len) {
         ssize_t w = _kai_proc_write_once(fd, buf + off, len - off);
         if (w >= 0) { off += (size_t) w; continue; }
-        if (errno == EINTR) continue;
-        if (errno != EAGAIN && errno != EWOULDBLOCK) return _kai_process_err(k, errno);
+        int e = kai_errno();
+        if (e == EINTR) continue;
+        if (e != EAGAIN && e != EWOULDBLOCK) return _kai_process_err(k, e);
         kai_reactor_park_socket_write(kai_current_fiber(), fd);
         fd = _kai_proc_pipe_fd(pid, 0);
         if (fd < 0) return _kai_process_err_msg(k, "write_stdin: stdin was closed");
@@ -915,8 +916,9 @@ static KaiValue *_kai_proc_read_chunk(KaiValue *child, int which, KaiCont *k) {
     for (;;) {
         n = read(fd, buf, KAI_PROC_READ_CHUNK);
         if (n >= 0) break;
-        if (errno == EINTR) continue;
-        if (errno != EAGAIN && errno != EWOULDBLOCK) break;
+        int e = kai_errno();
+        if (e == EINTR) continue;
+        if (e != EAGAIN && e != EWOULDBLOCK) break;
         kai_reactor_park_socket_read(kai_current_fiber(), fd);
         fd = _kai_proc_pipe_fd(pid, which);
         if (fd < 0) {
@@ -926,7 +928,7 @@ static KaiValue *_kai_proc_read_chunk(KaiValue *child, int which, KaiCont *k) {
         }
     }
     if (n < 0) {
-        int e = errno;
+        int e = kai_errno();
         free(buf);
         return _kai_process_err(k, e);
     }

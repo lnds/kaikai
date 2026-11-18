@@ -162,6 +162,7 @@ KAI_SCHED_FN KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k)
             free(buf);
             return kai_cont_resume(k, kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = s}}));
         }
+        int e = kai_errno();
         if (r == 0) {
             /* EOF: a partial line is returned, nothing buffered is None. */
             if (n == 0) {
@@ -171,14 +172,14 @@ KAI_SCHED_FN KaiValue *kai_default_stdin_read_line(void *self, KaiCont *k)
             KaiValue *s = kai_str_from_bytes(buf, n);
             free(buf);
             return kai_cont_resume(k, kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = s}}));
-        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        } else if (e == EAGAIN || e == EWOULDBLOCK) {
             if (kai_reactor_park_stdin(kai_current_fiber()) != 0) {
                 kai_eprintf(
                     "kai: stdin: multiple fibers reading concurrently "
                     "is undefined; serialize via an actor\n");
                 kai_exit(1);
             }
-        } else if (errno == EINTR) {
+        } else if (e == EINTR) {
             continue;
         } else {
             /* Real I/O error reads as end of stream. */
@@ -220,19 +221,20 @@ KAI_SCHED_FN KaiValue *kai_default_stdin_read_bytes(void *self, KaiValue *n, Kai
 
     while (got < (size_t) want) {
         ssize_t r = read(STDIN_FILENO, buf + got, (size_t) want - got);
+        int e = kai_errno();
         if (r > 0) {
             got += (size_t) r;
         } else if (r == 0) {
             /* EOF — return what we have. */
             break;
-        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        } else if (e == EAGAIN || e == EWOULDBLOCK) {
             if (kai_reactor_park_stdin(kai_current_fiber()) != 0) {
                 kai_eprintf(
                     "kai: stdin: multiple fibers reading concurrently "
                     "is undefined; serialize via an actor\n");
                 kai_exit(1);
             }
-        } else if (errno == EINTR) {
+        } else if (e == EINTR) {
             continue;
         } else {
             /* Real I/O error — surface as short read (matches
@@ -305,7 +307,7 @@ static KaiValue *kai_default_env_set_var(void *self, KaiValue *name,
     if (value->as.s.len > 0) memcpy(vbuf, value->as.s.bytes, value->as.s.len);
     vbuf[value->as.s.len] = '\0';
     int rc = setenv(nbuf, vbuf, 1);
-    int saved_errno = errno;
+    int saved_errno = kai_errno();
     free(vbuf);
     if (rc != 0) {
         const char *msg = strerror(saved_errno);
@@ -331,7 +333,7 @@ static KaiValue *kai_default_env_unset_var(void *self, KaiValue *name, KaiCont *
     memcpy(nbuf, name->as.s.bytes, nlen);
     nbuf[nlen] = '\0';
     if (unsetenv(nbuf) != 0) {
-        const char *msg = strerror(errno);
+        const char *msg = strerror(kai_errno());
         if (!msg) msg = "unset_var failed";
         KaiValue *m = kai_str(msg);
         KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
@@ -704,7 +706,7 @@ static KaiValue *kai_default_clock_wall_now(void *self, KaiCont *k) {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
         kai_eprintf("kai: Clock.wall_now: clock_gettime failed: %s\n",
-                strerror(errno));
+                strerror(kai_errno()));
         kai_exit(1);
     }
     return kai_cont_resume(k, _kai_clock_make_record(
@@ -716,7 +718,7 @@ static KaiValue *kai_default_clock_monotonic_now(void *self, KaiCont *k) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
         kai_eprintf("kai: Clock.monotonic_now: clock_gettime failed: %s\n",
-                strerror(errno));
+                strerror(kai_errno()));
         kai_exit(1);
     }
     return kai_cont_resume(k, _kai_clock_make_record(
@@ -737,7 +739,7 @@ KAI_SCHED_FN KaiValue *kai_default_clock_sleep_ns(void *self, KaiValue *ns, KaiC
 #if defined(__wasm__) && !KAI_HOST_FIBERS
     if (ns_v > 0) {
         struct timespec nap = { (time_t) (ns_v / 1000000000), (long) (ns_v % 1000000000) };
-        while (nanosleep(&nap, &nap) != 0 && errno == EINTR) {}
+        while (nanosleep(&nap, &nap) != 0 && kai_errno() == EINTR) {}
     }
     return kai_cont_resume(k, kai_unit());
 #else
