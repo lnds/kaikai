@@ -8,6 +8,7 @@ import compiler.written
 import compiler.symtab
 import compiler.modules_paths
 import compiler.driver_cli
+import compiler.kir
 import compiler.kir_lin
 import compiler.edition
 import compiler.cache_key
@@ -28,38 +29,23 @@ import compiler.kir_c_modular
 import compiler.kir_c_prog
 import compiler.driver_mono
 import compiler.driver_policy
+import compiler.driver_solve
+import compiler.core_cut
 
-pub(pkg) fn emit_native(req: Req, cx: PerceusRun) : Int / Console + File + Mutable {
+pub(pkg) type NativeKir = { kp: KProgram, nfns: [EFn], nvariants: [VariantEntry] }
+
+fn native_kir(req: Req, cx: PerceusRun) : NativeKir / Console + File + Mutable {
   let bmode = cx.unboxrun.bmode
-  let core_cache = req.core_cache
-  let core_hit = cx.solved.core_hit
-  let core_mods = req.core_mods
-  let edition = req.edition
   let emit_tab = cx.monoed.emit_tab
   let entry = entry_id(root_module_name(req.path), runs_blocks(req.mode))
-  let kir_verify = req.kir_verify
-  let npre = cx.cutrun.npre
-  let nsrcs = cx.cutrun.nsrcs
-  let path = req.path
   let perceus_decls = cx.perceusrun.perceus_decls
   let proto_reg = cx.checked.proto_reg
-  let pruned = cx.inferrun.pruned
   let raw_arm_binders = cx.unboxrun.raw_arm_binders
   let specs = cx.monoed.specs
   let stamp_ids = cx.stamprun.stamp_ids
   let target_mod_name = root_module_name(req.path)
-  # In-process libLLVM native backend. Lower to
-  # KIR (same preamble as the KIR dumper: the decls
-  # are post-perceus / post-tcrec; only the
-  # symbol/variant tables are rebuilt), build the
-  # module via the C API in memory, and emit a
-  # native object. The output path is `<source>.o`;
-  # the `bin/kai` wrapper (or the test harness)
-  # links it against the effects runtime to the
-  # final executable.
   let nfns = register_fn_decls(perceus_decls, emit_tab, specs, entry)
   let nvariants = register_variants(perceus_decls, emit_tab)
-  let ncore_names = core_mod_names(core_mods, [])
   let kp = kir_lin_hook(
     ncore_prune_unreachable(
       kir_tail_program(
@@ -83,10 +69,101 @@ pub(pkg) fn emit_native(req: Req, cx: PerceusRun) : Int / Console + File + Mutab
       perceus_decls,
       nfns,
       bmode,
-      ncore_names
+      core_mod_names(req.core_mods, [])
     ),
-    kir_verify
+    req.kir_verify
   )
+  NativeKir { kp: kp, nfns: nfns, nvariants: nvariants }
+}
+
+#[doc("""
+The core object of a program typed against the whole core, stored in the
+cache before the program is cut; none when this run does not store one.
+""")]
+pub(pkg) fn native_core_stored(req: Req, cx: PerceusRun) : Option[String] / Console + File + Mutable {
+  let core_cache = req.core_cache
+  let nsrcs = cx.cutrun.nsrcs
+  if cx.unboxrun.use_native
+    and (not cx.inferrun.pruned)
+    and core_settles(req.mode, req.backend, core_cache, cx.solved.core_hit)
+    and nsrcs != "" {
+    let nk = native_kir(req, cx)
+    let obj_path = native_object_in(core_cache.nmod_dir, req.path)
+    build_native_core_stored(
+      nk.kp,
+      cx.perceusrun.perceus_decls,
+      nk.nvariants,
+      nk.nfns,
+      cx.unboxrun.bmode,
+      obj_path,
+      req.path,
+      NCoreCfg {
+        dir: core_cache.dir,
+        toolchain: core_cache.toolchain,
+        edition: edition_key_text(req.edition),
+        tag: llvm_backend_tag(),
+        srcs_hex: nsrcs,
+        stats: core_cache.stats,
+        pre: cx.cutrun.npre
+      },
+      core_mod_names(req.core_mods, [])
+    )
+  } else {
+    None
+  }
+}
+
+#[doc("""
+The program cut against the core object just stored, as the compile of a
+later build with that object in the cache starts from it: its decls are
+the ones the program reaches, so a build's output does not depend on the
+cache holding the object beforehand. None when no object was stored or
+the cut leaves a reference behind.
+""")]
+pub(pkg) fn stage_settle(req: Req, mn: Monoed, cx: PerceusRun) : Option[Monoed] / Console + File + Mutable =
+  and_then(native_core_stored(req, cx), co => settled_cut(req, mn, co))
+
+fn settled_cut(req: Req, mn: Monoed, co: String) : Option[Monoed] / Console =
+  match core_typed_cut(
+    mn.monoed.mono_decls,
+    core_mod_names(req.core_mods, []),
+    mn.checked.proto_reg,
+    []
+  ) {
+    TypedCut(ds, []) -> Some(Monoed {
+      ...mn,
+      solved: SolvedOut { ...mn.solved, core_hit: Some(co) },
+      inferrun: InferRunOut { ...mn.inferrun, pruned: true },
+      monoed: MonoedOut { ...mn.monoed, tcut: TypedCut(ds, []), mono_decls: ds }
+    })
+    TypedCut(_, _) -> None
+  }
+
+pub(pkg) fn emit_native(req: Req, cx: PerceusRun) : Int / Console + File + Mutable {
+  let bmode = cx.unboxrun.bmode
+  let core_cache = req.core_cache
+  let core_hit = cx.solved.core_hit
+  let core_mods = req.core_mods
+  let edition = req.edition
+  let npre = cx.cutrun.npre
+  let nsrcs = cx.cutrun.nsrcs
+  let path = req.path
+  let perceus_decls = cx.perceusrun.perceus_decls
+  let pruned = cx.inferrun.pruned
+  # In-process libLLVM native backend. Lower to
+  # KIR (same preamble as the KIR dumper: the decls
+  # are post-perceus / post-tcrec; only the
+  # symbol/variant tables are rebuilt), build the
+  # module via the C API in memory, and emit a
+  # native object. The output path is `<source>.o`;
+  # the `bin/kai` wrapper (or the test harness)
+  # links it against the effects runtime to the
+  # final executable.
+  let ncore_names = core_mod_names(core_mods, [])
+  let nk = native_kir(req, cx)
+  let kp = nk.kp
+  let nfns = nk.nfns
+  let nvariants = nk.nvariants
   let obj_path = native_object_in(core_cache.nmod_dir, path)
   # Core-object split: with the shared core cache
   # available (dir + toolchain id) and a backend tag

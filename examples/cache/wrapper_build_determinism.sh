@@ -63,3 +63,17 @@ for memo in 0 1; do
   check c --backend=c "$memo"
   check native --backend=native "$memo"
 done
+
+# Every cache switch off, the package at two paths.
+if [ "$NATIVE" = 1 ]; then
+  off="$WORK/off"
+  mkdir -p "$off/a" "$off/b/deeper/place"
+  cp -R "$WORK/one/pkg" "$off/b/deeper/place/pkg"
+  for pair in "a:$WORK/one/pkg" "b:$off/b/deeper/place/pkg"; do
+    (cd "${pair#*:}" && KAI_BIN_MEMO=0 KAI_NATIVE_CORE_OBJ=0 KAI_CACHE=0 KAI_CORE_CACHE_DIR="$off/cc" \
+       "$KAI" build --backend=native . -o "$off/${pair%%:*}/out" > "$off/log" 2>&1) \
+      || { cat "$off/log"; fail "switches-off build failed"; }
+  done
+  same "$off/a/out" "$off/b/out" "switches off: the same package at two paths differs"
+  echo "wrapper_build_determinism OK (switches off) — two paths are byte-identical"
+fi
