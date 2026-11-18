@@ -315,6 +315,19 @@ static int kai_nthreads = 1;
 #include <arpa/inet.h>
 #endif
 #include <errno.h>
+
+/* A fiber resumes on any worker after a park, and the compiler may keep the
+ * previous thread's `errno` address across it. Every runtime access goes
+ * through these calls; tools/errno-audit.sh rejects a raw `errno`. */
+static __attribute__((noinline, unused)) int kai_errno(void) {
+    __asm__ volatile("" ::: "memory");
+    return errno;
+}
+
+static __attribute__((noinline, unused)) void kai_set_errno(int e) {
+    __asm__ volatile("" ::: "memory");
+    errno = e;
+}
 #if KAI_HOST_SOCKETS
 #include <netdb.h>
 #include <netinet/in.h>

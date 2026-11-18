@@ -89,7 +89,7 @@ static KaiValue *kai_core_file_read_chunk(KaiValue *h, KaiValue *max) {
         char *buf = (char *) malloc((size_t) cap);
         if (!buf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
         ssize_t got;
-        do { got = read(fd, buf, (size_t) cap); } while (got < 0 && errno == EINTR);
+        do { got = read(fd, buf, (size_t) cap); } while (got < 0 && kai_errno() == EINTR);
         if (got < 0) {
             free(buf);
             r = _kai_file_err("read_chunk: read failed");
@@ -146,7 +146,7 @@ static KaiValue *kai_core_file_write_chunk(KaiValue *h, KaiValue *data) {
         while (off < total) {
             ssize_t w = write(fd, data->as.s.bytes + off, total - off);
             if (w < 0) {
-                if (errno == EINTR) continue;
+                if (kai_errno() == EINTR) continue;
                 failed = 1;
                 break;
             }
@@ -486,7 +486,7 @@ static KaiValue *kai_core_file_metadata(KaiValue *path) {
         pbuf[plen] = '\0';
         struct stat st;
         if (stat(pbuf, &st) != 0) {
-            r = _kai_fs_err("file_metadata", pbuf, plen, errno);
+            r = _kai_fs_err("file_metadata", pbuf, plen, kai_errno());
         } else {
 #if defined(__APPLE__)
             int64_t ns = (int64_t) st.st_mtimespec.tv_nsec;
@@ -509,7 +509,7 @@ static KaiValue *kai_core_file_metadata(KaiValue *path) {
 
 static KaiValue *kai_core_dir_current_dir(void) {
     char buf[KAI_PATH_BUF];
-    if (getcwd(buf, sizeof(buf)) == NULL) return _kai_fs_err("dir_current_dir", "", 0, errno);
+    if (getcwd(buf, sizeof(buf)) == NULL) return _kai_fs_err("dir_current_dir", "", 0, kai_errno());
     KaiValue *s = kai_str_dyn(buf);
     return kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = s}});
 }
@@ -669,9 +669,9 @@ static int kai_stdin_take_line(char **acc, size_t *an, size_t *acap, ssize_t *rc
     if (kai_stdin_pos == kai_stdin_len) {
         ssize_t r = read(STDIN_FILENO, kai_stdin_buf, KAI_STDIN_BUF_SIZE);
         if (r <= 0) {
-            int saved = errno;
+            int saved = kai_errno();
             pthread_mutex_unlock(&kai_stdin_mu);
-            errno = saved;
+            kai_set_errno(saved);
             *rc = r;
             return -1;
         }
@@ -747,13 +747,14 @@ static KaiValue *kai_core_read_bytes(KaiValue *n) {
     size_t got = kai_stdin_drain(buf, (size_t) want);
     while (got < (size_t) want) {
         ssize_t r = read(STDIN_FILENO, buf + got, (size_t) want - got);
+        int e = kai_errno();
         if (r > 0) {
             got += (size_t) r;
         } else if (r == 0) {
             break;  /* EOF */
-        } else if (errno == EINTR) {
+        } else if (e == EINTR) {
             continue;
-        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        } else if (e == EAGAIN || e == EWOULDBLOCK) {
             /* fd 0 is O_NONBLOCK because the R3 reactor handler
              * flipped it earlier in this process. The flat core
              * has no fiber to park; emulate blocking semantics by
@@ -762,7 +763,7 @@ static KaiValue *kai_core_read_bytes(KaiValue *n) {
             struct pollfd p = { STDIN_FILENO, POLLIN, 0 };
             kai_flush_stdout();
             int prc = poll(&p, 1, -1);
-            if (prc < 0 && errno != EINTR) break;
+            if (prc < 0 && kai_errno() != EINTR) break;
             continue;
 #else
             kai_host_absent("reactor");

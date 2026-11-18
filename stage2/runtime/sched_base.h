@@ -134,8 +134,9 @@ static void _kai_securerandom_fill(unsigned char *buf, size_t n) {
     while (off < n) {
         ssize_t got = getrandom(buf + off, n - off, 0);
         if (got < 0) {
-            if (errno == EINTR) continue;
-            kai_eprintf("kai: SecureRandom: getrandom failed: %s\n", strerror(errno));
+            int e = kai_errno();
+            if (e == EINTR) continue;
+            kai_eprintf("kai: SecureRandom: getrandom failed: %s\n", strerror(e));
             kai_exit(1);
         }
         off += (size_t) got;

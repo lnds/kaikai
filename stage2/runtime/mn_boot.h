@@ -288,7 +288,7 @@ static void kai_workers_ensure(void) {
             kai_rc_go_mt();
             if (pthread_create(&kai_worker_threads[i], &attr,
                                kai_worker_thread_main, (void *) (intptr_t) i) != 0) {
-                kai_eprintf("kai: scheduler pthread_create failed: %s\n", strerror(errno));
+                kai_eprintf("kai: scheduler pthread_create failed: %s\n", strerror(kai_errno()));
                 kai_exit(1);
             }
         }
@@ -307,7 +307,7 @@ static void kai_reactor_thread_ensure(void) {
         atomic_store(&kai_reactor_idle, 0);
         kai_rc_go_mt();
         if (pthread_create(&kai_reactor_thread, NULL, kai_reactor_thread_main, NULL) != 0) {
-            kai_eprintf("kai: reactor pthread_create failed: %s\n", strerror(errno));
+            kai_eprintf("kai: reactor pthread_create failed: %s\n", strerror(kai_errno()));
             kai_exit(1);
         }
         atomic_store_explicit(&kai_reactor_up, 1, memory_order_release);
