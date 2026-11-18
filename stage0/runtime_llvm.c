@@ -1811,6 +1811,10 @@ KaiValue *kaix_resume_frames_run(KaiEvidence *node, KaiValue *v) {
     return kai_resume_frames_run(node, v);
 }
 
+void kaix_resume_frames_drop(KaiEvidence *node) {
+    kai_resume_frames_drop(kai_current_fiber(), node);
+}
+
 /* Stack segments: a body on its own stack, suspended and resumed through a
  * one-shot continuation box. */
 KaiValue *kaix_seg_start(KaiValue *body, KaiValue **k) {

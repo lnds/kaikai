@@ -524,6 +524,7 @@ static inline void kaix_register_one_payload_ctor(int32_t tag, const char *name,
 void kaix_register_one_reusable_tag(int32_t tag);
 void kaix_register_one_variant_head(int32_t variant_tag, int32_t head_tag);
 KaiValue *kaix_resume_frame_push(KaiValue *clo);
+void kaix_resume_frames_drop(KaiEvidence *node);
 KaiValue *kaix_resume_frames_run(KaiEvidence *node, KaiValue *v);
 static inline __attribute__((always_inline)) KaiValue *kaix_reuse_commit(KaiValue *at, int32_t tag);
 static inline __attribute__((always_inline)) int32_t kaix_reuse_fits(KaiValue *at, int32_t n);
