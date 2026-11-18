@@ -1,5 +1,12 @@
 /* Fragment of runtime.h; include runtime.h, never this file. */
 #if KAI_HOST_SOCKETS
+/* A fiber resumes on any worker after a park, but the compiler may keep the
+ * previous thread's `errno` address across it; read through a call. */
+static __attribute__((noinline)) int kai_errno(void) {
+    __asm__ volatile("" ::: "memory");
+    return errno;
+}
+
 static KaiValue *_kai_net_err(KaiCont *k, int saved_errno) {
     const char *msg = strerror(saved_errno);
     if (!msg) msg = "unknown error";
@@ -102,14 +109,14 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, Ka
     int saved_errno = 0;
     for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
         fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (fd < 0) { saved_errno = errno; continue; }
+        if (fd < 0) { saved_errno = kai_errno(); continue; }
         kai_socket_set_nonblock(fd);
         int crc = connect(fd, p->ai_addr, p->ai_addrlen);
         if (crc == 0) {
             saved_errno = 0;
             break;  /* instant success — loopback path */
         }
-        if (errno == EINPROGRESS || errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (kai_errno() == EINPROGRESS || kai_errno() == EAGAIN || kai_errno() == EWOULDBLOCK) {
             /* Park until the kernel marks the fd writable. POLLHUP /
              * POLLERR also wake us — drain treats them as ready and
              * the SO_ERROR check below surfaces the real reason. */
@@ -117,7 +124,7 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, Ka
             int so_err = 0;
             socklen_t slen = sizeof(so_err);
             if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &slen) < 0) {
-                saved_errno = errno;
+                saved_errno = kai_errno();
                 close(fd);
                 fd = -1;
                 continue;
@@ -131,7 +138,7 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_connect(void *self, KaiValue *host, Ka
             fd = -1;
             continue;
         }
-        saved_errno = errno;
+        saved_errno = kai_errno();
         close(fd);
         fd = -1;
     }
@@ -160,7 +167,7 @@ static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue 
     host_buf[hlen] = '\0';
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return _kai_net_err(k, errno);
+    if (fd < 0) return _kai_net_err(k, kai_errno());
 
     /* SO_REUSEADDR mirrors the convention every server example sets
      * — without it a listener that crashed seconds ago can't rebind
@@ -195,10 +202,10 @@ static KaiValue *kai_default_nettcp_listen(void *self, KaiValue *host, KaiValue 
     }
 
     if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-        int e = errno; close(fd); return _kai_net_err(k, e);
+        int e = kai_errno(); close(fd); return _kai_net_err(k, e);
     }
     if (listen(fd, KAI_LISTEN_BACKLOG) < 0) {
-        int e = errno; close(fd); return _kai_net_err(k, e);
+        int e = kai_errno(); close(fd); return _kai_net_err(k, e);
     }
     /* Issue #630 — Phase R2: the listener fd must be non-blocking so
      * the parking accept() path below sees EAGAIN/EWOULDBLOCK when
@@ -254,15 +261,15 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_accept(void *self, KaiValue *l, KaiCon
             KaiValue *ok   = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = conn}});
             return kai_cont_resume(k, ok);
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (kai_errno() == EAGAIN || kai_errno() == EWOULDBLOCK) {
             kai_reactor_park_socket_read(kai_current_fiber(), lfd);
             /* On resume, kai_sched_park runs the cancel-yield check
              * for us (issue #679 fix) — a sibling-triggered cancel
              * longjmps to cancel_pad before the retry below. */
             continue;  /* Resume → retry accept() */
         }
-        if (errno == EINTR) continue;
-        return _kai_net_err(k, errno);
+        if (kai_errno() == EINTR) continue;
+        return _kai_net_err(k, kai_errno());
     }
 }
 #endif
@@ -331,12 +338,12 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue
             total += (size_t) w;
             continue;
         }
-        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (w < 0 && (kai_errno() == EAGAIN || kai_errno() == EWOULDBLOCK)) {
             kai_reactor_park_socket_write(kai_current_fiber(), fd);
             continue;  /* Resume → retry send() */
         }
-        if (w < 0 && errno == EINTR) continue;
-        saved_errno = errno;
+        if (w < 0 && kai_errno() == EINTR) continue;
+        saved_errno = kai_errno();
         break;
     }
     free(buf);
@@ -389,12 +396,12 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue
     for (;;) {
         got = recv(fd, buf, (size_t) cap, 0);
         if (got >= 0) break;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (kai_errno() == EAGAIN || kai_errno() == EWOULDBLOCK) {
             kai_reactor_park_socket_read(kai_current_fiber(), fd);
             continue;  /* Resume → retry recv() */
         }
-        if (errno == EINTR) continue;
-        int saved_errno = errno;
+        if (kai_errno() == EINTR) continue;
+        int saved_errno = kai_errno();
         free(buf);
         return _kai_net_err(k, saved_errno);
     }
@@ -442,7 +449,7 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_recv_timeout(void *self, KaiValue *c,
     for (;;) {
         got = recv(fd, buf, (size_t) cap, 0);
         if (got >= 0) break;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (kai_errno() == EAGAIN || kai_errno() == EWOULDBLOCK) {
             if (!kai_reactor_park_socket_read_timeout(kai_current_fiber(),
                                                       fd, deadline)) {
                 free(buf);
@@ -450,8 +457,8 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_recv_timeout(void *self, KaiValue *c,
             }
             continue;  /* Readiness → retry recv() */
         }
-        if (errno == EINTR) continue;
-        int saved_errno = errno;
+        if (kai_errno() == EINTR) continue;
+        int saved_errno = kai_errno();
         free(buf);
         const char *m = strerror(saved_errno);
         if (!m) m = "unknown error";
@@ -480,7 +487,7 @@ static KaiValue *kai_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
     if (fd >= 0) {
         if (close(fd) < 0) {
             /* Stderr only — the surface op returns Unit. */
-            kai_eprintf("kai: NetTcp.close: %s\n", strerror(errno));
+            kai_eprintf("kai: NetTcp.close: %s\n", strerror(kai_errno()));
         }
     }
     return kai_cont_resume(k, kai_unit());
@@ -537,7 +544,7 @@ static int _kai_unix_is_stale(const char *path) {
     if (fd < 0) return 0;
     kai_socket_set_nonblock(fd);
     int rc = connect(fd, (struct sockaddr *) &sa, sizeof(sa));
-    int e = errno;
+    int e = kai_errno();
     close(fd);
     return rc < 0 && e == ECONNREFUSED;
 }
@@ -549,10 +556,10 @@ static int _kai_unix_bind_private(const char *tmp, mode_t mode, int *out_fd, str
     struct sockaddr_un sa;
     if (_kai_unix_addr(&sa, tmp) < 0) return ENAMETOOLONG;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return errno;
+    if (fd < 0) return kai_errno();
     if (bind(fd, (struct sockaddr *) &sa, sizeof(sa)) < 0 || chmod(tmp, mode) < 0
         || listen(fd, KAI_LISTEN_BACKLOG) < 0 || lstat(tmp, st) < 0) {
-        int e = errno;
+        int e = kai_errno();
         close(fd);
         return e;
     }
@@ -565,14 +572,14 @@ static int _kai_unix_bind_private(const char *tmp, mode_t mode, int *out_fd, str
  * node is still the one that was probed. */
 static int _kai_unix_publish(const char *tmp, const char *path) {
     if (link(tmp, path) == 0) return 0;
-    if (errno != EEXIST) return errno;
+    if (kai_errno() != EEXIST) return kai_errno();
     struct stat st;
     if (lstat(path, &st) == 0) {
         if (!S_ISSOCK(st.st_mode)) return EEXIST;
         if (!_kai_unix_is_stale(path)) return EADDRINUSE;
         if (_kai_unix_same_node(path, (int64_t) st.st_dev, (int64_t) st.st_ino)) unlink(path);
     }
-    return link(tmp, path) == 0 ? 0 : errno;
+    return link(tmp, path) == 0 ? 0 : kai_errno();
 }
 
 /* The private directory sits beside `path` so link(2) stays on one
@@ -584,8 +591,8 @@ static int _kai_unix_listen_at(const char *path, mode_t mode, int *fd, struct st
     char dir[KAI_PATH_BUF], tmp[KAI_PATH_BUF];
     int n = snprintf(dir, sizeof(dir), "%.*s.kaiXXXXXX", plen, path);
     if (n < 0 || (size_t) n >= sizeof(dir)) return ENAMETOOLONG;
-    if (!mkdtemp(dir)) return errno;
-    int e = chmod(dir, 0700) < 0 ? errno : 0;
+    if (!mkdtemp(dir)) return kai_errno();
+    int e = chmod(dir, 0700) < 0 ? kai_errno() : 0;
     n = snprintf(tmp, sizeof(tmp), "%s/s", dir);
     if (e == 0 && (n < 0 || (size_t) n >= sizeof(tmp))) e = ENAMETOOLONG;
     if (e == 0) e = _kai_unix_bind_private(tmp, mode, fd, st);
@@ -645,16 +652,16 @@ KAI_SCHED_FN KaiValue *kai_default_netunix_connect(void *self, KaiValue *path, K
     if (_kai_unix_cstr(path, p, sizeof(p)) < 0) return _kai_net_err_msg(k, "connect: bad arguments");
     if (_kai_unix_addr(&sa, p) < 0) return _kai_net_err_msg(k, "connect: path too long for a Unix socket");
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return _kai_net_err(k, errno);
+    if (fd < 0) return _kai_net_err(k, kai_errno());
     kai_reactor_init();
     kai_socket_set_nonblock(fd);
-    while (connect(fd, (struct sockaddr *) &sa, sizeof(sa)) < 0 && errno != EISCONN) {
-        if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EINPROGRESS || errno == EALREADY) {
+    while (connect(fd, (struct sockaddr *) &sa, sizeof(sa)) < 0 && kai_errno() != EISCONN) {
+        if (kai_errno() == EINTR) continue;
+        if (kai_errno() == EAGAIN || kai_errno() == EINPROGRESS || kai_errno() == EALREADY) {
             kai_reactor_park_timer(kai_current_fiber(), kai_reactor_now_ns() + 1000000);
             continue;
         }
-        int e = errno;
+        int e = kai_errno();
         close(fd);
         return _kai_net_err(k, e);
     }
@@ -668,13 +675,13 @@ static int _kai_unix_peer_uid(int fd, int64_t *uid) {
 #if defined(SO_PEERCRED)
     struct ucred cred;
     socklen_t len = sizeof(cred);
-    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0) return errno;
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) < 0) return kai_errno();
     *uid = (int64_t) cred.uid;
     return 0;
 #elif defined(LOCAL_PEERCRED)
     struct xucred cred;
     socklen_t len = sizeof(cred);
-    if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &cred, &len) < 0) return errno;
+    if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &cred, &len) < 0) return kai_errno();
     if (cred.cr_version != XUCRED_VERSION) return EPROTO;
     *uid = (int64_t) cred.cr_uid;
     return 0;
@@ -706,7 +713,7 @@ static KaiValue *kai_default_netunix_close_listener(void *self, KaiValue *l, Kai
     }
     int fd = _kai_net_record_fd(l);
     if (fd >= 0 && close(fd) < 0) {
-        kai_eprintf("kai: NetUnix.close_listener: %s\n", strerror(errno));
+        kai_eprintf("kai: NetUnix.close_listener: %s\n", strerror(kai_errno()));
     }
     return kai_cont_resume(k, kai_unit());
 }
@@ -855,7 +862,7 @@ static KaiValue *kai_default_netudp_bind(void *self, KaiValue *host, KaiValue *p
     host_buf[hlen] = '\0';
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return _kai_net_err(k, errno);
+    if (fd < 0) return _kai_net_err(k, kai_errno());
 
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
@@ -885,7 +892,7 @@ static KaiValue *kai_default_netudp_bind(void *self, KaiValue *host, KaiValue *p
     }
 
     if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-        int e = errno; close(fd); return _kai_net_err(k, e);
+        int e = kai_errno(); close(fd); return _kai_net_err(k, e);
     }
 
     struct sockaddr_in bound;
@@ -942,10 +949,10 @@ static KaiValue *kai_default_netudp_send(void *self, KaiValue *sock, KaiValue *d
 #else
         w = sendto(fd, buf, n, 0, (struct sockaddr *) &dst_addr, sizeof(dst_addr));
 #endif
-        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && kai_errno() == EINTR) continue;
         break;
     }
-    int saved_errno = (w < 0) ? errno : 0;
+    int saved_errno = (w < 0) ? kai_errno() : 0;
     free(buf);
     if (w < 0) return _kai_net_err(k, saved_errno);
 
@@ -975,8 +982,8 @@ static KaiValue *kai_default_netudp_recv(void *self, KaiValue *sock, KaiValue *m
         srclen = sizeof(src);
         got = recvfrom(fd, buf, (size_t) cap, 0, (struct sockaddr *) &src, &srclen);
         if (got >= 0) break;
-        if (errno == EINTR) continue;
-        int saved_errno = errno;
+        if (kai_errno() == EINTR) continue;
+        int saved_errno = kai_errno();
         free(buf);
         return _kai_net_err(k, saved_errno);
     }
@@ -1004,7 +1011,7 @@ static KaiValue *kai_default_netudp_close(void *self, KaiValue *sock, KaiCont *k
     int fd = _kai_net_record_fd(sock);
     if (fd >= 0) {
         if (close(fd) < 0) {
-            kai_eprintf("kai: NetUdp.close: %s\n", strerror(errno));
+            kai_eprintf("kai: NetUdp.close: %s\n", strerror(kai_errno()));
         }
     }
     return kai_cont_resume(k, kai_unit());
