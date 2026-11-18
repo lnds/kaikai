@@ -84,6 +84,19 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.196.3 (2026-11-18)
+
+### Fixed
+
+- **native**: derive the target-init result at compile time
+- **native**: register the LLVM targets and options once across emit workers
+- **runtime**: route every errno access through kai_errno
+- **runtime**: read errno through a call after a socket park
+- **cache**: cut the program against the core object a cold build stores
+- **cache**: make kai build output independent of cache state and package path
+- **effects**: drop a handle's pending resume frames when a fn exit leaves its body
+- **kir**: keep the argument type on a closure param bound once
+
 ## v0.196.2 (2026-11-17)
 
 ### Fixed
