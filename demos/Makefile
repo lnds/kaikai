@@ -81,6 +81,7 @@ verify:
 	    err=$$(tail -1 $(BUILD)/$$d.err 2>/dev/null | sed 's/^[[:space:]]*//'); \
 	    [ -z "$$err" ] && err="runtime error"; \
 	    echo "FAIL runtime: $$err" > $(BUILD)/$$d.status; \
+	    case "$$err" in TIMEOUT*) sed "s/^/$$d: /" $(BUILD)/$$d.err >&2;; esac; \
 	    continue; \
 	  fi; \
 	  if [ -f $$d/main.out.expected ]; then \
