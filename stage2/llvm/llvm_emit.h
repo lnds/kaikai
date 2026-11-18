@@ -362,8 +362,6 @@ static void kai_llvm_stamp_host_features(LLVMModuleRef m) {
     }
 }
 
-static int kai_llvm_init_targets_once_rc;
-
 static void kai_llvm_init_targets_once(void) {
     LLVMInitializeNativeTarget();
     LLVMInitializeNativeAsmPrinter();
@@ -378,7 +376,6 @@ static void kai_llvm_init_targets_once(void) {
     LLVMParseCommandLineOptions(3, eh, NULL);
 #else
     kai_eprintf("kai: this kai was built without the WebAssembly LLVM target\n");
-    kai_llvm_init_targets_once_rc = 1;
 #endif
 }
 
@@ -388,7 +385,11 @@ static void kai_llvm_init_targets_once(void) {
 static int kai_llvm_init_targets(void) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, kai_llvm_init_targets_once);
-    return kai_llvm_init_targets_once_rc;
+#ifdef KAI_LLVM_WEBASSEMBLY
+    return 0;
+#else
+    return kai_llvm_wasm_target() != 0;
+#endif
 }
 
 #ifdef KAI_LLVM_WEBASSEMBLY
