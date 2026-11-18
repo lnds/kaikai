@@ -362,12 +362,12 @@ static void kai_llvm_stamp_host_features(LLVMModuleRef m) {
     }
 }
 
-/* Registers the native target and, for a wasm build, the WebAssembly one.
- * A kai built without it says so instead of failing in the lookup. */
-static int kai_llvm_init_targets(void) {
+static int kai_llvm_init_targets_once_rc;
+
+static void kai_llvm_init_targets_once(void) {
     LLVMInitializeNativeTarget();
     LLVMInitializeNativeAsmPrinter();
-    if (!kai_llvm_wasm_target()) return 0;
+    if (!kai_llvm_wasm_target()) return;
 #ifdef KAI_LLVM_WEBASSEMBLY
     LLVMInitializeWebAssemblyTargetInfo();
     LLVMInitializeWebAssemblyTarget();
@@ -376,11 +376,19 @@ static int kai_llvm_init_targets(void) {
     LLVMInitializeWebAssemblyAsmParser();
     static const char *eh[] = { "kai", "-wasm-enable-sjlj", "-wasm-use-legacy-eh=false" };
     LLVMParseCommandLineOptions(3, eh, NULL);
-    return 0;
 #else
     kai_eprintf("kai: this kai was built without the WebAssembly LLVM target\n");
-    return 1;
+    kai_llvm_init_targets_once_rc = 1;
 #endif
+}
+
+/* Registers the native target and, for a wasm build, the WebAssembly one.
+ * Emit workers call it concurrently and LLVM's option registry is not
+ * thread-safe, so it runs once. A kai built without the target says so. */
+static int kai_llvm_init_targets(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, kai_llvm_init_targets_once);
+    return kai_llvm_init_targets_once_rc;
 }
 
 #ifdef KAI_LLVM_WEBASSEMBLY
