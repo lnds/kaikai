@@ -87,7 +87,7 @@ static inline KaiValue *kaix_cons_head(KaiValue *v);
 static inline KaiValue *kaix_cons_reuse_move(KaiValue *scr, KaiValue *h, KaiValue *t);
 static inline KaiValue *kaix_cons_tail(KaiValue *v);
 static inline KaiValue **kaix_cons_tail_addr(KaiValue *node);
-KaiValue *kaix_const_once_thunk(KaiValue *s, KaiValue **a, int n);
+static inline KaiValue *kaix_const_once(KaiValue **slot, KaiValue *init);
 static inline void kaix_cont_init_identity(KaiCont *k, KaiHandlerId hid);
 static inline KaiValue *kaix_cont_resume(KaiCont *k, KaiValue *v);
 KaiValue *kaix_core___deep_apply1(KaiValue *x, KaiValue *f);
@@ -138,7 +138,6 @@ KaiValue *kaix_core_bytes_put_string(KaiValue *d, KaiValue *o, KaiValue *s);
 KaiValue *kaix_core_char_at(KaiValue *s, KaiValue *i);
 KaiValue *kaix_core_char_to_int(KaiValue *c);
 KaiValue *kaix_core_char_to_string(KaiValue *c);
-KaiValue *kaix_core_const_once(KaiValue *init);
 KaiValue *kaix_core_core_program_name(void);
 static inline KaiValue *kaix_core_defer(KaiValue *thunk);
 KaiValue *kaix_core_dir_create_dir(KaiValue *p);
@@ -811,6 +810,7 @@ static inline KaiValue *kaix_cons_tail(KaiValue *v) {return kai_incref(kai_seq_n
 static inline KaiValue **kaix_cons_tail_addr(KaiValue *node) {
     return &node->as.cons.tail;
 }
+static inline KaiValue *kaix_const_once(KaiValue **slot, KaiValue *init) {return kai_const_once(slot, init); }
 static inline void kaix_cont_init_identity(KaiCont *k, KaiHandlerId hid) {kai_cont_init_identity(k, hid); }
 static inline KaiValue *kaix_cont_resume(KaiCont *k, KaiValue *v) {return kai_cont_resume(k, v); }
 static inline KaiValue *kaix_core_bit_and(KaiValue *a, KaiValue *b) {KaiValue *r = kai_int(kai_intf(a) & kai_intf(b)); kai_decref(a); kai_decref(b); return r; }

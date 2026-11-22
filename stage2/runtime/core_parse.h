@@ -638,7 +638,6 @@ static KaiValue *_kai_core_ref_make_thunk(KaiValue *s, KaiValue **a, int n)     
 static KaiValue *_kai_core_ref_get_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_ref_get(a[0]); }
 static KaiValue *_kai_core_ref_set_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_ref_set(a[0], a[1]); }
 static KaiValue *_kai_core_ref_take_thunk(KaiValue *s, KaiValue **a, int n)      { (void) s; (void) n; return kai_core_ref_take(a[0]); }
-static KaiValue *_kai_core_const_once_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_const_once(a[0]); }
 static KaiValue *_kai_core_ref_store_thunk(KaiValue *s, KaiValue **a, int n)     { (void) s; (void) n; return kai_core_ref_store(a[0], a[1]); }
 static KaiValue *_kai_core_list_length_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_list_length(a[0]); }
 static KaiValue *_kai_core_list_append_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_list_append(a[0], a[1]); }
