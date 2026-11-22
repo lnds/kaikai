@@ -667,6 +667,7 @@ static KaiValue *_kai_core_dir_remove_dir_thunk(KaiValue *s, KaiValue **a, int n
 static KaiValue *_kai_core_dir_walk_thunk(KaiValue *s, KaiValue **a, int n)       { (void) s; (void) n; return kai_core_dir_walk(a[0]); }
 static KaiValue *_kai_core_file_metadata_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_file_metadata(a[0]); }
 static KaiValue *_kai_core_file_symlink_metadata_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_file_symlink_metadata(a[0]); }
+static KaiValue *_kai_core_file_canonicalize_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_file_canonicalize(a[0]); }
 static KaiValue *_kai_core_dir_list_entries_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_dir_list_entries(a[0]); }
 static KaiValue *_kai_core_dir_current_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) a; (void) n; return kai_core_dir_current_dir(); }
 static KaiValue *_kai_core_dir_temp_dir_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) a; (void) n; return kai_core_dir_temp_dir(); }
