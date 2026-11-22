@@ -71,6 +71,10 @@ def inlinable(body, names):
     return not any(w in names for w in WORD.findall(body))
 
 
+def storage(sig):
+    return "static " if "noinline" in sig else "static inline "
+
+
 def render(text):
     lines_in = join_signatures(text)
     names = local_names(lines_in)
@@ -127,10 +131,10 @@ def render(text):
         "#include <runtime.h>",
     ]
     for k in sorted(protos):
-        out.append(("static inline " + protos[k].replace("KAI_RT_SHARED ", "") if k in bodies else protos[k]))
+        out.append((storage(protos[k]) + protos[k].replace("KAI_RT_SHARED ", "") if k in bodies else protos[k]))
     for k in sorted(bodies):
         sig = protos[k][:-1].replace("KAI_RT_SHARED ", "")
-        out.append("static inline " + sig + " " + bodies[k])
+        out.append(storage(sig) + sig + " " + bodies[k])
     out.append("#endif")
     return "\n".join(out) + "\n"
 
