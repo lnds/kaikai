@@ -584,20 +584,36 @@ KAIX_CORE_THUNK2(mailbox_assign_owner)
 KAIX_CORE_THUNK2(spawn_actor_fiber)
 
 /* ---------- M3d: variants + match ---------- */
-KaiValue *kaix_variant_interned(int32_t tag, const char *name, int32_t n, KaiValue **args) {
-    KaiVarSlot slots[KAI_IMMORTAL_VAR_MAXN];
-    for (int i = 0; i < n; i++) slots[i].ptr = args[i];
-    return kai_variant_u(tag, name, n, 0, slots);
-}
-
 KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, KaiValue **args) {
     /* LLVM backend still passes args as KaiValue **; bridge to the
      * slot-mask shape by stamping each as a pointer slot. mask==0
      * means "all slots boxed", which is what the legacy boxed path
      * always emitted. */
     if (n <= 0) return kai_variant_u(tag, name, 0, 0, NULL);
-    /* A slot that cannot be interned (a scalar box, a heap cell) rules out
-     * the immortal-args cache, so the cell is built straight from `args`. */
+    KaiVarSlot stack_slots[16];
+    KaiVarSlot *slots = stack_slots;
+    KaiVarSlot *heap = NULL;
+    if (n > (int)(sizeof(stack_slots) / sizeof(stack_slots[0]))) {
+        heap = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+        slots = heap;
+    }
+    for (int i = 0; i < n; i++) slots[i].ptr = args[i];
+    KaiValue *r = kai_variant_u(tag, name, n, 0, slots);
+    if (heap) free(heap);
+    return r;
+}
+
+__attribute__((noinline)) KaiValue *kaix_variant_interned(int32_t tag, const char *name, int32_t n, KaiValue **args) {
+    KaiVarSlot slots[KAI_IMMORTAL_VAR_MAXN];
+    for (int i = 0; i < n; i++) slots[i].ptr = args[i];
+    return kai_variant_u(tag, name, n, 0, slots);
+}
+
+/* `kaix_variant` for the native backend: a cell whose slots cannot hit the
+ * immortal-args cache is built straight from `args`, skipping the generic
+ * constructor. */
+KaiValue *kaix_variant_fresh(int32_t tag, const char *name, int32_t n, KaiValue **args) {
+    if (n <= 0) return kai_variant_u(tag, name, 0, 0, NULL);
     if (n == 1 && !kai_slot_internable(args[0])) {
         KaiValue *v = kai_alloc_var_nz(1);
         v->variant_tag = tag;
@@ -607,7 +623,7 @@ KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, KaiValue **args
     }
     int internable = n <= KAI_IMMORTAL_VAR_MAXN;
     for (int i = 0; i < n && internable; i++) internable = kai_slot_internable(args[i]);
-    if (!internable) {
+    if (!internable || kai_tag_is_reusable(tag)) {
         KaiValue *v = kai_alloc_var_nz(n);
         v->variant_tag = tag;
         v->var_n_args = (uint8_t) n;
