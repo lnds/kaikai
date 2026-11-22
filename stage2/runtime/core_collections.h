@@ -832,7 +832,7 @@ static KaiValue *kai_const_once(KaiValue **slot, KaiValue *init) {
     kai_pin_walk(v, &log);
     KaiValue *none = NULL;
     if (__atomic_compare_exchange_n(slot, &none, v, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        kai_rc_count_live_sub((int64_t) log.n);
+        for (size_t i = 0; i < log.n; i++) kai_rc_count_free();
     } else {
         kai_pin_undo(&log);
         kai_decref(v);
