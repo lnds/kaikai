@@ -1,23 +1,24 @@
 #[doc("`kai migrate`: rewrite a source from one edition's surface to the next, dry-run unless `--write`.")]
 
-import cli_compile
+import cli_blocks
 import cli_err
 import cli_fs
 import cli_layout
 import cli_manifest
+import cli_paths
 import cli_proc
-import cli_spec
 import cli_sys
 import cli_toolchain
 import cli_tool_help
 import fs.file
 
 type MigrateOpts = {
-  spec: String,
+  specs: [String],
   from: String,
   from_explicit: Bool,
   to: String,
   write: Bool,
+  headed: Bool,
   help: Bool
 }
 
@@ -42,16 +43,8 @@ fn parse(args: [String], o: MigrateOpts) : Result[MigrateOpts, Int] / Stderr =
       parse(rest, MigrateOpts { ...o, write: true })
     [a, ..._] if string.starts_with(a, "-") ->
       cli_err.die("unknown flag: #{a} (see 'kai migrate --help')")
-    [a, ...rest] ->
-      if o.spec != "" {
-        cli_err.die("only one input file supported")
-      } else {
-        parse(rest, MigrateOpts { ...o, spec: a })
-      }
+    [a, ...rest] -> parse(rest, MigrateOpts { ...o, specs: o.specs ++ [a] })
   }
-
-fn source(spec: String) : Result[String, Int] / Stderr + File + Ffi =
-  if cli_spec.is_package(spec) { cli_spec.resolve(spec, "migrating", false) } else { Ok(spec) }
 
 fn manifest_of(src: String) : String / Ffi =
   match cli_fs.dir_of(src) {
@@ -87,22 +80,34 @@ fn stamp(line: String, ed: String) : String {
 }
 
 # After a `--write` the package IS in the target edition: record it, so a second run is a no-op.
-fn promote(src: String, ed: String) : Unit / Stderr + File + Ffi {
-  let dir = manifest_of(src)
-  if dir != "" {
-    let manifest = "#{dir}/kai.toml"
-    let text = cli_fs.read_or_empty(manifest)
-    let stamped = string.join(string.split(text, "\n") | (l => stamp(l, ed)), "\n")
-    if stamped != text { let _ = file.write(manifest, stamped) }
-    Stderr.eprint("kai: #{manifest} now declares edition = \"#{ed}\"")
-  }
+# Only once every file is rewritten: the stamp changes how the package's remaining files resolve.
+fn promote(dir: String, ed: String) : Unit / Stderr + File + Ffi {
+  let manifest = "#{dir}/kai.toml"
+  let text = cli_fs.read_or_empty(manifest)
+  let stamped = string.join(string.split(text, "\n") | (l => stamp(l, ed)), "\n")
+  if stamped != text { let _ = file.write(manifest, stamped) }
+  Stderr.eprint("kai: #{manifest} now declares edition = \"#{ed}\"")
 }
 
-fn rewrite(t: Toolchain, src: String, o: MigrateOpts, from: String, tmp: String) : Result[
-  Int,
-  Int
-] / Stderr + File + Ffi {
-  let out = "#{tmp}/out.kai"
+type Outcome = Produced | Skipped | Failed
+
+type Job = { idx: Int, src: String }
+
+type Batch = { ready: [Job], status: Int }
+
+fn target_edition(o: MigrateOpts) : String = if o.to == "" { "orongo" } else { o.to }
+
+fn source_edition(t: Toolchain, src: String, o: MigrateOpts) : String / File + Ffi =
+  if o.from == "" { package_edition(t.layout, src) } else { o.from }
+
+fn migrates(t: Toolchain, src: String, o: MigrateOpts) : Bool / File + Ffi {
+  let from = source_edition(t, src, o)
+  (from == "tongariki" or from == "hanga-roa") and target_edition(o) == "orongo"
+}
+
+fn out_of(tmp: String, idx: Int) : String = "#{tmp}/m#{idx}.kai"
+
+fn compile(t: Toolchain, src: String, from: String, out: String) : Outcome / Stderr + File + Ffi {
   let argv = [
     t.layout.kaic2,
     "--path",
@@ -116,51 +121,129 @@ fn rewrite(t: Toolchain, src: String, o: MigrateOpts, from: String, tmp: String)
   ]
   if cli_proc.run(argv, cli_proc.Spawn { ...cli_proc.inherit(), out: out }) != 0 {
     cli_sys.copy_to_stderr(out)
-    Ok(1)
-  } else if not o.write {
+    Failed
+  } else {
+    Produced
+  }
+}
+
+fn produce(t: Toolchain, job: Job, o: MigrateOpts, tmp: String) : Outcome / Stderr + File + Ffi {
+  let from = source_edition(t, job.src, o)
+  if migrates(t, job.src, o) {
+    compile(t, job.src, from, out_of(tmp, job.idx))
+  } else if o.from_explicit {
+    Stderr.eprint("kai: error: no migration rules for #{from} -> #{target_edition(o)}")
+    Stderr.eprint("  supported migrations: tongariki -> orongo, hanga-roa -> orongo")
+    Failed
+  } else {
+    Stderr.eprint("migrate: already at edition #{from}; no rules apply")
+    Skipped
+  }
+}
+
+# Every file is migrated before any is written: a rewrite must not change how a later file resolves.
+fn produce_all(
+  t: Toolchain,
+  o: MigrateOpts,
+  tmp: String,
+  files: [String],
+  idx: Int,
+  b: Batch
+) : Batch / Stderr + File + Ffi =
+  match files {
+    [] -> b
+    [src, ...rest] -> {
+      let job = Job { idx: idx, src: src }
+      let next = match produce(t, job, o, tmp) {
+        Produced -> Batch { ...b, ready: b.ready ++ [job] }
+        Skipped -> b
+        Failed -> Batch { ...b, status: 1 }
+      }
+      produce_all(t, o, tmp, rest, idx + 1, next)
+    }
+  }
+
+fn emit(
+  job: Job,
+  o: MigrateOpts,
+  tmp: String,
+  status: Int
+) : Result[Int, Int] / Stdout + File + Ffi {
+  let out = out_of(tmp, job.idx)
+  if not o.write {
+    if o.headed { Stdout.print("# kai migrate: #{job.src}") }
     cli_sys.copy_to_stdout(out)
-    Ok(0)
   } else {
     let migrated = cli_fs.read_or_empty(out)
-    let same = match file.read(src) {
+    let same = match file.read(job.src) {
       Ok(s) -> s == migrated
       Err(_) -> false
     }
-    if not same { let _ = file.write(src, migrated) }
-    promote(src, o.to)
-    Ok(0)
+    if not same { let _ = file.write(job.src, migrated) }
   }
+  Ok(status)
 }
 
-fn migrate(t: Toolchain, o: MigrateOpts, tmp: String) : Result[Int, Int] / Stderr + File + Ffi {
-  let src = source(o.spec)!
-  if src == "" {
-    cli_err.die("missing input file (see 'kai migrate --help')")
-  } else if not cli_sys.is_file(src) {
-    cli_compile.not_found(src, "migrate")
+fn promoted(dir: String, ed: String, status: Int) : Result[Int, Int] / Stderr + File + Ffi {
+  promote(dir, ed)
+  Ok(status)
+}
+
+# A directory is a package: every file it owns, as `<dir>/<member>`.
+fn files_of(spec: String) : Result[[String], Int] / Stderr + File + Ffi =
+  if spec == "." {
+    cli_paths.members(".", "migrate")
+  } else if cli_sys.is_dir(spec) {
+    let dir = cli_paths.sub_package_dir(spec)!
+    Ok((cli_paths.members(dir, "migrate")!) | (rel => "#{dir}/#{rel}"))
   } else {
-    let to = if o.to == "" { "orongo" } else { o.to }
-    let from = if o.from == "" { package_edition(t.layout, src) } else { o.from }
-    if (from == "tongariki" or from == "hanga-roa") and to == "orongo" {
-      rewrite(t, src, MigrateOpts { ...o, to: to }, from, tmp)
-    } else if o.from_explicit {
-      Stderr.eprint("kai: error: no migration rules for #{from} -> #{to}")
-      Stderr.eprint("  supported migrations: tongariki -> orongo, hanga-roa -> orongo")
-      Err(1)
-    } else {
-      Stderr.eprint("migrate: already at edition #{from}; no rules apply")
-      Ok(0)
+    Ok([spec])
+  }
+
+fn expand(specs: [String]) : Result[[String], Int] / Stderr + File + Ffi =
+  match specs {
+    [] -> Ok([])
+    [s, ...rest] -> {
+      let here = files_of(s)!
+      Ok(here ++ (expand(rest)!))
     }
   }
+
+# Every path is checked before the first rewrite; a failing file does not stop the rest.
+fn migrate(
+  t: Toolchain,
+  o: MigrateOpts,
+  tmp: String
+) : Result[Int, Int] / Stdout + Stderr + File + Ffi {
+  let specs = cli_paths.sorted_unique(if list.is_empty(o.specs) { ["."] } else { o.specs })
+  let _ = cli_paths.require_all(specs, "migrate")!
+  let files = cli_paths.sorted_unique(expand(specs)!)
+  let o2 = MigrateOpts { ...o, headed: list.length(files) > 1 }
+  let b = produce_all(t, o2, tmp, files, 0, Batch { ready: [], status: 0 })
+  let _ = cli_blocks.fold_files(b.ready, 0, (j, st) => emit(j, o2, tmp, st))!
+  if o.write and b.status == 0 {
+    let dirs = cli_paths.sorted_unique(b.ready | (j => manifest_of(j.src)) |? (d => d != ""))
+    cli_blocks.fold_files(dirs, 0, (d, st) => promoted(d, target_edition(o), st))
+  } else {
+    Ok(b.status)
+  }
 }
 
-#[doc("`kai migrate [--from <ed>] [--to <ed>] [--write] [<spec>]`: the migrated source, or a rewrite in place.")]
+#[doc("`kai migrate [--from <ed>] [--to <ed>] [--write] [<path>...]`: the migrated source, or a rewrite in place.")]
 pub fn migrate_verb(
   t: Toolchain,
   args: [String]
 ) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
   let none =
-    MigrateOpts { spec: "", from: "", from_explicit: false, to: "", write: false, help: false }
+    MigrateOpts {
+      specs: [],
+      from: "",
+      from_explicit: false,
+      to: "",
+      write: false,
+      headed: false,
+      help: false
+    }
   let o = parse(args, none)!
   if o.help {
     Stdout.print(cli_tool_help.migrate_text())

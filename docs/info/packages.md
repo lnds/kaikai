@@ -21,7 +21,7 @@ kai install <spec> [--force]      # build a package, install its binary
 kai install --list                # what this prefix has installed
 kai update [<name>]               # refresh deps
 kai show                          # dump parsed manifest
-kai migrate [<file>] [--write]    # migrate source across an edition bump
+kai migrate [<path>...] [--write]   # migrate source across an edition bump
 ```
 
 `kai install <spec>` is the `cargo install` / `go install`
@@ -163,6 +163,7 @@ parse.
 kai migrate src/main.kai            # dry-run: print migrated source, write nothing
 kai migrate --write src/main.kai    # apply the rewrite in place
 kai migrate --from hanga-roa --to orongo src/main.kai
+kai migrate --write a.kai b.kai pkg # several files and package directories
 ```
 
 - **Dry-run by default** — prints the migrated source to stdout and
