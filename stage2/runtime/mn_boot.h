@@ -164,8 +164,19 @@ KAI_SCHED_FN void *kai_native_stack_call(void *fn, void **args)
 
 
 #if defined(KAI_MAIN_STACK_SIZE)
+#if defined(KAI_ASAN_FIBERS)
+static const void *kai_main_host_bottom;
+static size_t kai_main_host_size;
+#endif
+
 static void kai_sized_main_trampoline(void) {
+#if defined(KAI_ASAN_FIBERS)
+    __sanitizer_finish_switch_fiber(NULL, &kai_main_host_bottom, &kai_main_host_size);
+#endif
     kai_user_main_result = kai_main_runs(kai_user_main_fn);
+#if defined(KAI_ASAN_FIBERS)
+    __sanitizer_start_switch_fiber(NULL, kai_main_host_bottom, kai_main_host_size);
+#endif
 }
 
 /* One thread, main on a stack of KAI_MAIN_STACK_SIZE instead of the OS
@@ -192,7 +203,14 @@ static KaiValue *kai_run_main_on_sized_stack(KaiValue *(*user_main)(void)) {
     kai_ctx_set_stack(&ctx, (char *) region + ps, size);
     ctx.uc_link = &host;
     makecontext(&ctx, kai_sized_main_trampoline, 0);
+#if defined(KAI_ASAN_FIBERS)
+    void *asan_fake = NULL;
+    __sanitizer_start_switch_fiber(&asan_fake, (char *) region + ps, size);
+#endif
     swapcontext(&host, &ctx);
+#if defined(KAI_ASAN_FIBERS)
+    __sanitizer_finish_switch_fiber(asan_fake, NULL, NULL);
+#endif
     root->stack_base = NULL;
     root->stack_size = 0;
     kai_stack_unmap(region, size);
