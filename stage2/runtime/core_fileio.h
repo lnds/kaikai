@@ -18,9 +18,7 @@
  * which segfault on a tagged 0x1. String args stay `->tag == KAI_STR`:
  * a String is always a heap pointer, never a tagged Int. */
 
-/* Build a FileHandle record `{ fd }`. Field-name string matches the
- * kaikai-side `type FileHandle = { fd: Int }` decl
- * (builtin_filehandle_decl) — kai_op_field reads by strcmp. */
+/* Build a FileHandle record `{ fd }`; the field order is in record_layout.h. */
 static KaiValue *_kai_file_make_handle(int fd) {
     KaiValue *fd_kv = kai_int((int64_t) fd);
     KaiValue *fields[1] = { fd_kv };
@@ -33,14 +31,9 @@ static KaiValue *_kai_file_make_handle(int fd) {
  * which stage2 boxes tagged — read it with kai_is_int / kai_intf. */
 static int _kai_file_handle_fd(KaiValue *v) {
     if (!kai_is_ptr(v) || v->tag != KAI_RECORD) return -1;
-    for (int i = 0; i < v->as.rec.n_fields; ++i) {
-        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "fd") == 0) {
-            KaiValue *f = v->as.rec.fields[i];
-            if (!kai_is_int(f)) return -1;
-            return (int) kai_intf(f);
-        }
-    }
-    return -1;
+    KaiValue *f = v->as.rec.fields[KAI_SLOT_FILEHANDLE_FD];
+    if (!kai_is_int(f)) return -1;
+    return (int) kai_intf(f);
 }
 
 static KaiValue *_kai_file_err(const char *msg) {

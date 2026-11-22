@@ -551,50 +551,28 @@ static KAI_RC_NOINLINE KaiValue *kai_tail_apply(KaiValue *clo, int argc, KaiValu
 
 /* ---------- field access helpers ---------- */
 
-static KaiValue *kai_op_field(KaiValue *rec, const char *name) {
-    if (!rec || rec->tag != KAI_RECORD) {
-        kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
-    }
-    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
-        if (strcmp(rec->as.rec.names[i], name) == 0) {
-            return kai_incref(rec->as.rec.fields[i]);
-        }
-    }
-    kai_eprintf("kai: no such field `%s`\n", name); kai_exit(1);
-}
-
 /* Field read for an arm that owns its record: a unique cell hands the field
    over and keeps the unit immediate in its slot, so the binder is the sole
-   owner and a write through it is in place; a shared cell increfs as
-   kai_op_field does. Only an unguarded arm may use it, since a rejected arm
-   would find the slot emptied. */
-static KaiValue *kai_op_field_take(KaiValue *rec, const char *name) {
+   owner and a write through it is in place; a shared cell increfs. Only an
+   unguarded arm may use it, since a rejected arm would find the slot
+   emptied. */
+static KaiValue *kai_op_field_take_at(KaiValue *rec, int i) {
     if (!rec || rec->tag != KAI_RECORD) {
         kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
     }
-    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
-        if (strcmp(rec->as.rec.names[i], name) == 0) {
-            KaiValue *f = rec->as.rec.fields[i];
-            if (kai_check_unique(rec)) { rec->as.rec.fields[i] = kai_unit(); return f; }
-            return kai_incref(f);
-        }
-    }
-    kai_eprintf("kai: no such field `%s`\n", name); kai_exit(1);
+    KaiValue *f = rec->as.rec.fields[i];
+    if (kai_check_unique(rec)) { rec->as.rec.fields[i] = kai_unit(); return f; }
+    return kai_incref(f);
 }
 
 /* After a guard passed: when the cell is held only by its owner, its own
    reference to a field the arm binds moves to that binder, the slot left
    unit. The binder's reference to the same value stays. */
-static void kai_op_field_untake(KaiValue *rec, const char *name) {
+static void kai_op_field_untake_at(KaiValue *rec, int i) {
     if (!kai_check_unique(rec) || rec->tag != KAI_RECORD) return;
-    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
-        if (strcmp(rec->as.rec.names[i], name) == 0) {
-            KaiValue *old = rec->as.rec.fields[i];
-            rec->as.rec.fields[i] = kai_unit();
-            kai_decref(old);
-            return;
-        }
-    }
+    KaiValue *old = rec->as.rec.fields[i];
+    rec->as.rec.fields[i] = kai_unit();
+    kai_decref(old);
 }
 
 /* Field read of a dup'd base at slot `i`: when the base is held only by its
@@ -615,10 +593,9 @@ static inline KaiValue *kai_op_field_take_dup_at(KaiValue *rec, int i) {
     return f;
 }
 
-/* Constant-index field read. Same RC contract as kai_op_field (increfs the
-   read field) but skips the strcmp: the emitter computes the slot from the
-   static record type when known, relying on the desugar-canonicalised
-   declaration-order layout. */
+/* Constant-index field read, increfing the field. The slot is the field's
+   position in its record's declaration; the emitter computes it from the
+   record's declared layout. */
 static KaiValue *kai_op_field_at(KaiValue *rec, int i) {
     if (!rec || rec->tag != KAI_RECORD) {
         kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
@@ -626,23 +603,13 @@ static KaiValue *kai_op_field_at(KaiValue *rec, int i) {
     return kai_incref(rec->as.rec.fields[i]);
 }
 
-/* m5.x §4b sibling: borrow the field without incref. Used in pat_test
-   paths where the caller only reads the field's tag / value to decide
-   the arm match — no downstream consumer that would need an owned ref.
-   Pre-fix every pat_test of a record-shaped pattern leaked one ref per
-   field tested (kai_op_field always increfed; the test result was
-   discarded). emit_pat_binds keeps using the incref-ing kai_op_field so
-   bindings still own their own refs. */
-static KaiValue *kai_op_field_borrow(KaiValue *rec, const char *name) {
+/* Borrow the field at slot `i` without incref, for pattern tests that only
+   read the field to decide the arm: a failing arm leaks no reference. */
+static KaiValue *kai_op_field_borrow_at(KaiValue *rec, int i) {
     if (!rec || rec->tag != KAI_RECORD) {
         kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
     }
-    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
-        if (strcmp(rec->as.rec.names[i], name) == 0) {
-            return rec->as.rec.fields[i];
-        }
-    }
-    kai_eprintf("kai: no such field `%s`\n", name); kai_exit(1);
+    return rec->as.rec.fields[i];
 }
 
 /* ---------- equality ---------- */

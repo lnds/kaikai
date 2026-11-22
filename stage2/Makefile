@@ -245,7 +245,7 @@ LINK_SH := ../tools/kaic-link.sh
 HOP_OPT := $(if $(filter aarch64,$(shell uname -m)),-O1,-O0)
 CFLAGS_HOP := $(filter-out -O2 -O1 -g,$(CFLAGS)) $(HOP_OPT)
 boot-hop:
-	CC='$(CC)' LDLIBS='$(LDLIBS_M)' $(LINK_SH) $(HOP_C) $(HOP_BIN) $(CFLAGS_HOP) $(COMPILER_DEFS) $(if $(HOP_INC),-I $(HOP_INC),$(CPPFLAGS_CORE) -I ../stage0) $(KAI_MAIN_STACK)
+	CC='$(CC)' LDLIBS='$(LDLIBS_M)' $(LINK_SH) $(HOP_C) $(HOP_BIN) $(CFLAGS_HOP) $(COMPILER_DEFS) $(if $(HOP_INC),-I $(HOP_INC),$(CPPFLAGS_CORE) -I ../stage0) $(KAI_MAIN_STACK) $(HOP_COMPAT)
 
 # Announce which backend capability got compiled in, so a dev never has
 # to guess why `kai build` behaves differently across two checkouts (the
@@ -256,7 +256,7 @@ ifeq ($(KAI_LLVM),1)
 else
 	@echo "building stage2: C-only$(if $(KAI_LLVM_AUTO), (no $(LLVM_CONFIG) in PATH; run make KAI_LLVM=1 for native),)"
 endif
-	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS) $(CPPFLAGS_CORE) $(COMPILER_DEFS) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0
+	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS) $(CPPFLAGS_CORE) $(COMPILER_DEFS) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0 $(shell $(BOOT_SH) compat-flags $<)
 	@if [ -f $(STAGE2_ID) ]; then $(BOOT_SH) seal $< $@; else rm -f build/$@.id; fi
 ifeq ($(KAI_LLVM),1)
 	@# Linking libLLVM does not prove native works: a kaic2 compiled by kaic2
@@ -286,7 +286,7 @@ endif
 # is for the edit-check loop only, never for CI or the selfhost oracle.
 CFLAGS_DEV := $(filter-out -O2 -O1,$(CFLAGS)) -O0
 kaic2-dev: build/stage2.c $(RUNTIME_H)
-	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS_DEV) $(CPPFLAGS_CORE) $(COMPILER_DEFS) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0
+	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS_DEV) $(CPPFLAGS_CORE) $(COMPILER_DEFS) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0 $(shell $(BOOT_SH) compat-flags $<)
 	@echo "kaic2-dev OK (-O0; edit-loop binary, not for CI/selfhost)"
 
 # --- Dev fast rebuild: modular self-compile ---------------------------

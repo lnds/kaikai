@@ -280,6 +280,21 @@ run_boot() {
   fi
 }
 
+# Boots older than the constant-slot field codegen emit by-name reads: the C
+# they emit needs the compat header, and only that C.
+boot_needs_compat() {
+  case "$1" in
+    "release kaikai-v"*|"seed bootstrap-seed-v"*)
+      ver="${1#*-v}"; ver="${ver%%[- ]*}"
+      case "$ver" in 0.[0-9].*|0.[0-9][0-9].*|0.1[0-8][0-9].*|0.19[0-6].*) return 0 ;; esac
+      return 1 ;;
+    "path "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+COMPAT_DEF=-DKAI_BOOT_COMPAT_FIELD_BY_NAME
+
 hops() { if [ "$1" = kaic2 ]; then echo "${KAIC_BOOT_HOPS:-2}"; else echo 1; fi; }
 
 # emit_to <out.c>: run BOOT_BIN, replacing <out.c> only on success.
@@ -294,7 +309,9 @@ hop_a() {
   say "boot $BOOT_ID -> $dir/stage2-a.c"
   emit_to "$dir/stage2-a.c"
   say "cc $dir/stage2-a.c -> $dir/kaic2-a"
-  "${MAKE:-make}" -s -C "$STAGE2" boot-hop HOP_C="$dir/stage2-a.c" HOP_BIN="$dir/kaic2-a" >&2
+  compat=""
+  ! boot_needs_compat "$BOOT_ID" || compat="$COMPAT_DEF"
+  "${MAKE:-make}" -s -C "$STAGE2" boot-hop HOP_C="$dir/stage2-a.c" HOP_BIN="$dir/kaic2-a" HOP_COMPAT="$compat" >&2
   BOOT_BIN="$dir/kaic2-a"
   say "kaic2-a -> $1"
 }
@@ -372,6 +389,15 @@ cmd_seal() {
   fi
 }
 
+# The flags the C of <out.c> is compiled with beyond the tree's own: the
+# compat define when the boot's own codegen emitted it (one hop) and is old.
+cmd_compat_flags() {
+  rec="$1.id"
+  [ -f "$rec" ] || return 0
+  [ "$(field hops "$rec")" = 1 ] || return 0
+  ! boot_needs_compat "$(field boot "$rec")" || echo "$COMPAT_DEF"
+}
+
 # Identifies the release boot without downloading it, for a cache key.
 cmd_release_id() {
   plat="$(boot_platform)" || die "no release tarball for $(uname -s)-$(uname -m)"
@@ -390,6 +416,7 @@ case "${1:-}" in
   emit)  [ $# -eq 2 ] || die "usage: kaic-boot.sh emit <out.c>";        cmd_emit "$2" ;;
   fresh) [ $# -eq 2 ] || die "usage: kaic-boot.sh fresh <out.c>";       cmd_fresh "$2" ;;
   seal)  [ $# -eq 3 ] || die "usage: kaic-boot.sh seal <out.c> <bin>";  cmd_seal "$2" "$3" ;;
+  compat-flags) [ $# -eq 2 ] || die "usage: kaic-boot.sh compat-flags <out.c>"; cmd_compat_flags "$2" ;;
   release-id) [ $# -eq 1 ] || die "usage: kaic-boot.sh release-id";     cmd_release_id ;;
   *)     die "usage: kaic-boot.sh emit|fresh|seal|release-id ..." ;;
 esac

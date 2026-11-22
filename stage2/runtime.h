@@ -60,6 +60,7 @@
 #define KAI_RUNTIME_H
 #include "runtime/host.h"
 #include "runtime/types.h"
+#include "runtime/record_layout.h"
 #include "runtime/rc_trace.h"
 #include "runtime/heap.h"
 #include "runtime/alloc.h"
@@ -68,6 +69,9 @@
 #include "runtime/ranges.h"
 #include "runtime/perceus_vec.h"
 #include "runtime/vec_ops.h"
+#ifdef KAI_BOOT_COMPAT_FIELD_BY_NAME
+#include "boot_compat/field_by_name.h"
+#endif
 #include "runtime/core_basic.h"
 #include "runtime/core_collections.h"
 #include "runtime/core_ops_io.h"

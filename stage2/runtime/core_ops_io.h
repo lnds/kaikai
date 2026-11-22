@@ -7,7 +7,7 @@
  * decrefs `a` and `b` separately, but the read-then-decref ordering means
  * both reads complete on a still-alive value. This pairs with the dup
  * pass + exit drops + producer-side incref-on-extract (Steps A + B) so
- * every value is released exactly once. NOT flipped: `kai_op_field` (already
+ * every value is released exactly once. NOT flipped: `kai_op_field_at` (already
  * increfs its return; introspection rather than consumer), `kai_op_eq` (C-int
  * returning, used inside non-consuming match tests), `kai_apply` (closure
  * invocation; lifecycle managed at the call lowering).
