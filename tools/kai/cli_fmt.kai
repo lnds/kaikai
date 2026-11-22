@@ -12,7 +12,7 @@ import cli_toolchain
 import cli_tool_help
 import fs.file as fio
 
-type FmtOpts = { spec: String, check_only: Bool, stdin: Bool, width: String, help: Bool }
+type FmtOpts = { specs: [String], check_only: Bool, stdin: Bool, width: String, help: Bool }
 
 fn parse(args: [String], o: FmtOpts) : Result[FmtOpts, Int] / Stderr =
   match args {
@@ -27,11 +27,7 @@ fn parse(args: [String], o: FmtOpts) : Result[FmtOpts, Int] / Stderr =
     [a, ..._] if string.starts_with(a, "-") ->
       cli_err.die("unknown flag: #{a} (see 'kai fmt --help')")
     [a, ...rest] ->
-      if o.spec != "" {
-        cli_err.die("only one input file supported")
-      } else {
-        parse(rest, FmtOpts { ...o, spec: a })
-      }
+      parse(rest, FmtOpts { ...o, specs: o.specs ++ [a] })
   }
 
 # The width a file under `dir` is laid out against: the flag, else its package's `[fmt]` width, else 100.
@@ -82,6 +78,7 @@ fn package_file(
   width: String,
   listing: Bool,
   tmp: String,
+  label: String,
   rel: String,
   status: Int
 ) : Result[Int, Int] / Stdout + Stderr + File + Ffi {
@@ -90,12 +87,12 @@ fn package_file(
     match unformatted(t, file, width, tmp) {
       None -> Ok(status)
       Some(named) -> {
-        if named { Stdout.print(rel) }
+        if named { Stdout.print("#{label}#{rel}") }
         Ok(1)
       }
     }
   } else {
-    Stderr.eprint("kai: fmt #{rel}")
+    Stderr.eprint("kai: fmt #{label}#{rel}")
     Ok(if rewrite(t, file, width, tmp) { status } else { 1 })
   }
 }
@@ -104,6 +101,7 @@ fn package_file(
 fn package(
   t: Toolchain,
   dir: String,
+  label: String,
   o: FmtOpts,
   tmp: String
 ) : Result[Int, Int] / Stdout + Stderr + File + Ffi {
@@ -118,40 +116,43 @@ fn package(
     cli_blocks.fold_files(
       files,
       0,
-      (rel, st) => package_file(t, root, width, o.check_only, tmp, rel, st)
+      (rel, st) => package_file(t, root, width, o.check_only, tmp, label, rel, st)
     )
   }
 }
 
 fn sub_package(
   t: Toolchain,
+  spec: String,
+  label: String,
   o: FmtOpts,
   tmp: String
 ) : Result[Int, Int] / Stdout + Stderr + File + Ffi {
-  let dir = string.drop_suffix(o.spec, "/") ?? o.spec
+  let dir = string.drop_suffix(spec, "/") ?? spec
   if not cli_sys.is_file("#{dir}/kai.toml") {
-    cli_err.die("#{o.spec} has no kai.toml — sub-packages must declare their own manifest")
+    cli_err.die("#{spec} has no kai.toml — sub-packages must declare their own manifest")
   } else {
-    package(t, dir, o, tmp)
+    package(t, dir, label, o, tmp)
   }
 }
 
 fn one_file(
   t: Toolchain,
+  spec: String,
   o: FmtOpts,
   tmp: String
 ) : Result[Int, Int] / Stdout + Stderr + File + Ffi =
-  if not cli_sys.is_file(o.spec) {
-    cli_compile.not_found(o.spec, "fmt")
+  if not cli_sys.is_file(spec) {
+    cli_compile.not_found(spec, "fmt")
   } else {
-    let width = width_for(cli_fs.dir_of(o.spec) ?? "", o.width)
+    let width = width_for(cli_fs.dir_of(spec) ?? "", o.width)
     if not o.check_only {
-      Ok(if rewrite(t, o.spec, width, tmp) { 0 } else { 1 })
+      Ok(if rewrite(t, spec, width, tmp) { 0 } else { 1 })
     } else {
-      match unformatted(t, o.spec, width, tmp) {
+      match unformatted(t, spec, width, tmp) {
         None -> Ok(0)
         Some(named) -> {
-          if named { Stdout.print(o.spec) }
+          if named { Stdout.print(spec) }
           Ok(1)
         }
       }
@@ -160,7 +161,7 @@ fn one_file(
 
 # Under `--check` the verdict is the exit status alone: stdin has no name to list.
 fn from_stdin(t: Toolchain, o: FmtOpts, tmp: String) : Result[Int, Int] / Stderr + File + Ffi =
-  if o.spec != "" {
+  if not list.is_empty(o.specs) {
     cli_err.die("--stdin takes no file argument")
   } else {
     let src = "#{tmp}/in.kai"
@@ -173,26 +174,62 @@ fn from_stdin(t: Toolchain, o: FmtOpts, tmp: String) : Result[Int, Int] / Stderr
     }
   }
 
+fn target(
+  t: Toolchain,
+  o: FmtOpts,
+  tmp: String,
+  spec: String,
+  named: Bool,
+  status: Int
+) : Result[Int, Int] / Stdout + Stderr + File + Ffi {
+  let r =
+    if spec == "." {
+      package(t, ".", "", o, tmp)!
+    } else if cli_sys.is_dir(spec) {
+      let dir = string.drop_suffix(spec, "/") ?? spec
+      sub_package(t, spec, if named { "#{dir}/" } else { "" }, o, tmp)!
+    } else {
+      one_file(t, spec, o, tmp)!
+    }
+  Ok(if r != 0 { 1 } else { status })
+}
+
+fn dedup_sorted(xs: [String]) : [String] =
+  match xs {
+    [a, b, ...rest] if a == b -> dedup_sorted([b] ++ rest)
+    [a, ...rest] -> [a] ++ dedup_sorted(rest)
+    [] -> []
+  }
+
+fn missing(spec: String, status: Int) : Result[Int, Int] / Stderr + Ffi =
+  if cli_sys.is_dir(spec) or cli_sys.is_file(spec) {
+    Ok(status)
+  } else {
+    cli_compile.not_found(spec, "fmt")
+  }
+
+# Every path is checked before the first rewrite, so a typo never leaves a half-formatted run.
 fn format(t: Toolchain, o: FmtOpts, tmp: String) : Result[Int, Int] / Stdout + Stderr + File + Ffi =
   if o.stdin {
     from_stdin(t, o, tmp)
-  } else if o.spec == "" or o.spec == "." {
-    package(t, ".", o, tmp)
-  } else if cli_sys.is_dir(o.spec) {
-    sub_package(t, o, tmp)
+  } else if list.is_empty(o.specs) {
+    package(t, ".", "", o, tmp)
   } else {
-    one_file(t, o, tmp)
+    let specs = dedup_sorted(list.sort(o.specs))
+    let _ = cli_blocks.fold_files(specs, 0, (s, st) => missing(s, st))!
+    let named = list.length(specs) > 1
+    cli_blocks.fold_files(specs, 0, (s, st) => target(t, o, tmp, s, named, st))
   }
 
 fn digits(s: String) : Bool = string.chars(s) |> list.all(c => char.is_digit(c))
 
-#[doc("`kai fmt [--width N] [--check | --stdin] [<spec>]`: 1 when a checked file is unformatted or a rewrite fails.")]
+#[doc("`kai fmt [--width N] [--check | --stdin] [<path>...]`: 1 when a checked file is unformatted or a rewrite fails.")]
 pub fn fmt_verb(
   t: Toolchain,
   args: [String]
 ) : Result[Int, Int] / Stdout + Stderr + Env + File + Ffi {
   let o =
-    parse(args, FmtOpts { spec: "", check_only: false, stdin: false, width: "", help: false })!
+    parse(args, FmtOpts { specs: [], check_only: false, stdin: false, width: "", help: false })!
   if o.help {
     Stdout.print(cli_tool_help.fmt_text())
     Ok(0)
