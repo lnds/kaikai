@@ -821,7 +821,7 @@ static int _kai_net_sockaddr_host(KaiValue *v, char *out, size_t cap) {
     if (cap == 0 || !f || f->tag != KAI_STR) return -1;
     size_t n = f->as.s.len < cap - 1 ? f->as.s.len : cap - 1;
     memcpy(out, f->as.s.bytes, n);
-    out[n] = '0';
+    out[n] = '\0';
     return 0;
 }
 
