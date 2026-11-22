@@ -819,51 +819,26 @@ static void kai_pin_undo(KaiPinLog *log) {
     for (size_t i = log->n; i-- > 0;) log->items[i].node->rc = log->items[i].rc;
 }
 
-#define KAI_CONST_SLOTS 16384u
-
-typedef struct { _Atomic uintptr_t key; _Atomic(KaiValue *) value; } KaiConstSlot;
-static KaiConstSlot kai_const_slots[KAI_CONST_SLOTS];
-
-/* The slot of the initialiser `key`: a probe from its hash, claimed by the
- * first reader. */
-static KaiConstSlot *kai_const_slot(uintptr_t key) {
-    size_t i = (size_t) (((uint64_t) key >> 3) * 0x9E3779B97F4A7C15ull >> 50);
-    for (unsigned n = 0; n < KAI_CONST_SLOTS; n++, i = (i + 1) & (KAI_CONST_SLOTS - 1)) {
-        KaiConstSlot *s = &kai_const_slots[i];
-        uintptr_t k = 0;
-        if (atomic_compare_exchange_strong_explicit(&s->key, &k, key, memory_order_acq_rel,
-                                                    memory_order_acquire) || k == key)
-            return s;
-    }
-    kai_eprintf("kai: too many constants\n");
-    kai_exit(1);
-    return NULL;
-}
-
 /* The value the initialiser `init` builds, built once for the whole program:
- * the first read runs it, every later read returns the same immortal value.
- * No lock is held while `init` runs, so an initialiser may read other
- * constants; readers racing the first one each build a value and the loser's
- * is released. Consumes `init`. */
-static KaiValue *kai_core_const_once(KaiValue *init) {
-    KaiConstSlot *s = kai_const_slot((uintptr_t) init->as.clo.fn);
-    KaiValue *v = atomic_load_explicit(&s->value, memory_order_acquire);
-    if (v == NULL) {
-        v = kai_apply_borrow(init, 0, NULL);
-        KaiPinLog log = { NULL, 0, 0 };
-        kai_pin_walk(v, &log);
-        KaiValue *none = NULL;
-        if (atomic_compare_exchange_strong_explicit(&s->value, &none, v, memory_order_acq_rel,
-                                                    memory_order_acquire)) {
-            kai_rc_count_live_sub((int64_t) log.n);
-        } else {
-            kai_pin_undo(&log);
-            kai_decref(v);
-            v = none;
-        }
-        free(log.items);
+ * the first read runs it and publishes the result through `slot`, every
+ * later read returns that immortal value. No lock is held while `init`
+ * runs, so an initialiser may read other constants; readers racing the first
+ * one each build a value and the loser's is released. `init` is borrowed. */
+static KaiValue *kai_const_once(KaiValue **slot, KaiValue *init) {
+    KaiValue *v = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+    if (v != NULL) return v;
+    v = kai_apply_borrow(init, 0, NULL);
+    KaiPinLog log = { NULL, 0, 0 };
+    kai_pin_walk(v, &log);
+    KaiValue *none = NULL;
+    if (__atomic_compare_exchange_n(slot, &none, v, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        kai_rc_count_live_sub((int64_t) log.n);
+    } else {
+        kai_pin_undo(&log);
+        kai_decref(v);
+        v = none;
     }
-    kai_decref(init);
+    free(log.items);
     return v;
 }
 
