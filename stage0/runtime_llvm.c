@@ -584,7 +584,7 @@ KAIX_CORE_THUNK2(mailbox_assign_owner)
 KAIX_CORE_THUNK2(spawn_actor_fiber)
 
 /* ---------- M3d: variants + match ---------- */
-static __attribute__((noinline)) KaiValue *kaix_variant_interned(int32_t tag, const char *name, int32_t n, KaiValue **args) {
+KaiValue *kaix_variant_interned(int32_t tag, const char *name, int32_t n, KaiValue **args) {
     KaiVarSlot slots[KAI_IMMORTAL_VAR_MAXN];
     for (int i = 0; i < n; i++) slots[i].ptr = args[i];
     return kai_variant_u(tag, name, n, 0, slots);
