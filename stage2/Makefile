@@ -11320,6 +11320,9 @@ test-native-pkg-native: $(TARGET) bin-kai
 test-intra-pkg-cycles: $(TARGET) bin-kai
 	@../tests/intra_pkg_cycles.sh
 
+test-qualified-op-test: $(TARGET) bin-kai
+	@../tests/qualified_op_test.sh
+
 # `pub(pkg)` reaches the modules of the declaring package, its tests included, and no other.
 test-pub-pkg: $(TARGET) bin-kai
 	@../tests/pub_pkg.sh
