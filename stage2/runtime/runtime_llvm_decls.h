@@ -611,8 +611,9 @@ static inline KaiValue *kaix_variant_at_argv(int32_t tag, const char *name, int 
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_at_argv_i64(int32_t tag, const char *name, int n, KaiVarSlot *slots);
 static inline KaiValue *kaix_variant_at_argv_k(int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_at_masked(KaiReuse at, int32_t tag, const char *name, int n, int32_t mask, KaiVarSlot *slots);
+static inline KaiValue *kaix_variant_fresh(int32_t tag, const char *name, int32_t n, KaiValue **args);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_fresh_at(KaiReuse at, int32_t tag, int32_t n, KaiVarSlot *slots);
-static inline KaiValue *kaix_variant_interned(int32_t tag, const char *name, int32_t n, KaiValue **args);
+static inline __attribute__((noinline)) KaiValue *kaix_variant_interned(int32_t tag, const char *name, int32_t n, KaiValue **args);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_masked(int32_t tag, const char *name, int32_t n, KaiVarSlot *slots);
 static inline KaiValue *kaix_variant_reuse_at(KaiValue *scr, int32_t tag, const char *name, int n, KaiValue **args);
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_reuse_at_i64(KaiValue *scr, int32_t tag, const char *name, int n, KaiVarSlot *slots);
@@ -1056,25 +1057,17 @@ static inline KaiValue *kaix_variant(int32_t tag, const char *name, int32_t n, K
      * means "all slots boxed", which is what the legacy boxed path
      * always emitted. */
     if (n <= 0) return kai_variant_u(tag, name, 0, 0, NULL);
-    /* A slot that cannot be interned (a scalar box, a heap cell) rules out
-     * the immortal-args cache, so the cell is built straight from `args`. */
-    if (n == 1 && !kai_slot_internable(args[0])) {
-        KaiValue *v = kai_alloc_var_nz(1);
-        v->variant_tag = tag;
-        v->var_n_args = 1;
-        kai_var_slots(v)[0].ptr = args[0];
-        return v;
+    KaiVarSlot stack_slots[16];
+    KaiVarSlot *slots = stack_slots;
+    KaiVarSlot *heap = NULL;
+    if (n > (int)(sizeof(stack_slots) / sizeof(stack_slots[0]))) {
+        heap = (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
+        slots = heap;
     }
-    int internable = n <= KAI_IMMORTAL_VAR_MAXN;
-    for (int i = 0; i < n && internable; i++) internable = kai_slot_internable(args[i]);
-    if (!internable) {
-        KaiValue *v = kai_alloc_var_nz(n);
-        v->variant_tag = tag;
-        v->var_n_args = (uint8_t) n;
-        for (int i = 0; i < n; i++) kai_var_slots(v)[i].ptr = args[i];
-        return v;
-    }
-    return kaix_variant_interned(tag, name, n, args);
+    for (int i = 0; i < n; i++) slots[i].ptr = args[i];
+    KaiValue *r = kai_variant_u(tag, name, n, 0, slots);
+    if (heap) free(heap);
+    return r;
 }
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_arg(KaiValue *v, int i) {
     /* The slot mask discriminates the read: a typed slot (Int / Real /
@@ -1132,11 +1125,31 @@ static inline __attribute__((always_inline)) KaiValue *kaix_variant_at_masked(Ka
   if (n <= 0) return kai_variant_at(at, tag, name, 0, 0, NULL);
   return kai_variant_at(at, tag, name, n, (uint32_t) mask, slots);
 }
+static inline KaiValue *kaix_variant_fresh(int32_t tag, const char *name, int32_t n, KaiValue **args) {
+    if (n <= 0) return kai_variant_u(tag, name, 0, 0, NULL);
+    if (n == 1 && !kai_slot_internable(args[0])) {
+        KaiValue *v = kai_alloc_var_nz(1);
+        v->variant_tag = tag;
+        v->var_n_args = 1;
+        kai_var_slots(v)[0].ptr = args[0];
+        return v;
+    }
+    int internable = n <= KAI_IMMORTAL_VAR_MAXN;
+    for (int i = 0; i < n && internable; i++) internable = kai_slot_internable(args[i]);
+    if (!internable || kai_tag_is_reusable(tag)) {
+        KaiValue *v = kai_alloc_var_nz(n);
+        v->variant_tag = tag;
+        v->var_n_args = (uint8_t) n;
+        for (int i = 0; i < n; i++) kai_var_slots(v)[i].ptr = args[i];
+        return v;
+    }
+    return kaix_variant_interned(tag, name, n, args);
+}
 static inline __attribute__((always_inline)) KaiValue *kaix_variant_fresh_at(KaiReuse at, int32_t tag, int32_t n, KaiVarSlot *slots) {
   kai_reuse_free(at);
   return kai_variant_u_fast(tag, n, slots);
 }
-static inline KaiValue *kaix_variant_interned(int32_t tag, const char *name, int32_t n, KaiValue **args) {
+static inline __attribute__((noinline)) KaiValue *kaix_variant_interned(int32_t tag, const char *name, int32_t n, KaiValue **args) {
     KaiVarSlot slots[KAI_IMMORTAL_VAR_MAXN];
     for (int i = 0; i < n; i++) slots[i].ptr = args[i];
     return kai_variant_u(tag, name, n, 0, slots);
