@@ -755,6 +755,118 @@ static KaiValue *kai_seq_once(KaiValue *init) {
     return kai_incref(v);
 }
 
+typedef struct { KaiValue *node; int32_t rc; } KaiPinned;
+typedef struct { KaiPinned *items; size_t n, cap; } KaiPinLog;
+
+static void kai_pin_log_push(KaiPinLog *log, KaiValue *v) {
+    if (log->n == log->cap) {
+        log->cap = log->cap ? log->cap * 2 : 64;
+        log->items = (KaiPinned *) realloc(log->items, log->cap * sizeof(KaiPinned));
+        if (log->items == NULL) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+    }
+    log->items[log->n++] = (KaiPinned) { v, v->rc };
+}
+
+/* Make every cell reachable from `v` immortal, logging each one's count so
+ * `kai_pin_undo` can restore it. A cell already immortal is not descended:
+ * whatever it reaches was pinned with it. A cell under the atomic count (a
+ * handle) is shared by design and stays as it is. */
+static void kai_pin_walk(KaiValue *v, KaiPinLog *log) {
+    while (kai_is_ptr(v)) {
+        int32_t r = kai_rc_load(v);
+        if (r == INT32_MAX || r >= KAI_RC_SPECIAL) return;
+        kai_pin_log_push(log, v);
+        v->rc = INT32_MAX;
+        switch ((KaiTag) v->tag) {
+            case KAI_CONS:
+                kai_pin_walk(v->as.cons.head, log);
+                v = v->as.cons.tail;
+                continue;
+            case KAI_RECORD:
+                for (int i = 0; i < v->as.rec.n_fields; ++i) kai_pin_walk(v->as.rec.fields[i], log);
+                return;
+            case KAI_VARIANT: {
+                int n = v->var_n_args;
+                uint32_t mask = n > 0 ? kai_slot_mask_of(v->variant_tag) : 0;
+                for (int i = 0; i < n; ++i)
+                    if (kai_var_slot_kind(mask, i) == KAI_VAR_SLOT_PTR)
+                        kai_pin_walk(kai_var_slots(v)[i].ptr, log);
+                return;
+            }
+            case KAI_ARRAY:
+                for (int64_t i = 0; i < v->as.arr.len; ++i) kai_pin_walk(v->as.arr.items[i], log);
+                return;
+            case KAI_VEC:
+                if (kai_vec_meta(v)->ekind == KAI_VEC_EK_BOXED) {
+                    KaiValue **el = (KaiValue **) kai_vec_elems(v);
+                    for (int64_t i = 0; i < v->as.vec.len; ++i) kai_pin_walk(el[i], log);
+                }
+                return;
+            case KAI_CLOSURE:
+                for (int i = 0; i < v->as.clo.n_captures; ++i)
+                    kai_pin_walk(v->as.clo.captures[i], log);
+                return;
+            case KAI_REF:
+                kai_pin_walk(v->as.ref.cell, log);
+                return;
+            default:
+                return;
+        }
+    }
+}
+
+static void kai_pin_undo(KaiPinLog *log) {
+    for (size_t i = log->n; i-- > 0;) log->items[i].node->rc = log->items[i].rc;
+}
+
+#define KAI_CONST_SLOTS 16384u
+
+typedef struct { _Atomic uintptr_t key; _Atomic(KaiValue *) value; } KaiConstSlot;
+static KaiConstSlot kai_const_slots[KAI_CONST_SLOTS];
+
+/* The slot of the initialiser `key`: a probe from its hash, claimed by the
+ * first reader. */
+static KaiConstSlot *kai_const_slot(uintptr_t key) {
+    size_t i = (size_t) (((uint64_t) key >> 3) * 0x9E3779B97F4A7C15ull >> 50);
+    for (unsigned n = 0; n < KAI_CONST_SLOTS; n++, i = (i + 1) & (KAI_CONST_SLOTS - 1)) {
+        KaiConstSlot *s = &kai_const_slots[i];
+        uintptr_t k = 0;
+        if (atomic_compare_exchange_strong_explicit(&s->key, &k, key, memory_order_acq_rel,
+                                                    memory_order_acquire) || k == key)
+            return s;
+    }
+    kai_eprintf("kai: too many constants\n");
+    kai_exit(1);
+    return NULL;
+}
+
+/* The value the initialiser `init` builds, built once for the whole program:
+ * the first read runs it, every later read returns the same immortal value.
+ * No lock is held while `init` runs, so an initialiser may read other
+ * constants; readers racing the first one each build a value and the loser's
+ * is released. Consumes `init`. */
+static KaiValue *kai_core_const_once(KaiValue *init) {
+    KaiConstSlot *s = kai_const_slot((uintptr_t) init->as.clo.fn);
+    KaiValue *v = atomic_load_explicit(&s->value, memory_order_acquire);
+    if (v == NULL) {
+        v = kai_apply_borrow(init, 0, NULL);
+        KaiPinLog log = { NULL, 0, 0 };
+        kai_pin_walk(v, &log);
+        KaiValue *none = NULL;
+        if (atomic_compare_exchange_strong_explicit(&s->value, &none, v, memory_order_acq_rel,
+                                                    memory_order_acquire)) {
+            kai_rc_count_live_sub((int64_t) log.n);
+        } else {
+            kai_pin_undo(&log);
+            kai_decref(v);
+            v = none;
+        }
+        free(log.items);
+    }
+    kai_decref(init);
+    return v;
+}
+
 static KaiValue *kai_core_map(KaiValue *xs, KaiValue *f) {
     KaiValue *held[3] = { xs, f, kai_nil() };
     KaiFiber *uf = kai_unw_push(held, 3);
