@@ -256,7 +256,7 @@ ifeq ($(KAI_LLVM),1)
 else
 	@echo "building stage2: C-only$(if $(KAI_LLVM_AUTO), (no $(LLVM_CONFIG) in PATH; run make KAI_LLVM=1 for native),)"
 endif
-	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS) $(CPPFLAGS_CORE) $(COMPILER_DEFS) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0 $(shell $(BOOT_SH) compat-flags $<)
+	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS) $(CPPFLAGS_CORE) $(COMPILER_DEFS) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0 $$($(BOOT_SH) compat-flags $<)
 	@if [ -f $(STAGE2_ID) ]; then $(BOOT_SH) seal $< $@; else rm -f build/$@.id; fi
 ifeq ($(KAI_LLVM),1)
 	@# Linking libLLVM does not prove native works: a kaic2 compiled by kaic2
@@ -286,7 +286,7 @@ endif
 # is for the edit-check loop only, never for CI or the selfhost oracle.
 CFLAGS_DEV := $(filter-out -O2 -O1,$(CFLAGS)) -O0
 kaic2-dev: build/stage2.c $(RUNTIME_H)
-	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS_DEV) $(CPPFLAGS_CORE) $(COMPILER_DEFS) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0 $(shell $(BOOT_SH) compat-flags $<)
+	CC='$(CC)' LDLIBS='$(LDLIBS_M) $(LLVM_LDFLAGS)' $(LINK_SH) $< $@ $(CFLAGS_DEV) $(CPPFLAGS_CORE) $(COMPILER_DEFS) $(LLVM_CPPFLAGS) $(KAI_MAIN_STACK) -I ../stage0 $$($(BOOT_SH) compat-flags $<)
 	@echo "kaic2-dev OK (-O0; edit-loop binary, not for CI/selfhost)"
 
 # --- Dev fast rebuild: modular self-compile ---------------------------
