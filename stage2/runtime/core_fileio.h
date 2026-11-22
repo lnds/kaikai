@@ -511,6 +511,29 @@ static KaiValue *kai_core_file_symlink_metadata(KaiValue *path) {
     return _kai_fs_metadata("file_symlink_metadata", path, 0);
 }
 
+/* file_canonicalize(path) : Result[String, String] — realpath(3). */
+static KaiValue *kai_core_file_canonicalize(KaiValue *path) {
+    KaiValue *r;
+    if (!path || path->tag != KAI_STR) {
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = kai_str("file_canonicalize: path is not a String")}});
+    } else {
+        char *pbuf = (char *) malloc(path->as.s.len + 1);
+        if (!pbuf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+        memcpy(pbuf, path->as.s.bytes, path->as.s.len);
+        pbuf[path->as.s.len] = '\0';
+        char *real = realpath(pbuf, NULL);
+        if (!real) {
+            r = _kai_fs_err("file_canonicalize", pbuf, path->as.s.len, kai_errno());
+        } else {
+            r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = kai_str_dyn(real)}});
+            free(real);
+        }
+        free(pbuf);
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
 /* The kind letter of a directory entry: f file, d dir, l symlink, o other.
  * `d_type` answers without a syscall; lstat only when the OS says unknown. */
 static char _kai_fs_entry_kind(const char *dir, size_t dlen, const struct dirent *e) {

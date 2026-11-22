@@ -493,6 +493,7 @@ KAIX_CORE_THUNK1(dir_remove_dir)
 KAIX_CORE_THUNK1(dir_walk)
 KAIX_CORE_THUNK1(file_metadata)
 KAIX_CORE_THUNK1(file_symlink_metadata)
+KAIX_CORE_THUNK1(file_canonicalize)
 KAIX_CORE_THUNK1(dir_list_entries)
 KAIX_CORE_THUNK0(dir_current_dir)
 KAIX_CORE_THUNK0(dir_temp_dir)
@@ -1428,6 +1429,7 @@ KaiValue *kaix_core_dir_remove_dir(KaiValue *p)          { return kai_core_dir_r
 KaiValue *kaix_core_dir_walk(KaiValue *p)                { return kai_core_dir_walk(p); }
 KaiValue *kaix_core_file_metadata(KaiValue *p)            { return kai_core_file_metadata(p); }
 KaiValue *kaix_core_file_symlink_metadata(KaiValue *p)    { return kai_core_file_symlink_metadata(p); }
+KaiValue *kaix_core_file_canonicalize(KaiValue *p)      { return kai_core_file_canonicalize(p); }
 KaiValue *kaix_core_dir_list_entries(KaiValue *p)         { return kai_core_dir_list_entries(p); }
 KaiValue *kaix_core_dir_current_dir(void)                { return kai_core_dir_current_dir(); }
 KaiValue *kaix_core_dir_temp_dir(void)                   { return kai_core_dir_temp_dir(); }
