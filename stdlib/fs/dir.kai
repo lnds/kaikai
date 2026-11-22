@@ -4,9 +4,37 @@ Directory operations on top of the `File` effect. Module path:
 
 `list_dir` / `walk` are total over `[String]`: a read error (path
 missing, permission denied) returns the empty list rather than
-raising. `walk` does not follow symlinks (avoids loops) and reports
-only regular files, not directories.
+raising. `walk` reports only regular files: symlinks of every kind
+are skipped and never followed, and directories are not reported.
+`list_entries` and `walk_with` see the links: they carry each entry's
+kind and return `Err` when the root cannot be read.
 """)]
+
+import path
+
+#[doc("What a directory entry is, as the OS reports it without following links.")]
+pub type EntryKind = EntryFile | EntryDir | EntrySymlink | EntryOther
+
+#[doc("A directory entry: its `name`, its `path` (the listed directory joined with `name`) and its `kind`.")]
+pub type DirEntry = { name: String, path: String, kind: EntryKind }
+
+#[doc("Lists a directory's entries with their kind, taken from the directory read and without following links (excluding `.` and `..`); `Err` carries the OS reason.")]
+pub fn list_entries(path: String) : Result[[DirEntry], String] / File =
+  match dir_list_entries(path) {
+    Ok(raw) -> Ok(raw | (r => decode_entry(path, r)))
+    Err(e) -> Err(e)
+  }
+
+fn decode_entry(dir: String, raw: String) : DirEntry {
+  let name = string.slice(raw, 1, string.length(raw) - 1)
+  let kind = match string.slice(raw, 0, 1) {
+    "f" -> EntryFile
+    "d" -> EntryDir
+    "l" -> EntrySymlink
+    _ -> EntryOther
+  }
+  DirEntry { name: name, path: path.join(dir, name), kind: kind }
+}
 
 #[doc("Lists a directory's entries (excluding `.` and `..`); returns `[]` on a read error.")]
 pub fn list_dir(path: String) : [String] / File =
@@ -20,9 +48,56 @@ pub fn create_dir(path: String) : Result[Unit, String] / File =
 pub fn remove_dir(path: String) : Result[Unit, String] / File =
   dir_remove_dir(path)
 
-#[doc("Recursively lists regular files under `path`, depth-first; symlinks are not followed and `[]` is returned on error.")]
+#[doc("Recursively lists regular files under `path`, depth-first; every symlink is skipped and none is followed, and `[]` is returned on error.")]
 pub fn walk(path: String) : [String] / File =
   dir_walk(path)
+
+#[doc("""
+Recursively lists the files under `path`, depth-first, skipping every
+directory for which `descend` returns false. `descend` sees each real
+directory entry once; a skipped directory is not read.
+
+A symbolic link is never followed: a link to a directory is not
+descended into and is not reported as a directory. Every other
+entry that is not a directory, symlinks of any target included
+(dangling ones too), is reported by its own path. Use `list_entries`
+or `file.symlink_metadata` to tell links apart.
+Unreadable directories contribute nothing; an unreadable root gives `[]`.
+""")]
+pub fn walk_with[e](path: String, descend: (DirEntry) -> Bool / e) : [String] / File + e =
+  walk_dirs([path], descend, [])
+
+fn walk_dirs[e](
+  pending: [String],
+  descend: (DirEntry) -> Bool / e,
+  acc: [String]
+) : [String] / File + e =
+  match pending {
+    [] -> list_reverse(acc)
+    [d, ...rest] -> match list_entries(d) {
+      Err(_) -> walk_dirs(rest, descend, acc)
+      Ok(entries) -> scan_entries(entries, descend, rest, acc, [])
+    }
+  }
+
+fn scan_entries[e](
+  entries: [DirEntry],
+  descend: (DirEntry) -> Bool / e,
+  rest: [String],
+  acc: [String],
+  subdirs: [String]
+) : [String] / File + e =
+  match entries {
+    [] -> walk_dirs(list_append(list_reverse(subdirs), rest), descend, acc)
+    [en, ...more] -> match en.kind {
+      EntryDir -> if descend(en) {
+        scan_entries(more, descend, rest, acc, [en.path, ...subdirs])
+      } else {
+        scan_entries(more, descend, rest, acc, subdirs)
+      }
+      _ -> scan_entries(more, descend, rest, [en.path, ...acc], subdirs)
+    }
+  }
 
 #[doc("The process working directory; `Err` carries the OS reason.")]
 pub fn current() : Result[String, String] / File =

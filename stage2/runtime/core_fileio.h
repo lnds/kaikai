@@ -472,21 +472,22 @@ static KaiValue *_kai_fs_err(const char *op, const char *path, size_t plen, int 
     return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
 }
 
-/* file_metadata(path) : Result[[Int], String] — [size, mtime_secs,
- * mtime_nanos, is_dir, is_file], following symlinks. */
-static KaiValue *kai_core_file_metadata(KaiValue *path) {
+/* [size, mtime_secs, mtime_nanos, is_dir, is_file, is_symlink]; lstat when
+ * `follow` is 0, so a link reports itself and is_dir / is_file are 0. */
+static KaiValue *_kai_fs_metadata(const char *op, KaiValue *path, int follow) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
-        KaiValue *msg = kai_str("file_metadata: path is not a String");
-        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+        char m[64];
+        snprintf(m, sizeof(m), "%s: path is not a String", op);
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = kai_str(m)}});
     } else {
         char pbuf[KAI_PATH_BUF];
         size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
         struct stat st;
-        if (stat(pbuf, &st) != 0) {
-            r = _kai_fs_err("file_metadata", pbuf, plen, kai_errno());
+        if ((follow ? stat(pbuf, &st) : lstat(pbuf, &st)) != 0) {
+            r = _kai_fs_err(op, pbuf, plen, kai_errno());
         } else {
 #if defined(__APPLE__)
             int64_t ns = (int64_t) st.st_mtimespec.tv_nsec;
@@ -495,12 +496,99 @@ static KaiValue *kai_core_file_metadata(KaiValue *path) {
             int64_t ns = (int64_t) st.st_mtim.tv_nsec;
             int64_t sec = (int64_t) st.st_mtim.tv_sec;
 #endif
-            KaiValue *l = kai_cons(kai_int(S_ISREG(st.st_mode) ? 1 : 0), kai_nil());
+            KaiValue *l = kai_cons(kai_int(S_ISLNK(st.st_mode) ? 1 : 0), kai_nil());
+            l = kai_cons(kai_int(S_ISREG(st.st_mode) ? 1 : 0), l);
             l = kai_cons(kai_int(S_ISDIR(st.st_mode) ? 1 : 0), l);
             l = kai_cons(kai_int(ns), l);
             l = kai_cons(kai_int(sec), l);
             l = kai_cons(kai_int((int64_t) st.st_size), l);
             r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = l}});
+        }
+    }
+    if (path) kai_decref(path);
+    return r;
+}
+
+static KaiValue *kai_core_file_metadata(KaiValue *path) {
+    return _kai_fs_metadata("file_metadata", path, 1);
+}
+
+static KaiValue *kai_core_file_symlink_metadata(KaiValue *path) {
+    return _kai_fs_metadata("file_symlink_metadata", path, 0);
+}
+
+/* The kind letter of a directory entry: f file, d dir, l symlink, o other.
+ * `d_type` answers without a syscall; lstat only when the OS says unknown. */
+static char _kai_fs_entry_kind(const char *dir, size_t dlen, const struct dirent *e) {
+#ifdef DT_UNKNOWN
+    switch (e->d_type) {
+    case DT_REG: return 'f';
+    case DT_DIR: return 'd';
+    case DT_LNK: return 'l';
+    case DT_UNKNOWN: break;
+    default: return 'o';
+    }
+#endif
+    size_t nlen = strlen(e->d_name);
+    char *full = (char *) malloc(dlen + 1 + nlen + 1);
+    if (!full) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+    memcpy(full, dir, dlen);
+    full[dlen] = '/';
+    memcpy(full + dlen + 1, e->d_name, nlen + 1);
+    struct stat st;
+    char k = 'o';
+    if (lstat(full, &st) == 0) {
+        if (S_ISLNK(st.st_mode)) k = 'l';
+        else if (S_ISDIR(st.st_mode)) k = 'd';
+        else if (S_ISREG(st.st_mode)) k = 'f';
+    }
+    free(full);
+    return k;
+}
+
+/* dir_list_entries(path) : Result[[String], String] — each entry is its
+ * kind letter followed by the name; Err when the directory cannot be read. */
+static KaiValue *kai_core_dir_list_entries(KaiValue *path) {
+    KaiValue *r;
+    if (!path || path->tag != KAI_STR) {
+        r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = kai_str("dir_list_entries: path is not a String")}});
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        DIR *d = opendir(pbuf);
+        if (!d) {
+            r = _kai_fs_err("dir_list_entries", pbuf, plen, kai_errno());
+        } else {
+            size_t cap = 16, n = 0;
+            char **ents = (char **) malloc(cap * sizeof(char *));
+            if (!ents) { closedir(d); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                const char *nm = e->d_name;
+                if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0'))) continue;
+                if (n + 1 > cap) {
+                    cap *= 2;
+                    ents = (char **) realloc(ents, cap * sizeof(char *));
+                    if (!ents) { closedir(d); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+                }
+                size_t len = strlen(nm);
+                char *copy = (char *) malloc(len + 2);
+                if (!copy) { closedir(d); kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+                copy[0] = _kai_fs_entry_kind(pbuf, plen, e);
+                memcpy(copy + 1, nm, len + 1);
+                ents[n++] = copy;
+            }
+            closedir(d);
+            KaiValue *acc = kai_nil();
+            for (size_t i = n; i > 0;) {
+                --i;
+                acc = kai_cons(kai_str_dyn(ents[i]), acc);
+                free(ents[i]);
+            }
+            free(ents);
+            r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = acc}});
         }
     }
     if (path) kai_decref(path);

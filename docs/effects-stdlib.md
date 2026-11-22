@@ -683,9 +683,9 @@ declaration, reached qualified through `fs.file`: `file.exists`,
 `file.append`, `file.delete`, `file.rename`, `file.read_bytes` /
 `file.write_bytes` (binary IO over `Array[Byte]`); the bare spellings
 do not exist. Beside them, the core `dir_list_dir`, `dir_create_dir`,
-`dir_remove_dir`, `dir_walk` (`dir_walk` does not follow symlinks).
-`fs.file.metadata(path) : Result[FileMetadata, String]` reads a
-file's metadata.
+`dir_remove_dir`, `dir_walk` (`dir_walk` skips symlinks), `dir_list_entries`
+(entry kinds without following links). `fs.file.metadata(path)` reads a
+file's metadata following links; `fs.file.symlink_metadata(path)` does not.
 
 ## `Clock`
 
