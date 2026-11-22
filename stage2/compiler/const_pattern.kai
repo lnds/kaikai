@@ -18,12 +18,13 @@ import compiler.written
 import compiler.symtab
 import compiler.modules_homes
 import compiler.desugar_refine_pred
-import compiler.local_names
 import compiler.expr_positions
 import compiler.fnreg
 import compiler.diag
 import compiler.diag_file
 import compiler.scc
+import compiler.core_types
+import compiler.core_builtins
 
 # A declared constant as a pattern can write it: its home module (`None`
 # for the root file) and its spelling. A pattern is read before name
@@ -243,19 +244,28 @@ fn cpat_pfields_loop(fs: [PField], cs: [CDecl], out: [PField], gss: [[Expr]]) : 
     }
   }
 
-#[doc("The declarations with every such initialiser moved into a function, and the table rows of the functions minted.")]
+#[doc("The declarations with every computed constant's initialiser moved into a function, and the table rows of the functions minted.")]
 pub(pkg) type ConstInits = { decls: [Decl], rows: [NEnt] }
 
-#[doc("Move each constant initialiser that declares a local or holds a lambda into a function homed beside the constant; `target` homes the root file's.")]
+#[doc("Move each constant initialiser that is not a literal expression into a function homed beside the constant, read through the program-wide once-cell; `target` homes the root file's.")]
 pub(pkg) fn const_init_fns(decls: [Decl], tab: SymTab, target: String) : ConstInits =
-  ci_loop(decls, tab, target, [], [])
+  ci_loop(decls, map(filter(decls, is_const), const_id), tab, target, [], [])
 
-fn ci_loop(ds: [Decl], tab: SymTab, target: String, out: [Decl], rows: [NEnt]) : ConstInits =
+fn ci_loop(
+  ds: [Decl],
+  consts: [SymId],
+  tab: SymTab,
+  target: String,
+  out: [Decl],
+  rows: [NEnt]
+) : ConstInits =
   match ds {
     [] -> ConstInits { decls: list_reverse(out), rows: list_reverse(rows) }
     [d, ...rest] -> match d {
       DConst(is_pub, s, ty, body, mo, l, c, nl, nc) ->
-        if ci_is_body(body) {
+        if ci_is_literal(body, consts) {
+          ci_loop(rest, consts, tab, target, [d, ...out], rows)
+        } else {
           let row = NEnt(
             NCFn,
             ci_name(written_text(decl_name(tab, s))),
@@ -265,17 +275,18 @@ fn ci_loop(ds: [Decl], tab: SymTab, target: String, out: [Decl], rows: [NEnt]) :
           )
           let init = fnid_decl(nent_sym(row))
           let fun = DFn(is_pub, init, [], [], Some(ty), REmpty, body, l, c, l, c, mo)
+          let read =
+            if is_seq_once_call(body) { ci_call(init, body) } else { ci_once_read(init, body) }
           ci_loop(
             rest,
+            consts,
             tab,
             target,
-            [fun, DConst(is_pub, s, ty, ci_call(init, body), mo, l, c, nl, nc), ...out],
+            [fun, DConst(is_pub, s, ty, read, mo, l, c, nl, nc), ...out],
             [row, ...rows]
           )
-        } else {
-          ci_loop(rest, tab, target, [d, ...out], rows)
         }
-      _ -> ci_loop(rest, tab, target, [d, ...out], rows)
+      _ -> ci_loop(rest, consts, tab, target, [d, ...out], rows)
     }
   }
 
@@ -286,38 +297,52 @@ fn ci_name(const_name: String) : String = string_concat("__kai_const_", const_na
 
 fn ci_home(mo: Option[String], target: String) : String = mo ?? target
 
-fn ci_is_body(e: Expr) : Bool =
-  if ln_is_empty(ln_with_expr(ln_empty(), e)) { ci_has_lambda(e) } else { true }
-
-fn ci_has_lambda(e: Expr) : Bool = match e.kind {
-  ELambda(_, _) -> true
-  _ -> ci_any_lambda(xp_positions(e))
+# A literal, arithmetic over literals, or a read of another constant: free
+# to repeat at each read, so it stays where it is written.
+fn ci_is_literal(e: Expr, consts: [SymId]) : Bool = match e.kind {
+  EInt(_, _) -> true
+  EReal(_, _) -> true
+  EFixed(_, _) -> true
+  EBool(_) -> true
+  EChar(_) -> true
+  EStr(_, _) -> true
+  EUnit -> true
+  EUnop(_, x) -> ci_is_literal(x, consts)
+  EBinop(op, a, b) -> ci_is_scalar_op(op) and ci_is_literal(a, consts) and ci_is_literal(b, consts)
+  ESym(s, _) -> any(consts, k => sym_raw(k) == sym_raw(s))
+  _ -> false
 }
 
-fn ci_any_lambda(ps: [XPos]) : Bool = match ps {
-  [] -> false
-  [XP(_, c), ...rest] -> ci_has_lambda(c) or ci_any_lambda(rest)
+fn ci_is_scalar_op(op: BinOp) : Bool = match op {
+  BoConcat -> false
+  BoPow -> false
+  _ -> true
 }
 
 # The call stands where the body stood: same position, type and mode.
 fn ci_call(init: FnId, body: Expr) : Expr {
   let fty = body.ty | (t => TyFnT([], t, row_empty()))
-  let callee = Expr {
-    kind: ESym(fnid_sym(init), spec_none()),
-    line: body.line,
-    col: body.col,
-    ty: fty,
-    mode: body.mode,
-    site: body.site
-  }
-  Expr {
-    kind: ECall(callee, []),
-    line: body.line,
-    col: body.col,
-    ty: body.ty,
-    mode: body.mode,
-    site: body.site
-  }
+  let callee = ci_at(body, ESym(fnid_sym(init), spec_none()), fty)
+  ci_at(body, ECall(callee, []), body.ty)
+}
+
+# `const_once(init)` where the body stood: the first read runs `init`, every
+# later read returns its value.
+fn ci_once_read(init: FnId, body: Expr) : Expr {
+  let fty = body.ty | (t => TyFnT([], t, row_empty()))
+  let oty = body.ty | (t => TyFnT([fty ?? t], t, row_empty()))
+  let init_ref = ci_at(body, ESym(fnid_sym(init), spec_none()), fty)
+  let once = ci_at(body, ESym(builtin_sym("const_once"), spec_none()), oty)
+  ci_at(body, ECall(once, [init_ref]), body.ty)
+}
+
+fn ci_at(body: Expr, kind: ExprKind, ty: Option[Ty]) : Expr = Expr {
+  kind: kind,
+  line: body.line,
+  col: body.col,
+  ty: ty,
+  mode: body.mode,
+  site: body.site
 }
 
 #[doc("The diagnostics for the constants of `decls` that reach themselves through the constants their initialisers read directly.")]
