@@ -84,6 +84,25 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.197.0 (2026-11-22)
+
+### Added
+
+- **stdlib**: walk_with reports each unreadable directory
+- **stdlib**: walk_with returns directory entries
+- **stdlib**: link-aware fs metadata, typed directory entries and a pruning walk
+- **migrate**: accept several paths in kai migrate
+- **fmt**: accept several paths in kai fmt and kai fmt --check
+
+### Fixed
+
+- **stdlib**: join entry paths in fs.dir without importing path
+- **typer**: accept a signed qualified op and name the declaring file in op-collision diagnostics
+
+### Changed
+
+- **stdlib**: lines without a list rebuild; byte loops for is_blank, trim and path
+
 ## v0.196.3 (2026-11-18)
 
 ### Fixed
