@@ -614,20 +614,10 @@ static void kai_vec_write_elem(KaiVecMeta *m, char *slot, KaiValue *x) {
                 x->as.rec.n_fields != m->n_fields)
                 kai_trap_abort("vec: record shape mismatch");
             for (int i = 0; i < m->n_fields; ++i) {
-                /* Constructors normally emit fields in one canonical
-                 * order; resolve by name so a permuted literal still
-                 * lands each payload in its column. */
-                int j = -1;
-                if (x->as.rec.names[i] == m->names[i]) j = i;
-                else {
-                    for (int k = 0; k < m->n_fields; ++k) {
-                        if (x->as.rec.names[k] == m->names[i] ||
-                            strcmp(x->as.rec.names[k], m->names[i]) == 0) { j = k; break; }
-                    }
-                }
-                if (j < 0 || kai_vec_scalar_tag(x->as.rec.fields[j]) != m->field_tags[i])
+                /* Record layout is declaration order, so column i is slot i. */
+                if (kai_vec_scalar_tag(x->as.rec.fields[i]) != m->field_tags[i])
                     kai_trap_abort("vec: record shape mismatch");
-                int64_t bits = kai_vec_scalar_bits(x->as.rec.fields[j], m->field_tags[i]);
+                int64_t bits = kai_vec_scalar_bits(x->as.rec.fields[i], m->field_tags[i]);
                 memcpy(slot + (size_t) i * 8, &bits, 8);
             }
             kai_decref(x);

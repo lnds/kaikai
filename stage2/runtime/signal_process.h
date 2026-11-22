@@ -266,10 +266,7 @@ KAI_SCHED_FN KaiValue *kai_default_signal_await(void *self, KaiCont *k)
  */
 
 #if KAI_HOST_PROCESS
-/* Build a Child record `{ pid: Int }`. The "pid" field name is
- * load-bearing — `_kai_process_record_pid` reads the slot by
- * strcmp on the name pointer's contents, in lockstep with
- * `builtin_child_decl` in stage2/compiler.kai. */
+/* Build a Child record `{ pid: Int }`; the field order is in record_layout.h. */
 static KaiValue *_kai_process_make_child(int pid) {
     KaiValue *pid_kv = kai_int((int64_t) pid);
     KaiValue *fields[1] = { pid_kv };
@@ -282,14 +279,9 @@ static KaiValue *_kai_process_make_child(int pid) {
  * the typer to keep this honest in normal flows. */
 static int _kai_process_record_pid(KaiValue *v) {
     if (!v || v->tag != KAI_RECORD) return -1;
-    for (int i = 0; i < v->as.rec.n_fields; ++i) {
-        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "pid") == 0) {
-            KaiValue *f = v->as.rec.fields[i];
-            if (!kai_is_int(f)) return -1;
-            return (int) kai_intf(f);
-        }
-    }
-    return -1;
+    KaiValue *f = v->as.rec.fields[KAI_SLOT_CHILD_PID];
+    if (!kai_is_int(f)) return -1;
+    return (int) kai_intf(f);
 }
 
 /* Mint Exited(code) / Signaled(signo) — variant *names* are the

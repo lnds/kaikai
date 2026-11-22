@@ -150,7 +150,7 @@ pub(pkg) fn pt_seal(p: Pattern, v: KVal, to: PtTo, st: LowerSt) : LowerSt / Cons
     PLit(lit) -> pt_seal_eq(v, pt_lit_atom(lit), to, KAt(p.line, p.col), st)
     PVariant(r, subs) -> pt_seal_ctor(kcr_of_pat(st, r), subs, v, to, p, st)
     PVariantRecord(r, fs) -> pt_seal_ctor_record(kcr_of_pat(st, r), fs, v, to, p, st)
-    PRecord(fs) -> pt_br(pt_field_tests(fs, v, pt_fail(to), st), pt_ok(to))
+    PRecord(_, fs) -> pt_br(pt_field_tests(pat_rec_sym(p), fs, v, pt_fail(to), st), pt_ok(to))
     PList(pats, rest) -> pt_seal_list(pats, rest, v, to, st)
     PAs(_, inner) -> pt_seal(inner, v, to, st)
     _ -> pt_br(st, pt_ok(to))
@@ -176,13 +176,14 @@ pub(pkg) fn pt_arm_subtests(
 ) : LowerSt / Console = match p.pkind {
   PVariant(r, subs) ->
     reopen(pt_slot_tests(kcr_of_pat(st, r), subs, scrv, 0, PtTo(body_lbl, fail_lbl), st), body_lbl)
-  PVariantRecord(_, fs) -> reopen(pt_br(pt_field_tests(fs, scrv, fail_lbl, st), body_lbl), body_lbl)
+  PVariantRecord(_, fs) -> reopen(pt_br(pt_field_tests(pat_rec_sym(p), fs, scrv, fail_lbl, st), body_lbl), body_lbl)
   PAs(_, inner) -> pt_arm_subtests(inner, scrv, body_lbl, fail_lbl, st)
   _ -> reopen(pt_br(st, body_lbl), body_lbl)
 }
 
 #[doc("Test each discriminating field of a record-shaped value, continuing in a fresh block once all pass.")]
 pub(pkg) fn pt_field_tests(
+  rs: SymId,
   fields: [PField],
   v: KVal,
   fail_lbl: String,
@@ -191,11 +192,11 @@ pub(pkg) fn pt_field_tests(
   [] -> st
   [PField(fname, sub, _), ...rest] ->
     if psub_is_discriminating(sub) {
-      match bind_op(st, KPrim(KpFieldBorrow, [v, KStrV(fname)]), KAt(sub.line, sub.col)) {
-        LRes(fv, st1) -> pt_field_tests(rest, v, fail_lbl, pt_test(sub, fv, fail_lbl, st1))
+      match bind_op(st, KPrim(KpFieldBorrowAt, [v, field_slot(st, rs, fname, sub)]), KAt(sub.line, sub.col)) {
+        LRes(fv, st1) -> pt_field_tests(rs, rest, v, fail_lbl, pt_test(sub, fv, fail_lbl, st1))
       }
     } else {
-      pt_field_tests(rest, v, fail_lbl, st)
+      pt_field_tests(rs, rest, v, fail_lbl, st)
     }
 }
 
@@ -232,7 +233,7 @@ fn pt_seal_ctor_record(
   match ls_fresh_label(st) {
     LSLabel(sub, st1) -> {
       let st2 = reopen(pt_seal_tag(v, c, PtTo(sub, pt_fail(to)), p, st1), sub)
-      pt_br(pt_field_tests(fields, v, pt_fail(to), st2), pt_ok(to))
+      pt_br(pt_field_tests(pat_rec_sym(p), fields, v, pt_fail(to), st2), pt_ok(to))
     }
   }
 
@@ -577,7 +578,7 @@ fn lm_flush_all(pend: [(Pattern, KVal)], st: LowerSt) : LowerSt / Console = matc
 fn lm_bind_head_value(hp: Pattern, headv: KVal, st: LowerSt) : LowerSt / Console = match hp.pkind {
   PBind(b) -> lm_bind_name(b, KLitOp(headv), hp, st)
   PAs(b, _) -> lm_bind_head_as(hp, b, headv, st)
-  PRecord(_) -> bind_pattern_fields_any(hp, headv, bind_body_none(), st)
+  PRecord(_, _) -> bind_pattern_fields_any(hp, headv, bind_body_none(), st)
   PVariant(_, _) -> bind_pattern_fields_any(hp, headv, bind_body_none(), st)
   PVariantRecord(_, _) -> bind_pattern_fields_any(hp, headv, bind_body_none(), st)
   PList(_, _) -> bind_pattern_fields_any(hp, headv, bind_body_none(), st)
@@ -873,7 +874,7 @@ fn lit_bind_whole(p: Pattern, scrv: KVal, st: LowerSt) : LowerSt = match p.pkind
 pub(pkg) fn match_is_record(arms: [Arm]) : Bool = match arms {
   [] -> false
   [Arm(p, _, _), ...rest] -> match p.pkind {
-    PRecord(_) -> true
+    PRecord(_, _) -> true
     _ -> match_is_record(rest)
   }
 }
@@ -887,7 +888,7 @@ pub(pkg) fn match_is_record(arms: [Arm]) : Bool = match arms {
 # literal fields, so a tuple-of-sums arm `(K1, K2)` — all-variant fields —
 # read as a catch-all and matched everything (hashmap_collision miscompile).
 pub(pkg) fn rec_arm_is_catchall(p: Pattern) : Bool = match p.pkind {
-  PRecord(fields) -> not rec_has_discriminating_field(fields)
+  PRecord(_, fields) -> not rec_has_discriminating_field(fields)
   _ -> true
 }
 
@@ -912,7 +913,7 @@ pub(pkg) fn rec_emit_arm(
   take: Bool,
   st: LowerSt
 ) : LMArm / Console = match p.pkind {
-  PRecord(fields) -> rec_emit_record_arm(fields, p, scrv, body_lbl, take, st)
+  PRecord(_, fields) -> rec_emit_record_arm(fields, p, scrv, body_lbl, take, st)
   _ -> {
     let st1 = rec_bind_whole(p, scrv, st)
     let st2 = ls_seal(st1, KBr(body_lbl, KAt(p.line, p.col)), body_lbl)
@@ -934,7 +935,7 @@ fn rec_emit_record_arm(
   if rec_has_discriminating_field(fields) {
     match ls_fresh_label(st) {
       LSLabel(fail_lbl, st1) -> {
-        let st2 = pt_field_tests(fields, scrv, fail_lbl, st1)
+        let st2 = pt_field_tests(pat_rec_sym(p), fields, scrv, fail_lbl, st1)
         let st3 = ls_seal(st2, KBr(body_lbl, KAt(p.line, p.col)), body_lbl)
         let st4 = bind_pattern_fields_any(p, scrv, bind_body_none(), reopen(st3, body_lbl))
         LMArm(st4, fail_lbl)
@@ -945,7 +946,7 @@ fn rec_emit_record_arm(
     let st2 = reopen(st1, body_lbl)
     LMArm(
       if take {
-        bind_record_taking(fields, scrv, st2)
+        bind_record_taking(pat_rec_sym(p), fields, scrv, st2)
       } else {
         bind_pattern_fields_any(p, scrv, bind_body_none(), st2)
       },

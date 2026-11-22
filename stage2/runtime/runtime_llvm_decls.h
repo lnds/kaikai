@@ -384,13 +384,12 @@ void kaix_evidence_run_cleanup(KaiEvidence *node);
 void kaix_evidence_set_cleanup(KaiEvidence *node, void *fn, void *env);
 KaiValue *kaix_exit_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_export_call(const char *name, KaiFn thunk, KaiValue **args, int n);
-static inline KaiValue *kaix_field(KaiValue *rec, const char *name);
 static inline KaiValue **kaix_field_addr(KaiValue *node, int32_t holeslot);
 static inline KaiValue *kaix_field_at(KaiValue *rec, int32_t i);
-static inline KaiValue *kaix_field_borrow(KaiValue *rec, const char *name);
-static inline KaiValue *kaix_field_take(KaiValue *rec, const char *name);
+static inline KaiValue *kaix_field_borrow_at(KaiValue *rec, int32_t i);
+static inline KaiValue *kaix_field_take_at(KaiValue *rec, int32_t i);
 static inline KaiValue *kaix_field_take_dup_at(KaiValue *rec, int32_t i);
-static inline KaiValue *kaix_field_untake(KaiValue *rec, const char *name);
+static inline KaiValue *kaix_field_untake_at(KaiValue *rec, int32_t i);
 KaiValue *kaix_file_metadata_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_filter_thunk(KaiValue *s, KaiValue **a, int n);
 static inline int64_t kaix_fixed_val_field(KaiValue *v);
@@ -852,15 +851,14 @@ static inline void *kaix_evidence_node_handler(void *node_v) {
     KaiEvidence *node = (KaiEvidence *) node_v;
     return node == NULL ? NULL : node->handler;
 }
-static inline KaiValue *kaix_field(KaiValue *rec, const char *name) {return kai_op_field(rec, name); }
 static inline KaiValue **kaix_field_addr(KaiValue *node, int32_t holeslot) {
     return &kai_var_slots(node)[holeslot].ptr;
 }
 static inline KaiValue *kaix_field_at(KaiValue *rec, int32_t i) {return kai_op_field_at(rec, i); }
-static inline KaiValue *kaix_field_borrow(KaiValue *rec, const char *name) {return kai_op_field_borrow(rec, name); }
-static inline KaiValue *kaix_field_take(KaiValue *rec, const char *name) {return kai_op_field_take(rec, name); }
+static inline KaiValue *kaix_field_borrow_at(KaiValue *rec, int32_t i) {return kai_op_field_borrow_at(rec, i); }
+static inline KaiValue *kaix_field_take_at(KaiValue *rec, int32_t i) {return kai_op_field_take_at(rec, i); }
 static inline KaiValue *kaix_field_take_dup_at(KaiValue *rec, int32_t i) {return kai_op_field_take_dup_at(rec, i); }
-static inline KaiValue *kaix_field_untake(KaiValue *rec, const char *name) {kai_op_field_untake(rec, name); return kai_unit(); }
+static inline KaiValue *kaix_field_untake_at(KaiValue *rec, int32_t i) {kai_op_field_untake_at(rec, i); return kai_unit(); }
 static inline int64_t kaix_fixed_val_field(KaiValue *v) {
     if (!v) return 0;
     switch ((KaiTag) v->tag) {

@@ -14,11 +14,7 @@ static KaiValue *_kai_net_err_msg(KaiCont *k, const char *msg) {
     return kai_cont_resume(k, err);
 }
 
-/* Build a Conn record `{ fd }`. Static field-name strings match
- * what the kaikai-side `type Conn = { fd: Int }` declaration
- * produces from emit_record_constructor — kai_op_field reads by
- * strcmp on the name pointer's contents, so any pointer to a
- * matching cstring works. */
+/* Build a Conn record `{ fd }`; the field order is in record_layout.h. */
 static KaiValue *_kai_net_make_conn(int fd) {
     KaiValue *fd_kv = kai_int((int64_t) fd);
     KaiValue *fields[1] = { fd_kv };
@@ -34,26 +30,25 @@ static KaiValue *_kai_net_make_listener(int fd, int port) {
     return kai_record(2, fields, names);
 }
 
-/* Read a named slot of a handle record. A missing or mistyped slot
- * reads as NULL / -1 (the caller falls through to an error return);
- * the typer keeps the shape honest. */
-static KaiValue *_kai_net_record_slot(KaiValue *v, const char *name) {
-    if (!v || v->tag != KAI_RECORD) return NULL;
-    for (int i = 0; i < v->as.rec.n_fields; ++i) {
-        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], name) == 0) {
-            return v->as.rec.fields[i];
-        }
-    }
-    return NULL;
+/* Read slot `i` of a handle record. A missing or mistyped slot reads as
+ * NULL / -1 (the caller falls through to an error return); the typer keeps
+ * the shape honest. */
+static KaiValue *_kai_net_record_slot(KaiValue *v, int i) {
+    if (!v || v->tag != KAI_RECORD || i >= v->as.rec.n_fields) return NULL;
+    return v->as.rec.fields[i];
 }
 
-static int64_t _kai_net_record_int(KaiValue *v, const char *name) {
-    KaiValue *f = _kai_net_record_slot(v, name);
+static int64_t _kai_net_record_int(KaiValue *v, int i) {
+    KaiValue *f = _kai_net_record_slot(v, i);
     return (f && kai_is_int(f)) ? kai_intf(f) : -1;
 }
 
+_Static_assert(KAI_SLOT_CONN_FD == KAI_SLOT_LISTENER_FD && KAI_SLOT_CONN_FD == KAI_SLOT_UDPSOCKET_FD
+               && KAI_SLOT_CONN_FD == KAI_SLOT_UNIXCONN_FD && KAI_SLOT_CONN_FD == KAI_SLOT_UNIXLISTENER_FD,
+               "every handle record keeps its fd in the same slot");
+
 static int _kai_net_record_fd(KaiValue *v) {
-    return (int) _kai_net_record_int(v, "fd");
+    return (int) _kai_net_record_int(v, KAI_SLOT_CONN_FD);
 }
 
 /* connect(host, port) -> Result[Conn, String]. host is a hostname
@@ -704,8 +699,8 @@ static KaiValue *kai_default_netunix_peer_uid(void *self, KaiValue *c, KaiCont *
 static KaiValue *kai_default_netunix_close_listener(void *self, KaiValue *l, KaiCont *k) {
     (void) self;
     char p[KAI_PATH_BUF];
-    if (_kai_unix_cstr(_kai_net_record_slot(l, "path"), p, sizeof(p)) == 0
-        && _kai_unix_same_node(p, _kai_net_record_int(l, "dev"), _kai_net_record_int(l, "ino"))) {
+    if (_kai_unix_cstr(_kai_net_record_slot(l, KAI_SLOT_UNIXLISTENER_PATH), p, sizeof(p)) == 0
+        && _kai_unix_same_node(p, _kai_net_record_int(l, KAI_SLOT_UNIXLISTENER_DEV), _kai_net_record_int(l, KAI_SLOT_UNIXLISTENER_INO))) {
         unlink(p);
     }
     int fd = _kai_net_record_fd(l);
@@ -729,7 +724,7 @@ static KaiValue *kai_default_netunix_close_listener(void *self, KaiValue *l, Kai
 /* Build an IpAddr record `{ addr }` from an addrinfo node. The field
  * name "addr" is the runtime contract with the kaikai-side builtin
  * `type IpAddr = { addr: String }` (stdlib/net/dns.kai);
- * kai_op_field reads it by strcmp, so the static cstring is enough. */
+ */
 static KaiValue *_kai_net_make_ipaddr(struct addrinfo *p) {
     char ip_buf[INET_ADDRSTRLEN];
     struct sockaddr_in *sin = (struct sockaddr_in *) p->ai_addr;
@@ -822,30 +817,16 @@ static KaiValue *_kai_net_make_sockaddr(const char *host, int port) {
 }
 
 static int _kai_net_sockaddr_host(KaiValue *v, char *out, size_t cap) {
-    if (!v || v->tag != KAI_RECORD || cap == 0) return -1;
-    for (int i = 0; i < v->as.rec.n_fields; ++i) {
-        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "host") == 0) {
-            KaiValue *f = v->as.rec.fields[i];
-            if (!f || f->tag != KAI_STR) return -1;
-            size_t n = f->as.s.len < cap - 1 ? f->as.s.len : cap - 1;
-            memcpy(out, f->as.s.bytes, n);
-            out[n] = '\0';
-            return 0;
-        }
-    }
-    return -1;
+    KaiValue *f = _kai_net_record_slot(v, KAI_SLOT_SOCKADDR_HOST);
+    if (cap == 0 || !f || f->tag != KAI_STR) return -1;
+    size_t n = f->as.s.len < cap - 1 ? f->as.s.len : cap - 1;
+    memcpy(out, f->as.s.bytes, n);
+    out[n] = '0';
+    return 0;
 }
 
 static int _kai_net_record_port(KaiValue *v) {
-    if (!v || v->tag != KAI_RECORD) return -1;
-    for (int i = 0; i < v->as.rec.n_fields; ++i) {
-        if (v->as.rec.names[i] && strcmp(v->as.rec.names[i], "port") == 0) {
-            KaiValue *f = v->as.rec.fields[i];
-            if (!kai_is_int(f)) return -1;
-            return (int) kai_intf(f);
-        }
-    }
-    return -1;
+    return (int) _kai_net_record_int(v, KAI_SLOT_SOCKADDR_PORT);
 }
 
 static KaiValue *kai_default_netudp_bind(void *self, KaiValue *host, KaiValue *port, KaiCont *k) {

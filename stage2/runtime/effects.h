@@ -689,10 +689,7 @@ static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue
  * the rest of the scheduler free to run other fibers while one is
  * asleep.
  *
- * Field names ("secs", "nanos") are load-bearing: kai_op_field reads
- * the slot by strcmp on the name pointer's contents, so the static
- * cstrings here must match the kaikai-side `WallTime` / `Instant`
- * declarations in stdlib/time.kai exactly. */
+ * The field order is in record_layout.h. */
 static KaiValue *_kai_clock_make_record(int64_t secs, int64_t nanos) {
     KaiValue *secs_kv  = kai_int(secs);
     KaiValue *nanos_kv = kai_int(nanos);
