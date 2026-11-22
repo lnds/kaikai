@@ -95,7 +95,7 @@ printf '#!/bin/sh\necho ran\n' > "$TMP/noexec/kai-quiet"
 
 expect "plugin: argv, env, exit status" 7 "[a b][--flag][]
 $ROOT|$ROOT/stdlib|$tid|$ROOT/stage2/kaic2" env PATH="$TMP/plugins:$PATH" "$KAI" hello "a b" --flag ""
-expect_line "plugin: never shadows a core verb" 0 "usage: kai fmt [--width N] <file.kai>            # rewrite file in place" \
+expect_line "plugin: never shadows a core verb" 0 "usage: kai fmt [--width N] <path>...             # rewrite files / packages in place" \
   env PATH="$TMP/plugins:$PATH" "$KAI" fmt --help
 expect_line "plugin: a non-executable file is skipped" 2 "kai: error: unknown command: quiet" \
   env PATH="$TMP/noexec:$PATH" "$KAI" quiet
