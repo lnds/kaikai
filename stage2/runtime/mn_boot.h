@@ -114,9 +114,20 @@ typedef void *(*KaiNsFn)(void **);
 #  if KAI_HOST_FIBERS && !defined(__wasm__)
 typedef struct { KaiNsFn fn; void **args; void *ret; } KaiNsCall;
 
+#    if defined(KAI_ASAN_FIBERS)
+static __thread const void *kai_ns_host_bottom;
+static __thread size_t kai_ns_host_size;
+#    endif
+
 static void kai_native_stack_entry(void) {
+#    if defined(KAI_ASAN_FIBERS)
+    __sanitizer_finish_switch_fiber(NULL, &kai_ns_host_bottom, &kai_ns_host_size);
+#    endif
     KaiNsCall *c = (KaiNsCall *) kai_worker_here()->ns_call;
     c->ret = c->fn(c->args);
+#    if defined(KAI_ASAN_FIBERS)
+    __sanitizer_start_switch_fiber(NULL, kai_ns_host_bottom, kai_ns_host_size);
+#    endif
 }
 #  endif
 #endif
@@ -150,7 +161,14 @@ KAI_SCHED_FN void *kai_native_stack_call(void *fn, void **args)
     void *tsan_here = __tsan_get_current_fiber();
     __tsan_switch_to_fiber(w->main_fiber.tsan_fiber, 0);
 #  endif
+#  if defined(KAI_ASAN_FIBERS)
+    void *asan_fake = NULL;
+    __sanitizer_start_switch_fiber(&asan_fake, (char *) w->ns_base - KAI_NS_WINDOW, KAI_NS_WINDOW);
+#  endif
     swapcontext(&back, &ctx);
+#  if defined(KAI_ASAN_FIBERS)
+    __sanitizer_finish_switch_fiber(asan_fake, NULL, NULL);
+#  endif
 #  if defined(KAI_TSAN_FIBERS)
     __tsan_switch_to_fiber(tsan_here, 0);
 #  endif
