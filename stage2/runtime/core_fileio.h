@@ -465,7 +465,8 @@ static KaiValue *_kai_fs_err(const char *op, const char *path, size_t plen, int 
     size_t n = strlen(op) + plen + strlen(why) + 6;
     char *buf = (char *) malloc(n);
     if (!buf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
-    if (plen) snprintf(buf, n, "%s: %.*s: %s", op, (int) plen, path, why);
+    if (plen && !op[0]) snprintf(buf, n, "%.*s: %s", (int) plen, path, why);
+    else if (plen) snprintf(buf, n, "%s: %.*s: %s", op, (int) plen, path, why);
     else snprintf(buf, n, "%s: %s", op, why);
     KaiValue *msg = kai_str_dyn(buf);
     free(buf);
@@ -559,7 +560,7 @@ static KaiValue *kai_core_dir_list_entries(KaiValue *path) {
         pbuf[plen] = '\0';
         DIR *d = opendir(pbuf);
         if (!d) {
-            r = _kai_fs_err("dir_list_entries", pbuf, plen, kai_errno());
+            r = _kai_fs_err("", pbuf, plen, kai_errno());
         } else {
             size_t cap = 16, n = 0;
             char **ents = (char **) malloc(cap * sizeof(char *));
