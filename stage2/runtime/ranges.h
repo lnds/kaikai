@@ -610,9 +610,12 @@ static KaiValue *kai_arena_record_masked(int n, const char **names, uint32_t mas
 }
 
 static KaiValue *kai_arena_record(int n, KaiValue **fields, const char **names) {
-    KaiVarSlot tmp[KAI_REC_MAX_FIELDS];
+    KaiVarSlot small[16];
+    KaiVarSlot *tmp = n <= 16 ? small : (KaiVarSlot *) malloc((size_t) n * sizeof(KaiVarSlot));
     for (int i = 0; i < n; ++i) tmp[i].ptr = fields[i];
-    return kai_arena_record_masked(n, kai_names_intern(n, names), 0, tmp);
+    KaiValue *r = kai_arena_record_masked(n, kai_names_intern(n, names), 0, tmp);
+    if (tmp != small) free(tmp);
+    return r;
 }
 
 static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
@@ -704,17 +707,22 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
         case KAI_RANGE:
             return kai_range_new(v->as.range.from, v->as.range.to, v->as.range.step);
         case KAI_RECORD: {
+            /* Filled in place: a deep chain of records recurses here, so the
+             * frame holds no per-field buffer. */
             int n = kai_rec_n(v);
             uint32_t mask = v->as.rec.slot_mask;
-            KaiVarSlot slots[KAI_REC_MAX_FIELDS];
+            KaiValue *c = kai_alloc_rec(n);
+            c->as.rec.names = v->as.rec.names;
+            c->as.rec.head_type_tag = v->as.rec.head_type_tag;
+            c->as.rec.slot_mask = mask;
+            KaiVarSlot *dst = kai_rec_slots(c);
+            for (int i = 0; i < n; ++i) dst[i].ptr = NULL;
             for (int i = 0; i < n; ++i) {
                 if (kai_var_slot_kind(mask, i) == KAI_VAR_SLOT_PTR)
-                    slots[i].ptr = kai_deep_copy(kai_rec_slots(v)[i].ptr, mode);
+                    dst[i].ptr = kai_deep_copy(kai_rec_slots(v)[i].ptr, mode);
                 else
-                    slots[i] = kai_rec_slots(v)[i];
+                    dst[i] = kai_rec_slots(v)[i];
             }
-            KaiValue *c = kai_record_masked(n, v->as.rec.names, mask, slots);
-            c->as.rec.head_type_tag = v->as.rec.head_type_tag;
             return c;
         }
         case KAI_VARIANT: {
