@@ -11815,3 +11815,6 @@ test-namespace-collisions-modular-axes: $(TARGET) build
 
 clean:
 	rm -rf build $(TARGET)
+
+test-fs-err-denied: $(TARGET) bin-kai
+	@../tests/fs_err_denied.sh
