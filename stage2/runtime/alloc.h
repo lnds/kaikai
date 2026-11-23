@@ -672,8 +672,10 @@ static inline void kai_tsan_fiber_free(KaiFiber *f) { (void) f; }
 #if defined(KAI_ASAN_FIBERS)
 void __sanitizer_start_switch_fiber(void **fake_stack_save, const void *bottom, size_t size);
 void __sanitizer_finish_switch_fiber(void *fake_stack_save, const void **bottom_old, size_t *size_old);
-/* A suspended fiber's fake stack frames are invisible to LeakSanitizer, so
- * values only they hold read as leaked. ASAN_OPTIONS still overrides this. */
+/* A suspended fiber's fake stack is detached from its thread, so LeakSanitizer
+ * misses the values its frames hold and reports them as leaked. An explicit
+ * ASAN_OPTIONS=detect_stack_use_after_return=1 overrides this and brings those
+ * false leaks back. */
 __attribute__((weak, used)) const char *__asan_default_options(void) {
     return "detect_stack_use_after_return=0";
 }
