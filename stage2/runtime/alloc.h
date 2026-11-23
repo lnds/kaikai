@@ -503,6 +503,14 @@ typedef struct KaiFreeStack {
     KaiValue *local[KAI_FREE_STACK_LOCAL];
 } KaiFreeStack;
 
+#if defined(__SANITIZE_ADDRESS__)
+#  define KAI_ASAN_FIBERS 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define KAI_ASAN_FIBERS 1
+#  endif
+#endif
+
 /* One OS scheduler thread's own state: the fiber it is running, its root
  * fiber (the dispatch loop's context), the N=1 ready queue, and the stacks
  * the root drains after each switch. Only its own thread touches it.
@@ -527,6 +535,11 @@ typedef struct KaiWorker {
     int         uc_link_ready;
     KaiFiber    main_fiber;
     KaiFreeStack free_stack;    /* the root fiber's */
+#if defined(KAI_ASAN_FIBERS)
+    const void *asan_root_bottom;   /* the root's own stack, learned on first arrival from it */
+    size_t      asan_root_size;
+    int         asan_root_pending;  /* the root left and its bounds are still unknown */
+#endif
     void       *ns_base;        /* top of the free part of this thread's OS stack, NULL if unknown */
     int         ns_active;      /* a native-stack call is running */
     void       *ns_call;        /* the call to run, read by the entry on that stack */
@@ -658,13 +671,6 @@ static inline void kai_tsan_fiber_free(KaiFiber *f) { (void) f; }
 
 /* AddressSanitizer learns about a stack-segment switch from these; without
  * them it misreads the stack bounds on a no-return path inside a segment. */
-#if defined(__SANITIZE_ADDRESS__)
-#  define KAI_ASAN_FIBERS 1
-#elif defined(__has_feature)
-#  if __has_feature(address_sanitizer)
-#    define KAI_ASAN_FIBERS 1
-#  endif
-#endif
 #if defined(KAI_ASAN_FIBERS)
 void __sanitizer_start_switch_fiber(void **fake_stack_save, const void *bottom, size_t size);
 void __sanitizer_finish_switch_fiber(void *fake_stack_save, const void **bottom_old, size_t *size_old);
