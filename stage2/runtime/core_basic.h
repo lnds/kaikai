@@ -348,12 +348,13 @@ KAI_RT_SHARED KaiValue *kai_to_string(KaiValue *v) {
         }
         case KAI_RECORD: {
             KaiValue *acc = kai_str("{");
-            for (int i = 0; i < v->as.rec.n_fields; ++i) {
+            for (int i = 0; i < kai_rec_n(v); ++i) {
                 if (i) { KaiValue *sep = kai_string_concat(acc, kai_str(", ")); kai_decref(acc); acc = sep; }
                 KaiValue *nm = kai_str(v->as.rec.names[i]);
                 KaiValue *a1 = kai_string_concat(acc, nm); kai_decref(acc); kai_decref(nm); acc = a1;
                 KaiValue *a2 = kai_string_concat(acc, kai_str(": ")); kai_decref(acc); acc = a2;
-                KaiValue *fs = kai_to_string(v->as.rec.fields[i]);
+                KaiValue *fb = kai_rec_slot_box(v, i);
+                KaiValue *fs = kai_to_string(fb); kai_decref(fb);
                 KaiValue *a3 = kai_string_concat(acc, fs); kai_decref(acc); kai_decref(fs); acc = a3;
             }
             KaiValue *cl = kai_string_concat(acc, kai_str("}")); kai_decref(acc);

@@ -110,16 +110,30 @@ KAI_RT_SHARED KaiValue *kai_seq_it_next(KaiSeqIt *it) {
     return r;
 }
 
-static KAI_RC_NOINLINE KaiValue *kai_record(int n, KaiValue **fields, const char **names) {
-    KaiValue *v = kai_alloc(KAI_RECORD);
-    v->as.rec.n_fields = n;
-    v->as.rec.fields = (KaiValue **) malloc(n * sizeof(KaiValue *));
-    v->as.rec.names  = (const char **) malloc(n * sizeof(const char *));
+/* A record whose field `i` is stored as the slot kind `mask` names. */
+static KAI_RC_NOINLINE KaiValue *kai_record_masked(int n, const char **names, uint32_t mask, const KaiVarSlot *slots) {
+    KaiValue *v = kai_alloc_rec(n);
+    v->as.rec.names = names;
     v->as.rec.head_type_tag = 0;  /* anonymous; kai_rec_stamp sets it nominally */
-    for (int i = 0; i < n; ++i) {
-        v->as.rec.fields[i] = fields[i];
-        v->as.rec.names[i]  = names[i];
-    }
+    v->as.rec.slot_mask = mask;
+    KaiVarSlot *dst = kai_rec_slots(v);
+    for (int i = 0; i < n; ++i) dst[i] = slots[i];
+    return v;
+}
+
+/* Slot words read at the kinds `mask` names; `names` may be a transient array. */
+static KaiValue *kai_record_w(int n, uint32_t mask, const KaiVarSlot *slots, const char **names) {
+    return kai_record_masked(n, kai_names_intern(n, names), mask, slots);
+}
+
+/* `names` may be a transient array: it is interned. */
+static KAI_RC_NOINLINE KaiValue *kai_record(int n, KaiValue **fields, const char **names) {
+    KaiValue *v = kai_alloc_rec(n);
+    v->as.rec.names = kai_names_intern(n, names);
+    v->as.rec.head_type_tag = 0;
+    v->as.rec.slot_mask = 0;
+    KaiVarSlot *dst = kai_rec_slots(v);
+    for (int i = 0; i < n; ++i) dst[i].ptr = fields[i];
     return v;
 }
 
@@ -577,18 +591,28 @@ static KaiValue *kai_arena_cons(KaiValue *head, KaiValue *tail) {
     return v;
 }
 
-static KaiValue *kai_arena_record(int n, KaiValue **fields, const char **names) {
+static KaiValue *kai_arena_record_masked(int n, const char **names, uint32_t mask, const KaiVarSlot *slots) {
     KaiArena *ar = kai_arena_current();
-    if (!ar) return kai_record(n, fields, names);
-    KaiValue *v = kai_arena_alloc(ar, KAI_RECORD);
-    KaiValue **af = (KaiValue **) kai_arena_raw(ar, (size_t) (n > 0 ? n : 1) * sizeof(KaiValue *));
-    const char **an = (const char **) kai_arena_raw(ar, (size_t) (n > 0 ? n : 1) * sizeof(const char *));
-    for (int i = 0; i < n; ++i) { af[i] = fields[i]; an[i] = names[i]; }
-    v->as.rec.n_fields = n;
-    v->as.rec.fields = af;
-    v->as.rec.names = an;
-    v->as.rec.head_type_tag = 0;
+    if (!ar) return kai_record_masked(n, names, mask, slots);
+    size_t bsz = kai_var_block_size(n + KAI_REC_PREFIX_SLOTS);
+    KaiValue *v = (KaiValue *) kai_arena_raw(ar, bsz);
+    memset(v, 0, bsz);
+    v->rc  = INT32_MAX;
+    v->tag = (uint8_t) KAI_RECORD;
+    v->var_n_args = (uint8_t) (n + KAI_REC_PREFIX_SLOTS);
+    v->as.rec.names = names;
+    v->as.rec.slot_mask = mask;
+    ar->n_live++;
+    kai_arena_alloc_total++;
+    kai_rc_count_live_inc();
+    for (int i = 0; i < n; ++i) kai_rec_slots(v)[i] = slots[i];
     return v;
+}
+
+static KaiValue *kai_arena_record(int n, KaiValue **fields, const char **names) {
+    KaiVarSlot tmp[KAI_REC_MAX_FIELDS];
+    for (int i = 0; i < n; ++i) tmp[i].ptr = fields[i];
+    return kai_arena_record_masked(n, kai_names_intern(n, names), 0, tmp);
 }
 
 static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
@@ -680,13 +704,17 @@ static KaiValue *kai_deep_copy(KaiValue *v, KaiCopyMode mode) {
         case KAI_RANGE:
             return kai_range_new(v->as.range.from, v->as.range.to, v->as.range.step);
         case KAI_RECORD: {
-            int n = v->as.rec.n_fields;
-            KaiValue **fields = (KaiValue **) malloc((size_t) (n > 0 ? n : 1) * sizeof(KaiValue *));
-            if (!fields) { kai_eprintf("kai: out of memory (region copy-out)\n"); kai_exit(1); }
-            for (int i = 0; i < n; ++i) fields[i] = kai_deep_copy(v->as.rec.fields[i], mode);
-            KaiValue *c = kai_record(n, fields, v->as.rec.names);
+            int n = kai_rec_n(v);
+            uint32_t mask = v->as.rec.slot_mask;
+            KaiVarSlot slots[KAI_REC_MAX_FIELDS];
+            for (int i = 0; i < n; ++i) {
+                if (kai_var_slot_kind(mask, i) == KAI_VAR_SLOT_PTR)
+                    slots[i].ptr = kai_deep_copy(kai_rec_slots(v)[i].ptr, mode);
+                else
+                    slots[i] = kai_rec_slots(v)[i];
+            }
+            KaiValue *c = kai_record_masked(n, v->as.rec.names, mask, slots);
             c->as.rec.head_type_tag = v->as.rec.head_type_tag;
-            free(fields);
             return c;
         }
         case KAI_VARIANT: {
@@ -880,6 +908,17 @@ static inline KaiValue *kai_variant_slot_box(KaiValue *v, int i) {
     if (k == KAI_VAR_SLOT_REAL) return kai_real(kai_var_slots(v)[i].r);
     if (k == KAI_VAR_SLOT_ENUM) return kai_enum_slot_box(kai_var_slots(v)[i].i64);
     return kai_var_slots(v)[i].ptr;
+}
+
+/* Field `i` of a record as a new owned reference, whatever its slot kind. */
+static inline KaiValue *kai_rec_slot_box(KaiValue *v, int i) {
+    KaiVarSlot s = kai_rec_slots(v)[i];
+    switch (kai_var_slot_kind(v->as.rec.slot_mask, i)) {
+        case KAI_VAR_SLOT_INT:  return kai_int(s.i64);
+        case KAI_VAR_SLOT_REAL: return kai_real(s.r);
+        case KAI_VAR_SLOT_ENUM: return kai_enum_slot_box(s.i64);
+        default:                return kai_incref(s.ptr);
+    }
 }
 
 /* Consume an owned boxed scalar: return its raw payload and release the

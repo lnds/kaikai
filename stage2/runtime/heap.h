@@ -56,6 +56,64 @@ static uint32_t kai_slot_mask_of(int32_t tag) {
     return (uint32_t) atomic_load_explicit(&kai_ctor_meta[tag].mask, memory_order_relaxed);
 }
 
+/* ---------- record field-name arrays ----------
+ *
+ * A record cell points at a name array that outlives it. Emitted code caches
+ * the canonical array per site; callers with transient arrays go through the
+ * intern table: lock-free chains, entries never freed, equality by content. */
+typedef struct KaiNamesEntry {
+    struct KaiNamesEntry *next;
+    int32_t               n;
+    const char           *names[];
+} KaiNamesEntry;
+
+#define KAI_NAMES_BUCKETS 4096
+static _Atomic(KaiNamesEntry *) kai_names_buckets[KAI_NAMES_BUCKETS];
+
+static uint32_t kai_names_hash(int n, const char **names) {
+    uint32_t h = 2166136261u ^ (uint32_t) n;
+    for (int i = 0; i < n; ++i)
+        for (const char *c = names[i]; *c; ++c) h = (h ^ (uint8_t) *c) * 16777619u;
+    return h;
+}
+
+static int kai_names_equal(const KaiNamesEntry *e, int n, const char **names) {
+    if (e->n != n) return 0;
+    for (int i = 0; i < n; ++i)
+        if (e->names[i] != names[i] && strcmp(e->names[i], names[i]) != 0) return 0;
+    return 1;
+}
+
+static const char **kai_names_intern(int n, const char **names) {
+    if (n == 0) return NULL;
+    _Atomic(KaiNamesEntry *) *bucket = &kai_names_buckets[kai_names_hash(n, names) % KAI_NAMES_BUCKETS];
+    KaiNamesEntry *head = atomic_load_explicit(bucket, memory_order_acquire);
+    KaiNamesEntry *fresh = NULL;
+    for (;;) {
+        for (KaiNamesEntry *e = head; e; e = e->next)
+            if (kai_names_equal(e, n, names)) { free(fresh); return e->names; }
+        if (!fresh) {
+            fresh = (KaiNamesEntry *) malloc(sizeof(KaiNamesEntry) + (size_t) n * sizeof(char *));
+            if (!fresh) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+            fresh->n = n;
+            for (int i = 0; i < n; ++i) fresh->names[i] = names[i];
+        }
+        fresh->next = head;
+        if (atomic_compare_exchange_weak_explicit(bucket, &head, fresh,
+                memory_order_release, memory_order_acquire))
+            return fresh->names;
+    }
+}
+
+/* The canonical array of a construction site: `*site` caches the intern. */
+static inline const char **kai_names_site(const char ***site, int n, const char **names) {
+    const char **p = __atomic_load_n(site, __ATOMIC_RELAXED);
+    if (__builtin_expect(p != NULL, 1)) return p;
+    p = kai_names_intern(n, names);
+    __atomic_store_n(site, p, __ATOMIC_RELAXED);
+    return p;
+}
+
 /* ---------- KAI_MAX_HEAP: process heap ceiling (host containment) ----------
  *
  * Caps the live committed heap so a runaway aborts clean instead of dragging
@@ -639,6 +697,43 @@ static KaiValue *kai_alloc_var_nz(int n) {
 }
 #ifdef KAI_TRACE_RC
 #define kai_alloc_var_nz(n) kai_alloc_var_nz_traced((n), __builtin_return_address(0))
+#endif
+
+/* A record block for `n` fields: header, the two-slot prefix, then the
+ * slots, uninitialised. The caller writes names, head tag, mask and every
+ * slot before the cell is observed. */
+#ifdef KAI_TRACE_RC
+static KaiValue *kai_alloc_rec_traced(int n, void *site) {
+#else
+static KaiValue *kai_alloc_rec(int n) {
+#endif
+    int total = n + KAI_REC_PREFIX_SLOTS;
+    if (n < 0 || n > KAI_REC_MAX_FIELDS) {
+        kai_eprintf("kai: record with %d fields exceeds the %d-field limit\n", n, KAI_REC_MAX_FIELDS);
+        kai_exit(1);
+    }
+    KaiValue *v;
+#ifdef KAI_CELL_POOL_ACTIVE
+    v = kai_var_block_take(total);
+#else
+    v = (KaiValue *) kai_heap_malloc(kai_var_block_size(total));
+#endif
+    if (!v) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+    v->rc = 1;
+    v->tag = (uint8_t) KAI_RECORD;
+    v->var_n_args = (uint8_t) total;
+    v->variant_tag = 0;
+    kai_rc_count_alloc((int) KAI_RECORD);
+#ifdef KAI_TRACE_RC
+    v->alloc_site = site;
+    kai_rc_site_record_alloc(site, (int32_t) KAI_RECORD);
+    kai_rc_site_register_once();
+    kai_rc_history_log(v, /* op=alloc */ 0, (int32_t) KAI_RECORD);
+#endif
+    return v;
+}
+#ifdef KAI_TRACE_RC
+#define kai_alloc_rec(n) kai_alloc_rec_traced((n), __builtin_return_address(0))
 #endif
 
 /* FAM lane: return a variant block (header + inline slots) to its

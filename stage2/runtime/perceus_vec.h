@@ -76,18 +76,14 @@ static KaiValue *kai_reuse_or_alloc_cons(KaiValue *_scr,
     return kai_cons(head, tail);
 }
 
-static KaiValue *kai_reuse_or_alloc_record(KaiValue *_scr,
-                                           int n, KaiValue **fields,
-                                           const char **names,
-                                           uint64_t kept_mask) {
+/* `names` is canonical; `slots` are read at the kinds `mask` names. */
+static KaiValue *kai_reuse_or_alloc_record_s(KaiValue *_scr, int n, uint32_t mask,
+                                             const KaiVarSlot *slots, const char **names,
+                                             uint64_t kept_mask) {
     if (_scr != NULL && _scr->tag == KAI_RECORD &&
-        _scr->as.rec.n_fields == n && kai_check_unique(_scr)) {
-        /* Decref the existing field values then overwrite. The
-         * fields[] / names[] pointer arrays are reused — both have
-         * the same length n, so no realloc is needed. names[]
-         * usually points at the same static-string literals across
-         * rebuilds (parsers thread the same record shape), so
-         * overwriting is idempotent in the common case. */
+        kai_rec_n(_scr) == n && kai_check_unique(_scr)) {
+        uint32_t old_mask = _scr->as.rec.slot_mask;
+        KaiVarSlot *dst = kai_rec_slots(_scr);
         for (int i = 0; i < n; ++i) {
             /* Aliasing guard (see kai_reuse_or_alloc_variant): skip
              * the old-slot decref when old == new, EXCEPT where
@@ -97,21 +93,29 @@ static KaiValue *kai_reuse_or_alloc_record(KaiValue *_scr,
              * old child is still owed — the skip would leak it once
              * per reuse. The mask never marks call results, the shape
              * whose consumed-and-recycled pointer the guard protects. */
-            KaiValue *old_f = _scr->as.rec.fields[i];
-            _scr->as.rec.fields[i] = fields[i];
-            _scr->as.rec.names[i]  = names[i];
-            if (old_f != fields[i] ||
-                (i < 64 && (kept_mask & ((uint64_t)1 << i)))) {
+            KaiValue *old_f = kai_var_slot_kind(old_mask, i) == KAI_VAR_SLOT_PTR ? dst[i].ptr : NULL;
+            int new_ptr = kai_var_slot_kind(mask, i) == KAI_VAR_SLOT_PTR;
+            dst[i] = slots[i];
+            if (old_f != NULL && (!new_ptr || old_f != slots[i].ptr ||
+                (i < 64 && (kept_mask & ((uint64_t)1 << i))))) {
                 kai_decref(old_f);
             }
         }
+        _scr->as.rec.names = names;
+        _scr->as.rec.slot_mask = mask;
         /* The donor may be another record type: the rebuild is untagged
          * unless its own site stamps it. */
         _scr->as.rec.head_type_tag = 0;
         kai_rc_count_reuse();
         return kai_incref(_scr);
     }
-    return kai_record(n, fields, names);
+    return kai_record_masked(n, names, mask, slots);
+}
+
+static KaiValue *kai_reuse_or_alloc_record(KaiValue *_scr, int n, KaiValue **fields,
+                                           const char **names, uint64_t kept_mask) {
+    return kai_reuse_or_alloc_record_s(_scr, n, 0, (const KaiVarSlot *) fields,
+                                       kai_names_intern(n, names), kept_mask);
 }
 
 
@@ -560,19 +564,22 @@ static void kai_vec_classify(KaiVecMeta *m, KaiValue *x) {
         return;
     }
     if (x && kai_is_ptr(x) && x->tag == KAI_RECORD &&
-        x->as.rec.n_fields > 0 && x->as.rec.n_fields <= KAI_VEC_REC_MAX) {
-        int n = x->as.rec.n_fields;
+        kai_rec_n(x) > 0 && kai_rec_n(x) <= KAI_VEC_REC_MAX) {
+        int n = kai_rec_n(x);
         int all_scalar = 1;
         for (int i = 0; i < n; ++i) {
-            int ft = kai_vec_scalar_tag(x->as.rec.fields[i]);
+            KaiValue *fb = kai_rec_slot_box(x, i);
+            int ft = kai_vec_scalar_tag(fb);
+            kai_decref(fb);
             if (ft < 0) { all_scalar = 0; break; }
             m->field_tags[i] = (uint8_t) ft;
-            m->names[i] = x->as.rec.names[i];
         }
         if (all_scalar) {
             m->ekind = KAI_VEC_EK_REC;
             m->n_fields = n;
+            m->names = x->as.rec.names;
             m->head_tag = x->as.rec.head_type_tag;
+            m->rec_mask = x->as.rec.slot_mask;
             m->stride = (int64_t) n * 8;
             return;
         }
@@ -611,13 +618,15 @@ static void kai_vec_write_elem(KaiVecMeta *m, char *slot, KaiValue *x) {
         }
         case KAI_VEC_EK_REC: {
             if (!x || !kai_is_ptr(x) || x->tag != KAI_RECORD ||
-                x->as.rec.n_fields != m->n_fields)
+                kai_rec_n(x) != m->n_fields)
                 kai_trap_abort("vec: record shape mismatch");
             for (int i = 0; i < m->n_fields; ++i) {
                 /* Record layout is declaration order, so column i is slot i. */
-                if (kai_vec_scalar_tag(x->as.rec.fields[i]) != m->field_tags[i])
+                KaiValue *fb = kai_rec_slot_box(x, i);
+                if (kai_vec_scalar_tag(fb) != m->field_tags[i])
                     kai_trap_abort("vec: record shape mismatch");
-                int64_t bits = kai_vec_scalar_bits(x->as.rec.fields[i], m->field_tags[i]);
+                int64_t bits = kai_vec_scalar_bits(fb, m->field_tags[i]);
+                kai_decref(fb);
                 memcpy(slot + (size_t) i * 8, &bits, 8);
             }
             kai_decref(x);
@@ -638,13 +647,16 @@ static KaiValue *kai_vec_read_elem(KaiVecMeta *m, const char *slot) {
             return kai_vec_scalar_box((uint8_t) m->elem_tag, bits);
         }
         case KAI_VEC_EK_REC: {
-            KaiValue *fields[KAI_VEC_REC_MAX];
+            KaiVarSlot slots[KAI_VEC_REC_MAX];
             for (int i = 0; i < m->n_fields; ++i) {
                 int64_t bits;
                 memcpy(&bits, slot + (size_t) i * 8, 8);
-                fields[i] = kai_vec_scalar_box(m->field_tags[i], bits);
+                if (kai_var_slot_kind(m->rec_mask, i) == KAI_VAR_SLOT_PTR)
+                    slots[i].ptr = kai_vec_scalar_box(m->field_tags[i], bits);
+                else
+                    slots[i].i64 = bits;
             }
-            KaiValue *r = kai_record(m->n_fields, fields, m->names);
+            KaiValue *r = kai_record_masked(m->n_fields, m->names, m->rec_mask, slots);
             r->as.rec.head_type_tag = m->head_tag;
             return r;
         }
@@ -851,8 +863,8 @@ static void kai_vec_store_rec_fields(KaiVecMeta *m, char *slot, int64_t n,
  * record is never allocated. A PENDING vec classifies REC directly
  * from the unpacked fields (`names` must be static literals); the
  * head tag is 0, mirroring kai_record's anonymous-literal stamp. */
-static KaiValue *kai_vec_push_rec_raw(KaiValue *v, int64_t n,
-                                      KaiValue **xs, const char **names) {
+static KaiValue *kai_vec_push_rec_raw(KaiValue *v, int64_t n, KaiValue **xs,
+                                      const char **names, uint32_t mask) {
     if (!v || kai_is_value(v) || v->tag != KAI_VEC) {
         kai_eprintf("kai: vec_push: not a vec\n"); kai_exit(1);
     }
@@ -879,8 +891,9 @@ static KaiValue *kai_vec_push_rec_raw(KaiValue *v, int64_t n,
             int ft = kai_vec_scalar_tag(xs[k]);
             if (ft < 0) kai_trap_abort("vec: record shape mismatch");
             m->field_tags[k] = (uint8_t) ft;
-            m->names[k] = names[k];
         }
+        m->names = kai_names_intern((int) n, names);
+        m->rec_mask = mask;
         int64_t ncap = v->as.vec.cap;
         if (ncap < 4) ncap = 4;
         m = kai_vec_grow_cap(v, ncap);

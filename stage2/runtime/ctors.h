@@ -6,7 +6,7 @@
     kai_rc_site_record_free((_kc)->alloc_site);                              \
     kai_rc_history_log((_kc), /* op=free */ 3, freed_tag);                   \
     { uint64_t *p64 = (uint64_t *) (_kc);                                    \
-      size_t _psz = (freed_tag == (int32_t) KAI_VARIANT)                     \
+      size_t _psz = (freed_tag == (int32_t) KAI_VARIANT || freed_tag == (int32_t) KAI_RECORD)                   \
           ? kai_var_block_size((_kc)->var_n_args) : sizeof(KaiValue);        \
       size_t nq = _psz / sizeof(uint64_t);                                   \
       for (size_t i = 0; i < nq; i++) p64[i] = KAI_RC_SENTINEL_U64; }        \
@@ -17,7 +17,8 @@
 
 #ifdef KAI_CELL_POOL_ACTIVE
 #define KAI_RC_RECYCLE_POOL(_kc) do {                                        \
-    if ((_kc)->tag == (int32_t) KAI_VARIANT) {                              \
+    if ((_kc)->tag == (int32_t) KAI_VARIANT ||                              \
+        (_kc)->tag == (int32_t) KAI_RECORD) {                               \
         kai_var_block_free((_kc), (_kc)->var_n_args);                        \
     } else if (!kai_cell_pool_push(_kc)) {                                    \
         free(_kc);                                                           \
@@ -120,9 +121,14 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
             if (kai_drop_hits_zero(v->as.cons.tail)) next = v->as.cons.tail;
             break;
         case KAI_RECORD:
-            for (int i = 0; i < v->as.rec.n_fields; ++i) kai_drop_child(v->as.rec.fields[i], depth, st);
-            free(v->as.rec.fields);
-            free((void *) v->as.rec.names);
+            {
+                uint32_t rmask = v->as.rec.slot_mask;
+                int rn = kai_rec_n(v);
+                for (int i = 0; i < rn; ++i) {
+                    if (rmask != 0 && kai_var_slot_kind(rmask, i) != KAI_VAR_SLOT_PTR) continue;
+                    kai_drop_child(kai_rec_slots(v)[i].ptr, depth, st);
+                }
+            }
             break;
         case KAI_VARIANT: {
             /* Only pointer slots carry RC (mask kind PTR; mask==0 means

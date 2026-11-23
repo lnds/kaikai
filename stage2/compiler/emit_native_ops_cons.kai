@@ -8,6 +8,7 @@ import compiler.emit_native_arm_slots
 import compiler.emit_native_fn
 import compiler.emit_native_ops_calls
 import compiler.emit_shared_syms
+import compiler.util
 
 #[doc("""
 `KTagOf` reads the raw `i32` variant tag (SInt32). The result feeds a
@@ -53,10 +54,57 @@ A record literal: `kaix_record(n, fieldbuf, namebuf)` — parallel C
 buffers, names as `i8*` globals (no [Handle] lists).
 """)]
 pub fn nemit_record(ctx: Handle, fields: [KFieldInit], rgn: Bool) : Handle / Console {
-  let vals = llvm_buf_new()
+  let p = native_ctx_ptrt(ctx)
+  let i32t = native_ctx_i32t(ctx)
+  let inits = field_slot_inits(fields)
   let names = llvm_buf_new()
-  nemit_push_fields(ctx, vals, names, fields)
-  nemit_record_call_sym(ctx, if rgn { "kaix_arena_record" } else { "kaix_record" }, vals, names)
+  nemit_push_names(ctx, names, fields)
+  let narr = nemit_ptr_array(ctx, names)
+  llvm_buf_free(names)
+  let slots = nemit_i64_slot_array(ctx, inits)
+  let site = nemit_names_site(ctx, fields)
+  let ptb = llvm_buf_new()
+  llvm_buf_push(ptb, i32t)
+  llvm_buf_push(ptb, i32t)
+  llvm_buf_push(ptb, p)
+  llvm_buf_push(ptb, p)
+  llvm_buf_push(ptb, p)
+  let ab = llvm_buf_new()
+  llvm_buf_push(ab, llvm_const_i32(i32t, list_length(fields)))
+  llvm_buf_push(ab, llvm_const_i32(i32t, nemit_inits_mask(inits)))
+  llvm_buf_push(ab, slots)
+  llvm_buf_push(ab, narr)
+  llvm_buf_push(ab, site)
+  ncall_finish(ctx, if rgn { "kaix_arena_record_s" } else { "kaix_record_s" }, p, ptb, ab)
+}
+
+fn nemit_inits_mask(inits: [KSlotInit]) : Int =
+  variant_slot_mask(map(inits, slot_init_kind))
+
+# The per-shape global that caches a record's canonical name array, shared by
+# every construction site with the same field names.
+fn nemit_names_site(ctx: Handle, fs: [KFieldInit]) : Handle / Console {
+  let name = cat2("_kai_rn_", nemit_names_key(fs, ""))
+  let found = llvm_get_named_global(native_ctx_m(ctx), name)
+  if llvm_handle_is_null(found) == 1 {
+    llvm_add_global_zeroed(native_ctx_m(ctx), native_ctx_ptrt(ctx), name)
+  } else {
+    found
+  }
+}
+
+fn nemit_names_key(fs: [KFieldInit], acc: String) : String = match fs {
+  [] -> acc
+  [KFI(nm, _), ...rest] -> nemit_names_key(rest, concat_all([acc, nm, "$"]))
+}
+
+fn nemit_push_names(ctx: Handle, names: Handle, fs: [KFieldInit]) : Unit / Console = match fs {
+  [] -> ()
+  [KFI(nm, _), ...rest] -> {
+    let nv = llvm_build_global_string(native_ctx_b(ctx), nm)
+    llvm_buf_push(names, nv)
+    nemit_push_names(ctx, names, rest)
+  }
 }
 
 #[doc("""
@@ -70,25 +118,6 @@ pub fn nemit_stamp(ctx: Handle, v: Handle, tag: Int) : Handle =
     let p = native_ctx_ptrt(ctx)
     let i32t = native_ctx_i32t(ctx)
     ncall_sig2(ctx, "kaix_rec_stamp", p, p, i32t, v, llvm_const_i32(i32t, tag))
-  }
-
-fn nemit_push_fields(ctx: Handle, vals: Handle, names: Handle, fs: [KFieldInit]) : Unit / Console =
-  match fs {
-    [] -> ()
-    [KFI(nm, v), ...rest] -> {
-      # Capture each handle in a `let` (the handle-binder exclusion) before
-      # pushing: a handle passed inline as a call ARGUMENT is RC-managed by
-      # Perceus (incref/decref around the call), and a decref
-      # of an LLVM `Value*`/`GlobalVariable*` corrupts it — surviving the IR
-      # printer but crashing the AsmPrinter (`isNullOrUndef` on a clobbered
-      # initializer). `nemit_atom`/`llvm_build_global_string` are
-      # handle-returning, so the `let` keeps each out of Perceus.
-      let fv = nemit_atom(ctx, v)
-      let nv = llvm_build_global_string(native_ctx_b(ctx), nm)
-      llvm_buf_push(vals, fv)
-      llvm_buf_push(names, nv)
-      nemit_push_fields(ctx, vals, names, rest)
-    }
   }
 
 #[doc("An indirect call to a closure value: `kaix_apply(clo, n, argbuf)`.")]
@@ -737,8 +766,8 @@ fn nemit_cons_reuse_call(ctx: Handle, scr: Handle, argvalbuf: Handle) : Handle /
 }
 
 #[doc("""
-`kaix_reuse_or_alloc_record(ptr scr, i32 n, ptr* fields, i8** names,
-i64 kept_mask) -> ptr` — record reuse-in-place. Donate the unique
+`kaix_reuse_or_alloc_record_s(ptr scr, i32 n, i32 mask, i64* slots,
+i8** names, i64 kept_mask, ptr site) -> ptr` — record reuse-in-place. Donate the unique
 scrutinee cell, overwrite its fields (decref'ing the old field values
 where they differ, plus the kept-mask slots whose aliased old child
 still carries the donor's claim — records are bijective by field index,
@@ -754,27 +783,30 @@ pub fn nemit_record_reuse(
   let p = native_ctx_ptrt(ctx)
   let i32t = native_ctx_i32t(ctx)
   let i64t = native_ctx_i64t(ctx)
-  let vals = llvm_buf_new()
+  let inits = field_slot_inits(fields)
   let names = llvm_buf_new()
-  nemit_push_fields(ctx, vals, names, fields)
-  let n = llvm_buf_len(vals)
-  let farr = nemit_ptr_array(ctx, vals)
+  nemit_push_names(ctx, names, fields)
   let narr = nemit_ptr_array(ctx, names)
-  llvm_buf_free(vals)
   llvm_buf_free(names)
+  let slots = nemit_i64_slot_array(ctx, inits)
+  let site = nemit_names_site(ctx, fields)
   let ptb = llvm_buf_new()
   llvm_buf_push(ptb, p)
+  llvm_buf_push(ptb, i32t)
   llvm_buf_push(ptb, i32t)
   llvm_buf_push(ptb, p)
   llvm_buf_push(ptb, p)
   llvm_buf_push(ptb, i64t)
+  llvm_buf_push(ptb, p)
   let ab = llvm_buf_new()
   llvm_buf_push(ab, scr)
-  llvm_buf_push(ab, llvm_const_i32(i32t, n))
-  llvm_buf_push(ab, farr)
+  llvm_buf_push(ab, llvm_const_i32(i32t, list_length(fields)))
+  llvm_buf_push(ab, llvm_const_i32(i32t, nemit_inits_mask(inits)))
+  llvm_buf_push(ab, slots)
   llvm_buf_push(ab, narr)
   llvm_buf_push(ab, llvm_const_int(i64t, kept))
-  ncall_finish(ctx, "kaix_reuse_or_alloc_record", p, ptb, ab)
+  llvm_buf_push(ab, site)
+  ncall_finish(ctx, "kaix_reuse_or_alloc_record_s", p, ptb, ab)
 }
 
 # `kaix_record(i32 n, ptr* fields, ptr* names) -> ptr`. `vals`/`names` are

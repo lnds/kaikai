@@ -691,11 +691,9 @@ static KaiValue *kai_default_random_int_range(void *self, KaiValue *lo, KaiValue
  *
  * The field order is in record_layout.h. */
 static KaiValue *_kai_clock_make_record(int64_t secs, int64_t nanos) {
-    KaiValue *secs_kv  = kai_int(secs);
-    KaiValue *nanos_kv = kai_int(nanos);
-    KaiValue *fields[2] = { secs_kv, nanos_kv };
+    KaiVarSlot slots[2] = { { .i64 = secs }, { .i64 = nanos } };
     static const char *names[2] = { "secs", "nanos" };
-    return kai_record(2, fields, names);
+    return kai_record_w(2, KAI_MASK_TIME, slots, names);
 }
 
 static KaiValue *kai_default_clock_wall_now(void *self, KaiCont *k) {

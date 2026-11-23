@@ -155,7 +155,7 @@ fn lower_expr_boxed_unpadded(x: Expr, st: LowerSt) : LRes / Console = match x.ki
   # A record literal `T { f: v, ... }` → a `kai_record(n, fields, names)`
   # allocation. Lower each field value (left-to-right), pairing with its
   # name; the translator builds the parallel value/name buffers.
-  ERecordLit(_, fis) -> lower_record_lit(fis, rec_stamp_of(st.stamps, x.ty), kpos_of(x), st)
+  ERecordLit(_, fis) -> lower_record_lit(fis, expr_rec_sym(x), rec_stamp_of(st.stamps, x.ty), kpos_of(x), st)
   # A range `lo..hi` / `lo..hi:step` → the runtime range builder.
   ERange(lo, hi, stp) -> lower_range(lo, hi, stp, kpos_of(x), st)
   # An inline lambda → a `KClosure` over its lifted-body thunk symbol
@@ -212,12 +212,35 @@ fn lower_field_boxed(x: Expr, base: Expr, fname: String, st: LowerSt) : LRes / C
       LRes(bv, st1) ->
         lower_field_read(
           st1,
-          KPrim(KpFieldAt, [bv, expr_field_slot(st1, base, fname)]),
+          rec_read_op(st1, expr_rec_sym(base), expr_field_slot(st1, base, fname), bv, KpFieldAt),
           bv,
           kpos_of(x)
         )
     }
   }
+
+# A raw-kinded field projects its word at the result's slot and releases the
+# owned base; any other field crosses the box border.
+fn lower_rec_field_raw(x: Expr, base: Expr, fname: String, st: LowerSt) : LRes / Console = {
+  let k = expr_field_kind(st, base, fname)
+  if k == 0 {
+    lower_scalar_unbox_border(x, st)
+  } else {
+    match lower_expr(base, st) {
+      LRes(bv, st1) -> match expr_field_slot(st1, base, fname) {
+        KIntV(i) -> match bind_op_slot(
+          st1,
+          KProjKind(bv, i + 2, k),
+          if k == 1 { SInt64 } else { SReal },
+          kpos_of(x)
+        ) {
+          LRes(rv, st2) -> LRes(rv, ls_emit(st2, KRC(KDrop(bv), kpos_of(x))))
+        }
+        _ -> lower_scalar_unbox_border(x, st)
+      }
+    }
+  }
+}
 
 # `and` / `or` short-circuit, so they lower as branches: a `KPrim` would
 # evaluate both operand atoms before the helper runs.
@@ -372,9 +395,9 @@ fn lower_expr_raw_kind(x: Expr, st: LowerSt) : LRes / Console = match x.kind {
   EBinop(op, a, b) -> lower_raw_arith(x, op, a, b, st)
   EUnop(op, a) -> lower_raw_unop(x, op, a, st)
   ECall(f, cargs) -> lower_raw_call(x, f, cargs, st)
-  EField(_, _) -> match vec_raw_read(st.recs, x.kind, x.ty) {
+  EField(base, fname) -> match vec_raw_read(st.recs, x.kind, x.ty) {
     Some(rd) -> lower_vec_raw_read(x, rd, st)
-    None -> lower_scalar_unbox_border(x, st)
+    None -> lower_rec_field_raw(x, base, fname, st)
   }
   EBlock(stmts, tail) -> lower_raw_block(x, stmts, tail, st)
   EIntrinsic(inm, iargs) -> lower_raw_intrinsic(x, inm, iargs, st)

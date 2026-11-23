@@ -783,7 +783,9 @@ static void kai_pin_walk(KaiValue *v, KaiPinLog *log) {
                 v = v->as.cons.tail;
                 continue;
             case KAI_RECORD:
-                for (int i = 0; i < v->as.rec.n_fields; ++i) kai_pin_walk(v->as.rec.fields[i], log);
+                for (int i = 0; i < kai_rec_n(v); ++i)
+                    if (kai_var_slot_kind(v->as.rec.slot_mask, i) == KAI_VAR_SLOT_PTR)
+                        kai_pin_walk(kai_rec_slots(v)[i].ptr, log);
                 return;
             case KAI_VARIANT: {
                 int n = v->var_n_args;

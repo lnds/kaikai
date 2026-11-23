@@ -12,6 +12,9 @@ import compiler.infer_env
 import compiler.infer_state
 import compiler.kir
 import compiler.kir_lower
+import compiler.rec_kinds
+import compiler.emit_shared_syms.{variant_slot_mask}
+import compiler.kir_lower_bind.{expr_rec_sym}
 import compiler.core_builtins
 import compiler.kir_lower_reuse
 import compiler.kir_lower_scalar
@@ -421,30 +424,67 @@ fn lower_list_cons(
 # value/name buffers `kai_record` takes. The desugar already normalised the
 # field order to DECLARATION order (eval still in source order via its
 # let-bind), so the layout reaching here is canonical — KIR does not reorder.
-pub(pkg) fn lower_record_lit(fis: [FieldInit], tag: Int, pos: KPos, st: LowerSt) : LRes / Console =
-  match lower_field_inits(fis, st, []) {
+pub(pkg) fn lower_record_lit(
+  fis: [FieldInit],
+  rs: SymId,
+  tag: Int,
+  pos: KPos,
+  st: LowerSt
+) : LRes / Console =
+  match lower_field_inits(fis, rec_kinds_of(st.rdecl, rs), st, []) {
     RecPlan(pairs, st1) ->
       bind_op(st1, KRecord(pairs, st1.in_region, tag), pos)
   }
 
 pub(pkg) fn lower_field_inits(
   fis: [FieldInit],
+  ks: [Int],
   st: LowerSt,
   acc: [KFieldInit]
-) : RecPlan / Console = match lower_field_inits_flying(fis, st, acc) {
+) : RecPlan / Console = match lower_field_inits_flying(fis, ks, st, acc) {
   RecPlan(pairs, st1) -> RecPlan(pairs, lower_flight_end(st, st1))
 }
 
-fn lower_field_inits_flying(fis: [FieldInit], st: LowerSt, acc: [KFieldInit]) : RecPlan / Console =
+# Each field lowers at its declared slot kind, as a constructor's payload does:
+# an Int raw, a Real boxed and wrapped, every other field boxed.
+fn lower_field_inits_flying(
+  fis: [FieldInit],
+  ks: [Int],
+  st: LowerSt,
+  acc: [KFieldInit]
+) : RecPlan / Console =
   match fis {
     [] -> RecPlan(acc, st)
-    [FI(fname, fe), ...rest] -> match lower_expr(fe, st) {
-      LRes(v, st1) ->
-        lower_field_inits_flying(
-          rest,
-          lower_flight_next(fe, v, rest == [], st1),
-          list_append(acc, [KFI(fname, v)])
-        )
+    [FI(fname, fe), ...rest] -> {
+      let k = match ks {
+        [h, ..._] -> h
+        [] -> 0
+      }
+      let krest = match ks {
+        [_, ...r] -> r
+        [] -> []
+      }
+      if k == 1 {
+        match lower_expr_raw_at(fe, SInt64, st) {
+          LRes(v, st1) ->
+            lower_field_inits_flying(rest, krest, st1, list_append(acc, [KFI(fname, SIInt64(v))]))
+        }
+      } else if k == 2 {
+        match lower_expr(fe, st) {
+          LRes(v, st1) ->
+            lower_field_inits_flying(rest, krest, st1, list_append(acc, [KFI(fname, SIReal(v))]))
+        }
+      } else {
+        match lower_expr(fe, st) {
+          LRes(v, st1) ->
+            lower_field_inits_flying(
+              rest,
+              krest,
+              lower_flight_next(fe, v, rest == [], st1),
+              list_append(acc, [KFI(fname, SIBoxed(v))])
+            )
+        }
+      }
     }
   }
 
@@ -532,7 +572,7 @@ pub(pkg) fn lower_vec_write_rec_fused(
 fn lower_vec_push_fused(x: Expr, v: Expr, lit: Expr, st: LowerSt) : Option[LRes] / Console =
   match lit.kind {
     ERecordLit(_, fis) -> match vec_rec_lit_bits(st.recs, lit.ty, fis) {
-      Some(bs) -> Some(lower_vec_push_rec_bits(x, v, fis, bs, st))
+      Some(bs) -> Some(lower_vec_push_rec_bits(x, v, lit, fis, bs, st))
       None -> lower_vec_push_rec_pairs(x, v, lit, fis, st)
     }
     _ -> lower_vec_push_scalar(x, v, lit, st)
@@ -549,7 +589,10 @@ fn lower_vec_push_rec_pairs(x: Expr, v: Expr, lit: Expr, fis: [FieldInit], st: L
             Some(
               bind_op(
                 lower_flight_end(st, st2),
-                KPrim(KpVecPushRecRaw, [vv, KIntV(list_length(fis)), ...pvs]),
+                KPrim(
+                  KpVecPushRecRaw,
+                  [vv, KIntV(rec_slot_mask(st, lit)), KIntV(list_length(fis)), ...pvs]
+                ),
                 kpos_of(x)
               )
             )
@@ -621,9 +664,15 @@ fn lower_vec_fields_raw(
   }
 }
 
+# The slot mask of the record `lit` builds: a vec that classifies on this push
+# rebuilds its elements under it.
+fn rec_slot_mask(st: LowerSt, lit: Expr) : Int =
+  variant_slot_mask(rec_kinds_of(st.rdecl, expr_rec_sym(lit)))
+
 fn lower_vec_push_rec_bits(
   x: Expr,
   v: Expr,
+  lit: Expr,
   fis: [FieldInit],
   bs: [VecBits],
   st: LowerSt
@@ -632,7 +681,7 @@ fn lower_vec_push_rec_bits(
     LRes(vv, st1) ->
       match lower_vec_fields_raw(fis, bs, st1, []) {
         LVecFields(fs, st2) ->
-          bind_op(lower_flight_end(st, st2), vec_push_rec_op(vv, fs), kpos_of(x))
+          bind_op(lower_flight_end(st, st2), vec_push_rec_op(vv, rec_slot_mask(st, lit), fs), kpos_of(x))
       }
   }
 

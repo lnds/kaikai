@@ -387,10 +387,9 @@ struct KaiValue {
          * step < 0). */
         struct { int64_t from; int64_t to; int64_t step; } range;
         struct {
-            int          n_fields;
-            KaiValue   **fields;
             const char **names;                     /* static strings, not freed */
             int32_t      head_type_tag;             /* docs/variant-tags.md "Head-type tags" */
+            uint32_t     slot_mask;                 /* kind pair per field; 0 = all pointers */
         } rec;
         /* Monomorphic-node packing: a variant's slots live INLINE here,
          * overlapping the union (a variant uses none of the other union
@@ -499,6 +498,14 @@ struct KaiValue {
  * byte-for-byte identical, only the spelling changes. */
 #define kai_var_slots(v) ((KaiVarSlot *) (&(v)->as))
 
+/* A KAI_RECORD cell is one block: the two-slot `as.rec` prefix, then the
+ * fields as variant-style slots. `var_n_args` counts prefix + fields, so the
+ * variant block pool sizes and recycles it unchanged. */
+#define KAI_REC_PREFIX_SLOTS 2
+#define KAI_REC_MAX_FIELDS   (255 - KAI_REC_PREFIX_SLOTS)
+#define kai_rec_n(v)     ((int) (v)->var_n_args - KAI_REC_PREFIX_SLOTS)
+#define kai_rec_slots(v) (kai_var_slots(v) + KAI_REC_PREFIX_SLOTS)
+
 /* ---------- Vec[T] element-storage metadata ---------- */
 
 /* How a KAI_VEC stores its elements. Decided once, from the first
@@ -515,16 +522,17 @@ struct KaiValue {
 
 /* Prefix of the single heap block behind a KAI_VEC: the block is
  * [KaiVecMeta][cap * stride bytes]. Field names are the static string
- * literals record constructors carry; the meta stores copies of the
- * pointers, never owns the strings. */
+ * arrays record constructors carry; the meta stores the array pointer,
+ * never owns the strings. */
 typedef struct {
     int32_t     ekind;
     int32_t     elem_tag;                     /* RAW: KaiTag reboxed on read */
     int64_t     stride;                       /* bytes per element */
     int32_t     n_fields;                     /* REC */
     int32_t     head_tag;                     /* REC: nominal head-type tag */
+    uint32_t    rec_mask;                     /* REC: slot kinds of a rebuilt record */
     uint8_t     field_tags[KAI_VEC_REC_MAX];  /* REC: per-field scalar KaiTag */
-    const char *names[KAI_VEC_REC_MAX];       /* REC: field names (static) */
+    const char **names;                       /* REC: field names (static array) */
 } KaiVecMeta;
 
 /* Owner: `data` is the block start ([meta][elems]). View: `data` is
