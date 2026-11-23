@@ -115,8 +115,8 @@ typedef void *(*KaiNsFn)(void **);
 typedef struct { KaiNsFn fn; void **args; void *ret; } KaiNsCall;
 
 #    if defined(KAI_ASAN_FIBERS)
-static __thread const void *kai_ns_host_bottom;
-static __thread size_t kai_ns_host_size;
+static KAI_TLS const void *kai_ns_host_bottom;
+static KAI_TLS size_t kai_ns_host_size;
 #    endif
 
 static void kai_native_stack_entry(void) {
@@ -183,8 +183,8 @@ KAI_SCHED_FN void *kai_native_stack_call(void *fn, void **args)
 
 #if defined(KAI_MAIN_STACK_SIZE)
 #if defined(KAI_ASAN_FIBERS)
-static const void *kai_main_host_bottom;
-static size_t kai_main_host_size;
+static KAI_TLS const void *kai_main_host_bottom;
+static KAI_TLS size_t kai_main_host_size;
 #endif
 
 static void kai_sized_main_trampoline(void) {
