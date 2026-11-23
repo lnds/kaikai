@@ -494,6 +494,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     if (atomic_load(&kai_workers_up))
         for (int i = 1; i < kai_nthreads; i++) pthread_join(kai_worker_threads[i], NULL);
     if (atomic_load(&kai_reactor_up)) pthread_join(kai_reactor_thread, NULL);
+    kai_fiber_exit_orphan(root);
     free(root->unw_buf);
     free(root->rframe_buf);
     free(root);

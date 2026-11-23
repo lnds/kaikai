@@ -376,6 +376,19 @@ static void kai_fiber_exit_unref(KaiFiberExit *x) {
     if (x && atomic_fetch_sub_explicit(&x->refs, 1, memory_order_acq_rel) == 1) free(x);
 }
 
+/* Detach `f` from its exit record and drop f's own reference. */
+static void kai_fiber_exit_orphan(KaiFiber *f) {
+    KaiFiberExit *x = atomic_load_explicit(&f->exit_rec, memory_order_acquire);
+    if (!x) return;
+    kai_fiber_exit_lock(x);
+    if (x->fiber == f) {
+        x->fiber  = NULL;
+        x->reason = KAI_EXIT_CRASHED;
+    }
+    kai_fiber_exit_unlock(x);
+    kai_fiber_exit_unref(x);
+}
+
 /* `f`'s exit record with one more reference. Must run before `f` can
  * terminate: on `f` itself, or before it is enqueued. */
 static KaiFiberExit *kai_fiber_exit_ref(KaiFiber *f) {
