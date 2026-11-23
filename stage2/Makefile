@@ -5222,7 +5222,7 @@ test-effects-file_stream_open_missing: $(TARGET) build core-cache-warm
 	    || { echo "effects FAIL $$name (C compile failed)"; exit 1; }; \
 	  ./build/s2-$$name > build/s2-$$name.out 2>&1 \
 	    || { echo "effects FAIL $$name (binary exit non-zero)"; cat build/s2-$$name.out; exit 1; }; \
-	  grep -q "^open_read failed: /tmp/kai_file_stream_771_definitely_absent: No such file or directory (os error 2)$$" build/s2-$$name.out \
+	  grep -q "^open_read failed: /tmp/kai_file_stream_771_definitely_absent: No such file or directory \[code\]$$" build/s2-$$name.out \
 	    && echo "effects OK $$name (#771 open_read missing -> inspectable Err)" \
 	    || { echo "effects FAIL $$name (negative output wrong)"; cat build/s2-$$name.out; exit 1; }; \
 	done
