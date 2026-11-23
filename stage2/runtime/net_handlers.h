@@ -16,31 +16,28 @@ static KaiValue *_kai_net_err_msg(KaiCont *k, const char *msg) {
 
 /* Build a Conn record `{ fd }`; the field order is in record_layout.h. */
 static KaiValue *_kai_net_make_conn(int fd) {
-    KaiValue *fd_kv = kai_int((int64_t) fd);
-    KaiValue *fields[1] = { fd_kv };
+    KaiVarSlot slots[1] = { { .i64 = fd } };
     static const char *names[1] = { "fd" };
-    return kai_record(1, fields, names);
+    return kai_record_w(1, KAI_MASK_CONN, slots, names);
 }
 
 static KaiValue *_kai_net_make_listener(int fd, int port) {
-    KaiValue *fd_kv   = kai_int((int64_t) fd);
-    KaiValue *port_kv = kai_int((int64_t) port);
-    KaiValue *fields[2] = { fd_kv, port_kv };
+    KaiVarSlot slots[2] = { { .i64 = fd }, { .i64 = port } };
     static const char *names[2] = { "fd", "port" };
-    return kai_record(2, fields, names);
+    return kai_record_w(2, KAI_MASK_LISTENER, slots, names);
 }
 
 /* Read slot `i` of a handle record. A missing or mistyped slot reads as
  * NULL / -1 (the caller falls through to an error return); the typer keeps
  * the shape honest. */
 static KaiValue *_kai_net_record_slot(KaiValue *v, int i) {
-    if (!v || v->tag != KAI_RECORD || i >= v->as.rec.n_fields) return NULL;
-    return v->as.rec.fields[i];
+    if (!v || v->tag != KAI_RECORD || i >= kai_rec_n(v)) return NULL;
+    return kai_rec_slots(v)[i].ptr;
 }
 
 static int64_t _kai_net_record_int(KaiValue *v, int i) {
-    KaiValue *f = _kai_net_record_slot(v, i);
-    return (f && kai_is_int(f)) ? kai_intf(f) : -1;
+    if (!v || v->tag != KAI_RECORD || i >= kai_rec_n(v)) return -1;
+    return kai_rec_slots(v)[i].i64;
 }
 
 _Static_assert(KAI_SLOT_CONN_FD == KAI_SLOT_LISTENER_FD && KAI_SLOT_CONN_FD == KAI_SLOT_UDPSOCKET_FD
@@ -598,12 +595,12 @@ static int _kai_unix_listen_at(const char *path, mode_t mode, int *fd, struct st
 }
 
 static KaiValue *_kai_unix_make_listener(int fd, const char *path, const struct stat *st) {
-    KaiValue *fields[4] = {
-        kai_int((int64_t) fd), kai_str_dyn(path),
-        kai_int((int64_t) st->st_dev), kai_int((int64_t) st->st_ino)
+    KaiVarSlot slots[4] = {
+        { .i64 = fd }, { .ptr = kai_str_dyn(path) },
+        { .i64 = (int64_t) st->st_dev }, { .i64 = (int64_t) st->st_ino }
     };
     static const char *names[4] = { "fd", "path", "dev", "ino" };
-    return kai_record(4, fields, names);
+    return kai_record_w(4, KAI_MASK_UNIXLISTENER, slots, names);
 }
 
 static KaiValue *_kai_unix_ok(KaiCont *k, KaiValue *v) {
@@ -801,19 +798,15 @@ static KaiValue *kai_default_netdns_resolve(void *self, KaiValue *host, KaiCont 
  */
 
 static KaiValue *_kai_net_make_udpsocket(int fd, int port) {
-    KaiValue *fd_kv   = kai_int((int64_t) fd);
-    KaiValue *port_kv = kai_int((int64_t) port);
-    KaiValue *fields[2] = { fd_kv, port_kv };
+    KaiVarSlot slots[2] = { { .i64 = fd }, { .i64 = port } };
     static const char *names[2] = { "fd", "port" };
-    return kai_record(2, fields, names);
+    return kai_record_w(2, KAI_MASK_UDPSOCKET, slots, names);
 }
 
 static KaiValue *_kai_net_make_sockaddr(const char *host, int port) {
-    KaiValue *host_kv = kai_str_dyn(host);
-    KaiValue *port_kv = kai_int((int64_t) port);
-    KaiValue *fields[2] = { host_kv, port_kv };
+    KaiVarSlot slots[2] = { { .ptr = kai_str_dyn(host) }, { .i64 = port } };
     static const char *names[2] = { "host", "port" };
-    return kai_record(2, fields, names);
+    return kai_record_w(2, KAI_MASK_SOCKADDR, slots, names);
 }
 
 static int _kai_net_sockaddr_host(KaiValue *v, char *out, size_t cap) {

@@ -6,6 +6,7 @@ import compiler.ast_ids
 import compiler.ast_build
 import compiler.ast_ids
 import compiler.ctor_ix
+import compiler.rec_kinds
 import compiler.emit_shared_syms
 import compiler.arm_release
 import compiler.kir
@@ -350,6 +351,27 @@ pub(pkg) fn expr_field_slot(st: LowerSt, base: Expr, fname: String) : KVal =
     )
   }
 
+#[doc("The record `e` evaluates to; none when its type names no nominal type.")]
+pub(pkg) fn expr_rec_sym(e: Expr) : SymId = match e.ty {
+  Some(t) -> rec_head_sym(t)
+  None -> sym_none()
+}
+
+#[doc("The slot kind of field `fname` of the record `base` evaluates to: 0 pointer, 1 Int, 2 Real.")]
+pub(pkg) fn expr_field_kind(st: LowerSt, base: Expr, fname: String) : Int = match base.ty {
+  Some(t) -> rec_field_kind_named(st.rdecl, rec_head_sym(t), fname)
+  None -> 0
+}
+
+#[doc("The read of the record field at `slot`: a raw-kinded field projects its word, a pointer field goes through `boxed`.")]
+pub(pkg) fn rec_read_op(st: LowerSt, rs: SymId, slot: KVal, v: KVal, boxed: PrimOp) : KOp = match slot {
+  KIntV(i) -> {
+    let k = rec_slot_kind(st.rdecl, rs, i)
+    if k == 0 { KPrim(boxed, [v, slot]) } else { KProjKind(v, i + 2, k) }
+  }
+  _ -> KPrim(boxed, [v, slot])
+}
+
 #[doc("The constructor a variant pattern names, as the slot readers need it: its row, or none when the pattern references no constructor.")]
 pub(pkg) type KCtorRef = KCR(Option[VariantEntry])
 
@@ -543,7 +565,7 @@ fn bind_record_subfields(
       rest,
       v,
       body,
-      bind_field_pattern(field_slot(st, rs, fname, sub), sub, v, body, st)
+      bind_field_pattern(rs, field_slot(st, rs, fname, sub), sub, v, body, st)
     )
 }
 
@@ -587,12 +609,12 @@ pub(pkg) fn bind_record_taking(
         st,
         b,
         SBoxed,
-        KPrim(KpFieldTakeAt, [v, field_slot(st, rs, fname, sub)]),
+        rec_read_op(st, rs, field_slot(st, rs, fname, sub), v, KpFieldTakeAt),
         KAt(sub.line, sub.col)
       )
     PRecord(t, inner) -> {
       let pos = KAt(sub.line, sub.col)
-      match bind_op(st, KPrim(KpFieldTakeAt, [v, field_slot(st, rs, fname, sub)]), pos) {
+      match bind_op(st, rec_read_op(st, rs, field_slot(st, rs, fname, sub), v, KpFieldTakeAt), pos) {
         LRes(tv, st1) ->
           ls_emit(bind_record_taking(rec_head_sym(t), inner, tv, st1), KRC(KDrop(tv), pos))
       }
@@ -603,6 +625,7 @@ pub(pkg) fn bind_record_taking(
 
 # A plain field binder owns the field read (`kai_op_field_at` increfs).
 fn bind_field_pattern(
+  rs: SymId,
   slot: KVal,
   sub: Pattern,
   v: KVal,
@@ -610,14 +633,15 @@ fn bind_field_pattern(
   st: LowerSt
 ) : LowerSt / Console =
   match sub.pkind {
-    PBind(b) -> ls_let(st, b, SBoxed, KPrim(KpFieldAt, [v, slot]), KAt(sub.line, sub.col))
+    PBind(b) -> ls_let(st, b, SBoxed, rec_read_op(st, rs, slot, v, KpFieldAt), KAt(sub.line, sub.col))
     PAs(b, inner) ->
       if field_sub_destructures(inner) {
-        bind_field_owned(slot, sub, v, body, st)
+        bind_field_owned(rs, slot, sub, v, body, st)
       } else {
-        bind_field_as(slot, b, sub, v, body, st)
+        bind_field_as(rs, slot, b, sub, v, body, st)
       }
-    _ -> if field_sub_destructures(sub) { bind_field_owned(slot, sub, v, body, st) } else { st }
+    _ ->
+      if field_sub_destructures(sub) { bind_field_owned(rs, slot, sub, v, body, st) } else { st }
   }
 
 fn field_sub_destructures(p: Pattern) : Bool = match p.pkind {
@@ -635,6 +659,7 @@ fn field_sub_destructures(p: Pattern) : Bool = match p.pkind {
 # (`emit_pat_binds_record`). The decision tree already tested the field's
 # shape, so these binds are dominated by that test.
 fn bind_field_owned(
+  rs: SymId,
   slot: KVal,
   sub: Pattern,
   v: KVal,
@@ -642,7 +667,7 @@ fn bind_field_owned(
   st: LowerSt
 ) : LowerSt / Console {
   let pos = KAt(sub.line, sub.col)
-  match bind_op(st, KPrim(KpFieldAt, [v, slot]), pos) {
+  match bind_op(st, rec_read_op(st, rs, slot, v, KpFieldAt), pos) {
     LRes(fv, st1) -> {
       let st2 = bind_field_sub(sub, fv, body, st1)
       let st3 = dup_binders(pat_alias_binders(sub, st2.ctor_ix), pos, st2)
@@ -703,6 +728,7 @@ fn bind_list_head(hp: Pattern, headv: KVal, st: LowerSt) : LowerSt / Console = m
 # An as-pattern field whose inner pattern binds no cells (`f: name @ x`):
 # `name` owns the field read outright.
 fn bind_field_as(
+  rs: SymId,
   slot: KVal,
   b: Binder,
   sub: Pattern,
@@ -710,7 +736,7 @@ fn bind_field_as(
   body: Expr,
   st: LowerSt
 ) : LowerSt / Console =
-  match bind_op(st, KPrim(KpFieldAt, [v, slot]), KAt(sub.line, sub.col)) {
+  match bind_op(st, rec_read_op(st, rs, slot, v, KpFieldAt), KAt(sub.line, sub.col)) {
     LRes(fv, st1) -> {
       let st2 = ls_let(st1, b, SBoxed, KLitOp(fv), KAt(sub.line, sub.col))
       bind_pattern_fields_any(as_inner(sub), fv, body, st2)

@@ -171,10 +171,10 @@ static void kai_vec_box_rec_bits(int64_t n, const int64_t *bits, const char *kin
 
 static KAI_RC_NOINLINE KaiValue *kai_vec_push_rec_bits_slow(
         KaiValue *v, int64_t n, const int64_t *bits, const char *kinds,
-        const char **names) {
+        const char **names, uint32_t mask) {
     KaiValue *xs[KAI_VEC_REC_MAX];
     kai_vec_box_rec_bits(n, bits, kinds, xs);
-    return kai_vec_push_rec_raw(v, n, xs, names);
+    return kai_vec_push_rec_raw(v, n, xs, names, mask);
 }
 
 static KAI_RC_NOINLINE KaiValue *kai_vec_set_rec_bits_slow(
@@ -186,7 +186,7 @@ static KAI_RC_NOINLINE KaiValue *kai_vec_set_rec_bits_slow(
 
 /* `vec_push(v, Rec{..})` over unpacked raw fields; consumes v. */
 KAI_VEC_FAST KaiValue *kai_vec_push_rec_bits(KaiValue *v, int64_t n, const int64_t *bits,
-                                             const char *kinds, const char **names) {
+                                             const char *kinds, const char **names, uint32_t mask) {
     KaiVecMeta *m = kai_vec_inplace_meta(v);
     if (__builtin_expect(m != NULL && kai_vec_rec_kinds_match(m, n, kinds), 1)) {
         int64_t len = v->as.vec.len;
@@ -197,7 +197,7 @@ KAI_VEC_FAST KaiValue *kai_vec_push_rec_bits(KaiValue *v, int64_t n, const int64
             return v;
         }
     }
-    return kai_vec_push_rec_bits_slow(v, n, bits, kinds, names);
+    return kai_vec_push_rec_bits_slow(v, n, bits, kinds, names, mask);
 }
 
 /* `vec_set(v, i, Rec{..})` over unpacked raw fields; consumes v. */
@@ -560,8 +560,9 @@ static KaiValue *kai_op_field_take_at(KaiValue *rec, int i) {
     if (!rec || rec->tag != KAI_RECORD) {
         kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
     }
-    KaiValue *f = rec->as.rec.fields[i];
-    if (kai_check_unique(rec)) { rec->as.rec.fields[i] = kai_unit(); return f; }
+    if (kai_var_slot_kind(rec->as.rec.slot_mask, i) != KAI_VAR_SLOT_PTR) return kai_rec_slot_box(rec, i);
+    KaiValue *f = kai_rec_slots(rec)[i].ptr;
+    if (kai_check_unique(rec)) { kai_rec_slots(rec)[i].ptr = kai_unit(); return f; }
     return kai_incref(f);
 }
 
@@ -570,8 +571,9 @@ static KaiValue *kai_op_field_take_at(KaiValue *rec, int i) {
    unit. The binder's reference to the same value stays. */
 static void kai_op_field_untake_at(KaiValue *rec, int i) {
     if (!kai_check_unique(rec) || rec->tag != KAI_RECORD) return;
-    KaiValue *old = rec->as.rec.fields[i];
-    rec->as.rec.fields[i] = kai_unit();
+    if (kai_var_slot_kind(rec->as.rec.slot_mask, i) != KAI_VAR_SLOT_PTR) return;
+    KaiValue *old = kai_rec_slots(rec)[i].ptr;
+    kai_rec_slots(rec)[i].ptr = kai_unit();
     kai_decref(old);
 }
 
@@ -582,9 +584,14 @@ static inline KaiValue *kai_op_field_take_dup_at(KaiValue *rec, int i) {
     if (!rec || rec->tag != KAI_RECORD) {
         kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
     }
-    KaiValue *f = rec->as.rec.fields[i];
+    if (kai_var_slot_kind(rec->as.rec.slot_mask, i) != KAI_VAR_SLOT_PTR) {
+        KaiValue *r = kai_rec_slot_box(rec, i);
+        kai_decref(rec);
+        return r;
+    }
+    KaiValue *f = kai_rec_slots(rec)[i].ptr;
     if (!kai_is_value(rec) && kai_rc_load(rec) == 2) {
-        rec->as.rec.fields[i] = kai_unit();
+        kai_rec_slots(rec)[i].ptr = kai_unit();
         kai_decref(rec);
         return f;
     }
@@ -600,7 +607,7 @@ static KaiValue *kai_op_field_at(KaiValue *rec, int i) {
     if (!rec || rec->tag != KAI_RECORD) {
         kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
     }
-    return kai_incref(rec->as.rec.fields[i]);
+    return kai_rec_slot_box(rec, i);
 }
 
 /* Borrow the field at slot `i` without incref, for pattern tests that only
@@ -609,7 +616,10 @@ static KaiValue *kai_op_field_borrow_at(KaiValue *rec, int i) {
     if (!rec || rec->tag != KAI_RECORD) {
         kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
     }
-    return rec->as.rec.fields[i];
+    if (kai_var_slot_kind(rec->as.rec.slot_mask, i) != KAI_VAR_SLOT_PTR) {
+        kai_eprintf("kai: borrowed read of a primitive record slot\n"); kai_exit(1);
+    }
+    return kai_rec_slots(rec)[i].ptr;
 }
 
 /* ---------- equality ---------- */
@@ -735,9 +745,17 @@ KAI_RT_SHARED int kai_op_eq(KaiValue *a, KaiValue *b) {
                 kai_decref(_eq_r);
                 return _eq_res;
             }
-            if (a->as.rec.n_fields != b->as.rec.n_fields) return 0;
-            for (int i = 0; i < a->as.rec.n_fields; ++i) {
-                if (!kai_op_eq(a->as.rec.fields[i], b->as.rec.fields[i])) return 0;
+            if (kai_rec_n(a) != kai_rec_n(b)) return 0;
+            for (int i = 0; i < kai_rec_n(a); ++i) {
+                uint32_t k = kai_var_slot_kind(a->as.rec.slot_mask, i);
+                if (k == KAI_VAR_SLOT_PTR && kai_var_slot_kind(b->as.rec.slot_mask, i) == KAI_VAR_SLOT_PTR) {
+                    if (!kai_op_eq(kai_rec_slots(a)[i].ptr, kai_rec_slots(b)[i].ptr)) return 0;
+                    continue;
+                }
+                KaiValue *x = kai_rec_slot_box(a, i), *y = kai_rec_slot_box(b, i);
+                int same = kai_op_eq(x, y);
+                kai_decref(x); kai_decref(y);
+                if (!same) return 0;
             }
             return 1;
         }

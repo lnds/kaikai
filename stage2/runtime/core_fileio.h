@@ -20,10 +20,9 @@
 
 /* Build a FileHandle record `{ fd }`; the field order is in record_layout.h. */
 static KaiValue *_kai_file_make_handle(int fd) {
-    KaiValue *fd_kv = kai_int((int64_t) fd);
-    KaiValue *fields[1] = { fd_kv };
+    KaiVarSlot slots[1] = { { .i64 = fd } };
     static const char *names[1] = { "fd" };
-    return kai_record(1, fields, names);
+    return kai_record_w(1, KAI_MASK_FILEHANDLE, slots, names);
 }
 
 /* Pull the `fd` slot out of a FileHandle record. Returns -1 when the
@@ -31,9 +30,7 @@ static KaiValue *_kai_file_make_handle(int fd) {
  * which stage2 boxes tagged — read it with kai_is_int / kai_intf. */
 static int _kai_file_handle_fd(KaiValue *v) {
     if (!kai_is_ptr(v) || v->tag != KAI_RECORD) return -1;
-    KaiValue *f = v->as.rec.fields[KAI_SLOT_FILEHANDLE_FD];
-    if (!kai_is_int(f)) return -1;
-    return (int) kai_intf(f);
+    return (int) kai_rec_slots(v)[KAI_SLOT_FILEHANDLE_FD].i64;
 }
 
 static KaiValue *_kai_file_err(const char *msg) {

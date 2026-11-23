@@ -969,6 +969,12 @@ KaiValue *kaix_reuse_or_alloc_record(KaiValue *scr, int n,
                                      uint64_t kept_mask) {
   return kai_reuse_or_alloc_record(scr, n, fields, names, kept_mask);
 }
+KaiValue *kaix_reuse_or_alloc_record_s(KaiValue *scr, int n, int32_t mask, KaiVarSlot *slots,
+                                       const char **names, uint64_t kept_mask,
+                                       const char ***site) {
+  return kai_reuse_or_alloc_record_s(scr, n, (uint32_t) mask, slots,
+                                     kai_names_site(site, n, names), kept_mask);
+}
 KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag,
                                       const char *name, int n, KaiValue **args) {
   /* Same bridge as kaix_variant: LLVM's emit path still hands us
@@ -1282,7 +1288,16 @@ KaiValue *kaix_record(int n, KaiValue **fields, const char **names) {
     return kai_record(n, fields, names);
 }
 
-KaiValue *kaix_rec_stamp(KaiValue *rec, int32_t head_tag)    { return kai_rec_stamp(rec, head_tag); }
+/* Record construction from slot words read at the kinds `mask` names;
+   `names` is a transient array canonicalised once per `site`. */
+KaiValue *kaix_record_s(int n, int32_t mask, KaiVarSlot *slots, const char **names, const char ***site) {
+    return kai_record_masked(n, kai_names_site(site, n, names), (uint32_t) mask, slots);
+}
+KaiValue *kaix_arena_record_s(int n, int32_t mask, KaiVarSlot *slots, const char **names, const char ***site) {
+    return kai_arena_record_masked(n, kai_names_site(site, n, names), (uint32_t) mask, slots);
+}
+
+KaiValue *kaix_rec_stamp(KaiValue *rec, int32_t head_tag)   { return kai_rec_stamp(rec, head_tag); }
 
 KaiValue *kaix_field_take_at(KaiValue *rec, int32_t i)       { return kai_op_field_take_at(rec, i); }
 KaiValue *kaix_field_take_dup_at(KaiValue *rec, int32_t i)   { return kai_op_field_take_dup_at(rec, i); }
@@ -1498,7 +1513,7 @@ KaiValue *kaix_core_vec_from_list(KaiValue *xs)                       { return k
 /* Vec raw element paths (compiler-fused): field read without record
  * rebuild, push/set of an unpacked record literal. */
 KaiValue *kaix_vec_field_boxed(KaiValue *v, int64_t i, int32_t fidx, int32_t owned) { return kai_vec_field_boxed(v, i, fidx, owned); }
-KaiValue *kaix_vec_push_rec_raw(KaiValue *v, int64_t n, KaiValue **xs, const char **names) { return kai_vec_push_rec_raw(v, n, xs, names); }
+KaiValue *kaix_vec_push_rec_raw(KaiValue *v, int64_t n, KaiValue **xs, const char **names, int32_t mask) { return kai_vec_push_rec_raw(v, n, xs, names, (uint32_t) mask); }
 KaiValue *kaix_vec_set_rec_raw(KaiValue *v, KaiValue *i, int64_t n, KaiValue **xs) { return kai_vec_set_rec_raw(v, i, n, xs); }
 /* Vec raw scalar paths: always inlined, so a loop over a read keeps its
  * guards hoistable and a write keeps its in-place store in the caller. */
@@ -1506,7 +1521,7 @@ __attribute__((always_inline)) int64_t kaix_vec_field_i64(KaiValue *v, int64_t i
 __attribute__((always_inline)) double kaix_vec_field_f64(KaiValue *v, int64_t i, int32_t fidx, int32_t n, int32_t owned) { return kai_vec_field_f64(v, i, fidx, n, owned); }
 __attribute__((always_inline)) int64_t kaix_vec_get_i64(KaiValue *v, int64_t i, int32_t owned) { return kai_vec_get_i64(v, i, owned); }
 __attribute__((always_inline)) double kaix_vec_get_f64(KaiValue *v, int64_t i, int32_t owned) { return kai_vec_get_f64(v, i, owned); }
-__attribute__((always_inline)) KaiValue *kaix_vec_push_rec_bits(KaiValue *v, int64_t n, const int64_t *bits, const char *kinds, const char **names) { return kai_vec_push_rec_bits(v, n, bits, kinds, names); }
+__attribute__((always_inline)) KaiValue *kaix_vec_push_rec_bits(KaiValue *v, int64_t n, const int64_t *bits, const char *kinds, const char **names, int32_t mask) { return kai_vec_push_rec_bits(v, n, bits, kinds, names, (uint32_t) mask); }
 __attribute__((always_inline)) KaiValue *kaix_vec_set_rec_bits(KaiValue *v, int64_t i, int64_t n, const int64_t *bits, const char *kinds) { return kai_vec_set_rec_bits(v, i, n, bits, kinds); }
 __attribute__((always_inline)) KaiValue *kaix_vec_push_i64(KaiValue *v, int64_t x) { return kai_vec_push_bits(v, x, KAI_INT); }
 __attribute__((always_inline)) KaiValue *kaix_vec_push_f64(KaiValue *v, double x) { return kai_vec_push_bits(v, kai_real_bits(x), KAI_REAL); }

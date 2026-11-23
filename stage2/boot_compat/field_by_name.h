@@ -7,9 +7,9 @@ static KaiValue *kai_op_field(KaiValue *rec, const char *name) {
     if (!rec || rec->tag != KAI_RECORD) {
         kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
     }
-    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
+    for (int i = 0; i < kai_rec_n(rec); ++i) {
         if (strcmp(rec->as.rec.names[i], name) == 0) {
-            return kai_incref(rec->as.rec.fields[i]);
+            return kai_incref(kai_rec_slots(rec)[i].ptr);
         }
     }
     kai_eprintf("kai: no such field `%s`\n", name); kai_exit(1);
@@ -19,7 +19,7 @@ static KaiValue *kai_op_field_take(KaiValue *rec, const char *name) {
     if (!rec || rec->tag != KAI_RECORD) {
         kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
     }
-    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
+    for (int i = 0; i < kai_rec_n(rec); ++i) {
         if (strcmp(rec->as.rec.names[i], name) == 0) {
             return kai_op_field_take_at(rec, i);
         }
@@ -29,7 +29,7 @@ static KaiValue *kai_op_field_take(KaiValue *rec, const char *name) {
 
 static void kai_op_field_untake(KaiValue *rec, const char *name) {
     if (!kai_check_unique(rec) || rec->tag != KAI_RECORD) return;
-    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
+    for (int i = 0; i < kai_rec_n(rec); ++i) {
         if (strcmp(rec->as.rec.names[i], name) == 0) {
             kai_op_field_untake_at(rec, i);
             return;
@@ -41,9 +41,9 @@ static KaiValue *kai_op_field_borrow(KaiValue *rec, const char *name) {
     if (!rec || rec->tag != KAI_RECORD) {
         kai_eprintf("kai: field access on non-record\n"); kai_exit(1);
     }
-    for (int i = 0; i < rec->as.rec.n_fields; ++i) {
+    for (int i = 0; i < kai_rec_n(rec); ++i) {
         if (strcmp(rec->as.rec.names[i], name) == 0) {
-            return rec->as.rec.fields[i];
+            return kai_rec_slots(rec)[i].ptr;
         }
     }
     kai_eprintf("kai: no such field `%s`\n", name); kai_exit(1);

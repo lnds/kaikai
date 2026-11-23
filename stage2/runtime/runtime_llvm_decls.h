@@ -14,6 +14,7 @@ static inline KaiValue *kaix_arena_cons(KaiValue *h, KaiValue *t);
 static inline void kaix_arena_pop(void);
 static inline void kaix_arena_push(void);
 static inline KaiValue *kaix_arena_record(int n, KaiValue **fields, const char **names);
+static inline KaiValue *kaix_arena_record_s(int n, int32_t mask, KaiVarSlot *slots, const char **names, const char ***site);
 static inline KaiValue *kaix_arena_variant(int32_t tag, const char *name, int n, KaiValue **args);
 static inline KaiValue *kaix_arena_variant_masked(int32_t tag, const char *name, int32_t n, KaiVarSlot *slots);
 KaiValue *kaix_args_thunk(KaiValue *s, KaiValue **a, int n);
@@ -519,6 +520,7 @@ KaiValue *kaix_real_to_int_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_real_to_string_thunk(KaiValue *s, KaiValue **a, int n);
 static inline KaiValue *kaix_rec_stamp(KaiValue *rec, int32_t head_tag);
 static inline KaiValue *kaix_record(int n, KaiValue **fields, const char **names);
+static inline KaiValue *kaix_record_s(int n, int32_t mask, KaiVarSlot *slots, const char **names, const char ***site);
 KaiValue *kaix_reduce_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_ref_get_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_ref_make_thunk(KaiValue *s, KaiValue **a, int n);
@@ -540,6 +542,7 @@ static inline __attribute__((always_inline)) KaiValue *kaix_reuse_move_commit(Ka
 static inline __attribute__((always_inline)) KaiValue *kaix_reuse_move_keep(KaiValue *at);
 static inline KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, KaiValue *t);
 static inline KaiValue *kaix_reuse_or_alloc_record(KaiValue *scr, int n, KaiValue **fields, const char **names, uint64_t kept_mask);
+static inline KaiValue *kaix_reuse_or_alloc_record_s(KaiValue *scr, int n, int32_t mask, KaiVarSlot *slots, const char **names, uint64_t kept_mask, const char ***site);
 static inline KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag, const char *name, int n, KaiValue **args);
 static inline void kaix_seed_nullary(int32_t tag, const char *name);
 KaiValue *kaix_seg_handle(KaiValue *body, KaiValue *ret, int32_t n, KaiValue **clauses);
@@ -638,8 +641,8 @@ KaiValue *kaix_vec_length_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_vec_make_thunk(KaiValue *s, KaiValue **a, int n);
 static inline __attribute__((always_inline)) KaiValue *kaix_vec_push_f64(KaiValue *v, double x);
 static inline __attribute__((always_inline)) KaiValue *kaix_vec_push_i64(KaiValue *v, int64_t x);
-static inline __attribute__((always_inline)) KaiValue *kaix_vec_push_rec_bits(KaiValue *v, int64_t n, const int64_t *bits, const char *kinds, const char **names);
-static inline KaiValue *kaix_vec_push_rec_raw(KaiValue *v, int64_t n, KaiValue **xs, const char **names);
+static inline __attribute__((always_inline)) KaiValue *kaix_vec_push_rec_bits(KaiValue *v, int64_t n, const int64_t *bits, const char *kinds, const char **names, int32_t mask);
+static inline KaiValue *kaix_vec_push_rec_raw(KaiValue *v, int64_t n, KaiValue **xs, const char **names, int32_t mask);
 KaiValue *kaix_vec_push_thunk(KaiValue *s, KaiValue **a, int n);
 static inline const void *kaix_vec_raw_slot(KaiValue *v, int64_t i);
 KaiValue *kaix_vec_reserve_thunk(KaiValue *s, KaiValue **a, int n);
@@ -671,6 +674,9 @@ static inline KaiValue *kaix_arena_cons(KaiValue *h, KaiValue *t) {return kai_ar
 static inline void kaix_arena_pop(void) {kai_arena_pop(); }
 static inline void kaix_arena_push(void) {(void) kai_arena_push(); }
 static inline KaiValue *kaix_arena_record(int n, KaiValue **fields, const char **names) {return kai_arena_record(n, fields, names); }
+static inline KaiValue *kaix_arena_record_s(int n, int32_t mask, KaiVarSlot *slots, const char **names, const char ***site) {
+    return kai_arena_record_masked(n, kai_names_site(site, n, names), (uint32_t) mask, slots);
+}
 static inline KaiValue *kaix_arena_variant(int32_t tag, const char *name, int n, KaiValue **args) {
     /* Same boxed-args bridge as kaix_variant: stamp into slot-mask shape
      * with mask 0 and forward to the arena variant ctor. */
@@ -947,6 +953,9 @@ static inline KaiValue *kaix_rec_stamp(KaiValue *rec, int32_t head_tag) {return 
 static inline KaiValue *kaix_record(int n, KaiValue **fields, const char **names) {
     return kai_record(n, fields, names);
 }
+static inline KaiValue *kaix_record_s(int n, int32_t mask, KaiVarSlot *slots, const char **names, const char ***site) {
+    return kai_record_masked(n, kai_names_site(site, n, names), (uint32_t) mask, slots);
+}
 static inline void kaix_register_one_payload_ctor(int32_t tag, const char *name, int32_t mask) {
     kai_varname_register(tag, name);
     kai_slotmask_register(tag, (uint32_t) mask);
@@ -983,6 +992,10 @@ static inline KaiValue *kaix_reuse_or_alloc_cons(KaiValue *scr, KaiValue *h, Kai
 }
 static inline KaiValue *kaix_reuse_or_alloc_record(KaiValue *scr, int n, KaiValue **fields, const char **names, uint64_t kept_mask) {
   return kai_reuse_or_alloc_record(scr, n, fields, names, kept_mask);
+}
+static inline KaiValue *kaix_reuse_or_alloc_record_s(KaiValue *scr, int n, int32_t mask, KaiVarSlot *slots, const char **names, uint64_t kept_mask, const char ***site) {
+  return kai_reuse_or_alloc_record_s(scr, n, (uint32_t) mask, slots,
+                                     kai_names_site(site, n, names), kept_mask);
 }
 static inline KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag, const char *name, int n, KaiValue **args) {
   /* Same bridge as kaix_variant: LLVM's emit path still hands us
@@ -1208,8 +1221,8 @@ static inline __attribute__((always_inline)) double kaix_vec_get_f64(KaiValue *v
 static inline __attribute__((always_inline)) int64_t kaix_vec_get_i64(KaiValue *v, int64_t i, int32_t owned) {return kai_vec_get_i64(v, i, owned); }
 static inline __attribute__((always_inline)) KaiValue *kaix_vec_push_f64(KaiValue *v, double x) {return kai_vec_push_bits(v, kai_real_bits(x), KAI_REAL); }
 static inline __attribute__((always_inline)) KaiValue *kaix_vec_push_i64(KaiValue *v, int64_t x) {return kai_vec_push_bits(v, x, KAI_INT); }
-static inline __attribute__((always_inline)) KaiValue *kaix_vec_push_rec_bits(KaiValue *v, int64_t n, const int64_t *bits, const char *kinds, const char **names) {return kai_vec_push_rec_bits(v, n, bits, kinds, names); }
-static inline KaiValue *kaix_vec_push_rec_raw(KaiValue *v, int64_t n, KaiValue **xs, const char **names) {return kai_vec_push_rec_raw(v, n, xs, names); }
+static inline __attribute__((always_inline)) KaiValue *kaix_vec_push_rec_bits(KaiValue *v, int64_t n, const int64_t *bits, const char *kinds, const char **names, int32_t mask) {return kai_vec_push_rec_bits(v, n, bits, kinds, names, (uint32_t) mask); }
+static inline KaiValue *kaix_vec_push_rec_raw(KaiValue *v, int64_t n, KaiValue **xs, const char **names, int32_t mask) {return kai_vec_push_rec_raw(v, n, xs, names, (uint32_t) mask); }
 static inline const void *kaix_vec_raw_slot(KaiValue *v, int64_t i) {return kai_vec_raw_slot(v, i); }
 static inline __attribute__((always_inline)) KaiValue *kaix_vec_set_f64(KaiValue *v, int64_t i, double x) {return kai_vec_set_bits(v, i, kai_real_bits(x), KAI_REAL); }
 static inline __attribute__((always_inline)) KaiValue *kaix_vec_set_i64(KaiValue *v, int64_t i, int64_t x) {return kai_vec_set_bits(v, i, x, KAI_INT); }

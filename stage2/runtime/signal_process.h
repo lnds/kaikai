@@ -268,10 +268,9 @@ KAI_SCHED_FN KaiValue *kai_default_signal_await(void *self, KaiCont *k)
 #if KAI_HOST_PROCESS
 /* Build a Child record `{ pid: Int }`; the field order is in record_layout.h. */
 static KaiValue *_kai_process_make_child(int pid) {
-    KaiValue *pid_kv = kai_int((int64_t) pid);
-    KaiValue *fields[1] = { pid_kv };
+    KaiVarSlot slots[1] = { { .i64 = pid } };
     static const char *names[1] = { "pid" };
-    return kai_record(1, fields, names);
+    return kai_record_w(1, KAI_MASK_CHILD, slots, names);
 }
 
 /* Pull the `pid` slot out of a Child record. Returns -1 on shape
@@ -279,9 +278,7 @@ static KaiValue *_kai_process_make_child(int pid) {
  * the typer to keep this honest in normal flows. */
 static int _kai_process_record_pid(KaiValue *v) {
     if (!v || v->tag != KAI_RECORD) return -1;
-    KaiValue *f = v->as.rec.fields[KAI_SLOT_CHILD_PID];
-    if (!kai_is_int(f)) return -1;
-    return (int) kai_intf(f);
+    return (int) kai_rec_slots(v)[KAI_SLOT_CHILD_PID].i64;
 }
 
 /* Mint Exited(code) / Signaled(signo) — variant *names* are the
