@@ -35,6 +35,7 @@ examples/quickstart
 examples/stdlib
 examples/attributes
 examples/unstable
+examples/sugars
 demos"
 
 KAI_CORPUS_SKIPS="${KAI_CORPUS_SKIPS:-tools/backend-parity-skips.txt}"
