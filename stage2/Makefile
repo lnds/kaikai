@@ -1384,7 +1384,7 @@ test-ffi-v2-struct: $(TARGET) build
 	  && echo "ffi-v2-struct OK (C backend)" \
 	  || { echo "ffi-v2-struct DIFF (C backend)"; diff ../examples/ffi/v2_struct_by_value.out.expected build/v2_struct.out; exit 1; }; \
 	$(CC) $(CFLAGS) -fsanitize=address -Wno-absolute-value -I build/v2_struct.d -I ../stage2 -I ../stage0 build/v2_struct.d/out.c ../examples/ffi/v2_struct_shim.c -o build/v2_struct-asan $(LDLIBS_M); \
-	./build/v2_struct-asan > build/v2_struct.asan.raw 2>&1; \
+	./build/v2_struct-asan > build/v2_struct.asan.raw 2>&1 || { echo "ffi-v2-struct ASAN RUN FAIL"; cat build/v2_struct.asan.raw; exit 1; }; \
 	grep -v "makecontext/swapcontext" build/v2_struct.asan.raw > build/v2_struct.asan.out || true; \
 	diff -q ../examples/ffi/v2_struct_by_value.out.expected build/v2_struct.asan.out > /dev/null \
 	  && echo "ffi-v2-struct OK (ASAN clean)" \
@@ -1410,7 +1410,7 @@ test-ffi-v2-opaque: $(TARGET) build
 	  && echo "ffi-v2-opaque OK (C backend)" \
 	  || { echo "ffi-v2-opaque DIFF (C backend)"; diff ../examples/ffi/v2_opaque_handle.out.expected build/v2_opaque.out; exit 1; }; \
 	$(CC) $(CFLAGS) -fsanitize=address -Wno-absolute-value -I ../stage2 -I ../stage0 build/v2_opaque.c ../examples/ffi/v2_shim.c -o build/v2_opaque-asan $(LDLIBS_M); \
-	./build/v2_opaque-asan > build/v2_opaque.asan.raw 2>&1; \
+	./build/v2_opaque-asan > build/v2_opaque.asan.raw 2>&1 || { echo "ffi-v2-opaque ASAN RUN FAIL"; cat build/v2_opaque.asan.raw; exit 1; }; \
 	grep -v "makecontext/swapcontext" build/v2_opaque.asan.raw > build/v2_opaque.asan.out || true; \
 	diff -q ../examples/ffi/v2_opaque_handle.out.expected build/v2_opaque.asan.out > /dev/null \
 	  && echo "ffi-v2-opaque OK (ASAN clean)" \
