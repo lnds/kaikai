@@ -236,6 +236,34 @@ static void *kai_llvm_build_extractvalue(void *b, void *agg, int64_t idx) {
     return (void *) LLVMBuildExtractValue((LLVMBuilderRef) b, (LLVMValueRef) agg,
                                           (unsigned) idx, "");
 }
+/* Raw `i64` bit operations, the `ibinop` opcodes 5..16. Shift counts are
+ * masked to their low 6 bits so every shift is defined, like the C path.
+ * `a` is the only operand of `not` and popcount. */
+static void *kai_llvm_build_ibit(LLVMBuilderRef bld, int64_t op, LLVMValueRef la, LLVMValueRef lc) {
+    LLVMTypeRef i64 = LLVMTypeOf(la);
+    LLVMValueRef sh = LLVMBuildAnd(bld, lc, LLVMConstInt(i64, 63, 0), "");
+    LLVMValueRef one = LLVMConstInt(i64, 1, 0);
+    switch (op) {
+        case 5:  return (void *) LLVMBuildAnd(bld, la, lc, "");
+        case 6:  return (void *) LLVMBuildOr(bld, la, lc, "");
+        case 7:  return (void *) LLVMBuildXor(bld, la, lc, "");
+        case 8:  return (void *) LLVMBuildShl(bld, la, sh, "");
+        case 9:  return (void *) LLVMBuildAShr(bld, la, sh, "");
+        case 10: return (void *) LLVMBuildLShr(bld, la, sh, "");
+        case 11: return (void *) LLVMBuildNot(bld, la, "");
+        case 12: {
+            LLVMModuleRef m = LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInsertBlock(bld)));
+            LLVMValueRef fn = LLVMGetNamedFunction(m, "llvm.ctpop.i64");
+            LLVMTypeRef fty = LLVMFunctionType(i64, &i64, 1, 0);
+            if (!fn) fn = LLVMAddFunction(m, "llvm.ctpop.i64", fty);
+            return (void *) LLVMBuildCall2(bld, fty, fn, &la, 1, "");
+        }
+        case 13: return (void *) LLVMBuildOr(bld, la, LLVMBuildShl(bld, one, sh, ""), "");
+        case 14: return (void *) LLVMBuildAnd(bld, la, LLVMBuildNot(bld, LLVMBuildShl(bld, one, sh, ""), ""), "");
+        case 15: return (void *) LLVMBuildXor(bld, la, LLVMBuildShl(bld, one, sh, ""), "");
+        default: return (void *) LLVMBuildAnd(bld, LLVMBuildLShr(bld, la, sh, ""), one, "");
+    }
+}
 /* Raw `i64` arithmetic for the unboxed-Int path (KIR mode-slave to the
  * unbox pass). `op`: 0=`add`, 1=`sub`, 2=`mul` — matching the C-direct
  * oracle's `kair_a + kair_b` on a raw `int64_t`. NO `nsw`/`nuw` flags:
@@ -256,7 +284,8 @@ static void *kai_llvm_build_ibinop(void *b, int64_t op, void *a, void *c) {
         case 1:  return (void *) LLVMBuildSub(bld, la, lc, "");
         case 2:  return (void *) LLVMBuildMul(bld, la, lc, "");
         case 3:  return (void *) LLVMBuildSDiv(bld, la, lc, "");
-        default: return (void *) LLVMBuildSRem(bld, la, lc, "");
+        case 4:  return (void *) LLVMBuildSRem(bld, la, lc, "");
+        default: return kai_llvm_build_ibit(bld, op, la, lc);
     }
 }
 /* Raw `i64` SIGNED comparison → an `i1`. `pred`: 0=`<`, 1=`>`, 2=`<=`,
