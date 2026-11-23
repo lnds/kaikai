@@ -9614,10 +9614,10 @@ test-root-reaps-children-asan: $(TARGET) build
 	      -Wno-unused-function -Wno-unused-variable \
 	      -I ../stage2 -I ../stage0 build/$$name-asan.c -o build/$$name-asan-c -lm -lpthread; \
 	for n in 1 4; do \
-	  KAI_THREADS=$$n ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=$(SEG_RT_LEAKS):symbolize=0" \
+	  KAI_THREADS=$$n ASAN_OPTIONS="abort_on_error=0:halt_on_error=1:detect_leaks=$(SEG_RT_LEAKS):symbolize=1:fast_unwind_on_malloc=0" LSAN_OPTIONS="report_objects=1" \
 	  UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1" \
 	    $(KAI_BOUNDED) 300 ./build/$$name-asan-c > build/$$name-asan.$$n.out 2> build/$$name-asan.$$n.err \
-	    || { echo "root-reaps-asan FAIL (KAI_THREADS=$$n)"; cat build/$$name-asan.$$n.err; exit 1; }; \
+	    || { echo "root-reaps-asan FAIL (KAI_THREADS=$$n)"; cat build/$$name-asan.$$n.err; grep -o "asan-c+0x[0-9a-f]*" build/$$name-asan.$$n.err | sed "s/.*+//" | sort -u | xargs addr2line -f -C -p -e build/$$name-asan-c; exit 1; }; \
 	  diff -q ../examples/runtime/$$name.out.expected build/$$name-asan.$$n.out > /dev/null \
 	    || { echo "root-reaps-asan DIFF (KAI_THREADS=$$n)"; cat build/$$name-asan.$$n.out; exit 1; }; \
 	done; \
