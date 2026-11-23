@@ -672,13 +672,6 @@ static inline void kai_tsan_fiber_free(KaiFiber *f) { (void) f; }
 #if defined(KAI_ASAN_FIBERS)
 void __sanitizer_start_switch_fiber(void **fake_stack_save, const void *bottom, size_t size);
 void __sanitizer_finish_switch_fiber(void *fake_stack_save, const void **bottom_old, size_t *size_old);
-/* A suspended fiber's fake stack is detached from its thread, so LeakSanitizer
- * misses the values its frames hold and reports them as leaked. An explicit
- * ASAN_OPTIONS=detect_stack_use_after_return=1 overrides this and brings those
- * false leaks back. */
-__attribute__((weak, used)) const char *__asan_default_options(void) {
-    return "detect_stack_use_after_return=0";
-}
 #endif
 /* LeakSanitizer scans thread stacks, not a mapped segment stack: a value only
  * a suspended segment's frames hold would read as leaked. */
@@ -687,13 +680,7 @@ void __lsan_register_root_region(const void *p, size_t size);
 void __lsan_unregister_root_region(const void *p, size_t size);
 #  define KAI_SEG_LSAN_ROOT(seg)   __lsan_register_root_region((seg)->own.stack_base, (seg)->own.stack_size + kai_page_size())
 #  define KAI_SEG_LSAN_UNROOT(seg) __lsan_unregister_root_region((seg)->own.stack_base, (seg)->own.stack_size + kai_page_size())
-/* A suspended fiber's ASan fake stack is reachable only through the save slot
- * on its own stack, so that stack is scanned too. */
-#  define KAI_FIBER_LSAN_ROOT(base, size)   __lsan_register_root_region((base), (size) + kai_page_size())
-#  define KAI_FIBER_LSAN_UNROOT(base, size) __lsan_unregister_root_region((base), (size) + kai_page_size())
 #else
-#  define KAI_FIBER_LSAN_ROOT(base, size)   ((void) 0)
-#  define KAI_FIBER_LSAN_UNROOT(base, size) ((void) 0)
 #  define KAI_SEG_LSAN_ROOT(seg)   ((void) 0)
 #  define KAI_SEG_LSAN_UNROOT(seg) ((void) 0)
 #endif

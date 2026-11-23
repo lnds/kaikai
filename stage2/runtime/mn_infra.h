@@ -215,7 +215,6 @@ static void kai_drain_pending_free(KaiWorker *w) {
      * (free would corrupt the heap). */
 #if KAI_HOST_STACK_GUARD
     if (f->stack_base) {
-        KAI_FIBER_LSAN_UNROOT(f->stack_base, f->stack_size);
         kai_stack_unmap(f->stack_base, f->stack_size);
     }
 #elif defined(__wasm__)
