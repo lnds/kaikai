@@ -70,16 +70,18 @@ fn kc_con_masked(cx: KcCx, nm: String, tag: Int, inits: [KSlotInit], rgn: Bool) 
     [kc_i32(tag), kc_name(nm), kc_i32(list_length(inits)), kc_word_arr(kc_words(cx, inits))]
   )
 
+# Static: a per-call array would take space in the caller's frame on every recursion level.
 fn kc_field_names(fs: [KFieldInit]) : String =
-  kc_arr(
-    "const char *",
-    map(
+  concat_all([
+    "({ static const char *n_[] = {",
+    kc_args(map(
       fs,
       f => match f {
         KFI(nm, _) -> kc_cstr(nm)
       }
-    )
-  )
+    )),
+    "}; n_; })"
+  ])
 
 fn kc_stamp(e: String, tag: Int) : String =
   if tag == 0 { e } else { kc_call("kaix_rec_stamp", [e, kc_i32(tag)]) }
@@ -90,12 +92,57 @@ fn kc_names_site() : String = "({ static const char **s_; &s_; })"
 #[doc("A record literal, stamped with its head tag when it has one; a region-branded one builds in the arena.")]
 pub fn kc_record(cx: KcCx, fs: [KFieldInit], rgn: Bool, tag: Int) : String {
   let inits = field_slot_inits(fs)
+  let mask = kc_init_mask(inits, 0, 0)
+  if mask == 0 {
+    kc_stamp(
+      kc_call(
+        if rgn { "kaix_arena_record_p" } else { "kaix_record_p" },
+        [
+          kc_i32(list_length(fs)),
+          kc_arr("KaiValue *", map(inits, it => kc_init_atom(cx, it))),
+          kc_field_names(fs),
+          kc_names_site()
+        ]
+      ),
+      tag
+    )
+  } else if list_length(fs) <= 4 {
+    kc_record_words(cx, fs, inits, mask, rgn, tag)
+  } else {
+    kc_record_masked(cx, fs, inits, mask, rgn, tag)
+  }
+}
+
+fn kc_bits_word(cx: KcCx, it: KSlotInit) : String = match it {
+  SIInt64(v) -> concat_all(["(uint64_t)(", kc_atom_raw(cx, v, SInt64), ")"])
+  SIReal(v) -> kc_call("kai_real_bits", [kc_real_word(cx, v)])
+  SIEnum(v) -> concat_all(["(uint64_t)(", kc_enum_word(cx, v), ")"])
+  SIBoxed(v) -> concat_all(["(uint64_t)(uintptr_t)(", kc_atom(cx, v), ")"])
+}
+
+fn kc_pad_words(ws: [String]) : [String] =
+  if list_length(ws) >= 4 { ws } else { kc_pad_words(list_append(ws, ["0"])) }
+
+# Up to four slot words travel by value so a record literal adds no slot array to its caller's frame.
+fn kc_record_words(cx: KcCx, fs: [KFieldInit], inits: [KSlotInit], mask: Int, rgn: Bool, tag: Int) : String =
+  kc_stamp(
+    kc_call(
+      if rgn { "kaix_arena_record_w4" } else { "kaix_record_w4" },
+      list_append(
+        [kc_i32(list_length(fs)), kc_i32(mask), kc_field_names(fs), kc_names_site()],
+        kc_pad_words(map(inits, it => kc_bits_word(cx, it)))
+      )
+    ),
+    tag
+  )
+
+fn kc_record_masked(cx: KcCx, fs: [KFieldInit], inits: [KSlotInit], mask: Int, rgn: Bool, tag: Int) : String =
   kc_stamp(
     kc_call(
       if rgn { "kaix_arena_record_s" } else { "kaix_record_s" },
       [
         kc_i32(list_length(fs)),
-        kc_i32(kc_init_mask(inits, 0, 0)),
+        kc_i32(mask),
         kc_word_arr(kc_words(cx, inits)),
         kc_field_names(fs),
         kc_names_site()
@@ -103,7 +150,6 @@ pub fn kc_record(cx: KcCx, fs: [KFieldInit], rgn: Bool, tag: Int) : String {
     ),
     tag
   )
-}
 
 # ---- reuse -----------------------------------------------------------------
 

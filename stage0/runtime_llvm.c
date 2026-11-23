@@ -972,8 +972,7 @@ KaiValue *kaix_reuse_or_alloc_record(KaiValue *scr, int n,
 KaiValue *kaix_reuse_or_alloc_record_s(KaiValue *scr, int n, int32_t mask, KaiVarSlot *slots,
                                        const char **names, uint64_t kept_mask,
                                        const char ***site) {
-  return kai_reuse_or_alloc_record_s(scr, n, (uint32_t) mask, slots,
-                                     kai_names_site(site, n, names), kept_mask);
+  return kai_reuse_or_alloc_record_site(scr, n, (uint32_t) mask, slots, names, kept_mask, site);
 }
 KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag,
                                       const char *name, int n, KaiValue **args) {
@@ -1291,10 +1290,26 @@ KaiValue *kaix_record(int n, KaiValue **fields, const char **names) {
 /* Record construction from slot words read at the kinds `mask` names;
    `names` is a transient array canonicalised once per `site`. */
 KaiValue *kaix_record_s(int n, int32_t mask, KaiVarSlot *slots, const char **names, const char ***site) {
-    return kai_record_masked(n, kai_names_site(site, n, names), (uint32_t) mask, slots);
+    return kai_record_s(n, (uint32_t) mask, slots, names, site);
 }
 KaiValue *kaix_arena_record_s(int n, int32_t mask, KaiVarSlot *slots, const char **names, const char ***site) {
-    return kai_arena_record_masked(n, kai_names_site(site, n, names), (uint32_t) mask, slots);
+    return kai_arena_record_s(n, (uint32_t) mask, slots, names, site);
+}
+
+KaiValue *kaix_record_p(int n, KaiValue **fields, const char **names, const char ***site) {
+    return kai_record_p(n, fields, names, site);
+}
+KaiValue *kaix_arena_record_p(int n, KaiValue **fields, const char **names, const char ***site) {
+    return kai_arena_record_p(n, fields, names, site);
+}
+
+KaiValue *kaix_record_w4(int n, int32_t mask, const char **names, const char ***site,
+                         uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return kai_record_w4(n, (uint32_t) mask, names, site, a, b, c, d);
+}
+KaiValue *kaix_arena_record_w4(int n, int32_t mask, const char **names, const char ***site,
+                               uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return kai_arena_record_w4(n, (uint32_t) mask, names, site, a, b, c, d);
 }
 
 KaiValue *kaix_rec_stamp(KaiValue *rec, int32_t head_tag)   { return kai_rec_stamp(rec, head_tag); }

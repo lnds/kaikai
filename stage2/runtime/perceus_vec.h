@@ -112,6 +112,12 @@ static KaiValue *kai_reuse_or_alloc_record_s(KaiValue *_scr, int n, uint32_t mas
     return kai_record_masked(n, names, mask, slots);
 }
 
+static KAI_RC_NOINLINE KaiValue *kai_reuse_or_alloc_record_site(KaiValue *scr, int n, uint32_t mask,
+                                                                const KaiVarSlot *slots, const char **names,
+                                                                uint64_t kept_mask, const char ***site) {
+    return kai_reuse_or_alloc_record_s(scr, n, mask, slots, kai_names_site(site, n, names), kept_mask);
+}
+
 static KaiValue *kai_reuse_or_alloc_record(KaiValue *_scr, int n, KaiValue **fields,
                                            const char **names, uint64_t kept_mask) {
     return kai_reuse_or_alloc_record_s(_scr, n, 0, (const KaiVarSlot *) fields,
