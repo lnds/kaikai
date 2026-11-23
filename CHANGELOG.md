@@ -84,6 +84,30 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.199.0 (2026-11-23)
+
+### BREAKING CHANGE
+
+- trim, trim_left, trim_right and is_blank previously
+accepted only space, tab, \n and \r; they now also strip \v, \f and the
+non-ASCII White_Space codepoints.
+
+### Added
+
+- **stdlib**: trim and is_blank use the Unicode White_Space set
+- **stdlib**: add json_encode_pretty and short \b \f escapes in encoding.json
+
+### Fixed
+
+- **stdlib**: keep ASCII trim on byte loops and update tests to Unicode whitespace
+- **stdlib**: every fs error carries the path, the OS reason and the errno
+- **lint**: skip non_tail_list_recursion on a backtracking search
+
+### Changed
+
+- **stdlib**: restore the ASCII trim loop shape
+- **runtime**: keep short string bytes inside the string cell
+
 ## v0.198.0 (2026-11-23)
 
 ### Added
