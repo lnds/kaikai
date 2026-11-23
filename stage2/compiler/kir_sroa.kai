@@ -1,0 +1,243 @@
+#[doc("""
+Scalar replacement of records and tuples that never leave their function.
+
+A record literal whose every use is a field read, a dup or a drop of itself or
+of a register that only ever holds it is not built. Each field read becomes a
+read of the register that initialised the field, and the record's own
+reference count moves to its fields: a dup or drop of the record is a dup or
+drop of each pointer field. A record that escapes anywhere (a call, a return,
+a reuse, a store into anything else) is left as it is.
+""")]
+
+import compiler.kir
+import compiler.kir_inline_beta
+import compiler.kir_sroa_flow
+import compiler.util
+
+#[doc("`kp` with every non-escaping record literal of each function replaced by its fields.")]
+pub(pkg) fn kir_sroa_program(kp: KProgram) : KProgram =
+  KProgram { ...kp, fns: map(kp.fns, sr_fn) }
+
+fn sr_fn(f: KFn) : KFn =
+  if sr_has_handlers(f.blocks) {
+    f
+  } else {
+    match sr_cands(f, f.blocks, []) {
+      [] -> f
+      cs -> kfn_with_blocks(f, sr_each(f.blocks, cs))
+    }
+  }
+
+fn sr_each(bs: [KBlock], cs: [SrCand]) : [KBlock] = match cs {
+  [] -> bs
+  [c, ...rest] -> match sr_try(bs, c) {
+    Some(nbs) -> sr_each(nbs, rest)
+    None -> sr_each(bs, rest)
+  }
+}
+
+# A function with handler frames keeps its records: the landing pads reach
+# registers the block walk below cannot see.
+fn sr_has_handlers(bs: [KBlock]) : Bool = any(bs, b => any(b.stmts, sr_is_handler_stmt))
+
+fn sr_is_handler_stmt(s: KStmt) : Bool = match s {
+  KInstall(_, _, _, _, _, _) -> true
+  KPop(_, _, _) -> true
+  KLet(_, _, KSetjmp(_, _), _) -> true
+  _ -> false
+}
+
+type SrCand = { name: String, fields: [KFieldInit] }
+
+fn sr_cands(f: KFn, bs: [KBlock], acc: [SrCand]) : [SrCand] = match bs {
+  [] -> acc
+  [b, ...rest] -> sr_cands(f, rest, sr_block_cands(f, b.stmts, acc))
+}
+
+fn sr_block_cands(f: KFn, ss: [KStmt], acc: [SrCand]) : [SrCand] = match ss {
+  [] -> acc
+  [KLet(n, SBoxed, KRecord(fs, false, _), _), ...rest] ->
+    sr_block_cands(
+      f,
+      rest,
+      if sr_fields_ok(f, fs) and sr_single_def(f, n) {
+        [SrCand { name: n, fields: fs }, ...acc]
+      } else {
+        acc
+      }
+    )
+  [_, ...rest] -> sr_block_cands(f, rest, acc)
+}
+
+fn sr_fields_ok(f: KFn, fs: [KFieldInit]) : Bool = match fs {
+  [] -> true
+  [KFI(_, si), ...rest] -> sr_init_ok(f, si) and sr_fields_ok(f, rest)
+}
+
+# A field must be a register nothing reassigns, or a literal that is no box.
+fn sr_init_ok(f: KFn, si: KSlotInit) : Bool = match si {
+  SIBoxed(v) -> sr_atom_ok(f, v, false)
+  SIInt64(v) -> sr_atom_ok(f, v, true)
+  _ -> false
+}
+
+fn sr_atom_ok(f: KFn, v: KVal, raw: Bool) : Bool = match v {
+  KVar(n) -> sr_single_def(f, n) and (not sr_stored(f.blocks, n))
+  KIntV(_) -> true
+  KBoolV(_) -> not raw
+  KUnitV -> not raw
+  _ -> false
+}
+
+fn sr_single_def(f: KFn, n: String) : Bool =
+  list_length(filter(f.params, p => p.name == n)) + sr_def_count(f.blocks, n) == 1
+
+fn sr_def_count(bs: [KBlock], n: String) : Int = match bs {
+  [] -> 0
+  [b, ...rest] ->
+    list_length(filter(b.stmts, s => sr_defines(s, n))) + sr_def_count(rest, n)
+}
+
+fn sr_defines(s: KStmt, n: String) : Bool = match s {
+  KLet(m, _, _, _) -> m == n
+  _ -> false
+}
+
+fn sr_stored(bs: [KBlock], n: String) : Bool = any(
+  bs,
+  b => any(
+    b.stmts,
+    s => match s {
+      KStore(m, _, _) -> m == n
+      _ -> false
+    }
+  )
+)
+
+# ---- one candidate ------------------------------------------------------
+
+fn sr_try(bs: [KBlock], c: SrCand) : Option[[KBlock]] {
+  let names = sr_alias_names(bs, [c.name])
+  if sr_defs_dominate(bs, names, c.name) {
+    match sr_rewrite(bs, names, c, []) {
+      Some(nbs) ->
+        if any(names, n => kir_reg_used(nbs, n, true)) { None } else { Some(nbs) }
+      None -> None
+    }
+  } else {
+    None
+  }
+}
+
+# ---- the rewrite --------------------------------------------------------
+
+type SrOut = SrKeep | SrSub([KStmt]) | SrBad
+
+fn sr_rewrite(bs: [KBlock], names: [String], c: SrCand, acc: [KBlock]) : Option[[KBlock]] =
+  match bs {
+    [] -> Some(list_reverse(acc))
+    [b, ...rest] -> {
+      if sr_term_mentions(b, names) {
+        None
+      } else {
+        match sr_rewrite_stmts(b.stmts, names, c, []) {
+          Some(ss) -> sr_rewrite(rest, names, c, [KBlock { ...b, stmts: ss }, ...acc])
+          None -> None
+        }
+      }
+    }
+  }
+
+fn sr_term_mentions(b: KBlock, names: [String]) : Bool =
+  any(names, n => kir_reg_used([KBlock { ...b, stmts: [] }], n, true))
+
+fn sr_rewrite_stmts(ss: [KStmt], names: [String], c: SrCand, acc: [KStmt]) : Option[[KStmt]] =
+  match ss {
+    [] -> Some(list_reverse(acc))
+    [s, ...rest] -> match sr_stmt(s, names, c) {
+      SrKeep -> sr_rewrite_stmts(rest, names, c, [s, ...acc])
+      SrSub(new) -> sr_rewrite_stmts(rest, names, c, list_append(list_reverse(new), acc))
+      SrBad -> None
+    }
+  }
+
+fn sr_mentions(s: KStmt, names: [String]) : Bool =
+  any(
+    names,
+    n => kir_reg_used(
+      [KBlock { label: "", stmts: [s], term: KUnreachable(KNoPos), region_id: None }],
+      n,
+      true
+    )
+  )
+
+fn sr_stmt(s: KStmt, names: [String], c: SrCand) : SrOut = match s {
+  KLet(m, _, KRecord(_, _, _), _) -> sr_when(m == c.name, s, names, SrSub([]))
+  KLet(m, sl, KPrim(KpFieldAt, [KVar(v), KIntV(i)]), pos) ->
+    sr_when(list_has(names, v), s, names, sr_read_boxed(m, sl, sr_nth(c.fields, i), pos))
+  KLet(m, sl, KPrim(KpFieldBorrowAt, [KVar(v), KIntV(i)]), pos) ->
+    sr_when(list_has(names, v), s, names, sr_read_borrowed(m, sl, sr_nth(c.fields, i), pos))
+  KLet(m, sl, KProjKind(KVar(v), j, k), pos) ->
+    sr_when(list_has(names, v), s, names, sr_read_raw(m, sl, sr_nth(c.fields, j - 2), k, pos))
+  KRC(KDup(KVar(v)), pos) ->
+    sr_when(list_has(names, v), s, names, SrSub(sr_rc(c.fields, true, pos)))
+  KRC(KDrop(KVar(v)), pos) ->
+    sr_when(list_has(names, v), s, names, SrSub(sr_rc(c.fields, false, pos)))
+  KStore(m, KVar(v), _) -> sr_when(list_has(names, m) and list_has(names, v), s, names, SrSub([]))
+  KLet(m, _, KLitOp(KVar(v)), _) ->
+    sr_when(list_has(names, m) and list_has(names, v), s, names, SrSub([]))
+  KLet(m, _, KLitOp(KUnitV), _) -> if list_has(names, m) { SrSub([]) } else { SrKeep }
+  KLet(m, _, _, _) -> if list_has(names, m) { SrBad } else { sr_other(s, names) }
+  _ -> sr_other(s, names)
+}
+
+# `out` when this statement is the record's own, else the statement must not mention the record.
+fn sr_when(own: Bool, s: KStmt, names: [String], out: SrOut) : SrOut =
+  if own { out } else { sr_other(s, names) }
+
+fn sr_other(s: KStmt, names: [String]) : SrOut = if sr_mentions(s, names) { SrBad } else { SrKeep }
+
+fn sr_nth(fs: [KFieldInit], i: Int) : Option[KSlotInit] = match fs {
+  [] -> None
+  [KFI(_, si), ...rest] -> if i == 0 { Some(si) } else { sr_nth(rest, i - 1) }
+}
+
+fn sr_read_boxed(m: String, sl: KSlot, f: Option[KSlotInit], pos: KPos) : SrOut = match f {
+  Some(SIBoxed(v)) -> SrSub(list_append(sr_dup_atom(v, pos), [KLet(m, sl, KLitOp(v), pos)]))
+  Some(SIInt64(v)) -> SrSub([KLet(m, sl, KPrim(KpBox(RwInt), [v]), pos)])
+  _ -> SrBad
+}
+
+fn sr_read_borrowed(m: String, sl: KSlot, f: Option[KSlotInit], pos: KPos) : SrOut = match f {
+  Some(SIBoxed(v)) -> SrSub([KLet(m, sl, KLitOp(v), pos)])
+  _ -> SrBad
+}
+
+fn sr_read_raw(m: String, sl: KSlot, f: Option[KSlotInit], k: Int, pos: KPos) : SrOut = match f {
+  Some(SIInt64(v)) -> if k == 1 {
+    match sl {
+      SInt64 -> SrSub([KLet(m, sl, KLitOp(v), pos)])
+      _ -> SrSub([KLet(m, sl, KPrim(KpBox(RwInt), [v]), pos)])
+    }
+  } else {
+    SrBad
+  }
+  _ -> SrBad
+}
+
+fn sr_dup_atom(v: KVal, pos: KPos) : [KStmt] = match v {
+  KVar(_) -> [KRC(KDup(v), pos)]
+  _ -> []
+}
+
+fn sr_rc(fs: [KFieldInit], dup: Bool, pos: KPos) : [KStmt] = match fs {
+  [] -> []
+  [KFI(_, SIBoxed(v)), ...rest] -> {
+    let tail = sr_rc(rest, dup, pos)
+    match v {
+      KVar(_) -> [KRC(if dup { KDup(v) } else { KDrop(v) }, pos), ...tail]
+      _ -> tail
+    }
+  }
+  [_, ...rest] -> sr_rc(rest, dup, pos)
+}
