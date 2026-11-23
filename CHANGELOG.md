@@ -84,6 +84,17 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.199.2 (2026-11-23)
+
+### Fixed
+
+- **runtime**: issue the ASan switch calls from the caller's frame
+- **runtime**: release the root fiber's exit record at shutdown
+- **runtime**: guard the worker cell-pool trim on the pool being active
+- **runtime**: release a worker's cell pool and the root fiber's buffers at shutdown
+- **runtime**: keep the KaiWorker layout identical with and without ASan
+- **runtime**: annotate the M:N scheduler's stack switches for AddressSanitizer
+
 ## v0.199.1 (2026-11-23)
 
 ### Changed
