@@ -84,6 +84,14 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.199.1 (2026-11-23)
+
+### Changed
+
+- **stdlib**: keep the UTF-8 check primitive package-private
+- **stdlib**: string prefix, byte and UTF-8 paths work on the buffer in place
+- **stdlib**: last_index_of scans backwards in one runtime call
+
 ## v0.199.0 (2026-11-23)
 
 ### BREAKING CHANGE
