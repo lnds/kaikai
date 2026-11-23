@@ -1,0 +1,233 @@
+#[doc("""
+Fold the boxes of raw Ints that never leave their function.
+
+An Int register boxed only to be added, subtracted, multiplied, copied, dup'd,
+dropped or unboxed again is never boxed: the arithmetic runs on the raw words,
+and the dups and drops of boxes that no longer exist go with them. A box that
+is read anywhere else (passed, returned, stored, tested) keeps its definition
+and every use.
+""")]
+
+import compiler.ast_ids
+import compiler.kir
+import compiler.kir_inline_beta
+import compiler.util
+
+#[doc("`kp` with the boxes of purely local raw Ints folded away.")]
+pub(pkg) fn kir_box_fold_program(kp: KProgram) : KProgram =
+  KProgram { ...kp, fns: map(kp.fns, bf_fn) }
+
+fn bf_max_stmts() : Int = 600
+
+fn bf_fn(f: KFn) : KFn {
+  let stmts = flat_map(f.blocks, b => b.stmts)
+  if list_length(stmts) > bf_max_stmts() {
+    f
+  } else {
+    match bf_cands(f, stmts) {
+      [] -> f
+      cs -> bf_apply(f, stmts, cs)
+    }
+  }
+}
+
+type BfDef = BfBox(KVal) | BfCopy(String) | BfArith(BinOp, KVal, KVal)
+
+type BfCand = BfCand(String, BfDef)
+
+fn bf_cands(f: KFn, stmts: [KStmt]) : [BfCand] = flat_map(stmts, s => bf_cand_of(f, stmts, s))
+
+fn bf_cand_of(f: KFn, stmts: [KStmt], s: KStmt) : [BfCand] = match s {
+  KLet(x, SBoxed, KPrim(KpBox(RwInt), [r]), _) ->
+    if bf_stable(f, stmts, x) and bf_raw_ok(f, stmts, r) { [BfCand(x, BfBox(r))] } else { [] }
+  KLet(y, SBoxed, KLitOp(KVar(x)), _) ->
+    if bf_stable(f, stmts, y) { [BfCand(y, BfCopy(x))] } else { [] }
+  KLet(z, SBoxed, KPrim(KpBin(op), [a, b]), _) ->
+    if bf_arith(op) and bf_stable(f, stmts, z) { [BfCand(z, BfArith(op, a, b))] } else { [] }
+  _ -> []
+}
+
+fn bf_arith(op: BinOp) : Bool = match op {
+  BoAdd -> true
+  BoSub -> true
+  BoMul -> true
+  _ -> false
+}
+
+fn bf_raw_ok(f: KFn, stmts: [KStmt], r: KVal) : Bool = match r {
+  KIntV(_) -> true
+  KVar(n) -> bf_stable(f, stmts, n)
+  _ -> false
+}
+
+# Defined once and never stored into.
+fn bf_stable(f: KFn, stmts: [KStmt], n: String) : Bool =
+  list_length(filter(f.params, p => p.name == n))
+    + list_length(filter(stmts, s => bf_defines(s, n)))
+    == 1
+    and (not any(stmts, s => bf_stores(s, n)))
+
+fn bf_defines(s: KStmt, n: String) : Bool = match s {
+  KLet(m, _, _, _) -> m == n
+  _ -> false
+}
+
+fn bf_stores(s: KStmt, n: String) : Bool = match s {
+  KStore(m, _, _) -> m == n
+  _ -> false
+}
+
+# ---- which boxes can go -------------------------------------------------
+
+# `need`: a box that goes only if another does.
+type BfFacts = { bad: [String], need: [(String, String)] }
+
+fn bf_apply(f: KFn, stmts: [KStmt], cs: [BfCand]) : KFn {
+  let names = map(cs, c => bf_name(c))
+  let facts = bf_facts(stmts, names, f.blocks, BfFacts { bad: [], need: [] })
+  let keep = bf_fix(cs, filter(names, n => not list_has(facts.bad, n)), facts.need)
+  match keep {
+    [] -> f
+    _ -> kfn_with_blocks(f, map(f.blocks, b => KBlock { ...b, stmts: bf_stmts(b.stmts, keep, cs) }))
+  }
+}
+
+fn bf_name(c: BfCand) : String = match c {
+  BfCand(n, _) -> n
+}
+
+fn bf_facts(ss: [KStmt], names: [String], bs: [KBlock], acc: BfFacts) : BfFacts {
+  let withTerms = bf_term_facts(bs, names, acc)
+  bf_stmt_facts(ss, names, withTerms)
+}
+
+fn bf_term_facts(bs: [KBlock], names: [String], acc: BfFacts) : BfFacts = match bs {
+  [] -> acc
+  [b, ...rest] ->
+    bf_term_facts(
+      rest,
+      names,
+      bf_mark(acc, filter(names, n => kir_reg_used([KBlock { ...b, stmts: [] }], n, true)))
+    )
+}
+
+fn bf_stmt_facts(ss: [KStmt], names: [String], acc: BfFacts) : BfFacts = match ss {
+  [] -> acc
+  [s, ...rest] -> bf_stmt_facts(rest, names, bf_one(s, names, acc))
+}
+
+fn bf_one(s: KStmt, names: [String], acc: BfFacts) : BfFacts = match s {
+  KRC(KDup(KVar(_)), _) -> acc
+  KRC(KDrop(KVar(_)), _) -> acc
+  KLet(_, _, KPrim(KpUnbox(RwInt), [KVar(_)]), _) -> acc
+  KLet(y, _, KLitOp(KVar(x)), _) ->
+    if list_has(names, y) {
+      BfFacts { ...acc, need: [(x, y), ...acc.need] }
+    } else {
+      bf_stray(s, names, acc)
+    }
+  KLet(z, _, KPrim(KpBin(_), [a, b]), _) ->
+    if list_has(names, z) {
+      BfFacts {
+        ...acc,
+        need: list_append(bf_operand_need(a, z), list_append(bf_operand_need(b, z), acc.need))
+      }
+    } else {
+      bf_stray(s, names, acc)
+    }
+  _ -> bf_stray(s, names, acc)
+}
+
+fn bf_operand_need(v: KVal, z: String) : [(String, String)] = match v {
+  KVar(x) -> [(x, z)]
+  _ -> []
+}
+
+fn bf_stray(s: KStmt, names: [String], acc: BfFacts) : BfFacts =
+  bf_mark(
+    acc,
+    filter(
+      names,
+      n => kir_reg_used(
+        [KBlock { label: "", stmts: [s], term: KUnreachable(KNoPos), region_id: None }],
+        n,
+        true
+      )
+    )
+  )
+
+fn bf_mark(acc: BfFacts, ns: [String]) : BfFacts = BfFacts { ...acc, bad: list_append(ns, acc.bad) }
+
+# A box stays foldable while the boxes its definition reads are, and the
+# boxes that read it are.
+fn bf_fix(cs: [BfCand], keep: [String], need: [(String, String)]) : [String] {
+  let next = filter(keep, n => bf_holds(cs, n, keep, need))
+  if list_length(next) == list_length(keep) { keep } else { bf_fix(cs, next, need) }
+}
+
+fn bf_holds(cs: [BfCand], n: String, keep: [String], need: [(String, String)]) : Bool =
+  bf_def_ok(bf_def_of(cs, n), keep)
+    and (not any(
+      need,
+      p => match p {
+        (x, y) -> x == n and (not list_has(keep, y))
+      }
+    ))
+
+fn bf_def_of(cs: [BfCand], n: String) : BfDef = match cs {
+  [] -> BfBox(KUnitV)
+  [BfCand(m, d), ...rest] -> if m == n { d } else { bf_def_of(rest, n) }
+}
+
+fn bf_def_ok(d: BfDef, keep: [String]) : Bool = match d {
+  BfBox(_) -> true
+  BfCopy(s) -> list_has(keep, s)
+  BfArith(_, a, b) -> bf_atom_ok(a, keep) and bf_atom_ok(b, keep)
+}
+
+fn bf_atom_ok(v: KVal, keep: [String]) : Bool = match v {
+  KVar(x) -> list_has(keep, x)
+  KIntV(_) -> true
+  _ -> false
+}
+
+# ---- the rewrite --------------------------------------------------------
+
+fn bf_stmts(ss: [KStmt], keep: [String], cs: [BfCand]) : [KStmt] = match ss {
+  [] -> []
+  [s, ...rest] -> list_append(bf_stmt(s, keep, cs), bf_stmts(rest, keep, cs))
+}
+
+fn bf_stmt(s: KStmt, keep: [String], cs: [BfCand]) : [KStmt] = match s {
+  KLet(x, _, KPrim(KpBox(RwInt), [_]), _) -> if list_has(keep, x) { [] } else { [s] }
+  KLet(y, _, KLitOp(KVar(_)), _) -> if list_has(keep, y) { [] } else { [s] }
+  KLet(z, _, KPrim(KpBin(op), [a, b]), pos) ->
+    if list_has(keep, z) {
+      [
+        KLet(
+          bf_raw_name(z),
+          SInt64,
+          KPrim(KpRawBin(RwInt, op), [bf_raw(a, cs), bf_raw(b, cs)]),
+          pos
+        )
+      ]
+    } else {
+      [s]
+    }
+  KRC(KDup(KVar(x)), _) -> if list_has(keep, x) { [] } else { [s] }
+  KRC(KDrop(KVar(x)), _) -> if list_has(keep, x) { [] } else { [s] }
+  KLet(u, sl, KPrim(KpUnbox(RwInt), [KVar(x)]), pos) ->
+    if list_has(keep, x) { [KLet(u, sl, KLitOp(bf_raw(KVar(x), cs)), pos)] } else { [s] }
+  _ -> [s]
+}
+
+fn bf_raw_name(z: String) : String = cat2(z, "$bx")
+
+fn bf_raw(v: KVal, cs: [BfCand]) : KVal = match v {
+  KVar(x) -> match bf_def_of(cs, x) {
+    BfBox(r) -> r
+    BfCopy(s) -> bf_raw(KVar(s), cs)
+    BfArith(_, _, _) -> KVar(bf_raw_name(x))
+  }
+  _ -> v
+}

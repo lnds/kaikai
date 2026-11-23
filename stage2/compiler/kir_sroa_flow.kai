@@ -1,0 +1,128 @@
+#[doc("Alias and dominance analysis for scalar replacement: which registers carry a record, and whether every use follows its binding.")]
+
+import compiler.kir
+import compiler.kir_inline_beta
+import compiler.util
+
+# The registers that only ever carry the record: copies of it and the join
+# registers it is stored into.
+#[doc("The registers that only ever carry the record `acc` starts from.")]
+pub(pkg) fn sr_alias_names(bs: [KBlock], acc: [String]) : [String] {
+  let next = sr_grow(bs, acc, acc)
+  if list_length(next) == list_length(acc) { acc } else { sr_alias_names(bs, next) }
+}
+
+fn sr_grow(bs: [KBlock], cur: [String], acc: [String]) : [String] = match bs {
+  [] -> acc
+  [b, ...rest] -> sr_grow(rest, cur, sr_grow_stmts(b.stmts, cur, acc))
+}
+
+fn sr_grow_stmts(ss: [KStmt], cur: [String], acc: [String]) : [String] = match ss {
+  [] -> acc
+  [s, ...rest] -> sr_grow_stmts(rest, cur, match s {
+    KStore(m, KVar(v), _) ->
+      if list_has(cur, v) and (not list_has(acc, m)) { [m, ...acc] } else { acc }
+    KLet(m, _, KLitOp(KVar(v)), _) ->
+      if list_has(cur, v) and (not list_has(acc, m)) { [m, ...acc] } else { acc }
+    _ -> acc
+  })
+}
+
+# Where a register takes the record: its binding, or a store into it. Every
+# use must come after that point on every path.
+#[doc("Whether every use of each register follows its single binding on every path.")]
+pub(pkg) fn sr_defs_dominate(bs: [KBlock], names: [String], root: String) : Bool =
+  not any(names, n => not sr_name_ok(bs, n, root))
+
+fn sr_name_ok(bs: [KBlock], n: String, root: String) : Bool {
+  let defs = sr_def_points(bs, n, root)
+  match defs {
+    [d] -> not any(sr_use_points(bs, n), u => not sr_dominates(bs, d, u))
+    _ -> false
+  }
+}
+
+# A point is a block label and a statement index; a terminator is one past
+# the last statement.
+fn sr_def_points(bs: [KBlock], n: String, root: String) : [(String, Int)] =
+  flat_map(bs, b => sr_def_stmts(b.label, b.stmts, 0, n, root))
+
+fn sr_def_stmts(lbl: String, ss: [KStmt], i: Int, n: String, root: String) : [(String, Int)] =
+  match ss {
+    [] -> []
+    [s, ...rest] -> {
+      let here = match s {
+        KLet(m, _, KRecord(_, _, _), _) -> m == n and n == root
+        KLet(m, _, KLitOp(KVar(_)), _) -> m == n
+        KStore(m, KVar(_), _) -> m == n
+        _ -> false
+      }
+      let tail = sr_def_stmts(lbl, rest, i + 1, n, root)
+      if here { [(lbl, i), ...tail] } else { tail }
+    }
+  }
+
+fn sr_use_points(bs: [KBlock], n: String) : [(String, Int)] =
+  flat_map(bs, b => sr_use_stmts(b, b.stmts, 0, n))
+
+fn sr_use_stmts(b: KBlock, ss: [KStmt], i: Int, n: String) : [(String, Int)] = match ss {
+  [] -> if kir_reg_used([KBlock { ...b, stmts: [] }], n, true) { [(b.label, i)] } else { [] }
+  [s, ...rest] -> {
+    let tail = sr_use_stmts(b, rest, i + 1, n)
+    if kir_reg_used([KBlock { ...b, stmts: [s] }], n, true) {
+      [(b.label, i), ...tail]
+    } else {
+      tail
+    }
+  }
+}
+
+# ---- dominance ----------------------------------------------------------
+
+# `d` dominates `u` when no path from the entry reaches `u` without crossing `d`'s block.
+fn sr_dominates(bs: [KBlock], d: (String, Int), u: (String, Int)) : Bool = match (d, u) {
+  ((dl, di), (ul, ui)) ->
+    if dl == ul {
+      di < ui
+    } else {
+      match bs {
+        [e, ..._] -> not sr_reaches(bs, [e.label], dl, ul, [])
+        [] -> false
+      }
+    }
+}
+
+fn sr_reaches(bs: [KBlock], work: [String], avoid: String, target: String, seen: [String]) : Bool =
+  match work {
+    [] -> false
+    [l, ...rest] ->
+      if l == avoid or list_has(seen, l) {
+        sr_reaches(bs, rest, avoid, target, seen)
+      } else if l == target {
+        true
+      } else {
+        sr_reaches(bs, list_append(sr_block_succs(bs, l), rest), avoid, target, [l, ...seen])
+      }
+  }
+
+fn sr_block_succs(bs: [KBlock], l: String) : [String] = match bs {
+  [] -> []
+  [b, ...rest] -> if b.label == l { sr_succs(b.term) } else { sr_block_succs(rest, l) }
+}
+
+fn sr_succs(t: KTerm) : [String] = match t {
+  KBr(l, _) -> [l]
+  KCondBr(_, a, b, _) -> [a, b]
+  KSwitch(_, cases, d, _) -> [
+    d,
+    ...map(
+      cases,
+      c => match c {
+        KC(_, l) -> l
+      }
+    )
+  ]
+  KTcrecGoto(l, _, _, _) -> [l]
+  KTrmcStep(l, _, _, _, _, _, _, _, _, _, _) -> [l]
+  _ -> []
+}
