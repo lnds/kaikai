@@ -11817,4 +11817,7 @@ clean:
 	rm -rf build $(TARGET)
 
 test-fs-err-denied: $(TARGET) bin-kai
-	@../tests/fs_err_denied.sh
+	@../tests/fs_err_denied.sh c
+
+test-fs-err-denied-native: $(TARGET) bin-kai
+	@../tests/fs_err_denied.sh native
