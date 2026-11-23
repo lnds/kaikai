@@ -8,38 +8,40 @@
  * switch off `cur`, naming the stack of `to`; `fake` is the slot the
  * matching KAI_ASAN_IN reads on arrival, or NULL when `cur`'s stack is
  * abandoned for good. A root's own stack is learned by the first fiber
- * dispatched from it. */
+ * dispatched from it.
+ *
+ * TRAP: both are macros so the sanitizer call sits in the caller's frame. A
+ * helper frame lives on the fake stack the call destroys or replaces, and its
+ * epilogue would then write to unmapped memory. */
 #if defined(KAI_ASAN_FIBERS)
-static inline void kai_asan_bounds(KaiWorker *w, KaiFiber *f, const void **bottom, size_t *size) {
-    if (f->stack_base != NULL) {
-        *bottom = (char *) f->stack_base + kai_page_size();
-        *size   = f->stack_size;
+static inline void kai_asan_prepare(KaiWorker *w, KaiFiber *cur, KaiFiber *to, const void **bottom, size_t *size) {
+    if (cur == &w->main_fiber && cur->stack_base == NULL && w->asan_root_size == 0) w->asan_root_pending = 1;
+    if (to->stack_base != NULL) {
+        *bottom = (char *) to->stack_base + kai_page_size();
+        *size   = to->stack_size;
     } else {
         *bottom = w->asan_root_bottom;
         *size   = w->asan_root_size;
     }
 }
 
-static inline void kai_asan_out(KaiWorker *w, KaiFiber *cur, KaiFiber *to, void **fake) {
-    if (cur == &w->main_fiber && cur->stack_base == NULL && w->asan_root_size == 0) w->asan_root_pending = 1;
-    const void *bottom;
-    size_t size;
-    kai_asan_bounds(w, to, &bottom, &size);
-    __sanitizer_start_switch_fiber(fake, bottom, size);
-}
-
-static inline void kai_asan_in(KaiWorker *w, void *fake) {
-    const void *bottom;
-    size_t size;
-    __sanitizer_finish_switch_fiber(fake, &bottom, &size);
+static inline void kai_asan_note_root(KaiWorker *w, const void *bottom, size_t size) {
     if (w->asan_root_pending) {
         w->asan_root_bottom  = bottom;
         w->asan_root_size    = size;
         w->asan_root_pending = 0;
     }
 }
-#  define KAI_ASAN_OUT(w, cur, to, fake) kai_asan_out((w), (cur), (to), (fake))
-#  define KAI_ASAN_IN(w, fake)           kai_asan_in((w), (fake))
+#  define KAI_ASAN_OUT(w, cur, to, fake) do { \
+        const void *asan_bottom_; size_t asan_size_; \
+        kai_asan_prepare((w), (cur), (to), &asan_bottom_, &asan_size_); \
+        __sanitizer_start_switch_fiber((fake), asan_bottom_, asan_size_); \
+    } while (0)
+#  define KAI_ASAN_IN(w, fake) do { \
+        const void *asan_bottom_; size_t asan_size_; \
+        __sanitizer_finish_switch_fiber((fake), &asan_bottom_, &asan_size_); \
+        kai_asan_note_root((w), asan_bottom_, asan_size_); \
+    } while (0)
 #  define KAI_ASAN_SLOT(fake)            void *fake = NULL
 #else
 #  define KAI_ASAN_OUT(w, cur, to, fake) ((void) 0)
