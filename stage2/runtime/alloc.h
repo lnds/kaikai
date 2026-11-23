@@ -680,7 +680,13 @@ void __lsan_register_root_region(const void *p, size_t size);
 void __lsan_unregister_root_region(const void *p, size_t size);
 #  define KAI_SEG_LSAN_ROOT(seg)   __lsan_register_root_region((seg)->own.stack_base, (seg)->own.stack_size + kai_page_size())
 #  define KAI_SEG_LSAN_UNROOT(seg) __lsan_unregister_root_region((seg)->own.stack_base, (seg)->own.stack_size + kai_page_size())
+/* A suspended fiber's ASan fake stack is reachable only through the save slot
+ * on its own stack, so that stack is scanned too. */
+#  define KAI_FIBER_LSAN_ROOT(base, size)   __lsan_register_root_region((base), (size) + kai_page_size())
+#  define KAI_FIBER_LSAN_UNROOT(base, size) __lsan_unregister_root_region((base), (size) + kai_page_size())
 #else
+#  define KAI_FIBER_LSAN_ROOT(base, size)   ((void) 0)
+#  define KAI_FIBER_LSAN_UNROOT(base, size) ((void) 0)
 #  define KAI_SEG_LSAN_ROOT(seg)   ((void) 0)
 #  define KAI_SEG_LSAN_UNROOT(seg) ((void) 0)
 #endif
