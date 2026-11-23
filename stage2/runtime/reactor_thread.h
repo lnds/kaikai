@@ -796,6 +796,7 @@ static void kai_fiber_init_ctx_sized(KaiFiber *f, size_t stack_size) {
      * page_size whenever we need to release the region. */
     void *region = kai_stack_map(f->stack_size);
     f->stack_base = region;
+    KAI_FIBER_LSAN_ROOT(region, f->stack_size);
     kai_ctx_set_stack(&f->ctx, (char *) region + kai_page_size(), f->stack_size);
     f->ctx.uc_link          = kai_uc_link_target();
     makecontext(&f->ctx, kai_fiber_trampoline, 0);

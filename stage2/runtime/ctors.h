@@ -270,6 +270,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
                      * and must release it via munmap. */
 #if KAI_HOST_STACK_GUARD
                     if (v->as.fib->stack_base) {
+                        KAI_FIBER_LSAN_UNROOT(v->as.fib->stack_base, v->as.fib->stack_size);
                         kai_stack_unmap(v->as.fib->stack_base, v->as.fib->stack_size);
                     }
 #elif defined(__wasm__)
