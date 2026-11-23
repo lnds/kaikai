@@ -15,17 +15,25 @@
 #define KAI_RC_RECYCLE_TRACE(_kc) ((void) 0)
 #endif
 
+/* A record wider than a cell is its own libc block; every other record rides
+ * the cell path. */
+#define KAI_REC_IS_BLOCK(_kc) ((_kc)->tag == (int32_t) KAI_RECORD &&         \
+    offsetof(KaiValue, as) + (size_t) (_kc)->var_n_args * sizeof(KaiVarSlot) > sizeof(KaiValue))
+
 #ifdef KAI_CELL_POOL_ACTIVE
 #define KAI_RC_RECYCLE_POOL(_kc) do {                                        \
-    if ((_kc)->tag == (int32_t) KAI_VARIANT ||                              \
-        (_kc)->tag == (int32_t) KAI_RECORD) {                               \
+    if ((_kc)->tag == (int32_t) KAI_VARIANT) {                              \
         kai_var_block_free((_kc), (_kc)->var_n_args);                        \
+    } else if (KAI_REC_IS_BLOCK(_kc)) {                                      \
+        kai_heap_free(_kc);                                                  \
     } else if (!kai_cell_pool_push(_kc)) {                                    \
         free(_kc);                                                           \
     }                                                                        \
 } while (0)
 #else
-#define KAI_RC_RECYCLE_POOL(_kc) free(_kc)
+#define KAI_RC_RECYCLE_POOL(_kc) do {                                        \
+    if (KAI_REC_IS_BLOCK(_kc)) kai_heap_free(_kc); else free(_kc);           \
+} while (0)
 #endif
 
 /* An atomic cell's decrement; 1 when it was the last owner. The release

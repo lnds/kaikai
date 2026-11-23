@@ -699,9 +699,11 @@ static KaiValue *kai_alloc_var_nz(int n) {
 #define kai_alloc_var_nz(n) kai_alloc_var_nz_traced((n), __builtin_return_address(0))
 #endif
 
-/* A record block for `n` fields: header, the two-slot prefix, then the
- * slots, uninitialised. The caller writes names, head tag, mask and every
- * slot before the cell is observed. */
+/* A record for `n` fields: header, the two-slot prefix, then the slots,
+ * uninitialised. One that fits a cell rides the trimmable cell pool; a wider
+ * one is its own libc block, so a peak of records goes back to the OS either
+ * way. The caller writes names, head tag, mask and every slot before the cell
+ * is observed. */
 #ifdef KAI_TRACE_RC
 static KaiValue *kai_alloc_rec_traced(int n, void *site) {
 #else
@@ -712,13 +714,18 @@ static KaiValue *kai_alloc_rec(int n) {
         kai_eprintf("kai: record with %d fields exceeds the %d-field limit\n", n, KAI_REC_MAX_FIELDS);
         kai_exit(1);
     }
+    size_t bsz = offsetof(KaiValue, as) + (size_t) total * sizeof(KaiVarSlot);
     KaiValue *v;
-#ifdef KAI_CELL_POOL_ACTIVE
-    v = kai_var_block_take(total);
+    if (bsz <= sizeof(KaiValue)) {
+#ifdef KAI_TRACE_RC
+        v = kai_alloc_traced(KAI_RECORD, site);
 #else
-    v = (KaiValue *) kai_heap_malloc(kai_var_block_size(total));
+        v = kai_alloc(KAI_RECORD);
 #endif
-    if (!v) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+        v->var_n_args = (uint8_t) total;
+        return v;
+    }
+    v = (KaiValue *) kai_heap_malloc(bsz);
     v->rc = 1;
     v->tag = (uint8_t) KAI_RECORD;
     v->var_n_args = (uint8_t) total;
