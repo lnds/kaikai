@@ -14,7 +14,9 @@ static inline KaiValue *kaix_arena_cons(KaiValue *h, KaiValue *t);
 static inline void kaix_arena_pop(void);
 static inline void kaix_arena_push(void);
 static inline KaiValue *kaix_arena_record(int n, KaiValue **fields, const char **names);
+static inline KaiValue *kaix_arena_record_p(int n, KaiValue **fields, const char **names, const char ***site);
 static inline KaiValue *kaix_arena_record_s(int n, int32_t mask, KaiVarSlot *slots, const char **names, const char ***site);
+static inline KaiValue *kaix_arena_record_w4(int n, int32_t mask, const char **names, const char ***site, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
 static inline KaiValue *kaix_arena_variant(int32_t tag, const char *name, int n, KaiValue **args);
 static inline KaiValue *kaix_arena_variant_masked(int32_t tag, const char *name, int32_t n, KaiVarSlot *slots);
 KaiValue *kaix_args_thunk(KaiValue *s, KaiValue **a, int n);
@@ -520,7 +522,9 @@ KaiValue *kaix_real_to_int_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_real_to_string_thunk(KaiValue *s, KaiValue **a, int n);
 static inline KaiValue *kaix_rec_stamp(KaiValue *rec, int32_t head_tag);
 static inline KaiValue *kaix_record(int n, KaiValue **fields, const char **names);
+static inline KaiValue *kaix_record_p(int n, KaiValue **fields, const char **names, const char ***site);
 static inline KaiValue *kaix_record_s(int n, int32_t mask, KaiVarSlot *slots, const char **names, const char ***site);
+static inline KaiValue *kaix_record_w4(int n, int32_t mask, const char **names, const char ***site, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
 KaiValue *kaix_reduce_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_ref_get_thunk(KaiValue *s, KaiValue **a, int n);
 KaiValue *kaix_ref_make_thunk(KaiValue *s, KaiValue **a, int n);
@@ -674,8 +678,14 @@ static inline KaiValue *kaix_arena_cons(KaiValue *h, KaiValue *t) {return kai_ar
 static inline void kaix_arena_pop(void) {kai_arena_pop(); }
 static inline void kaix_arena_push(void) {(void) kai_arena_push(); }
 static inline KaiValue *kaix_arena_record(int n, KaiValue **fields, const char **names) {return kai_arena_record(n, fields, names); }
+static inline KaiValue *kaix_arena_record_p(int n, KaiValue **fields, const char **names, const char ***site) {
+    return kai_arena_record_p(n, fields, names, site);
+}
 static inline KaiValue *kaix_arena_record_s(int n, int32_t mask, KaiVarSlot *slots, const char **names, const char ***site) {
-    return kai_arena_record_masked(n, kai_names_site(site, n, names), (uint32_t) mask, slots);
+    return kai_arena_record_s(n, (uint32_t) mask, slots, names, site);
+}
+static inline KaiValue *kaix_arena_record_w4(int n, int32_t mask, const char **names, const char ***site, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return kai_arena_record_w4(n, (uint32_t) mask, names, site, a, b, c, d);
 }
 static inline KaiValue *kaix_arena_variant(int32_t tag, const char *name, int n, KaiValue **args) {
     /* Same boxed-args bridge as kaix_variant: stamp into slot-mask shape
@@ -953,8 +963,14 @@ static inline KaiValue *kaix_rec_stamp(KaiValue *rec, int32_t head_tag) {return 
 static inline KaiValue *kaix_record(int n, KaiValue **fields, const char **names) {
     return kai_record(n, fields, names);
 }
+static inline KaiValue *kaix_record_p(int n, KaiValue **fields, const char **names, const char ***site) {
+    return kai_record_p(n, fields, names, site);
+}
 static inline KaiValue *kaix_record_s(int n, int32_t mask, KaiVarSlot *slots, const char **names, const char ***site) {
-    return kai_record_masked(n, kai_names_site(site, n, names), (uint32_t) mask, slots);
+    return kai_record_s(n, (uint32_t) mask, slots, names, site);
+}
+static inline KaiValue *kaix_record_w4(int n, int32_t mask, const char **names, const char ***site, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    return kai_record_w4(n, (uint32_t) mask, names, site, a, b, c, d);
 }
 static inline void kaix_register_one_payload_ctor(int32_t tag, const char *name, int32_t mask) {
     kai_varname_register(tag, name);
@@ -994,8 +1010,7 @@ static inline KaiValue *kaix_reuse_or_alloc_record(KaiValue *scr, int n, KaiValu
   return kai_reuse_or_alloc_record(scr, n, fields, names, kept_mask);
 }
 static inline KaiValue *kaix_reuse_or_alloc_record_s(KaiValue *scr, int n, int32_t mask, KaiVarSlot *slots, const char **names, uint64_t kept_mask, const char ***site) {
-  return kai_reuse_or_alloc_record_s(scr, n, (uint32_t) mask, slots,
-                                     kai_names_site(site, n, names), kept_mask);
+  return kai_reuse_or_alloc_record_site(scr, n, (uint32_t) mask, slots, names, kept_mask, site);
 }
 static inline KaiValue *kaix_reuse_or_alloc_variant(KaiValue *scr, int32_t tag, const char *name, int n, KaiValue **args) {
   /* Same bridge as kaix_variant: LLVM's emit path still hands us

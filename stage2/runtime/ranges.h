@@ -618,6 +618,48 @@ static KaiValue *kai_arena_record(int n, KaiValue **fields, const char **names) 
     return r;
 }
 
+/* Emitted record literals call these: the name-site lookup stays out of the
+ * caller's frame, which a deep recursion pays once per level. */
+static KAI_RC_NOINLINE KaiValue *kai_record_s(int n, uint32_t mask, const KaiVarSlot *slots,
+                                              const char **names, const char ***site) {
+    return kai_record_masked(n, kai_names_site(site, n, names), mask, slots);
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_arena_record_s(int n, uint32_t mask, const KaiVarSlot *slots,
+                                                    const char **names, const char ***site) {
+    return kai_arena_record_masked(n, kai_names_site(site, n, names), mask, slots);
+}
+
+/* Record of up to four slot words passed by value: the caller keeps no slot array in its frame. */
+static KAI_RC_NOINLINE KaiValue *kai_record_w4(int n, uint32_t mask, const char **names, const char ***site,
+                                               uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    KaiVarSlot s[4];
+    s[0].i64 = (int64_t) a; s[1].i64 = (int64_t) b; s[2].i64 = (int64_t) c; s[3].i64 = (int64_t) d;
+    return kai_record_masked(n, kai_names_site(site, n, names), mask, s);
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_arena_record_w4(int n, uint32_t mask, const char **names, const char ***site,
+                                                     uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    KaiVarSlot s[4];
+    s[0].i64 = (int64_t) a; s[1].i64 = (int64_t) b; s[2].i64 = (int64_t) c; s[3].i64 = (int64_t) d;
+    return kai_arena_record_masked(n, kai_names_site(site, n, names), mask, s);
+}
+
+/* All-pointer record from a pointer array: the caller's temporary stays one word per field. */
+static KAI_RC_NOINLINE KaiValue *kai_record_p(int n, KaiValue **fields, const char **names, const char ***site) {
+    KaiValue *v = kai_alloc_rec(n);
+    v->as.rec.names = kai_names_site(site, n, names);
+    v->as.rec.head_type_tag = 0;
+    v->as.rec.slot_mask = 0;
+    KaiVarSlot *dst = kai_rec_slots(v);
+    for (int i = 0; i < n; ++i) dst[i].ptr = fields[i];
+    return v;
+}
+
+static KAI_RC_NOINLINE KaiValue *kai_arena_record_p(int n, KaiValue **fields, const char **names, const char ***site) {
+    return kai_arena_record(n, fields, kai_names_site(site, n, names));
+}
+
 static KaiValue *kai_arena_variant(int32_t tag, const char *name, int n,
                                    uint32_t mask, KaiVarSlot *slots) {
     KaiArena *ar = kai_arena_current();
