@@ -265,7 +265,9 @@ static void *kai_worker_thread_main(void *arg) {
     kai_rc_ledger_register();
     kai_worker_loop(w);
     kai_seg_pool_drain();
+#ifdef KAI_CELL_POOL_ACTIVE
     kai_cell_pool_trim();
+#endif
     kai_rc_ledger_fold();
     return NULL;
 }
