@@ -4,6 +4,49 @@
  * docs/mn-scheduler-design.md §2, §4. Off at N=1.
  * ================================================================== */
 
+/* AddressSanitizer stack-switch brackets. KAI_ASAN_OUT runs right before a
+ * switch off `cur`, naming the stack of `to`; `fake` is the slot the
+ * matching KAI_ASAN_IN reads on arrival, or NULL when `cur`'s stack is
+ * abandoned for good. A root's own stack is learned by the first fiber
+ * dispatched from it. */
+#if defined(KAI_ASAN_FIBERS)
+static inline void kai_asan_bounds(KaiWorker *w, KaiFiber *f, const void **bottom, size_t *size) {
+    if (f->stack_base != NULL) {
+        *bottom = (char *) f->stack_base + kai_page_size();
+        *size   = f->stack_size;
+    } else {
+        *bottom = w->asan_root_bottom;
+        *size   = w->asan_root_size;
+    }
+}
+
+static inline void kai_asan_out(KaiWorker *w, KaiFiber *cur, KaiFiber *to, void **fake) {
+    if (cur == &w->main_fiber && cur->stack_base == NULL && w->asan_root_size == 0) w->asan_root_pending = 1;
+    const void *bottom;
+    size_t size;
+    kai_asan_bounds(w, to, &bottom, &size);
+    __sanitizer_start_switch_fiber(fake, bottom, size);
+}
+
+static inline void kai_asan_in(KaiWorker *w, void *fake) {
+    const void *bottom;
+    size_t size;
+    __sanitizer_finish_switch_fiber(fake, &bottom, &size);
+    if (w->asan_root_pending) {
+        w->asan_root_bottom  = bottom;
+        w->asan_root_size    = size;
+        w->asan_root_pending = 0;
+    }
+}
+#  define KAI_ASAN_OUT(w, cur, to, fake) kai_asan_out((w), (cur), (to), (fake))
+#  define KAI_ASAN_IN(w, fake)           kai_asan_in((w), (fake))
+#  define KAI_ASAN_SLOT(fake)            void *fake = NULL
+#else
+#  define KAI_ASAN_OUT(w, cur, to, fake) ((void) 0)
+#  define KAI_ASAN_IN(w, fake)           ((void) 0)
+#  define KAI_ASAN_SLOT(fake)
+#endif
+
 /* Find one runnable fiber for this thread: its own queue first (LIFO
  * locality preserved by the FIFO order the owner maintains), then a
  * round-robin steal sweep over the other live threads. Returns NULL when
@@ -296,7 +339,10 @@ static void kai_worker_loop(KaiWorker *w) {
         kai_worker_run(w, next);
         KAI_TSAN_SWITCH_TO(next);
 #if KAI_HOST_FIBERS
+        KAI_ASAN_SLOT(fake);
+        KAI_ASAN_OUT(w, root, next, &fake);
         swapcontext(&root->ctx, &next->ctx);
+        KAI_ASAN_IN(w, fake);
 #else
         kai_fibers_absent();
 #endif
@@ -335,7 +381,10 @@ static void kai_sched_yield(void) {
         w->active = &w->main_fiber;
         KAI_TSAN_SWITCH_TO_ROOT(w);
 #if KAI_HOST_FIBERS
+        KAI_ASAN_SLOT(fake);
+        KAI_ASAN_OUT(w, current, &w->main_fiber, &fake);
         swapcontext(&current->ctx, &w->main_fiber.ctx);
+        KAI_ASAN_IN(current->worker, fake);
 #else
         kai_fibers_absent();
 #endif
@@ -351,7 +400,10 @@ static void kai_sched_yield(void) {
     kai_worker_run(w, next);
     KAI_TSAN_SWITCH_TO(next);
 #if KAI_HOST_FIBERS
+    KAI_ASAN_SLOT(fake);
+    KAI_ASAN_OUT(w, current, next, &fake);
     swapcontext(&current->ctx, &next->ctx);
+    KAI_ASAN_IN(current->worker, fake);
 #else
     kai_fibers_absent();
 #endif
@@ -418,7 +470,10 @@ static void kai_sched_park_linked(void) {
         w->active = &w->main_fiber;
         KAI_TSAN_SWITCH_TO_ROOT(w);
 #if KAI_HOST_FIBERS
+        KAI_ASAN_SLOT(fake);
+        KAI_ASAN_OUT(w, current, &w->main_fiber, &fake);
         swapcontext(&current->ctx, &w->main_fiber.ctx);
+        KAI_ASAN_IN(current->worker, fake);
 #else
         kai_fibers_absent();
 #endif
@@ -468,7 +523,10 @@ static void kai_sched_park_linked(void) {
     kai_worker_run(w, next);
     KAI_TSAN_SWITCH_TO(next);
 #if KAI_HOST_FIBERS
+    KAI_ASAN_SLOT(fake);
+    KAI_ASAN_OUT(w, current, next, &fake);
     swapcontext(&current->ctx, &next->ctx);
+    KAI_ASAN_IN(current->worker, fake);
 #else
     kai_fibers_absent();
 #endif
@@ -566,6 +624,7 @@ static void kai_fiber_uc_link_landing(void) {
     KaiWorker *w = kai_worker_here();
     w->active = &w->main_fiber;
     KAI_TSAN_SWITCH_TO_ROOT(w);
+    KAI_ASAN_OUT(w, NULL, &w->main_fiber, NULL);
     setcontext(&w->main_fiber.ctx);
     kai_eprintf("kai: fiber uc_link landing failed to reach the scheduler root\n");
     kai_exit(1);
@@ -592,6 +651,7 @@ static void kai_root_nursery_join(KaiNursery *scope, int mode);
 
 static void kai_fiber_trampoline(void) {
     KaiWorker *w = kai_worker_here();
+    KAI_ASAN_IN(w, NULL);
     KaiFiber *self = w->active;
     /* First entry follows a setcontext from another fiber's
      * trampoline tail or a swap from yield/park. Drain any pending
@@ -755,10 +815,12 @@ static void kai_fiber_trampoline(void) {
             next->state = KAI_FIBER_RUNNING;
             kai_worker_run(w, next);
             KAI_TSAN_SWITCH_TO(next);
+            KAI_ASAN_OUT(w, self, next, NULL);
             setcontext(&next->ctx);
         }
         w->active = &w->main_fiber;
         KAI_TSAN_SWITCH_TO_ROOT(w);
+        KAI_ASAN_OUT(w, self, &w->main_fiber, NULL);
         setcontext(&w->main_fiber.ctx);
         /* setcontext does not return. */
     }
@@ -778,6 +840,7 @@ static void kai_fiber_trampoline(void) {
     next->state = KAI_FIBER_RUNNING;
     kai_worker_run(w, next);
     KAI_TSAN_SWITCH_TO(next);
+    KAI_ASAN_OUT(w, self, next, NULL);
     setcontext(&next->ctx);
     /* setcontext does not return. */
 }

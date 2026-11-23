@@ -74,6 +74,7 @@ static KaiValue *kai_main_runs(KaiValue *(*user_main)(void)) {
  * scheduler loop. */
 static void kai_bootstrap_trampoline(void) {
     KaiWorker *w = kai_worker_here();
+    KAI_ASAN_IN(w, NULL);
     KaiFiber *self = w->active;
     kai_drain_pending_free(w);
     self->state = KAI_FIBER_RUNNING;
@@ -87,6 +88,7 @@ static void kai_bootstrap_trampoline(void) {
     w = self->worker;
     w->active = &w->main_fiber;
     KAI_TSAN_SWITCH_TO_ROOT(w);
+    KAI_ASAN_OUT(w, self, &w->main_fiber, NULL);
     setcontext(&w->main_fiber.ctx);
 }
 #endif
