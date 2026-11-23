@@ -535,11 +535,6 @@ typedef struct KaiWorker {
     int         uc_link_ready;
     KaiFiber    main_fiber;
     KaiFreeStack free_stack;    /* the root fiber's */
-#if defined(KAI_ASAN_FIBERS)
-    const void *asan_root_bottom;   /* the root's own stack, learned on first arrival from it */
-    size_t      asan_root_size;
-    int         asan_root_pending;  /* the root left and its bounds are still unknown */
-#endif
     void       *ns_base;        /* top of the free part of this thread's OS stack, NULL if unknown */
     int         ns_active;      /* a native-stack call is running */
     void       *ns_call;        /* the call to run, read by the entry on that stack */
@@ -549,6 +544,9 @@ typedef struct KaiWorker {
     ucontext_t  uc_link_ctx;
     char        uc_link_stack[KAI_UC_LINK_STACK_SIZE];
 #endif
+    const void *asan_root_bottom;   /* the root's own stack, learned on first arrival from it */
+    size_t      asan_root_size;
+    int         asan_root_pending;  /* the root left and its bounds are still unknown */
 } KaiWorker;
 
 /* The scheduler's only thread-local. Read nowhere but kai_worker_here. */
