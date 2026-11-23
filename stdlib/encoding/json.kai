@@ -32,6 +32,7 @@ Coverage of RFC 8259:
 Public surface:
 
   pub fn json_encode(v: JsonValue) : String
+  pub fn json_encode_pretty(v: JsonValue, indent: Int) : String
   pub fn json_decode(s: String) : Option[JsonValue]
   pub fn json_decode_report(s: String) : Result[JsonValue, JsonParseError]
 
@@ -73,6 +74,8 @@ fn json_escape_loop(s: String, i: Int, run: Int, parts: [String]) : [String] {
 fn json_escape_char(b: Int) : String = match b {
   34 -> "\\\""
   92 -> "\\\\"
+  8 -> "\\b"
+  12 -> "\\f"
   10 -> "\\n"
   13 -> "\\r"
   9 -> "\\t"
@@ -84,14 +87,29 @@ fn json_hex_byte(n: Int) : String =
   string_slice("0123456789abcdef", n / 16 % 16, 1) ++ string_slice("0123456789abcdef", n % 16, 1)
 
 #[doc("Serialises a `JsonValue` to a compact JSON string (RFC 8259, no insignificant whitespace).")]
-pub fn json_encode(v: JsonValue) : String = json_encode_at(v, 0)
+pub fn json_encode(v: JsonValue) : String = json_encode_at(v, 0, 0 - 1)
+
+#[doc("""
+Serialises a `JsonValue` with one member or element per line, `indent` spaces
+per nesting level, `"key": value` members and `[]` / `{}` for empty containers.
+Byte-identical to `json.dumps(v, indent=indent, ensure_ascii=False)` and to
+`serde_json::to_string_pretty` for `indent = 2`. No trailing newline.
+""")]
+pub fn json_encode_pretty(v: JsonValue, indent: Int) : String =
+  json_encode_at(v, 0, if indent < 0 { 0 } else { indent })
+
+# Line break plus the indentation of `level`; empty when compact (`ind < 0`).
+fn json_nl(ind: Int, level: Int) : String =
+  if ind < 0 { "" } else { string_concat("\n", repeat(" ", ind * level)) }
+
+fn json_colon(ind: Int) : String = if ind < 0 { ":" } else { ": " }
 
 # Nesting deeper than this switches to the work-stack driver below.
 const JSON_ENC_DEPTH : Int = 32
 
-fn json_encode_at(v: JsonValue, depth: Int) : String =
+fn json_encode_at(v: JsonValue, depth: Int, ind: Int) : String =
   if depth >= JSON_ENC_DEPTH {
-    string_concat_all(list_reverse(json_encode_loop([json_enc_item(v)], [])))
+    string_concat_all(list_reverse(json_encode_loop([json_enc_item(v, depth)], [], ind)))
   } else {
     match v {
       JNull -> "null"
@@ -99,27 +117,45 @@ fn json_encode_at(v: JsonValue, depth: Int) : String =
       JNum(n) -> int_to_string(n)
       JReal(r) -> json_real_text(r)
       JStr(s) -> string_concat(string_concat("\"", json_escape(s)), "\"")
-      JArr(xs) -> string_concat(string_concat("[", json_join_elems(xs, depth + 1, [])), "]")
-      JObj(ps) -> string_concat(string_concat("{", json_join_members(ps, depth + 1, [])), "}")
+      JArr([]) -> "[]"
+      JArr(xs) -> string_concat_all(
+        [
+          "[",
+          json_nl(ind, depth + 1),
+          json_join_elems(xs, depth + 1, ind, []),
+          json_nl(ind, depth),
+          "]"
+        ]
+      )
+      JObj([]) -> "{}"
+      JObj(ps) -> string_concat_all(
+        [
+          "{",
+          json_nl(ind, depth + 1),
+          json_join_members(ps, depth + 1, ind, []),
+          json_nl(ind, depth),
+          "}"
+        ]
+      )
     }
   }
 
-# Elements rendered at `depth`, comma-joined.
-fn json_join_elems(xs: [JsonValue], depth: Int, acc: [String]) : String = match xs {
-  [] -> string.join(list_reverse(acc), ",")
-  [x, ...rest] -> json_join_elems(rest, depth, [json_encode_at(x, depth), ...acc])
+# Elements rendered at `depth`, joined by a comma and a line break.
+fn json_join_elems(xs: [JsonValue], depth: Int, ind: Int, acc: [String]) : String = match xs {
+  [] -> string.join(list_reverse(acc), string_concat(",", json_nl(ind, depth)))
+  [x, ...rest] -> json_join_elems(rest, depth, ind, [json_encode_at(x, depth, ind), ...acc])
 }
 
-fn json_join_members(ps: [Pair[String, JsonValue]], depth: Int, acc: [String]) : String = match ps {
-  [] -> string.join(list_reverse(acc), ",")
-  [p, ...rest] -> json_join_members(rest, depth, [json_encode_pair(p, depth), ...acc])
+fn json_join_members(ps: [Pair[String, JsonValue]], depth: Int, ind: Int, acc: [String]) : String = match ps {
+  [] -> string.join(list_reverse(acc), string_concat(",", json_nl(ind, depth)))
+  [p, ...rest] -> json_join_members(rest, depth, ind, [json_encode_pair(p, depth, ind), ...acc])
 }
 
-fn json_encode_pair(p: Pair[String, JsonValue], depth: Int) : String =
-  string_concat(
-    string_concat(string_concat("\"", json_escape(p.fst)), "\":"),
-    json_encode_at(p.snd, depth)
-  )
+fn json_encode_pair(p: Pair[String, JsonValue], depth: Int, ind: Int) : String =
+  string_concat(json_enc_key(p.fst, ind), json_encode_at(p.snd, depth, ind))
+
+fn json_enc_key(k: String, ind: Int) : String =
+  string_concat(string_concat(string_concat("\"", json_escape(k)), "\""), json_colon(ind))
 
 # A real whose text reads as an integer gets `.0`, so it decodes back as a real.
 fn json_real_text(r: Real) : String {
@@ -131,68 +167,92 @@ fn json_real_text(r: Real) : String {
   }
 }
 
-# Pending output of the encoder: final text, or a container still to expand.
-type JEnc = EncText(String) | EncArr([JsonValue]) | EncObj([Pair[String, JsonValue]])
+# Pending output of the encoder: final text, or a container still to expand
+# at its nesting level.
+type JEnc = EncText(String) | EncArr([JsonValue], Int) | EncObj([Pair[String, JsonValue]], Int)
 
-fn json_enc_item(v: JsonValue) : JEnc = match v {
+fn json_enc_item(v: JsonValue, level: Int) : JEnc = match v {
   JNull -> EncText("null")
   JBool(b) -> EncText(if b { "true" } else { "false" })
   JNum(n) -> EncText(int_to_string(n))
   JReal(r) -> EncText(json_real_text(r))
   JStr(s) -> EncText(string_concat(string_concat("\"", json_escape(s)), "\""))
-  JArr(xs) -> EncArr(xs)
-  JObj(ps) -> EncObj(ps)
+  JArr(xs) -> EncArr(xs, level)
+  JObj(ps) -> EncObj(ps, level)
 }
 
 # Work-stack driver: `work` is the output still to emit, `out` the emitted
 # pieces newest first. Containers expand in place, so stack use is constant
 # however deep the value nests.
-fn json_encode_loop(work: [JEnc], out: [String]) : [String] = match work {
+fn json_encode_loop(work: [JEnc], out: [String], ind: Int) : [String] = match work {
   [] -> out
   [item, ...rest] -> match item {
-    EncText(t) -> json_encode_loop(rest, [t, ...out])
-    EncArr(xs) -> json_encode_loop(
-      json_enc_elems(list_reverse(xs), [EncText("]"), ...rest], false),
-      ["[", ...out]
+    EncText(t) -> json_encode_loop(rest, [t, ...out], ind)
+    EncArr([], _) -> json_encode_loop(rest, ["[]", ...out], ind)
+    EncObj([], _) -> json_encode_loop(rest, ["{}", ...out], ind)
+    EncArr(xs, level) -> json_encode_loop(
+      json_enc_elems(
+        list_reverse(xs),
+        [EncText(json_nl(ind, level)), EncText("]"), ...rest],
+        level + 1,
+        ind,
+        false
+      ),
+      [json_nl(ind, level + 1), "[", ...out],
+      ind
     )
-    EncObj(ps) ->
-      json_encode_loop(json_enc_members(list_reverse(ps), [EncText("}"), ...rest]), ["{", ...out])
+    EncObj(ps, level) -> json_encode_loop(
+      json_enc_members(
+        list_reverse(ps),
+        [EncText(json_nl(ind, level)), EncText("}"), ...rest],
+        level + 1,
+        ind
+      ),
+      [json_nl(ind, level + 1), "{", ...out],
+      ind
+    )
   }
 }
 
 # `rev` is the elements last first; each is consed before `acc`, with a comma
-# between neighbours.
-fn json_enc_elems(rev: [JsonValue], acc: [JEnc], sep: Bool) : [JEnc] = match rev {
+# and line break between neighbours.
+fn json_enc_elems(rev: [JsonValue], acc: [JEnc], level: Int, ind: Int, sep: Bool) : [JEnc] = match rev {
   [] -> acc
-  [x, ...more] -> json_enc_elems(more, [json_enc_item(x), ...json_enc_comma(acc, sep)], true)
+  [x, ...more] -> json_enc_elems(
+    more,
+    [json_enc_item(x, level), ...json_enc_comma(acc, level, ind, sep)],
+    level,
+    ind,
+    true
+  )
 }
 
-# The comma between members rides on the key text of every member but the first.
-fn json_enc_members(rev: [Pair[String, JsonValue]], acc: [JEnc]) : [JEnc] = match rev {
+# The separator between members rides on the key text of every member but the
+# first.
+fn json_enc_members(rev: [Pair[String, JsonValue]], acc: [JEnc], level: Int, ind: Int) : [JEnc] = match rev {
   [] -> acc
   [p, ...more] -> json_enc_members(
     more,
     [
       EncText(
         string_concat(
-          string_concat(
-            match more {
-              [] -> "\""
-              _ -> ",\""
-            },
-            json_escape(p.fst)
-          ),
-          "\":"
+          match more {
+            [] -> ""
+            _ -> string_concat(",", json_nl(ind, level))
+          },
+          json_enc_key(p.fst, ind)
         )
       ),
-      json_enc_item(p.snd),
+      json_enc_item(p.snd, level),
       ...acc
-    ]
+    ],
+    level,
+    ind
   )
 }
 
-fn json_enc_comma(acc: [JEnc], sep: Bool) : [JEnc] =
-  if sep { [EncText(","), ...acc] } else { acc }
+fn json_enc_comma(acc: [JEnc], level: Int, ind: Int, sep: Bool) : [JEnc] =
+  if sep { [EncText(string_concat(",", json_nl(ind, level))), ...acc] } else { acc }
 
 # ---- Decoder -----------------------------------------------------
 #
