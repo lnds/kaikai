@@ -3346,20 +3346,29 @@ test-stdlib: $(addprefix test-stdlib-fixture-,$(STDLIB_FIXTURES))
 	    echo "stdlib FAIL $$f (intrinsic leaked as kai_bit_* call)"; grep 'kai_bit_' build/stdlib-$$f.c; exit 1; \
 	  fi; \
 	done
-	@chk() { grep -q "kaix_core_bit_$$2(" build/stdlib-$$1.c && grep -F -q "$$3" ../stage0/runtime_llvm.c \
-	  || { echo "stdlib FAIL $$1 ($$2 not an inline intrinsic)"; exit 1; }; }; \
-	chk bits_basic shl   '(uint64_t) kai_intf(a) << (kai_intf(b) & 63)'; \
-	chk bits_basic shr   'kai_intf(a) >> (kai_intf(b) & 63)'; \
-	chk bits_basic and   'kai_intf(a) & kai_intf(b)'; \
-	chk bits_basic or    'kai_intf(a) | kai_intf(b)'; \
-	chk bits_basic xor   'kai_intf(a) ^ kai_intf(b)'; \
-	chk bits_basic not   '~ kai_intf(a)'; \
-	chk bits_basic count '__builtin_popcount'; \
+	@for f in bits_basic bits_dotted; do \
+	  if grep -q 'kaix_core_bit_' build/stdlib-$$f.c; then \
+	    echo "stdlib FAIL $$f (raw operands still call a kaix_core_bit_* entry)"; exit 1; \
+	  fi; \
+	done
+	@chk() { grep -F -q "$$2" build/stdlib-$$1.c \
+	  || { echo "stdlib FAIL $$1 (no raw operator $$2)"; exit 1; }; }; \
+	chk bits_basic '<< (3LL & 63)'; \
+	chk bits_basic '>> (3LL & 63)'; \
+	chk bits_basic '(240LL & 15LL)'; \
+	chk bits_basic '(240LL | 15LL)'; \
+	chk bits_basic '(~0LL)'; \
+	chk bits_basic '__builtin_popcountll'; \
 	echo "stdlib OK bits_basic intrinsic-lowered"; \
-	chk bits_dotted shl   '(uint64_t) kai_intf(a) << (kai_intf(b) & 63)'; \
-	chk bits_dotted and   'kai_intf(a) & kai_intf(b)'; \
-	chk bits_dotted count '__builtin_popcount'; \
+	chk bits_dotted '<< ('; \
+	chk bits_dotted '__builtin_popcountll'; \
 	echo "stdlib OK bits_dotted intrinsic-lowered"
+	@rt() { grep -F -q "$$2" ../stage0/runtime_llvm.c \
+	  || { echo "stdlib FAIL boxed bit_$$1 entry lost its masked operator"; exit 1; }; }; \
+	rt shl   '(uint64_t) kai_intf(a) << (kai_intf(b) & 63)'; \
+	rt shr   'kai_intf(a) >> (kai_intf(b) & 63)'; \
+	rt ushr  '((uint64_t) kai_intf(a)) >> (kai_intf(b) & 63)'; \
+	echo "stdlib OK boxed bit entries masked"
 
 test-stdlib-fixture-%: $(TARGET) build core-cache-warm
 	@set -e; \
