@@ -555,6 +555,68 @@ static KaiValue *kai_core_string_rfind(KaiValue *s, KaiValue *sub) {
     return kai_int(at);
 }
 
+/* True when `sub` occurs in `s` at byte offset `off`; borrows nothing past the call. */
+static KaiValue *kai_core_string_has_at(KaiValue *s, KaiValue *sub, KaiValue *off) {
+    int64_t o = kai_bytes_int(off);
+    int yes = 0;
+    if (kai_is_ptr(s) && s->tag == KAI_STR && kai_is_ptr(sub) && sub->tag == KAI_STR) {
+        size_t n = (size_t) s->as.s.len, m = (size_t) sub->as.s.len;
+        yes = o >= 0 && (size_t) o <= n && m <= n - (size_t) o
+              && memcmp(s->as.s.bytes + o, sub->as.s.bytes, m) == 0;
+    }
+    if (s)   kai_decref(s);
+    if (sub) kai_decref(sub);
+    return kai_bool(yes);
+}
+
+/* The bytes of `s` as an `Array[Byte]`, one allocation. */
+static KaiValue *kai_core_string_to_bytes(KaiValue *s) {
+    size_t len = (kai_is_ptr(s) && s->tag == KAI_STR) ? (size_t) s->as.s.len : 0;
+    KaiValue *arr = kai_alloc(KAI_ARRAY);
+    arr->as.arr.len = (int64_t) len;
+    arr->as.arr.cap = len > 0 ? (int64_t) len : 1;
+    arr->as.arr.items = (KaiValue **) kai_heap_malloc((size_t) arr->as.arr.cap * sizeof(KaiValue *));
+    for (size_t i = 0; i < len; ++i) arr->as.arr.items[i] = kai_byte((uint8_t) s->as.s.bytes[i]);
+    if (s) kai_decref(s);
+    return arr;
+}
+
+/* The bytes of `s` as a `[Byte]`, built back to front in one pass. */
+static KaiValue *kai_core_string_to_byte_list(KaiValue *s) {
+    KaiValue *acc = kai_nil();
+    if (kai_is_ptr(s) && s->tag == KAI_STR) {
+        for (size_t i = (size_t) s->as.s.len; i-- > 0;)
+            acc = kai_cons(kai_byte((uint8_t) s->as.s.bytes[i]), acc);
+    }
+    if (s) kai_decref(s);
+    return acc;
+}
+
+/* Well-formed UTF-8 (Unicode Table 3-7): shortest form, no surrogates, <= U+10FFFF. */
+static int kai_utf8_valid(const unsigned char *p, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        unsigned char b = p[i];
+        if (b < 0x80) { i++; continue; }
+        size_t w; unsigned char lo = 0x80, hi = 0xBF;
+        if (b >= 0xC2 && b <= 0xDF) w = 2;
+        else if (b >= 0xE0 && b <= 0xEF) { w = 3; if (b == 0xE0) lo = 0xA0; if (b == 0xED) hi = 0x9F; }
+        else if (b >= 0xF0 && b <= 0xF4) { w = 4; if (b == 0xF0) lo = 0x90; if (b == 0xF4) hi = 0x8F; }
+        else return 0;
+        if (n - i < w || p[i + 1] < lo || p[i + 1] > hi) return 0;
+        for (size_t k = 2; k < w; ++k) if (p[i + k] < 0x80 || p[i + k] > 0xBF) return 0;
+        i += w;
+    }
+    return 1;
+}
+
+static KaiValue *kai_core_string_is_utf8(KaiValue *s) {
+    int yes = (kai_is_ptr(s) && s->tag == KAI_STR)
+        ? kai_utf8_valid((const unsigned char *) s->as.s.bytes, (size_t) s->as.s.len) : 1;
+    if (s) kai_decref(s);
+    return kai_bool(yes);
+}
+
 /* Digit value of an ASCII byte in base 36; 36 for a byte that is no digit. */
 static int kai_radix_digit(unsigned char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -745,6 +807,10 @@ KAI_CORE_THUNK2(to_int_radix)
 KAI_CORE_THUNK2(int_to_string_radix)
 KAI_CORE_THUNK2(string_find)
 KAI_CORE_THUNK2(string_rfind)
+KAI_CORE_THUNK3(string_has_at)
+KAI_CORE_THUNK1(string_to_bytes)
+KAI_CORE_THUNK1(string_to_byte_list)
+KAI_CORE_THUNK1(string_is_utf8)
 KAI_CORE_THUNK1(int_to_le4)
 KAI_CORE_THUNK1(int_to_le8)
 KAI_CORE_THUNK5(bytes_blit)
