@@ -54,7 +54,7 @@ static KaiValue *kai_core_file_open_read(KaiValue *path) {
         memcpy(pbuf, path->as.s.bytes, plen);
         pbuf[plen] = '\0';
         int fd = open(pbuf, O_RDONLY);
-        if (fd < 0) r = _kai_file_err("open_read: cannot open file");
+        if (fd < 0) r = _kai_fs_err(pbuf, plen, kai_errno());
         else        r = _kai_file_ok(_kai_file_make_handle(fd));
     }
     if (path) kai_decref(path);
@@ -113,7 +113,7 @@ static KaiValue *kai_core_file_open_write(KaiValue *path) {
         /* O_RDWR, not O_WRONLY: the handle's typed capability is
          * read + write, so reads through it must be valid. */
         int fd = open(pbuf, O_RDWR | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) r = _kai_file_err("open_write: cannot open file");
+        if (fd < 0) r = _kai_fs_err(pbuf, plen, kai_errno());
         else        r = _kai_file_ok(_kai_file_make_handle(fd));
     }
     if (path) kai_decref(path);
@@ -191,8 +191,7 @@ static KaiValue *kai_core_file_delete(KaiValue *path) {
             KaiValue *u = kai_unit();
             r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
         } else {
-            KaiValue *msg = kai_str("file_delete: unlink failed");
-            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            r = _kai_fs_err(pbuf, plen, kai_errno());
         }
     }
     if (path) kai_decref(path);
@@ -218,8 +217,7 @@ static KaiValue *kai_core_file_rename(KaiValue *from, KaiValue *to) {
             KaiValue *u = kai_unit();
             r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
         } else {
-            KaiValue *msg = kai_str("file_rename: rename failed");
-            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            r = _kai_fs_err(fbuf, flen, kai_errno());
         }
     }
     if (from) kai_decref(from);
@@ -247,29 +245,27 @@ static KaiValue *kai_core_file_read_bytes(KaiValue *path) {
         FILE *fp = fopen(pbuf, "rb");
         struct stat st;
         if (!fp) {
-            KaiValue *msg = kai_str("file_read_bytes: cannot open file");
-            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            r = _kai_fs_err(pbuf, plen, kai_errno());
         } else if (fstat(fileno(fp), &st) == 0 && S_ISDIR(st.st_mode)) {
             /* fopen accepts directories; on Linux ext4 ftell(SEEK_END) then
              * reports the htree EOF sentinel (~2^63), so reject before
              * sizing the buffer. */
             fclose(fp);
-            KaiValue *msg = kai_str("file_read_bytes: is a directory");
-            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            r = _kai_fs_err(pbuf, plen, EISDIR);
         } else if (fseek(fp, 0, SEEK_END) != 0) {
+            int err = kai_errno();
             fclose(fp);
-            KaiValue *msg = kai_str("file_read_bytes: seek failed");
-            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            r = _kai_fs_err(pbuf, plen, err);
         } else {
             long n = ftell(fp);
             if (n < 0) {
+                int err = kai_errno();
                 fclose(fp);
-                KaiValue *msg = kai_str("file_read_bytes: tell failed");
-                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+                r = _kai_fs_err(pbuf, plen, err);
             } else if (fseek(fp, 0, SEEK_SET) != 0) {
+                int err = kai_errno();
                 fclose(fp);
-                KaiValue *msg = kai_str("file_read_bytes: rewind failed");
-                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+                r = _kai_fs_err(pbuf, plen, err);
             } else {
                 /* Allocating the kai_array directly (instead of
                  * kai_array_make + array_set in a loop) avoids the
@@ -308,8 +304,7 @@ static KaiValue *kai_core_file_write_bytes(KaiValue *path, KaiValue *bytes) {
         pbuf[plen] = '\0';
         FILE *fp = fopen(pbuf, "wb");
         if (!fp) {
-            KaiValue *msg = kai_str("file_write_bytes: cannot open file");
-            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            r = _kai_fs_err(pbuf, plen, kai_errno());
         } else {
             /* Pack the kai_array into a contiguous C buffer, then
              * issue a single fwrite. Cheaper than per-slot fwrite
@@ -317,6 +312,7 @@ static KaiValue *kai_core_file_write_bytes(KaiValue *path, KaiValue *bytes) {
              * a non-Byte slot before any IO. */
             int64_t n = bytes->as.arr.len;
             int ok = 1;
+            int werr = EINVAL;
             unsigned char *out = NULL;
             if (n > 0) {
                 out = (unsigned char *) malloc((size_t) n);
@@ -328,13 +324,12 @@ static KaiValue *kai_core_file_write_bytes(KaiValue *path, KaiValue *bytes) {
                 }
             }
             if (ok && n > 0) {
-                if (fwrite(out, 1, (size_t) n, fp) != (size_t) n) ok = 0;
+                if (fwrite(out, 1, (size_t) n, fp) != (size_t) n) { werr = kai_errno(); ok = 0; }
             }
             if (out) free(out);
             fclose(fp);
             if (!ok) {
-                KaiValue *msg = kai_str("file_write_bytes: write failed");
-                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+                r = _kai_fs_err(pbuf, plen, werr);
             } else {
                 KaiValue *u = kai_unit();
                 r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
@@ -420,8 +415,7 @@ static KaiValue *kai_core_dir_create_dir(KaiValue *path) {
             KaiValue *u = kai_unit();
             r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
         } else {
-            KaiValue *msg = kai_str("dir_create_dir: mkdir failed");
-            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            r = _kai_fs_err(pbuf, plen, kai_errno());
         }
     }
     if (path) kai_decref(path);
@@ -442,25 +436,11 @@ static KaiValue *kai_core_dir_remove_dir(KaiValue *path) {
             KaiValue *u = kai_unit();
             r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
         } else {
-            KaiValue *msg = kai_str("dir_remove_dir: rmdir failed");
-            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            r = _kai_fs_err(pbuf, plen, kai_errno());
         }
     }
     if (path) kai_decref(path);
     return r;
-}
-
-static KaiValue *_kai_fs_err(const char *op, const char *path, size_t plen, int err) {
-    const char *why = strerror(err);
-    size_t n = strlen(op) + plen + strlen(why) + 6;
-    char *buf = (char *) malloc(n);
-    if (!buf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
-    if (plen && !op[0]) snprintf(buf, n, "%.*s: %s", (int) plen, path, why);
-    else if (plen) snprintf(buf, n, "%s: %.*s: %s", op, (int) plen, path, why);
-    else snprintf(buf, n, "%s: %s", op, why);
-    KaiValue *msg = kai_str_dyn(buf);
-    free(buf);
-    return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
 }
 
 /* [size, mtime_secs, mtime_nanos, is_dir, is_file, is_symlink]; lstat when
@@ -478,7 +458,7 @@ static KaiValue *_kai_fs_metadata(const char *op, KaiValue *path, int follow) {
         pbuf[plen] = '\0';
         struct stat st;
         if ((follow ? stat(pbuf, &st) : lstat(pbuf, &st)) != 0) {
-            r = _kai_fs_err(op, pbuf, plen, kai_errno());
+            r = _kai_fs_err(pbuf, plen, kai_errno());
         } else {
 #if defined(__APPLE__)
             int64_t ns = (int64_t) st.st_mtimespec.tv_nsec;
@@ -520,7 +500,7 @@ static KaiValue *kai_core_file_canonicalize(KaiValue *path) {
         pbuf[path->as.s.len] = '\0';
         char *real = realpath(pbuf, NULL);
         if (!real) {
-            r = _kai_fs_err("file_canonicalize", pbuf, path->as.s.len, kai_errno());
+            r = _kai_fs_err(pbuf, path->as.s.len, kai_errno());
         } else {
             r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = kai_str_dyn(real)}});
             free(real);
@@ -573,7 +553,7 @@ static KaiValue *kai_core_dir_list_entries(KaiValue *path) {
         pbuf[plen] = '\0';
         DIR *d = opendir(pbuf);
         if (!d) {
-            r = _kai_fs_err("", pbuf, plen, kai_errno());
+            r = _kai_fs_err(pbuf, plen, kai_errno());
         } else {
             size_t cap = 16, n = 0;
             char **ents = (char **) malloc(cap * sizeof(char *));
@@ -611,7 +591,7 @@ static KaiValue *kai_core_dir_list_entries(KaiValue *path) {
 
 static KaiValue *kai_core_dir_current_dir(void) {
     char buf[KAI_PATH_BUF];
-    if (getcwd(buf, sizeof(buf)) == NULL) return _kai_fs_err("dir_current_dir", "", 0, kai_errno());
+    if (getcwd(buf, sizeof(buf)) == NULL) return _kai_fs_err("", 0, kai_errno());
     KaiValue *s = kai_str_dyn(buf);
     return kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = s}});
 }
