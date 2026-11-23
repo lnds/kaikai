@@ -286,7 +286,7 @@ boot_needs_compat() {
   case "$1" in
     "release kaikai-v"*|"seed bootstrap-seed-v"*)
       ver="${1#*-v}"; ver="${ver%%[- ]*}"
-      case "$ver" in 0.[0-9].*|0.[0-9][0-9].*|0.1[0-8][0-9].*|0.19[0-6].*) return 0 ;; esac
+      case "$ver" in 0.[0-9].*|0.[0-9][0-9].*|0.1[0-8][0-9].*|0.19[0-7].*) return 0 ;; esac
       return 1 ;;
     "path "*) return 0 ;;
     *) return 1 ;;
