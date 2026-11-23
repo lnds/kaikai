@@ -521,6 +521,19 @@ static int64_t kai_str_find(KaiValue *s, KaiValue *sub) {
     return hit ? (int64_t) (hit - s->as.s.bytes) : -1;
 }
 
+/* Byte offset of the last `sub` in `s` (overlaps included), or -1; borrows both. */
+static int64_t kai_str_rfind(KaiValue *s, KaiValue *sub) {
+    if (!s || s->tag != KAI_STR || !sub || sub->tag != KAI_STR) return -1;
+    size_t n = (size_t) s->as.s.len, m = (size_t) sub->as.s.len;
+    if (m == 0) return (int64_t) n;
+    if (m > n) return -1;
+    const char *h = s->as.s.bytes, *nd = sub->as.s.bytes;
+    for (size_t i = n - m + 1; i-- > 0;) {
+        if (h[i] == nd[0] && memcmp(h + i, nd, m) == 0) return (int64_t) i;
+    }
+    return -1;
+}
+
 static KaiValue *kai_core_string_contains(KaiValue *s, KaiValue *sub) {
     int yes = kai_str_find(s, sub) >= 0;
     if (s)   kai_decref(s);
@@ -530,6 +543,13 @@ static KaiValue *kai_core_string_contains(KaiValue *s, KaiValue *sub) {
 
 static KaiValue *kai_core_string_find(KaiValue *s, KaiValue *sub) {
     int64_t at = kai_str_find(s, sub);
+    if (s)   kai_decref(s);
+    if (sub) kai_decref(sub);
+    return kai_int(at);
+}
+
+static KaiValue *kai_core_string_rfind(KaiValue *s, KaiValue *sub) {
+    int64_t at = kai_str_rfind(s, sub);
     if (s)   kai_decref(s);
     if (sub) kai_decref(sub);
     return kai_int(at);
@@ -724,6 +744,7 @@ static KaiValue *_kai_core_mailbox_free_thunk(KaiValue *s, KaiValue **a, int n) 
 KAI_CORE_THUNK2(to_int_radix)
 KAI_CORE_THUNK2(int_to_string_radix)
 KAI_CORE_THUNK2(string_find)
+KAI_CORE_THUNK2(string_rfind)
 KAI_CORE_THUNK1(int_to_le4)
 KAI_CORE_THUNK1(int_to_le8)
 KAI_CORE_THUNK5(bytes_blit)
