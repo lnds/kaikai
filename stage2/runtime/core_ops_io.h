@@ -700,6 +700,20 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_free(KaiValue *pid)
 
 /* ---------- core: file io ---------- */
 
+/* Err(`<path>: <strerror> (os error <errno>)`); `err` must be captured
+ * right after the failing call, before any cleanup can clobber errno. */
+static KaiValue *_kai_fs_err(const char *path, size_t plen, int err) {
+    const char *why = strerror(err);
+    size_t n = plen + strlen(why) + 32;
+    char *buf = (char *) malloc(n);
+    if (!buf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+    if (plen) snprintf(buf, n, "%.*s: %s (os error %d)", (int) plen, path, why, err);
+    else snprintf(buf, n, "%s (os error %d)", why, err);
+    KaiValue *msg = kai_str_dyn(buf);
+    free(buf);
+    return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+}
+
 static KAI_RC_NOINLINE KaiValue *kai_core_read_file(KaiValue *path) {
     KaiValue *r = NULL;
     if (!path || path->tag != KAI_STR) {
@@ -713,29 +727,27 @@ static KAI_RC_NOINLINE KaiValue *kai_core_read_file(KaiValue *path) {
         FILE *fp = fopen(pbuf, "rb");
         struct stat st;
         if (!fp) {
-            KaiValue *msg = kai_str("read_file: cannot open file");
-            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            r = _kai_fs_err(pbuf, plen, kai_errno());
         } else if (fstat(fileno(fp), &st) == 0 && S_ISDIR(st.st_mode)) {
             /* fopen accepts directories; on Linux ext4 ftell(SEEK_END) then
              * reports the htree EOF sentinel (~2^63), so reject before
              * sizing the buffer. */
             fclose(fp);
-            KaiValue *msg = kai_str("read_file: is a directory");
-            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            r = _kai_fs_err(pbuf, plen, EISDIR);
         } else if (fseek(fp, 0, SEEK_END) != 0) {
+            int err = kai_errno();
             fclose(fp);
-            KaiValue *msg = kai_str("read_file: seek failed");
-            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            r = _kai_fs_err(pbuf, plen, err);
         } else {
             long n = ftell(fp);
             if (n < 0) {
+                int err = kai_errno();
                 fclose(fp);
-                KaiValue *msg = kai_str("read_file: tell failed");
-                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+                r = _kai_fs_err(pbuf, plen, err);
             } else if (fseek(fp, 0, SEEK_SET) != 0) {
+                int err = kai_errno();
                 fclose(fp);
-                KaiValue *msg = kai_str("read_file: rewind failed");
-                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+                r = _kai_fs_err(pbuf, plen, err);
             } else {
                 KaiValue *v = kai_alloc(KAI_STR);
                 v->as.s.len = (size_t) n;
@@ -767,14 +779,13 @@ static KaiValue *kai_core_write_file(KaiValue *path, KaiValue *content) {
         pbuf[plen] = '\0';
         FILE *fp = fopen(pbuf, "wb");
         if (!fp) {
-            KaiValue *msg = kai_str("write_file: cannot open file");
-            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            r = _kai_fs_err(pbuf, plen, kai_errno());
         } else {
             size_t wrote = fwrite(content->as.s.bytes, 1, content->as.s.len, fp);
+            int err = kai_errno();
             fclose(fp);
             if (wrote != content->as.s.len) {
-                KaiValue *msg = kai_str("write_file: short write");
-                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+                r = _kai_fs_err(pbuf, plen, err);
             } else {
                 KaiValue *u = kai_unit();
                 r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
@@ -804,16 +815,17 @@ static KaiValue *kai_core_file_append(KaiValue *path, KaiValue *content) {
         pbuf[plen] = '\0';
         int fd = open(pbuf, O_WRONLY | O_APPEND | O_CREAT, 0666);
         if (fd < 0) {
-            KaiValue *msg = kai_str("file_append: cannot open file");
-            r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+            r = _kai_fs_err(pbuf, plen, kai_errno());
         } else {
             const char *p = content->as.s.bytes;
             size_t left = content->as.s.len;
             int ok = 1;
+            int werr = 0;
             while (left > 0) {
                 ssize_t w = write(fd, p, left);
                 if (w < 0) {
                     if (kai_errno() == EINTR) continue;
+                    werr = kai_errno();
                     ok = 0;
                     break;
                 }
@@ -822,8 +834,7 @@ static KaiValue *kai_core_file_append(KaiValue *path, KaiValue *content) {
             }
             close(fd);
             if (!ok) {
-                KaiValue *msg = kai_str("file_append: short write");
-                r = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
+                r = _kai_fs_err(pbuf, plen, werr);
             } else {
                 r = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = kai_unit()}});
             }
