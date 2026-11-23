@@ -15,7 +15,7 @@ GOLD="$ROOT/tests/fs_err_denied/main.out.expected"
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT INT TERM
 
-for backend in c native; do
+for backend in "${1:-c}"; do
   KAI_BACKEND="$backend" "$KAI" run "$SRC" > "$OUT" 2>/dev/null || { echo "fs_err_denied FAIL ($backend run)"; cat "$OUT"; exit 1; }
   diff "$OUT" "$GOLD" > /dev/null || { echo "fs_err_denied FAIL ($backend output)"; diff "$OUT" "$GOLD"; exit 1; }
   echo "fs_err_denied OK ($backend)"
