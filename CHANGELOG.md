@@ -84,6 +84,44 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.198.0 (2026-11-23)
+
+### Added
+
+- **stdlib**: file.canonicalize and lexical path.normalize
+
+### Fixed
+
+- **kir**: walk statement lists without non-tail recursion in the scalar-replacement passes
+- **runtime**: keep record literals out of the caller's frame
+- **runtime**: copy a record in place in deep copy
+- **runtime**: keep records trimmable and test raw record fields by word
+- **perceus**: pay destructured let binders and own scalar args in boxed slots
+- **kir**: release a computed const's read like any owned call result
+- **runtime**: retire a pinned constant's cells from the RC ledger as freed
+- **lower**: test the inner pattern of an as-pattern over a record, tuple or literal
+- **runtime**: keep the ASan switch bookkeeping thread-local and classify it
+- **runtime**: emit noinline decls as plain static
+- **runtime**: tell ASan about the native-stack call switch
+- **runtime**: tell ASan about the switch onto the sized main stack
+- **native**: build scalar-payload variants through a native-only constructor
+- **runtime**: define kaix_variant_interned where the generated decls see it
+- **build**: inject the field-by-name boot compat for a 0.197 boot
+- **build**: read the boot-compat flags in the recipe shell, not at make parse time
+- **lower**: resolve a record slot through a dimensioned record type
+- **lower**: keep the resolved record type through closure specialization and extern structs
+
+### Changed
+
+- **kir**: scalar-replace non-escaping records and fold local Int boxes
+- **runtime**: store record fields as raw Int/Real slots in a single inline cell
+- **stdlib**: host path.normalize in fs.path, compiled only when imported
+- **lower**: lower math.bits to raw Int instructions on both backends
+- **compiler**: give each computed const its own once-cell instead of a hashed table
+- **compiler**: evaluate a computed const once, lazily, and count const reads in the lint
+- **native**: keep ?? joins raw and build scalar-payload variants without interning
+- **lower**: read record and tuple fields by constant slot, never by name
+
 ## v0.197.0 (2026-11-22)
 
 ### Added
