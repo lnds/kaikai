@@ -112,6 +112,16 @@ __attribute__((import_module("kai_js"), import_name("release"))) extern void kai
 __attribute__((import_module("kai_js"), import_name("take"))) extern void kai_js_take(char *dst, uint32_t n);
 #endif
 
+/* A short string keeps its bytes in the cell's spare payload; `bytes` then
+ * points into the cell itself and there is no separate block to free. */
+#define KAI_STR_INLINE_CAP (sizeof(KaiValue) - offsetof(KaiValue, as) - sizeof(((KaiValue *) 0)->as.s))
+static inline char *kai_str_inline_bytes(KaiValue *v) {
+    return (char *) &v->as + sizeof(v->as.s);
+}
+static inline int kai_str_is_inline(const KaiValue *v) {
+    return v->as.s.bytes == kai_str_inline_bytes((KaiValue *) v);
+}
+
 /* One body for both modes; each wrapper inlines it with `st` fixed, so the
  * recursive mode never tests for a stack. */
 static inline __attribute__((always_inline))
@@ -120,7 +130,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
     KaiValue *next = NULL;
     switch ((KaiTag) v->tag) {
         case KAI_STR:
-            kai_heap_free(v->as.s.bytes);
+            if (!kai_str_is_inline(v)) kai_heap_free(v->as.s.bytes);
             break;
         case KAI_CONS:
             /* A unique tail continues this loop at the same depth, so a
@@ -618,7 +628,7 @@ static KAI_RC_NOINLINE KaiValue *kai_char(uint32_t c) {
 static KAI_RC_NOINLINE KaiValue *kai_str_from_bytes(const char *bytes, size_t len) {
     KaiValue *v = kai_alloc(KAI_STR);
     v->as.s.len = len;
-    v->as.s.bytes = (char *) kai_heap_malloc(len + 1);
+    v->as.s.bytes = len < KAI_STR_INLINE_CAP ? kai_str_inline_bytes(v) : (char *) kai_heap_malloc(len + 1);
     if (len > 0) memcpy(v->as.s.bytes, bytes, len);
     v->as.s.bytes[len] = '\0';
     return v;
