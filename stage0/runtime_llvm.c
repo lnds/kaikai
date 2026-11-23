@@ -520,6 +520,10 @@ KAIX_CORE_THUNK2(to_int_radix)
 KAIX_CORE_THUNK2(int_to_string_radix)
 KAIX_CORE_THUNK2(string_find)
 KAIX_CORE_THUNK2(string_rfind)
+KAIX_CORE_THUNK3(string_has_at)
+KAIX_CORE_THUNK1(string_to_bytes)
+KAIX_CORE_THUNK1(string_to_byte_list)
+KAIX_CORE_THUNK1(string_is_utf8)
 KAIX_CORE_THUNK1(int_to_le4)
 KAIX_CORE_THUNK1(int_to_le8)
 KAIX_CORE_THUNK5(bytes_blit)
@@ -1481,6 +1485,10 @@ KaiValue *kaix_core_string_split(KaiValue *s, KaiValue *d)  { return kai_core_st
 KaiValue *kaix_core_string_contains(KaiValue *s, KaiValue *sub) { return kai_core_string_contains(s, sub); }
 KaiValue *kaix_core_string_find(KaiValue *s, KaiValue *sub)     { return kai_core_string_find(s, sub); }
 KaiValue *kaix_core_string_rfind(KaiValue *s, KaiValue *sub)    { return kai_core_string_rfind(s, sub); }
+KaiValue *kaix_core_string_has_at(KaiValue *s, KaiValue *sub, KaiValue *off) { return kai_core_string_has_at(s, sub, off); }
+KaiValue *kaix_core_string_to_bytes(KaiValue *s)          { return kai_core_string_to_bytes(s); }
+KaiValue *kaix_core_string_to_byte_list(KaiValue *s)      { return kai_core_string_to_byte_list(s); }
+KaiValue *kaix_core_string_is_utf8(KaiValue *s)           { return kai_core_string_is_utf8(s); }
 KaiValue *kaix_core_to_int_radix(KaiValue *s, KaiValue *r)     { return kai_core_to_int_radix(s, r); }
 KaiValue *kaix_core_int_to_string_radix(KaiValue *v, KaiValue *r) { return kai_core_int_to_string_radix(v, r); }
 KaiValue *kaix_core_char_at(KaiValue *s, KaiValue *i)       { return kai_core_char_at(s, i); }
