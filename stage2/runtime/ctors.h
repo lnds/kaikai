@@ -235,19 +235,7 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
                 }
                 /* A fiber freed without terminating never ran to an exit;
                  * its pids must not keep pointing at it. */
-                {
-                    KaiFiberExit *x = atomic_load_explicit(&v->as.fib->exit_rec,
-                                                           memory_order_acquire);
-                    if (x) {
-                        kai_fiber_exit_lock(x);
-                        if (x->fiber == v->as.fib) {
-                            x->fiber  = NULL;
-                            x->reason = KAI_EXIT_CRASHED;
-                        }
-                        kai_fiber_exit_unlock(x);
-                        kai_fiber_exit_unref(x);
-                    }
-                }
+                kai_fiber_exit_orphan(v->as.fib);
                 /* R4 fix — when the trampoline drops the scheduler's
                  * ref on its own wrapper at DONE/CANCELLED, the wrapper
                  * may go to RC=0 here while we are still running on
