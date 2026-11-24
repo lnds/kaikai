@@ -157,8 +157,12 @@ KAI_SCHED_FN KaiValue *kai_ffi_retain(KaiValue *v)
             kai_trap_abort("retain_userdata: too many live userdata handles");
         }
         if (kai_ud_count == kai_ud_nchunks * KAI_UD_CHUNK) {
-            kai_ud_chunks = (KaiUdSlot **) realloc(kai_ud_chunks, (kai_ud_nchunks + 1) * sizeof *kai_ud_chunks);
-            kai_ud_chunks[kai_ud_nchunks++] = (KaiUdSlot *) calloc(KAI_UD_CHUNK, sizeof(KaiUdSlot));
+            KaiUdSlot **grown = (KaiUdSlot **) realloc(kai_ud_chunks, (kai_ud_nchunks + 1) * sizeof *kai_ud_chunks);
+            if (!grown) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+            kai_ud_chunks = grown;
+            KaiUdSlot *chunk = (KaiUdSlot *) calloc(KAI_UD_CHUNK, sizeof(KaiUdSlot));
+            if (!chunk) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+            kai_ud_chunks[kai_ud_nchunks++] = chunk;
         }
         idx = ++kai_ud_count;
         kai_ud_slot(idx)->gen = 1;

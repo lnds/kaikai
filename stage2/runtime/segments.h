@@ -190,9 +190,16 @@ static void kai_seg_unwind(KaiFiber *f, KaiSegment *seg) {
     kai_trap_unwind(f->unwind_frame, f->stack_base, kai_seg_land, seg);
 }
 
-/* Switch from the running segment back to its resumer for good. */
-__attribute__((noreturn))
-static void kai_seg_leave(KaiSegment *seg) {
+static void kai_seg_entry(void *arg) {
+    KaiSegment *seg = (KaiSegment *) arg;
+    KAI_SEG_ASAN_ARRIVE(NULL, &seg->asan_outer_bottom, &seg->asan_outer_size);
+    seg->fiber->unwind_frame = (uintptr_t) __builtin_frame_address(0);
+    if (_setjmp(seg->pad) == 0) {
+        seg->xfer  = kai_apply_borrow(seg->body, 0, NULL);
+        seg->state = KAI_SEG_RETURNED;
+    }
+    /* Inline: the NULL-save switch destroys this frame's fake stack, so no
+     * helper frame may be live across it. */
     KaiFiber *f = seg->fiber;
     kai_seg_ctx_save(f, &seg->own);
     kai_seg_ctx_load(f, &seg->outer);
@@ -205,17 +212,6 @@ static void kai_seg_leave(KaiSegment *seg) {
 #endif
     kai_seg_switch(&seg->sp, seg->outer_sp, NULL);
     __builtin_unreachable();
-}
-
-static void kai_seg_entry(void *arg) {
-    KaiSegment *seg = (KaiSegment *) arg;
-    KAI_SEG_ASAN_ARRIVE(NULL, &seg->asan_outer_bottom, &seg->asan_outer_size);
-    seg->fiber->unwind_frame = (uintptr_t) __builtin_frame_address(0);
-    if (_setjmp(seg->pad) == 0) {
-        seg->xfer  = kai_apply_borrow(seg->body, 0, NULL);
-        seg->state = KAI_SEG_RETURNED;
-    }
-    kai_seg_leave(seg);
 }
 
 /* Continue on this side a non-local exit that left a segment. */
