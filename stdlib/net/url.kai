@@ -424,22 +424,39 @@ pub fn to_string(u: Url) : String =
 
 # ---- percent-coding -----------------------------------------------
 
-fn url_hex_digit(n: Int) : String = string_slice("0123456789ABCDEF", n, 1)
-
-fn url_encode_byte(s: String, i: Int) : String {
-  let b = string_byte_at_int(s, i)
-  if url_is_unreserved(b) {
-    string_slice(s, i, 1)
-  } else {
-    string_concat_all(["%", url_hex_digit(b / 16), url_hex_digit(b % 16)])
-  }
-}
-
-fn url_encode_loop(s: String, i: Int, n: Int, parts: [String]) : String =
+fn url_encoded_len(s: String, i: Int, n: Int, acc: Int) : Int =
   if i >= n {
-    string_concat_all(list_reverse(parts))
+    acc
   } else {
-    url_encode_loop(s, i + 1, n, [url_encode_byte(s, i), ...parts])
+    url_encoded_len(
+      s,
+      i + 1,
+      n,
+      acc + (if url_is_unreserved(string_byte_at_int(s, i)) { 1 } else { 3 })
+    )
+  }
+
+fn url_encode_fill(
+  out: Array[Byte],
+  s: String,
+  src: Array[Byte],
+  digits: Array[Byte],
+  i: Int,
+  k: Int
+) : Unit / Mutable =
+  if i < array_length(src) {
+    let b = string_byte_at_int(s, i)
+    if url_is_unreserved(b) {
+      out[k] := src[i]
+      url_encode_fill(out, s, src, digits, i + 1, k + 1)
+    } else {
+      out[k] := 37u8
+      out[k + 1] := digits[b / 16]
+      out[k + 2] := digits[b % 16]
+      url_encode_fill(out, s, src, digits, i + 1, k + 3)
+    }
+  } else {
+    ()
   }
 
 #[doc("""
@@ -447,7 +464,12 @@ Percent-encodes every UTF-8 byte of `s` except the RFC 3986 unreserved
 set (`A-Z a-z 0-9 - . _ ~`), using uppercase hex: `"a b/é"` becomes
 `"a%20b%2F%C3%A9"`.
 """)]
-pub fn percent_encode(s: String) : String = url_encode_loop(s, 0, string_length(s), [])
+pub fn percent_encode(s: String) : String {
+  let len = url_encoded_len(s, 0, string_length(s), 0)
+  let out = array_make(len, 0u8)
+  url_encode_fill(out, s, string.to_byte_array(s), string.to_byte_array("0123456789ABCDEF"), 0, 0)
+  bytes_get_string(out, 0, len)
+}
 
 fn url_decode_loop(s: String, i: Int, n: Int, parts: [String]) : Result[String, String] =
   if i >= n {
@@ -513,61 +535,44 @@ pub fn query_string(pairs: [(String, String)]) : String =
 
 # ---- reference resolution -----------------------------------------
 
-fn url_pop_segment(out: String) : String {
-  let i = url_find_last(out, 47, string_length(out) - 1)
-  if i < 0 { "" } else { string_slice(out, 0, i) }
+# End of the first path segment at or after `p`, not counting a leading '/'.
+fn url_segment_end(s: String, p: Int, n: Int) : Int {
+  let start = if string_byte_at_int(s, p) == 47 { p + 1 } else { p }
+  let slash = url_find(s, 47, start, n)
+  if slash < 0 { n } else { slash }
 }
 
-# End of the first path segment, not counting a leading '/'.
-fn url_segment_end(input: String) : Int {
-  let start = if string.starts_with(input, "/") { 1 } else { 0 }
-  let slash = url_find(input, 47, start, string_length(input))
-  if slash < 0 { string_length(input) } else { slash }
+# `out` holds the output segments, newest first; each begins with '/'
+# except possibly the oldest, so popping drops the newest '/'-led one.
+fn url_pop_segment(out: [String]) : [String] = match out {
+  [] -> []
+  [seg, ...rest] -> if string_matches_at(seg, "/", 0) { rest } else { [] }
 }
 
-# RFC 3986 §5.2.4 steps A and B: the input after dropping a leading dot
-# segment, or None when the input does not start with one.
-fn url_skip_dot_prefix(input: String) : Option[String] =
-  if string.starts_with(input, "../") {
-    Some(url_after(input, 3))
-  } else if string.starts_with(input, "./") {
-    Some(url_after(input, 2))
-  } else if string.starts_with(input, "/./") {
-    Some(url_after(input, 2))
-  } else if input == "/." {
-    Some("/")
+# RFC 3986 §5.2.4 over the input from offset `p`, copying only the
+# emitted segments.
+fn url_remove_dots(s: String, p: Int, n: Int, out: [String]) : String {
+  let rem = n - p
+  if rem <= 0 {
+    string_concat_all(list_reverse(out))
+  } else if string_matches_at(s, "../", p) {
+    url_remove_dots(s, p + 3, n, out)
+  } else if string_matches_at(s, "./", p) or string_matches_at(s, "/./", p) {
+    url_remove_dots(s, p + 2, n, out)
+  } else if rem == 2 and string_matches_at(s, "/.", p) {
+    url_remove_dots(s, n, n, ["/", ...out])
+  } else if string_matches_at(s, "/../", p) {
+    url_remove_dots(s, p + 3, n, url_pop_segment(out))
+  } else if rem == 3 and string_matches_at(s, "/..", p) {
+    url_remove_dots(s, n, n, ["/", ...url_pop_segment(out)])
+  } else if (rem == 1 and string_matches_at(s, ".", p))
+    or (rem == 2 and string_matches_at(s, "..", p)) {
+    url_remove_dots(s, n, n, out)
   } else {
-    None
+    let e = url_segment_end(s, p, n)
+    url_remove_dots(s, e, n, [string_slice(s, p, e - p), ...out])
   }
-
-# Steps C, D and E: the remaining input and the output so far.
-fn url_dot_step_up(input: String, out: String) : (String, String) =
-  if string.starts_with(input, "/../") {
-    (url_after(input, 3), url_pop_segment(out))
-  } else if input == "/.." {
-    ("/", url_pop_segment(out))
-  } else if input == "." or input == ".." {
-    ("", out)
-  } else {
-    let e = url_segment_end(input)
-    (url_after(input, e), string_concat(out, url_range(input, 0, e)))
-  }
-
-fn url_dot_step(input: String, out: String) : (String, String) =
-  match url_skip_dot_prefix(input) {
-    Some(rest) -> (rest, out)
-    None -> url_dot_step_up(input, out)
-  }
-
-# The step functions never call back, so the recursion is a single self-call.
-fn url_remove_dots(input: String, out: String) : String =
-  if string_length(input) == 0 {
-    out
-  } else {
-    match url_dot_step(input, out) {
-      (rest, next) -> url_remove_dots(rest, next)
-    }
-  }
+}
 
 fn url_merge(base: Url, rel: String) : String =
   if option.is_some(base.host) and string_length(base.path) == 0 {
@@ -577,18 +582,20 @@ fn url_merge(base: Url, rel: String) : String =
     if i < 0 { rel } else { string_concat(url_range(base.path, 0, i + 1), rel) }
   }
 
+fn url_remove_dots_all(path: String) : String = url_remove_dots(path, 0, string_length(path), [])
+
 fn url_resolve_path(base: Url, r: Url) : String =
   if string.starts_with(r.path, "/") {
-    url_remove_dots(r.path, "")
+    url_remove_dots_all(r.path)
   } else {
-    url_remove_dots(url_merge(base, r.path), "")
+    url_remove_dots_all(url_merge(base, r.path))
   }
 
 fn url_resolve_ref(base: Url, r: Url) : Url =
   if option.is_some(r.scheme) {
-    Url { ...r, path: url_remove_dots(r.path, "") }
+    Url { ...r, path: url_remove_dots_all(r.path) }
   } else if option.is_some(r.host) {
-    Url { ...r, scheme: base.scheme, path: url_remove_dots(r.path, "") }
+    Url { ...r, scheme: base.scheme, path: url_remove_dots_all(r.path) }
   } else if string_length(r.path) == 0 {
     Url {
       ...base,
