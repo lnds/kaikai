@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.199.3 (2026-11-24)
+
+### Fixed
+
+- **runtime**: decode invalid UTF-8 lossily so trim and is_blank ignore stray bytes
+
 ## v0.199.2 (2026-11-23)
 
 ### Fixed
