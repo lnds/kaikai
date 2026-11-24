@@ -39,6 +39,9 @@ pub fn concat(a: String, b: String) : String = string_concat(a, b)
 
 extern "kai"("kai_core_string_has_at") fn string_has_at(s: String, sub: String, off: Int) : Bool
 
+#[doc("True when `sub` occurs in `s` at byte offset `off`, compared in place; `starts_with` / `ends_with` are the public forms.")]
+pub(pkg) fn string_matches_at(s: String, sub: String, off: Int) : Bool = string_has_at(s, sub, off)
+
 extern "kai"("kai_core_string_to_bytes") fn string_to_bytes(s: String) : Array[Byte]
 
 #[doc("The bytes of `s` as a flat `Array[Byte]`, in one allocation.")]
@@ -476,19 +479,83 @@ pub fn to_upper(s: String) : String = string_to_upper_ascii(s)
 pub fn to_lower(s: String) : String = string_to_lower_ascii(s)
 
 #[doc("Uppercases each codepoint over the scripts `core.char_unicode` covers (ASCII, Latin-1, Latin Extended-A, Greek, Cyrillic); anything else passes through. Not full Unicode: no one-to-many folding, no context sensitivity.")]
-pub fn to_upper_unicode(s: String) : String =
-  string_concat_all(list.reverse(string_map_chars(chars(s), char_unicode.to_upper, [])))
+pub fn to_upper_unicode(s: String) : String = string_map_unicode(s, char_unicode.to_upper)
 
 #[doc("Lowercases each codepoint over the scripts `core.char_unicode` covers (ASCII, Latin-1, Latin Extended-A, Greek, Cyrillic); anything else passes through. Not full Unicode: no one-to-many folding, no context sensitivity.")]
-pub fn to_lower_unicode(s: String) : String =
-  string_concat_all(list.reverse(string_map_chars(chars(s), char_unicode.to_lower, [])))
+pub fn to_lower_unicode(s: String) : String = string_map_unicode(s, char_unicode.to_lower)
 
-# Tail-recursive accumulator (one `[String]`, one alloc per piece),
-# then `string_concat_all` joins in a single pass. The accumulator
-# leaves pieces reversed, so `list.reverse` restores source order.
-fn string_map_chars(cs: [Char], f: (Char) -> Char, acc: [String]) : [String] = match cs {
-  [] -> acc
-  [c, ...t] -> string_map_chars(t, f, [string_encode_cp(char_to_int(f(c))), ...acc])
+fn string_cp_width(cp: Int) : Int =
+  if cp < 0x80 { 1 } else if cp < 0x800 { 2 } else if cp < 0x10000 { 3 } else { 4 }
+
+fn string_byte(n: Int) : Byte = match int_to_byte(n) {
+  Ok(b) -> b
+  Err(_) -> 0u8
+}
+
+fn string_put_cp(out: Array[Byte], k: Int, cp: Int) : Int / Mutable {
+  if cp < 0x80 {
+    out[k] := string_byte(cp)
+    k + 1
+  } else if cp < 0x800 {
+    out[k] := string_byte(0xC0 + cp / 64)
+    out[k + 1] := string_byte(0x80 + cp % 64)
+    k + 2
+  } else if cp < 0x10000 {
+    out[k] := string_byte(0xE0 + cp / 4096)
+    out[k + 1] := string_byte(0x80 + cp / 64 % 64)
+    out[k + 2] := string_byte(0x80 + cp % 64)
+    k + 3
+  } else {
+    out[k] := string_byte(0xF0 + cp / 262144)
+    out[k + 1] := string_byte(0x80 + cp / 4096 % 64)
+    out[k + 2] := string_byte(0x80 + cp / 64 % 64)
+    out[k + 3] := string_byte(0x80 + cp % 64)
+    k + 4
+  }
+}
+
+fn string_mapped_cp(s: String, off: Int, f: (Char) -> Char) : Int =
+  char_to_int(f(int_to_char(string_cp_at(s, off))))
+
+fn string_step(s: String, off: Int) : Int {
+  let w = string_cp_len(s, off)
+  if w <= 0 { 1 } else { w }
+}
+
+fn string_mapped_len(s: String, off: Int, n: Int, f: (Char) -> Char, acc: Int) : Int =
+  if off >= n {
+    acc
+  } else {
+    string_mapped_len(
+      s,
+      off + string_step(s, off),
+      n,
+      f,
+      acc + string_cp_width(string_mapped_cp(s, off, f))
+    )
+  }
+
+fn string_mapped_fill(
+  s: String,
+  off: Int,
+  n: Int,
+  f: (Char) -> Char,
+  out: Array[Byte],
+  k: Int
+) : Unit / Mutable =
+  if off < n {
+    let k2 = string_put_cp(out, k, string_mapped_cp(s, off, f))
+    string_mapped_fill(s, off + string_step(s, off), n, f, out, k2)
+  } else {
+    ()
+  }
+
+fn string_map_unicode(s: String, f: (Char) -> Char) : String {
+  let n = string_length(s)
+  let len = string_mapped_len(s, 0, n, f, 0)
+  let out = array_make(len, 0u8)
+  string_mapped_fill(s, 0, n, f, out, 0)
+  bytes_get_string(out, 0, len)
 }
 
 #[doc("""
@@ -523,7 +590,16 @@ pub fn count(s: String, needle: String) : Int =
   if string_length(needle) == 0 {
     char_count(s) + 1
   } else {
-    list_length(string_split(s, needle)) - 1
+    string_count_loop(s, needle, string_byte_at_int(needle, 0), string_length(needle), 0, 0)
+  }
+
+fn string_count_loop(s: String, needle: String, first: Int, m: Int, i: Int, acc: Int) : Int =
+  if i + m > string_length(s) {
+    acc
+  } else if string_byte_at_int(s, i) == first and string_has_at(s, needle, i) {
+    string_count_loop(s, needle, first, m, i + m, acc + 1)
+  } else {
+    string_count_loop(s, needle, first, m, i + 1, acc)
   }
 
 #[doc("Byte offset of the last (possibly overlapping) occurrence of `needle` in `s`, or -1; `string.last_index_of` is the `Option` form.")]
