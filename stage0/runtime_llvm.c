@@ -487,6 +487,8 @@ KAIX_FILE_THUNK1(delete, kai_core_file_delete)
 KAIX_FILE_THUNK2(rename, kai_core_file_rename)
 KAIX_FILE_THUNK1(read_bytes, kai_core_file_read_bytes)
 KAIX_FILE_THUNK2(write_bytes, kai_core_file_write_bytes)
+KaiValue *kaix___file_read_range_thunk(KaiValue *s, KaiValue **a, int n)
+    { (void) s; (void) n; return kai_core_file_read_range(a[0], a[1], a[2]); }
 KAIX_CORE_THUNK1(dir_list_dir)
 KAIX_CORE_THUNK1(dir_create_dir)
 KAIX_CORE_THUNK1(dir_remove_dir)
@@ -1456,6 +1458,7 @@ KaiValue *kaix_core___file_append(KaiValue *p, KaiValue *c){ return kai_core_fil
 KaiValue *kaix_core___file_exists(KaiValue *p)             { return kai_core_file_exists(p); }
 KaiValue *kaix_core___file_delete(KaiValue *p)             { return kai_core_file_delete(p); }
 KaiValue *kaix_core___file_rename(KaiValue *f, KaiValue *t){ return kai_core_file_rename(f, t); }
+KaiValue *kaix_core___file_read_range(KaiValue *p, KaiValue *o, KaiValue *l) { return kai_core_file_read_range(p, o, l); }
 KaiValue *kaix_core___file_read_bytes(KaiValue *p)              { return kai_core_file_read_bytes(p); }
 KaiValue *kaix_core___file_write_bytes(KaiValue *p, KaiValue *b){ return kai_core_file_write_bytes(p, b); }
 KaiValue *kaix_core_dir_list_dir(KaiValue *p)            { return kai_core_dir_list_dir(p); }
