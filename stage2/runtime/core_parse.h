@@ -82,33 +82,43 @@ static KaiValue *kai_core_char_at(KaiValue *s, KaiValue *i) {
     return kai_variant_u(1, "None", 0, 0, NULL);
 }
 
-/* UTF-8 codepoint decode primitives (issue #744). `string.chars()`,
- * `char_count`, `char_indices` are written in kaikai over these two:
- * walk the byte buffer advancing `off += string_cp_len(s, off)` and
- * read the codepoint with `string_cp_at(s, off)`. Keeping the decode
- * in C (one lead-byte classification per call) avoids a kaikai byte
- * loop that would box an Int per byte. Lenient at the value level: a
- * malformed lead byte decodes to its raw byte value so a corrupt
- * buffer never traps here (the scalar-value invariant is enforced at
- * `int_to_char` / char-literal lexing, not on every decode). */
-static int kai_utf8_seq_len(unsigned char b0) {
-    if (b0 < 0x80)            return 1;
-    if ((b0 & 0xE0) == 0xC0)  return 2;
-    if ((b0 & 0xF0) == 0xE0)  return 3;
-    if ((b0 & 0xF8) == 0xF0)  return 4;
-    return 1;  /* malformed lead byte: consume one byte */
+/* UTF-8 codepoint decode primitives: `string.chars()`, `char_count`,
+ * `char_indices` walk the byte buffer advancing `off += string_cp_len(s, off)`
+ * and read the codepoint with `string_cp_at(s, off)`. The decode is lossy
+ * like `from_utf8_lossy`: a byte that cannot start a sequence, a truncated
+ * or overlong sequence, a surrogate or a value above U+10FFFF is one U+FFFD
+ * of width 1, so the decoder and the width never disagree. */
+static int kai_utf8_valid_len(const unsigned char *b, size_t avail) {
+    unsigned char b0 = b[0];
+    if (b0 < 0x80) return 1;
+    int need;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (b0 >= 0xC2 && b0 <= 0xDF)      need = 2;
+    else if (b0 >= 0xE0 && b0 <= 0xEF) {
+        need = 3;
+        if (b0 == 0xE0) lo = 0xA0;
+        if (b0 == 0xED) hi = 0x9F;
+    } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+        need = 4;
+        if (b0 == 0xF0) lo = 0x90;
+        if (b0 == 0xF4) hi = 0x8F;
+    } else return 1;
+    if ((size_t) need > avail) return 1;
+    if (b[1] < lo || b[1] > hi) return 1;
+    for (int k = 2; k < need; k++) if ((b[k] & 0xC0) != 0x80) return 1;
+    return need;
 }
 
-/* Byte-width (1..4) of the UTF-8 sequence starting at byte index `off`.
- * Returns 0 on out-of-range / wrong type so a kaikai walk terminates. */
+/* Byte-width (1..4) of the sequence starting at byte index `off`; 1 for an
+ * invalid byte. Returns 0 on out-of-range / wrong type so a kaikai walk
+ * terminates. */
 static KaiValue *kai_core_string_cp_len(KaiValue *s, KaiValue *off) {
     int64_t w = 0;
     if (s && s->tag == KAI_STR && off && kai_is_int(off)) {
         int64_t i = kai_intf(off);
         if (i >= 0 && (size_t) i < s->as.s.len) {
-            int seq = kai_utf8_seq_len((unsigned char) s->as.s.bytes[i]);
-            size_t avail = s->as.s.len - (size_t) i;
-            w = ((size_t) seq > avail) ? (int64_t) avail : (int64_t) seq;
+            w = kai_utf8_valid_len((const unsigned char *) s->as.s.bytes + i,
+                                   s->as.s.len - (size_t) i);
         }
     }
     if (s)   kai_decref(s);
@@ -116,39 +126,19 @@ static KaiValue *kai_core_string_cp_len(KaiValue *s, KaiValue *off) {
     return kai_int(w);
 }
 
-/* Decode the codepoint of the UTF-8 sequence starting at byte index
- * `off`. Returns -1 on out-of-range / wrong type. Continuation bytes
- * beyond the buffer are skipped (lenient, matches the clamp above). */
+/* Decode the codepoint starting at byte index `off`; U+FFFD for an invalid
+ * byte. Returns -1 on out-of-range / wrong type. */
 static KaiValue *kai_core_string_cp_at(KaiValue *s, KaiValue *off) {
     int64_t cp = -1;
     if (s && s->tag == KAI_STR && off && kai_is_int(off)) {
         int64_t i = kai_intf(off);
         if (i >= 0 && (size_t) i < s->as.s.len) {
-            const unsigned char *b = (const unsigned char *) s->as.s.bytes;
-            size_t len = s->as.s.len;
-            unsigned char b0 = b[i];
-            if (b0 < 0x80) {
-                cp = b0;
-            } else {
-                uint32_t v;
-                int extra;
-                if      ((b0 & 0xE0) == 0xC0) { v = b0 & 0x1F; extra = 1; }
-                else if ((b0 & 0xF0) == 0xE0) { v = b0 & 0x0F; extra = 2; }
-                else if ((b0 & 0xF8) == 0xF0) { v = b0 & 0x07; extra = 3; }
-                else                          { v = b0; extra = 0; }
-                size_t j = (size_t) i + 1;
-                while (extra-- > 0 && j < len) {
-                    v = (v << 6) | (b[j] & 0x3F);
-                    j++;
-                }
-                /* Malformed input can decode above U+10FFFF or into the
-                 * surrogate range; map such non-scalar values to U+FFFD
-                 * (replacement char) so a `chars()` walk never feeds a
-                 * non-codepoint to `int_to_char` (which would panic).
-                 * Well-formed UTF-8 never hits this. */
-                if (v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) v = 0xFFFD;
-                cp = (int64_t) v;
-            }
+            const unsigned char *b = (const unsigned char *) s->as.s.bytes + i;
+            int w = kai_utf8_valid_len(b, s->as.s.len - (size_t) i);
+            if (w == 1)      cp = b[0] < 0x80 ? b[0] : 0xFFFD;
+            else if (w == 2) cp = ((b[0] & 0x1F) << 6) | (b[1] & 0x3F);
+            else if (w == 3) cp = ((b[0] & 0x0F) << 12) | ((b[1] & 0x3F) << 6) | (b[2] & 0x3F);
+            else             cp = ((int64_t) (b[0] & 0x07) << 18) | ((b[1] & 0x3F) << 12) | ((b[2] & 0x3F) << 6) | (b[3] & 0x3F);
         }
     }
     if (s)   kai_decref(s);
@@ -177,9 +167,7 @@ static KaiValue *kai_core_string_reverse(KaiValue *s) {
     size_t i = 0;
     size_t w = len;
     while (i < len) {
-        int seq = kai_utf8_seq_len(src[i]);
-        size_t avail = len - i;
-        size_t step = ((size_t) seq > avail) ? avail : (size_t) seq;
+        size_t step = (size_t) kai_utf8_valid_len(src + i, len - i);
         w -= step;
         memcpy(dst + w, src + i, step);
         i += step;
