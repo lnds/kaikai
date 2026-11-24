@@ -100,6 +100,7 @@ KaiValue *kaix_core___file_delete(KaiValue *p);
 KaiValue *kaix_core___file_exists(KaiValue *p);
 KaiValue *kaix_core___file_read(KaiValue *p);
 KaiValue *kaix_core___file_read_bytes(KaiValue *p);
+KaiValue *kaix_core___file_read_range(KaiValue *p, KaiValue *o, KaiValue *l);
 KaiValue *kaix_core___file_rename(KaiValue *f, KaiValue *t);
 KaiValue *kaix_core___file_write(KaiValue *p, KaiValue *c);
 KaiValue *kaix_core___file_write_bytes(KaiValue *p, KaiValue *b);

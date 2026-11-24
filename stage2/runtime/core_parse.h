@@ -731,6 +731,7 @@ static KaiValue *_kai_core_file_delete_thunk(KaiValue *s, KaiValue **a, int n)  
 static KaiValue *_kai_core_file_rename_thunk(KaiValue *s, KaiValue **a, int n)    { (void) s; (void) n; return kai_core_file_rename(a[0], a[1]); }
 static KaiValue *_kai_core_file_read_bytes_thunk(KaiValue *s, KaiValue **a, int n)  { (void) s; (void) n; return kai_core_file_read_bytes(a[0]); }
 static KaiValue *_kai_core_file_write_bytes_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_file_write_bytes(a[0], a[1]); }
+static KaiValue *_kai_core_file_read_range_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_file_read_range(a[0], a[1], a[2]); }
 static KaiValue *_kai_core_dir_list_dir_thunk(KaiValue *s, KaiValue **a, int n)   { (void) s; (void) n; return kai_core_dir_list_dir(a[0]); }
 static KaiValue *_kai_core_dir_create_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_dir_create_dir(a[0]); }
 static KaiValue *_kai_core_dir_remove_dir_thunk(KaiValue *s, KaiValue **a, int n) { (void) s; (void) n; return kai_core_dir_remove_dir(a[0]); }

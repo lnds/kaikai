@@ -860,3 +860,60 @@ static KaiValue *kai_core_read_bytes(KaiValue *n) {
     return s;
 }
 
+
+/* read_range(path, offset, length) -> Result[String, String]. Positioned
+ * read of up to `length` bytes starting at `offset`; EOF yields a short
+ * or empty String. Negative arguments are an Err, never a panic. */
+static KaiValue *kai_core_file_read_range(KaiValue *path, KaiValue *offset, KaiValue *length) {
+    KaiValue *r = NULL;
+    int64_t off = kai_is_int(offset) ? kai_intf(offset) : -1;
+    int64_t len = kai_is_int(length) ? kai_intf(length) : -1;
+    if (!path || path->tag != KAI_STR) {
+        r = _kai_file_err("read_range: path is not a String");
+    } else if (off < 0) {
+        r = _kai_file_err("read_range: offset is negative");
+    } else if (len < 0) {
+        r = _kai_file_err("read_range: length is negative");
+    } else {
+        char pbuf[KAI_PATH_BUF];
+        size_t plen = path->as.s.len < sizeof(pbuf) - 1 ? path->as.s.len : sizeof(pbuf) - 1;
+        memcpy(pbuf, path->as.s.bytes, plen);
+        pbuf[plen] = '\0';
+        int fd = open(pbuf, O_RDONLY);
+        struct stat st;
+        if (fd < 0) {
+            r = _kai_fs_err(pbuf, plen, kai_errno());
+        } else if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
+            close(fd);
+            r = _kai_fs_err(pbuf, plen, EISDIR);
+        } else {
+            char *buf = (char *) malloc((size_t) len + 1);
+            if (!buf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+            size_t got = 0;
+            int err = 0;
+            while (got < (size_t) len) {
+                ssize_t n = pread(fd, buf + got, (size_t) len - got, (off_t) (off + (int64_t) got));
+                if (n < 0 && kai_errno() == EINTR) continue;
+                if (n < 0) { err = kai_errno(); break; }
+                if (n == 0) break;
+                got += (size_t) n;
+            }
+            close(fd);
+            if (err) {
+                r = _kai_fs_err(pbuf, plen, err);
+            } else {
+                KaiValue *v = kai_alloc(KAI_STR);
+                v->as.s.len = got;
+                v->as.s.bytes = (char *) kai_heap_malloc(got + 1);
+                memcpy(v->as.s.bytes, buf, got);
+                v->as.s.bytes[got] = '\0';
+                r = _kai_file_ok(v);
+            }
+            free(buf);
+        }
+    }
+    if (path) kai_decref(path);
+    if (kai_is_ptr(offset)) kai_decref(offset);
+    if (kai_is_ptr(length)) kai_decref(length);
+    return r;
+}
