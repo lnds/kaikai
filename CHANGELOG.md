@@ -84,6 +84,20 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.199.4 (2026-11-24)
+
+### Fixed
+
+- **stdlib**: mask base64 and hex encoder inputs to a byte instead of indexing out of range
+- **runtime**: report errno on chunk io failures, leave segments inline, check userdata allocs
+
+### Changed
+
+- **stdlib**: shrink the unicode case-mapping helpers in core.string
+- **stdlib**: drop per-step copies and per-byte strings from text and encoding paths
+- **stdlib**: move http bodies as Strings, not per-byte lists, through request and response
+- **stdlib**: index crypto hash schedules and constants in Vec instead of rebuilding lists
+
 ## v0.199.3 (2026-11-24)
 
 ### Fixed
