@@ -904,6 +904,9 @@ effect NetTcp {
   send(c: Conn, data: [Int])                       : Result[Int, String]
   recv(c: Conn, max: Int)                          : Result[[Int], String]
   recv_timeout(c: Conn, max: Int, nanos: Int)      : Option[Result[[Int], String]]
+  send_bytes(c: Conn, data: Array[Byte])           : Result[Int, String]
+  recv_bytes(c: Conn, max: Int)                    : Result[Array[Byte], String]
+  recv_bytes_timeout(c: Conn, max: Int, nanos: Int) : Option[Result[Array[Byte], String]]
   close(c: Conn)                                   : Unit
 }
 

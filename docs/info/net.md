@@ -11,15 +11,17 @@ the IP stack.
 
 | module | effect | handles |
 |--------|--------|---------|
-| `net.tcp` | `NetTcp` | `connect(host, port)`, `listen(host, port)`, `accept`, `send`, `recv`, `recv_timeout`, `close` |
+| `net.tcp` | `NetTcp` | `connect(host, port)`, `listen(host, port)`, `accept`, `send`, `recv`, `recv_timeout`, `send_bytes`, `recv_bytes`, `recv_bytes_timeout`, `close` |
 | `net.udp` | `NetUdp` | `bind`, `send`, `recv`, `close` |
 | `net.dns` | `NetDns` | `resolve`, `resolve_first`, `with_dns` |
 | `net.unix` | `NetUnix` | `listen(path, mode)`, `connect(path)`, then the TCP ops, plus `peer_uid` and `close_listener` |
 
-Bytes are `[Int]` (each in `0..255`), results are Ok-first, and the
+Bytes are `[Int]` (each in `0..255`) or, through `send_bytes` /
+`recv_bytes` / `recv_bytes_timeout` on `net.tcp`, an `Array[Byte]` that
+costs one allocation instead of a cons per byte. Results are Ok-first, and the
 blocking stream ops park the fiber, not the OS thread — several
 fibers can `accept` on one listener. `recv` returning `Ok([])` means
-the peer closed; `recv_timeout` returns `None` when the deadline
+the peer closed (`recv_bytes`: an empty array); `recv_timeout` returns `None` when the deadline
 passes first.
 
 ## Unix-domain sockets

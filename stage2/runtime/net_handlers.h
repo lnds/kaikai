@@ -261,6 +261,103 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_accept(void *self, KaiValue *l, KaiCon
 }
 #endif
 
+#if !KAI_SCHED_DECL_ONLY
+/* Writes all of buf[0..n) to a non-blocking fd, parking on write-readiness
+ * while the kernel buffer is full. Returns the bytes written; `*err` is the
+ * errno that ended the loop early, or 0. */
+static size_t _kai_net_send_loop(int fd, const unsigned char *buf, size_t n, int *err) {
+    kai_reactor_init();
+    kai_socket_set_nonblock(fd);
+    size_t total = 0;
+    *err = 0;
+    while (total < n) {
+#ifdef MSG_NOSIGNAL
+        ssize_t w = send(fd, buf + total, n - total, MSG_NOSIGNAL);
+#else
+        ssize_t w = send(fd, buf + total, n - total, 0);
+#endif
+        if (w > 0) {
+            total += (size_t) w;
+            continue;
+        }
+        int e = kai_errno();
+        if (w < 0 && (e == EAGAIN || e == EWOULDBLOCK)) {
+            kai_reactor_park_socket_write(kai_current_fiber(), fd);
+            continue;
+        }
+        if (w < 0 && e == EINTR) continue;
+        *err = e;
+        break;
+    }
+    return total;
+}
+
+static KaiValue *_kai_net_send_result(KaiCont *k, size_t total, int err) {
+    if (err != 0 && total == 0) return _kai_net_err(k, err);
+    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = kai_int((int64_t) total)}});
+    return kai_cont_resume(k, ok);
+}
+
+/* One read of up to `cap` bytes, parking on read-readiness while empty.
+ * `deadline_ns` < 0 waits forever. Returns the byte count (0 = peer close),
+ * -1 on error with `*err` set, or -2 when the deadline elapsed. */
+static ssize_t _kai_net_recv_some(int fd, unsigned char *buf, size_t cap, int64_t deadline_ns, int *err) {
+    kai_reactor_init();
+    kai_socket_set_nonblock(fd);
+    for (;;) {
+        ssize_t got = recv(fd, buf, cap, 0);
+        if (got >= 0) return got;
+        int e = kai_errno();
+        if (e == EAGAIN || e == EWOULDBLOCK) {
+            if (deadline_ns < 0) {
+                kai_reactor_park_socket_read(kai_current_fiber(), fd);
+            } else if (!kai_reactor_park_socket_read_timeout(kai_current_fiber(), fd, (uint64_t) deadline_ns)) {
+                return -2;
+            }
+            continue;
+        }
+        if (e == EINTR) continue;
+        *err = e;
+        return -1;
+    }
+}
+
+static int64_t _kai_net_recv_cap(KaiValue *max) {
+    int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
+    if (cap > (1 << 20)) cap = 1 << 20;
+    return cap;
+}
+
+static KaiValue *_kai_net_byte_array(const unsigned char *buf, size_t n) {
+    KaiValue *arr = kai_alloc(KAI_ARRAY);
+    arr->as.arr.len = (int64_t) n;
+    arr->as.arr.cap = n > 0 ? (int64_t) n : 1;
+    arr->as.arr.items = (KaiValue **) kai_heap_malloc((size_t) arr->as.arr.cap * sizeof(KaiValue *));
+    for (size_t i = 0; i < n; ++i) arr->as.arr.items[i] = kai_byte(buf[i]);
+    return arr;
+}
+
+static KaiValue *_kai_net_byte_list(const unsigned char *buf, size_t n) {
+    KaiValue *acc = kai_nil();
+    for (size_t i = n; i > 0;) { --i; acc = kai_cons(kai_int((int64_t) buf[i]), acc); }
+    return acc;
+}
+
+static KaiValue *_kai_net_ok(KaiValue *v) {
+    return kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = v}});
+}
+
+static KaiValue *_kai_net_some(KaiValue *v) {
+    return kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = v}});
+}
+
+static KaiValue *_kai_net_some_err(KaiCont *k, int e) {
+    const char *m = strerror(e);
+    KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = kai_str(m ? m : "unknown error")}});
+    return kai_cont_resume(k, _kai_net_some(err));
+}
+#endif
+
 /* send(c, data) -> Result[Int, String]. data is a [Byte] = [Int]
  * cons list; each element is taken mod 256. v1 walks the list once
  * to assemble a contiguous buffer, then writes it.
@@ -300,48 +397,35 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_send(void *self, KaiValue *c, KaiValue
         }
     }
 
-    kai_reactor_init();
-    /* Defensive: send may be called on a Conn that was never funnelled
-     * through the local accept/connect path (e.g. constructed via FFI
-     * in a future user lane). Idempotent on already-nonblock fds. */
-    kai_socket_set_nonblock(fd);
-
-    size_t total = 0;
     int saved_errno = 0;
-    while (total < n) {
-        /* MSG_NOSIGNAL stops a SIGPIPE from killing the process when
-         * the peer has closed its read side; we surface EPIPE through
-         * the Result-shaped return instead. macOS does not have
-         * MSG_NOSIGNAL but exposes SO_NOSIGPIPE on the socket; we
-         * conservatively pass the flag where it exists and rely on
-         * the default SIGPIPE handler being SIG_IGN-equivalent on
-         * the install side for v1. */
-#ifdef MSG_NOSIGNAL
-        ssize_t w = send(fd, buf + total, n - total, MSG_NOSIGNAL);
-#else
-        ssize_t w = send(fd, buf + total, n - total, 0);
-#endif
-        if (w > 0) {
-            total += (size_t) w;
-            continue;
-        }
-        int e = kai_errno();
-        if (w < 0 && (e == EAGAIN || e == EWOULDBLOCK)) {
-            kai_reactor_park_socket_write(kai_current_fiber(), fd);
-            continue;  /* Resume → retry send() */
-        }
-        if (w < 0 && e == EINTR) continue;
-        saved_errno = e;
-        break;
-    }
+    size_t total = _kai_net_send_loop(fd, buf, n, &saved_errno);
     free(buf);
-    if (saved_errno != 0 && total == 0) {
-        return _kai_net_err(k, saved_errno);
-    }
+    return _kai_net_send_result(k, total, saved_errno);
+}
+#endif
 
-    KaiValue *cnt = kai_int((int64_t) total);
-    KaiValue *ok  = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = cnt}});
-    return kai_cont_resume(k, ok);
+/* send_bytes(c, data) -> Result[Int, String]. Same write as send, from an
+ * Array[Byte]. */
+KAI_SCHED_FN KaiValue *kai_default_nettcp_send_bytes(void *self, KaiValue *c, KaiValue *data, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    int fd = _kai_net_record_fd(c);
+    if (fd < 0) return _kai_net_err_msg(k, "send_bytes: invalid conn");
+    if (!data || data->tag != KAI_ARRAY) return _kai_net_err_msg(k, "send_bytes: data is not an Array");
+    size_t n = (size_t) data->as.arr.len;
+    unsigned char *buf = NULL;
+    if (n > 0) {
+        buf = (unsigned char *) malloc(n);
+        if (!buf) return _kai_net_err_msg(k, "send_bytes: out of memory");
+        for (size_t i = 0; i < n; ++i) buf[i] = data->as.arr.items[i]->as.byte_val;
+    }
+    int saved_errno = 0;
+    size_t total = _kai_net_send_loop(fd, buf, n, &saved_errno);
+    free(buf);
+    return _kai_net_send_result(k, total, saved_errno);
 }
 #endif
 
@@ -365,39 +449,51 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue
     (void) self;
     int fd = _kai_net_record_fd(c);
     if (fd < 0) return _kai_net_err_msg(k, "recv: invalid conn");
-    int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
+    int64_t cap = _kai_net_recv_cap(max);
     if (cap <= 0) {
         kai_eputs("kai: NetTcp.recv: max must be > 0\n");
         kai_exit(1);
     }
-    if (cap > (1 << 20)) cap = 1 << 20;  /* 1 MiB ceiling for v1 */
     unsigned char *buf = (unsigned char *) malloc((size_t) cap);
     if (!buf) return _kai_net_err_msg(k, "recv: out of memory");
-
-    kai_reactor_init();
-    /* Defensive idempotent flip — Conn fds from accept/connect are
-     * already non-blocking, but a future FFI-constructed Conn would
-     * not be. */
-    kai_socket_set_nonblock(fd);
-
-    ssize_t got;
-    for (;;) {
-        got = recv(fd, buf, (size_t) cap, 0);
-        if (got >= 0) break;
-        int e = kai_errno();
-        if (e == EAGAIN || e == EWOULDBLOCK) {
-            kai_reactor_park_socket_read(kai_current_fiber(), fd);
-            continue;  /* Resume → retry recv() */
-        }
-        if (e == EINTR) continue;
+    int e = 0;
+    ssize_t got = _kai_net_recv_some(fd, buf, (size_t) cap, -1, &e);
+    if (got < 0) {
         free(buf);
         return _kai_net_err(k, e);
     }
-    KaiValue *acc = kai_nil();
-    for (ssize_t i = got; i > 0;) { --i; acc = kai_cons(kai_int((int64_t) buf[i]), acc); }
+    KaiValue *acc = _kai_net_byte_list(buf, (size_t) got);
     free(buf);
-    KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = acc}});
-    return kai_cont_resume(k, ok);
+    return kai_cont_resume(k, _kai_net_ok(acc));
+}
+#endif
+
+/* recv_bytes(c, max) -> Result[Array[Byte], String]. Same read as recv;
+ * the bytes land in one array instead of a cons per byte. */
+KAI_SCHED_FN KaiValue *kai_default_nettcp_recv_bytes(void *self, KaiValue *c, KaiValue *max, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    int fd = _kai_net_record_fd(c);
+    if (fd < 0) return _kai_net_err_msg(k, "recv_bytes: invalid conn");
+    int64_t cap = _kai_net_recv_cap(max);
+    if (cap <= 0) {
+        kai_eputs("kai: NetTcp.recv_bytes: max must be > 0\n");
+        kai_exit(1);
+    }
+    unsigned char *buf = (unsigned char *) malloc((size_t) cap);
+    if (!buf) return _kai_net_err_msg(k, "recv_bytes: out of memory");
+    int e = 0;
+    ssize_t got = _kai_net_recv_some(fd, buf, (size_t) cap, -1, &e);
+    if (got < 0) {
+        free(buf);
+        return _kai_net_err(k, e);
+    }
+    KaiValue *arr = _kai_net_byte_array(buf, (size_t) got);
+    free(buf);
+    return kai_cont_resume(k, _kai_net_ok(arr));
 }
 #endif
 
@@ -417,51 +513,67 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_recv_timeout(void *self, KaiValue *c,
     (void) self;
     int fd = _kai_net_record_fd(c);
     if (fd < 0) return _kai_net_err_msg(k, "recv_timeout: invalid conn");
-    int64_t cap = (kai_is_int(max)) ? kai_intf(max) : 0;
+    int64_t cap = _kai_net_recv_cap(max);
     if (cap <= 0) {
         kai_eputs("kai: NetTcp.recv_timeout: max must be > 0\n");
         kai_exit(1);
     }
-    if (cap > (1 << 20)) cap = 1 << 20;  /* 1 MiB ceiling for v1 */
     int64_t budget = (kai_is_int(ns)) ? kai_intf(ns) : 0;
     if (budget < 0) budget = 0;
-
     unsigned char *buf = (unsigned char *) malloc((size_t) cap);
     if (!buf) return _kai_net_err_msg(k, "recv_timeout: out of memory");
-
     kai_reactor_init();
-    kai_socket_set_nonblock(fd);
-
-    uint64_t deadline = kai_reactor_now_ns() + (uint64_t) budget;
-    ssize_t got;
-    for (;;) {
-        got = recv(fd, buf, (size_t) cap, 0);
-        if (got >= 0) break;
-        int e = kai_errno();
-        if (e == EAGAIN || e == EWOULDBLOCK) {
-            if (!kai_reactor_park_socket_read_timeout(kai_current_fiber(),
-                                                      fd, deadline)) {
-                free(buf);
-                return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));
-            }
-            continue;  /* Readiness → retry recv() */
-        }
-        if (e == EINTR) continue;
+    int e = 0;
+    ssize_t got = _kai_net_recv_some(fd, buf, (size_t) cap, (int64_t) (kai_reactor_now_ns() + (uint64_t) budget), &e);
+    if (got == -2) {
         free(buf);
-        const char *m = strerror(e);
-        if (!m) m = "unknown error";
-        KaiValue *err = kai_variant_u(3, "Err", 1, 0,
-                                      (KaiVarSlot[]){{.ptr = kai_str(m)}});
-        KaiValue *some = kai_variant_u(0, "Some", 1, 0,
-                                       (KaiVarSlot[]){{.ptr = err}});
-        return kai_cont_resume(k, some);
+        return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));
     }
-    KaiValue *acc = kai_nil();
-    for (ssize_t i = got; i > 0;) { --i; acc = kai_cons(kai_int((int64_t) buf[i]), acc); }
+    if (got < 0) {
+        free(buf);
+        return _kai_net_some_err(k, e);
+    }
+    KaiValue *acc = _kai_net_byte_list(buf, (size_t) got);
     free(buf);
-    KaiValue *ok   = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = acc}});
-    KaiValue *some = kai_variant_u(0, "Some", 1, 0, (KaiVarSlot[]){{.ptr = ok}});
-    return kai_cont_resume(k, some);
+    return kai_cont_resume(k, _kai_net_some(_kai_net_ok(acc)));
+}
+#endif
+
+/* recv_bytes_timeout(c, max, nanos) -> Option[Result[Array[Byte], String]];
+ * recv_timeout with the bytes in one array. */
+KAI_SCHED_FN KaiValue *kai_default_nettcp_recv_bytes_timeout(void *self, KaiValue *c,
+                                                 KaiValue *max, KaiValue *ns,
+                                                 KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{
+    (void) self;
+    int fd = _kai_net_record_fd(c);
+    if (fd < 0) return _kai_net_err_msg(k, "recv_bytes_timeout: invalid conn");
+    int64_t cap = _kai_net_recv_cap(max);
+    if (cap <= 0) {
+        kai_eputs("kai: NetTcp.recv_bytes_timeout: max must be > 0\n");
+        kai_exit(1);
+    }
+    int64_t budget = (kai_is_int(ns)) ? kai_intf(ns) : 0;
+    if (budget < 0) budget = 0;
+    unsigned char *buf = (unsigned char *) malloc((size_t) cap);
+    if (!buf) return _kai_net_err_msg(k, "recv_bytes_timeout: out of memory");
+    kai_reactor_init();
+    int e = 0;
+    ssize_t got = _kai_net_recv_some(fd, buf, (size_t) cap, (int64_t) (kai_reactor_now_ns() + (uint64_t) budget), &e);
+    if (got == -2) {
+        free(buf);
+        return kai_cont_resume(k, kai_variant_u(1, "None", 0, 0, NULL));
+    }
+    if (got < 0) {
+        free(buf);
+        return _kai_net_some_err(k, e);
+    }
+    KaiValue *arr = _kai_net_byte_array(buf, (size_t) got);
+    free(buf);
+    return kai_cont_resume(k, _kai_net_some(_kai_net_ok(arr)));
 }
 #endif
 
@@ -1015,6 +1127,24 @@ KAI_SCHED_FN KaiValue *kai_default_nettcp_recv(void *self, KaiValue *c, KaiValue
 { kai_host_absent("sockets"); }
 #endif
 KAI_SCHED_FN KaiValue *kai_default_nettcp_recv_timeout(void *self, KaiValue *c, KaiValue *max, KaiValue *ns, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("sockets"); }
+#endif
+KAI_SCHED_FN KaiValue *kai_default_nettcp_send_bytes(void *self, KaiValue *c, KaiValue *data, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("sockets"); }
+#endif
+KAI_SCHED_FN KaiValue *kai_default_nettcp_recv_bytes(void *self, KaiValue *c, KaiValue *max, KaiCont *k)
+#if KAI_SCHED_DECL_ONLY
+;
+#else
+{ kai_host_absent("sockets"); }
+#endif
+KAI_SCHED_FN KaiValue *kai_default_nettcp_recv_bytes_timeout(void *self, KaiValue *c, KaiValue *max, KaiValue *ns, KaiCont *k)
 #if KAI_SCHED_DECL_ONLY
 ;
 #else
