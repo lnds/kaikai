@@ -81,8 +81,9 @@ static KaiValue *kai_core_file_read_chunk(KaiValue *h, KaiValue *max) {
         ssize_t got;
         do { got = read(fd, buf, (size_t) cap); } while (got < 0 && kai_errno() == EINTR);
         if (got < 0) {
+            int err = kai_errno();
             free(buf);
-            r = _kai_file_err("read_chunk: read failed");
+            r = _kai_fs_err("", 0, err);
         } else {
             KaiValue *v = kai_alloc(KAI_STR);
             v->as.s.len = (size_t) got;
@@ -132,18 +133,18 @@ static KaiValue *kai_core_file_write_chunk(KaiValue *h, KaiValue *data) {
     } else {
         size_t total = data->as.s.len;
         size_t off = 0;
-        int failed = 0;
+        int err = 0;
         while (off < total) {
             ssize_t w = write(fd, data->as.s.bytes + off, total - off);
             if (w < 0) {
                 if (kai_errno() == EINTR) continue;
-                failed = 1;
+                err = kai_errno();
                 break;
             }
             off += (size_t) w;
         }
-        if (failed) r = _kai_file_err("write_chunk: write failed");
-        else        r = _kai_file_ok(kai_unit());
+        if (err) r = _kai_fs_err("", 0, err);
+        else     r = _kai_file_ok(kai_unit());
     }
     if (kai_is_ptr(h))    kai_decref(h);
     if (kai_is_ptr(data)) kai_decref(data);
