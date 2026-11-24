@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.200.0 (2026-11-24)
+
+### Added
+
+- **stdlib**: add Array[Byte] socket ops to NetTcp and route net.http through them
+- **stdlib**: add fs.file.read_range to read a byte range without reading the bytes before it
+
 ## v0.199.4 (2026-11-24)
 
 ### Fixed
