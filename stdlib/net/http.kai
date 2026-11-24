@@ -19,6 +19,7 @@ runs the host string through `getaddrinfo(3)`, so both numeric
 IPv4 and hostnames work.
 """)]
 
+import bin
 import net.tcp
 
 # ---- types --------------------------------------------------------
@@ -83,11 +84,19 @@ fn http_string_to_bytes_loop(s: String, i: Int, n: Int, acc: [Int]) : [Int] =
 pub fn string_to_bytes(s: String) : [Int] =
   http_string_to_bytes_loop(s, 0, string_length(s), [])
 
-fn http_byte_to_str(b: Int) : String = int_to_byte_string(b)
+fn http_bytes_fill(buf: Array[Byte], i: Int, bs: [Int]) : Array[Byte] / Mutable = match bs {
+  [] -> buf
+  [b, ...t] -> {
+    buf[i] := bin.byte(bit_and(b, 255))
+    http_bytes_fill(buf, i + 1, t)
+  }
+}
 
 #[doc("Decodes a byte list (one `Int` per byte) back into a String.")]
-pub fn bytes_to_string(bs: [Int]) : String =
-  string_concat_all(list.map(bs, http_byte_to_str))
+pub fn bytes_to_string(bs: [Int]) : String {
+  let n = list_length(bs)
+  bytes_get_string(http_bytes_fill(array_make(n, 0u8), 0, bs), 0, n)
+}
 
 fn http_after(s: String, at: Int) : String =
   string_slice(s, at, string_length(s) - at)
@@ -392,26 +401,20 @@ pub fn dechunk_body(s: String) : String = http_dechunk_loop(s, 0, [])
 
 # ---- network surface ---------------------------------------------
 
-# Reverse-prepend `chunk` onto `acc` (callers list_reverse once at the
-# end), avoiding an O(n) `list_append` per chunk.
-fn http_recv_all_prepend(chunk: [Int], acc: [Int]) : [Int] = match chunk {
-  [] -> acc
-  [b, ...rest] -> http_recv_all_prepend(rest, [b, ...acc])
-}
-
-# Drain a Conn in 4096-byte chunks until the peer closes or recv fails.
-fn http_recv_all_loop(c: Conn, acc: [Int]) : [Int] / NetTcp + Cancel =
-  match NetTcp.recv(c, 4096) {
-    Err(_) -> list_reverse(acc)
-    Ok([]) -> list_reverse(acc)
-    Ok(chunk) -> http_recv_all_loop(c, http_recv_all_prepend(chunk, acc))
+# Drain a Conn until the peer closes or recv fails; `parts` holds the
+# received chunks, newest first.
+fn http_recv_all_loop(c: Conn, parts: [String]) : String / NetTcp + Cancel =
+  match NetTcp.recv(c, 65536) {
+    Err(_) -> string_concat_all(list_reverse(parts))
+    Ok([]) -> string_concat_all(list_reverse(parts))
+    Ok(chunk) -> http_recv_all_loop(c, [bytes_to_string(chunk), ...parts])
   }
 
 fn http_failure(body: String) : Response = Response { status: 0, headers: [], body: body }
 
 fn http_exchange(req: Request, u: HttpUrl, c: Conn) : Response / NetTcp + Cancel {
   let _ = NetTcp.send(c, string_to_bytes(http_serialize_for(req, u)))
-  let raw = bytes_to_string(http_recv_all_loop(c, []))
+  let raw = http_recv_all_loop(c, [])
   NetTcp.close(c)
   match parse_response(raw) {
     Ok(r) -> r
@@ -568,19 +571,19 @@ to cover `Content-Length`, (b) the peer closes (`Ok([])`), or
 answer 413.
 """)]
 pub fn read_request(conn: Conn, max_bytes: Int) : Result[Request, String] / NetTcp =
-  http_read_request_loop(conn, [], 0, max_bytes)
+  http_read_request_loop(conn, "", max_bytes)
 
 # Peer closed: Ok only when `Content-Length` is unusable, since a numeric
 # length would already have completed the request or left it truncated.
-fn http_finish_on_close(acc_rev: [Int]) : Result[Request, String] =
-  match parse_request(bytes_to_string(list_reverse(acc_rev))) {
+fn http_finish_on_close(acc: String) : Result[Request, String] =
+  match parse_request(acc) {
     Ok(r) if http_content_length(r.headers) == None -> Ok(r)
     _ -> Err("read_request: peer closed before request complete")
   }
 
 # Some(req) once the buffer holds a complete request; None to recv more.
-fn http_request_ready(acc_rev: [Int]) : Option[Request] =
-  match http_parse_request_unframed(bytes_to_string(list_reverse(acc_rev))) {
+fn http_request_ready(acc: String) : Option[Request] =
+  match http_parse_request_unframed(acc) {
     Err(_) -> None
     Ok(r) -> match header_lookup(r.headers, "Content-Length") {
       None -> Some(r)
@@ -591,33 +594,24 @@ fn http_request_ready(acc_rev: [Int]) : Option[Request] =
     }
   }
 
-fn http_read_more(
-  conn: Conn,
-  acc_rev: [Int],
-  have: Int,
-  max_bytes: Int
-) : Result[Request, String] / NetTcp =
+fn http_read_more(conn: Conn, acc: String, max_bytes: Int) : Result[Request, String] / NetTcp =
   match NetTcp.recv(conn, 4096) {
     Err(e) -> Err(string_concat("read_request: ", e))
-    Ok([]) -> http_finish_on_close(acc_rev)
-    Ok(chunk) -> http_read_request_loop(
-      conn,
-      http_recv_all_prepend(chunk, acc_rev),
-      have + list_length(chunk),
-      max_bytes
-    )
+    Ok([]) -> http_finish_on_close(acc)
+    Ok(chunk) -> http_read_request_loop(conn, string_concat(acc, bytes_to_string(chunk)), max_bytes)
   }
 
-fn http_read_request_loop(conn: Conn, acc_rev: [Int], have: Int, max_bytes: Int) : Result[
-  Request,
-  String
-] / NetTcp =
-  if have > max_bytes {
+fn http_read_request_loop(
+  conn: Conn,
+  acc: String,
+  max_bytes: Int
+) : Result[Request, String] / NetTcp =
+  if string_length(acc) > max_bytes {
     Err(string_concat_all(["read_request: exceeded max_bytes=", int_to_string(max_bytes)]))
   } else {
-    match http_request_ready(acc_rev) {
+    match http_request_ready(acc) {
       Some(req) -> Ok(req)
-      None -> http_read_more(conn, acc_rev, have, max_bytes)
+      None -> http_read_more(conn, acc, max_bytes)
     }
   }
 
