@@ -1,0 +1,151 @@
+# net-tcp-bytes — send_bytes / recv_bytes round trip of a buffer holding
+# every byte value, plus the recv_bytes_timeout outcomes (data, idle
+# timeout, clean EOF).
+
+import bin
+import net.tcp
+
+fn fill(buf: Array[Byte], i: Int, n: Int) : Array[Byte] / Mutable =
+  if i >= n {
+    buf
+  } else {
+    buf[i] := bin.byte(i % 256)
+    fill(buf, i + 1, n)
+  }
+
+fn payload(n: Int) : Array[Byte] = fill(array_make(n, 0u8), 0, n)
+
+fn chunk_matches(chunk: Array[Byte], offset: Int, i: Int, n: Int) : Bool =
+  if i >= n {
+    true
+  } else if byte_to_int(chunk[i]) != (offset + i) % 256 {
+    false
+  } else {
+    chunk_matches(chunk, offset, i + 1, n)
+  }
+
+fn recv_verify(c: Conn, have: Int, want: Int) : Result[Int, String] / NetTcp =
+  if have >= want {
+    Ok(have)
+  } else {
+    match NetTcp.recv_bytes(c, want - have) {
+      Err(e) -> Err(e)
+      Ok(chunk) -> {
+        let n = array_length(chunk)
+        if n == 0 {
+          Err("peer closed early")
+        } else if chunk_matches(chunk, have, 0, n) {
+          recv_verify(c, have + n, want)
+        } else {
+          Err("bytes differ")
+        }
+      }
+    }
+  }
+
+fn case_round_trip(client: Conn, server: Conn) : Int / NetTcp + Stdout {
+  let want = 4096
+  let sent = payload(want)
+  match NetTcp.send_bytes(client, sent) {
+    Err(e) -> {
+      Stdout.print(string_concat("send FAIL: ", e))
+      1
+    }
+    Ok(n) ->
+      if n != want {
+        Stdout.print("send FAIL: short count")
+        1
+      } else {
+        match recv_verify(server, 0, want) {
+          Err(e) -> {
+            Stdout.print(string_concat("recv FAIL: ", e))
+            1
+          }
+          Ok(_) -> {
+            Stdout.print("round trip ok")
+            0
+          }
+        }
+      }
+  }
+}
+
+fn budget_ns() : Int = 20000000
+
+fn case_timeout_data(client: Conn, server: Conn) : Int / NetTcp + Stdout =
+  match NetTcp.send_bytes(client, payload(4)) {
+    Err(_) -> {
+      Stdout.print("data FAIL: send")
+      1
+    }
+    Ok(_) ->
+      match NetTcp.recv_bytes_timeout(server, 64, budget_ns()) {
+        Some(Ok(b)) if array_length(b) == 4 -> {
+          Stdout.print("data ok")
+          0
+        }
+        _ -> {
+          Stdout.print("data FAIL")
+          1
+        }
+      }
+  }
+
+fn case_timeout(server: Conn) : Int / NetTcp + Stdout =
+  match NetTcp.recv_bytes_timeout(server, 64, budget_ns()) {
+    None -> {
+      Stdout.print("timeout ok")
+      0
+    }
+    _ -> {
+      Stdout.print("timeout FAIL")
+      1
+    }
+  }
+
+fn case_eof(client: Conn, server: Conn) : Int / NetTcp + Stdout {
+  NetTcp.close(client)
+  match NetTcp.recv_bytes_timeout(server, 64, budget_ns()) {
+    Some(Ok(b)) if array_length(b) == 0 -> {
+      Stdout.print("eof ok")
+      0
+    }
+    _ -> {
+      Stdout.print("eof FAIL")
+      1
+    }
+  }
+}
+
+fn run_session(l: Listener) : Int / NetTcp + Stdout =
+  match NetTcp.connect("127.0.0.1", local_port(l)) {
+    Err(e) -> {
+      Stdout.print(string_concat("connect FAIL: ", e))
+      1
+    }
+    Ok(client) ->
+      match NetTcp.accept(l) {
+        Err(e) -> {
+          NetTcp.close(client)
+          Stdout.print(string_concat("accept FAIL: ", e))
+          1
+        }
+        Ok(server) -> {
+          let r1 = case_round_trip(client, server)
+          let r2 = case_timeout_data(client, server)
+          let r3 = case_timeout(server)
+          let r4 = case_eof(client, server)
+          NetTcp.close(server)
+          r1 + r2 + r3 + r4
+        }
+      }
+  }
+
+fn main() : Int / NetTcp + Stdout =
+  match NetTcp.listen("127.0.0.1", 0) {
+    Err(e) -> {
+      Stdout.print(string_concat("listen FAIL: ", e))
+      1
+    }
+    Ok(l) -> run_session(l)
+  }

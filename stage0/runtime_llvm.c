@@ -2096,6 +2096,25 @@ KaiValue *kaix_default_nettcp_recv_timeout(void *self, KaiValue *c, KaiValue *ma
     kai_decref(ns);
     return _op_r;
 }
+KaiValue *kaix_default_nettcp_send_bytes(void *self, KaiValue *c, KaiValue *data, KaiCont *k) {
+    KaiValue *_op_r = kai_default_nettcp_send_bytes(self, c, data, k);
+    kai_decref(c);
+    kai_decref(data);
+    return _op_r;
+}
+KaiValue *kaix_default_nettcp_recv_bytes(void *self, KaiValue *c, KaiValue *max, KaiCont *k) {
+    KaiValue *_op_r = kai_default_nettcp_recv_bytes(self, c, max, k);
+    kai_decref(c);
+    kai_decref(max);
+    return _op_r;
+}
+KaiValue *kaix_default_nettcp_recv_bytes_timeout(void *self, KaiValue *c, KaiValue *max, KaiValue *ns, KaiCont *k) {
+    KaiValue *_op_r = kai_default_nettcp_recv_bytes_timeout(self, c, max, ns, k);
+    kai_decref(c);
+    kai_decref(max);
+    kai_decref(ns);
+    return _op_r;
+}
 KaiValue *kaix_default_nettcp_close(void *self, KaiValue *c, KaiCont *k) {
     KaiValue *_op_r = kai_default_nettcp_close(self, c, k);
     kai_decref(c);
