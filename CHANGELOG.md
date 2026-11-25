@@ -84,6 +84,25 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.201.0 (2026-11-25)
+
+### BREAKING CHANGE
+
+- error strings of NetTcp, NetUdp, NetUnix, NetDns, Process and
+Env ops are now `<subject>: <strerror> (os error N)` instead of the bare
+strerror text. `Process.start(cmd, args)` now returns `Result[Child, String]`
+instead of `Child`; migrate `Process.start(...)` to a `match` on `Ok`/`Err` or
+propagate with postfix `!`.
+
+### Added
+
+- **wasi**: build fiber programs through the native backend's stack-switching runtime
+
+### Fixed
+
+- **runtime**: file.read_range clamps to the file size and reads in bounded chunks
+- **runtime**: net, process and env errors carry subject and os error code
+
 ## v0.200.2 (2026-11-25)
 
 ### Fixed
