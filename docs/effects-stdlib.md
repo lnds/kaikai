@@ -1153,7 +1153,7 @@ Abstract-namespace (Linux) and datagram Unix sockets are not covered.
 
 ```kaikai-fragment
 effect Process {
-  start(cmd: String, args: [String])  : Child
+  start(cmd: String, args: [String])  : Result[Child, String]
   wait(c: Child)                      : Result[Exit, String]
   kill(c: Child, sig: Int)            : Result[Unit, String]
   exit(code: Int)                     : Nothing
@@ -1170,7 +1170,7 @@ effect Process {
 }
 ```
 
-- `start` launches a child process and returns a handle.
+- `start` launches a child process and returns a handle, or `Err("<cmd>: <reason> (os error N)")` when the fork or exec fails.
   Deliberately not named `spawn` to avoid clash with the `Spawn`
   effect (kaikai fibers); see §*Why `Process` and not `Spawn`*.
   Standard fds (stdin/stdout/stderr) inherit from the parent

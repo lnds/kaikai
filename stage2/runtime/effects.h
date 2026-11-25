@@ -310,11 +310,7 @@ static KaiValue *kai_default_env_set_var(void *self, KaiValue *name,
     int saved_errno = kai_errno();
     free(vbuf);
     if (rc != 0) {
-        const char *msg = strerror(saved_errno);
-        if (!msg) msg = "set_var failed";
-        KaiValue *m = kai_str(msg);
-        KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
-        return kai_cont_resume(k, err);
+        return kai_cont_resume(k, _kai_fs_err(nbuf, nlen, saved_errno));
     }
     KaiValue *u = kai_unit();
     KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
@@ -333,11 +329,7 @@ static KaiValue *kai_default_env_unset_var(void *self, KaiValue *name, KaiCont *
     memcpy(nbuf, name->as.s.bytes, nlen);
     nbuf[nlen] = '\0';
     if (unsetenv(nbuf) != 0) {
-        const char *msg = strerror(kai_errno());
-        if (!msg) msg = "unset_var failed";
-        KaiValue *m = kai_str(msg);
-        KaiValue *err = kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = m}});
-        return kai_cont_resume(k, err);
+        return kai_cont_resume(k, _kai_fs_err(nbuf, nlen, kai_errno()));
     }
     KaiValue *u = kai_unit();
     KaiValue *ok = kai_variant_u(2, "Ok", 1, 0, (KaiVarSlot[]){{.ptr = u}});
