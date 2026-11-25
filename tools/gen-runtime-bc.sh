@@ -177,7 +177,7 @@ wasm_sysroot() {
 }
 
 WASM_COMMON="--target=wasm32-wasip1 -mexception-handling -mtail-call -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_GETPID -D_DEFAULT_SOURCE"
-WASM_TARGETS="wasm32-wasi:-DKAI_HOST_JS=0 wasm32-browser:"
+WASM_TARGETS="wasm32-wasi:-DKAI_HOST_JS=0 wasm32-wasi-switch:-DKAI_HOST_JS=0,-DKAI_WASM_SWITCH=1 wasm32-browser:"
 
 gen_wasm_bc() {
   _gw_clang="$(resolve_clang || true)"
@@ -190,7 +190,7 @@ gen_wasm_bc() {
   _gw_want="$(printf '%s\n%s\n%s\n' "$(input_hash)" "$_gw_sysroot" "$WASM_COMMON $WASM_TARGETS" | $SHA256 | awk '{print $1}')"
   for entry in $WASM_TARGETS; do
     _gw_t="${entry%%:*}"
-    _gw_defs="${entry#*:}"
+    _gw_defs="$(printf '%s' "${entry#*:}" | tr , ' ')"
     _gw_bc="$ROOT/stage0/runtime_llvm.$_gw_t.bc"
     _gw_inl="$ROOT/stage0/runtime_inline.$_gw_t.bc"
     _gw_stamp="$ROOT/stage0/runtime_llvm.$_gw_t.stamp"

@@ -1162,7 +1162,7 @@ clang cannot emit the proposal, so the dispatcher is linked after the fact.
 `kai build --target=wasm32-wasi` builds the program as before; when the module
 still imports the `kai` context switch (the program reaches a fiber, an actor
 or a kept continuation; the runtime stubs that refuse it carry the import), it
-rebuilds through the C backend with `KAI_WASM_SWITCH=1` and the stack pointer
+rebuilds through the same backend with `KAI_WASM_SWITCH=1` (the native one against the `wasm32-wasi-switch` bitcode) and the stack pointer
 and function table exported, then
 merges the dispatcher with binaryen's `wasm-merge` (CI pins binaryen 133),
 which must be on `PATH` for such a program; without it `kai build` stops
