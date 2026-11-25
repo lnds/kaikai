@@ -492,6 +492,20 @@ struct KaiValue {
      * struct — is a GNU extension Linux clang rejects under -std=c99. */
 };
 
+/* The native emitter writes a nullary variant's immortal cell as the bytes
+ * `ff ff ff 7f 09 00 <variant_tag LE>`: these pin that layout. */
+_Static_assert(offsetof(KaiValue, rc) == 0 && offsetof(KaiValue, tag) == 4
+               && offsetof(KaiValue, var_n_args) == 5
+               && offsetof(KaiValue, variant_tag) == 6 && KAI_VARIANT == 9,
+               "nullary variant cell layout");
+
+/* A nullary ctor as a link-time constant immortal cell: the optimiser sees
+ * its header, so a tag test or an RC drop on it folds away. */
+#define KAI_NULLARY_CELL(vtag) \
+    ({ static const KaiValue c_ = { .rc = INT32_MAX, .tag = KAI_VARIANT, \
+                                    .variant_tag = (vtag) }; \
+       (KaiValue *) &c_; })
+
 /* Variant slots for a KAI_VARIANT node. `&v->as` cast to `KaiVarSlot *`
  * IS the slot array (the slots overlap the union at offset 0). Replaces
  * the old `v->as.var.var_slots[i]` FAM; address and layout are
