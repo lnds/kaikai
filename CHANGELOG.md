@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.200.1 (2026-11-25)
+
+### Fixed
+
+- **stdlib**: derive char boundaries from the lossy decoder's widths
+
 ## v0.200.0 (2026-11-24)
 
 ### Added
