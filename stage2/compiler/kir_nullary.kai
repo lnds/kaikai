@@ -1,11 +1,13 @@
 #[doc("""
 Known nullary constructors.
 
-A register whose every definition is a nullary constructor, or a copy of such
-a register, only ever holds an immortal cell. Its tag is read from a shadow
-`i32` register kept beside it instead of from memory, and its dups and drops
-are no-ops, so a join of nullary values reaches a `switch` as constants the
-backend folds into the branches. The cell itself stays for every other use.
+A register a nullary constructor flows into, whose every definition is such a
+constructor or a copy of such a register, only ever holds an immortal cell. Its
+tag is read from a shadow `i32` register kept beside it instead of from memory,
+and its dups and drops are no-ops, so a join of nullary values reaches a
+`switch` as constants the backend folds into the branches. The cell itself
+stays for every other use. A function where no tag test reads such a register
+is left as it is.
 """)]
 
 import compiler.kir
@@ -17,24 +19,14 @@ pub(pkg) fn kir_nullary_program(kp: KProgram) : KProgram =
 
 fn nl_max_stmts() : Int = 600
 
-type NlDef = NlCon(Int) | NlCopy(String) | NlNeutral | NlBad
-
-type NlRow = NlRow(String, NlDef)
-
-fn nl_fn(f: KFn) : KFn {
-  let stmts = flat_map(f.blocks, .stmts)
-  if list_length(stmts) > nl_max_stmts()
-    or (not (any(stmts, nl_is_tagof) and any(stmts, nl_is_nullary)))
-    or any(stmts, nl_is_handler) {
-    f
-  } else {
-    match nl_known(f, stmts) {
-      [] -> f
-      known ->
-        kfn_with_blocks(f, map(f.blocks, b => KBlock { ...b, stmts: nl_stmts(b.stmts, known) }))
-    }
+fn nl_fn(f: KFn) : KFn =
+  match nl_known(f) {
+    [] -> f
+    known ->
+      kfn_with_blocks(f, map(f.blocks, b => KBlock { ...b, stmts: nl_stmts(b.stmts, known) }))
   }
-}
+
+fn nl_some(bs: [KBlock], p: (KStmt) -> Bool) : Bool = any(bs, b => any(b.stmts, p))
 
 fn nl_is_tagof(s: KStmt) : Bool = match s {
   KLet(_, _, KTagOf(_), _) -> true
@@ -57,67 +49,79 @@ fn nl_is_handler(s: KStmt) : Bool = match s {
 
 # ---- which registers are known ------------------------------------------
 
-fn nl_known(f: KFn, stmts: [KStmt]) : [String] {
-  let rows = list_append(
-    map(f.params, p => NlRow(p.name, NlBad)),
-    flat_map(stmts, nl_rows)
-  )
-  nl_fix(nl_names(rows, []), rows)
-}
-
-fn nl_names(rows: [NlRow], acc: [String]) : [String] = match rows {
-  [] -> acc
-  [NlRow(n, _), ...rest] -> nl_names(rest, if list_has(acc, n) { acc } else { [n, ...acc] })
-}
-
-fn nl_rows(s: KStmt) : [NlRow] = match s {
-  KLet(n, SBoxed, op, _) -> [NlRow(n, nl_op_def(op))]
-  KLet(n, _, _, _) -> [NlRow(n, NlBad)]
-  KStore(n, v, _) -> [NlRow(n, nl_val_def(v))]
-  KRC(KArmTake(_, bs, _), _) -> flat_map(
-    bs,
-    b => match b {
-      KVar(n) -> [NlRow(n, NlBad)]
-      _ -> []
+# Empty unless a tag test reads one of them: without it there is nothing to
+# fold. Runs over every function, so the walks most of them stop at go first.
+# The candidates stay few, which keeps each walk linear: a set of all the
+# registers of a function would make the analysis quadratic.
+fn nl_known(f: KFn) : [String] =
+  if not (nl_some(f.blocks, nl_is_nullary) and nl_some(f.blocks, nl_is_tagof)) {
+    []
+  } else {
+    let reached = nl_reached(f.blocks, [])
+    if (not nl_tested(f.blocks, reached)) or (not nl_eligible(f.blocks)) {
+      []
+    } else {
+      let own = filter(reached, r => not any(f.params, p => p.name == r))
+      let known = nl_closed(f.blocks, own)
+      if nl_tested(f.blocks, known) { known } else { [] }
     }
-  )
-  _ -> []
+  }
+
+fn nl_tested(bs: [KBlock], regs: [String]) : Bool = nl_some(bs, s => nl_tests(s, regs))
+
+fn nl_tests(s: KStmt, regs: [String]) : Bool = match s {
+  KLet(_, _, KTagOf(KVar(r)), _) -> list_has(regs, r)
+  _ -> false
 }
 
-fn nl_op_def(op: KOp) : NlDef = match op {
-  KCon(_, tag, _, [], _) -> NlCon(tag)
-  KLitOp(v) -> nl_val_def(v)
-  _ -> NlBad
+fn nl_eligible(bs: [KBlock]) : Bool =
+  (not nl_some(bs, nl_is_handler))
+    and foldl(bs, 0, (n, b) => n + list_length(b.stmts)) <= nl_max_stmts()
+
+# The registers a nullary constructor flows into, directly or through copies.
+fn nl_reached(bs: [KBlock], acc: [String]) : [String] {
+  let next = foldl(bs, acc, (a, b) => foldl(b.stmts, a, nl_reach))
+  if list_length(next) == list_length(acc) { next } else { nl_reached(bs, next) }
 }
 
-fn nl_val_def(v: KVal) : NlDef = match v {
-  KVar(s) -> NlCopy(s)
-  KUnitV -> NlNeutral
-  _ -> NlBad
+fn nl_reach(acc: [String], s: KStmt) : [String] = match s {
+  KLet(n, SBoxed, KCon(_, _, _, [], _), _) -> nl_with(acc, n)
+  KLet(n, SBoxed, KLitOp(KVar(src)), _) -> if list_has(acc, src) { nl_with(acc, n) } else { acc }
+  KStore(n, KVar(src), _) -> if list_has(acc, src) { nl_with(acc, n) } else { acc }
+  _ -> acc
 }
 
-# The greatest set closed under copies: a register drops out when one of its
+fn nl_with(acc: [String], n: String) : [String] = if list_has(acc, n) { acc } else { [n, ...acc] }
+
+fn nl_without(acc: [String], n: String) : [String] =
+  if list_has(acc, n) { filter(acc, x => x != n) } else { acc }
+
+# The greatest subset closed under copies: a register drops out when one of its
 # definitions is not a nullary constructor or a copy of a register that stays.
-fn nl_fix(cands: [String], rows: [NlRow]) : [String] {
-  let keep = filter(cands, c => nl_defs_ok(c, cands, rows))
-  if list_length(keep) == list_length(cands) { keep } else { nl_fix(keep, rows) }
+fn nl_closed(bs: [KBlock], cands: [String]) : [String] {
+  let keep = foldl(bs, cands, (a, b) => foldl(b.stmts, a, nl_keep))
+  if list_length(keep) == list_length(cands) { keep } else { nl_closed(bs, keep) }
 }
 
-fn nl_defs_ok(c: String, cands: [String], rows: [NlRow]) : Bool =
-  all(
-    rows,
-    r => match r {
-      NlRow(n, d) -> if n == c {
-        match d {
-          NlBad -> false
-          NlCopy(s) -> list_has(cands, s)
-          _ -> true
-        }
-      } else {
-        true
-      }
-    }
-  )
+fn nl_keep(acc: [String], s: KStmt) : [String] = match s {
+  KLet(_, SBoxed, KCon(_, _, _, [], _), _) -> acc
+  KLet(n, SBoxed, KLitOp(v), _) -> if nl_is_copy(acc, v) { acc } else { nl_without(acc, n) }
+  KLet(n, _, _, _) -> nl_without(acc, n)
+  KStore(n, v, _) -> if nl_is_copy(acc, v) { acc } else { nl_without(acc, n) }
+  KRC(KArmTake(_, binds, _), _) -> foldl(binds, acc, nl_taken)
+  _ -> acc
+}
+
+fn nl_is_copy(acc: [String], v: KVal) : Bool = match v {
+  KVar(s) -> list_has(acc, s)
+  KUnitV -> true
+  _ -> false
+}
+
+fn nl_taken(acc: [String], b: KVal) : [String] = match b {
+  KVar(n) -> nl_without(acc, n)
+  _ -> acc
+}
 
 # ---- rewrite --------------------------------------------------------------
 
