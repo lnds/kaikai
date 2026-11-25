@@ -861,6 +861,43 @@ static KaiValue *kai_core_read_bytes(KaiValue *n) {
 }
 
 
+#define KAI_PREAD_CHUNK ((size_t) 1 << 30)
+#define KAI_PREAD_FIRST ((size_t) 1 << 16)
+
+/* Reads up to `len` bytes at `off`. `size` >= 0 is the file size (regular
+ * files): the buffer is sized to the bytes that exist. size < 0 grows the
+ * buffer as data arrives. Each pread stays under INT_MAX. */
+static int _kai_pread_range(int fd, int64_t off, int64_t len, int64_t size, char **out, size_t *got_out) {
+    int64_t target = len;
+    if (size >= 0) {
+        int64_t avail = size > off ? size - off : 0;
+        if (avail < target) target = avail;
+    }
+    size_t cap = size >= 0 ? (size_t) target : (size_t) (len < (int64_t) KAI_PREAD_FIRST ? len : (int64_t) KAI_PREAD_FIRST);
+    char *buf = (char *) malloc(cap + 1);
+    if (!buf) return ENOMEM;
+    size_t got = 0;
+    while ((int64_t) got < target) {
+        if (got == cap) {
+            size_t ncap = cap * 2 > cap ? cap * 2 : cap + 1;
+            if ((int64_t) ncap > target) ncap = (size_t) target;
+            char *nb = (char *) realloc(buf, ncap + 1);
+            if (!nb) { free(buf); return ENOMEM; }
+            buf = nb;
+            cap = ncap;
+        }
+        size_t want = cap - got < KAI_PREAD_CHUNK ? cap - got : KAI_PREAD_CHUNK;
+        ssize_t n = pread(fd, buf + got, want, (off_t) (off + (int64_t) got));
+        if (n < 0 && kai_errno() == EINTR) continue;
+        if (n < 0) { free(buf); return kai_errno(); }
+        if (n == 0) break;
+        got += (size_t) n;
+    }
+    *out = buf;
+    *got_out = got;
+    return 0;
+}
+
 /* read_range(path, offset, length) -> Result[String, String]. Positioned
  * read of up to `length` bytes starting at `offset`; EOF yields a short
  * or empty String. Negative arguments are an Err, never a panic. */
@@ -887,27 +924,14 @@ static KaiValue *kai_core_file_read_range(KaiValue *path, KaiValue *offset, KaiV
             close(fd);
             r = _kai_fs_err(pbuf, plen, EISDIR);
         } else {
-            char *buf = (char *) malloc((size_t) len + 1);
-            if (!buf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
+            char *buf = NULL;
             size_t got = 0;
-            int err = 0;
-            while (got < (size_t) len) {
-                ssize_t n = pread(fd, buf + got, (size_t) len - got, (off_t) (off + (int64_t) got));
-                if (n < 0 && kai_errno() == EINTR) continue;
-                if (n < 0) { err = kai_errno(); break; }
-                if (n == 0) break;
-                got += (size_t) n;
-            }
+            int err = _kai_pread_range(fd, off, len, S_ISREG(st.st_mode) ? (int64_t) st.st_size : -1, &buf, &got);
             close(fd);
             if (err) {
                 r = _kai_fs_err(pbuf, plen, err);
             } else {
-                KaiValue *v = kai_alloc(KAI_STR);
-                v->as.s.len = got;
-                v->as.s.bytes = (char *) kai_heap_malloc(got + 1);
-                memcpy(v->as.s.bytes, buf, got);
-                v->as.s.bytes[got] = '\0';
-                r = _kai_file_ok(v);
+                r = _kai_file_ok(kai_str_from_bytes(buf, got));
             }
             free(buf);
         }
