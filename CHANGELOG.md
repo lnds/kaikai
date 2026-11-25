@@ -84,6 +84,17 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.200.2 (2026-11-25)
+
+### Fixed
+
+- **kir**: fold unboxed and raw Int compares of known ints in the linearity model
+
+### Changed
+
+- **kir**: join a Bool or Char match at a raw slot and read a raw join without unbox/drop
+- **kir**: compare primitive literal patterns raw instead of through kai_eq_raw
+
 ## v0.200.1 (2026-11-25)
 
 ### Fixed
