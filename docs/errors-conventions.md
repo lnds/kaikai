@@ -342,6 +342,22 @@ have no business returning a `Result`.
 For deep non-local exit that the scheduler already models, use
 `Cancel.raise()`.
 
+## OS error text
+
+An `Err(String)` that comes from a failed OS call is `<subject>: <strerror> (os error N)`; the operation name is not part of the text. The subject is:
+
+| Site | Subject |
+|---|---|
+| `fs.*` | the path |
+| TCP/UDP/Unix `connect`, `send`, `recv`, `recv_timeout` | the peer, `host:port` (the socket path for Unix) |
+| `listen`, `bind`, `accept` | the local `host:port` |
+| `getaddrinfo` failure | `<host>: <gai_strerror>`, no `(os error N)` unless the failure is `EAI_SYSTEM` |
+| `Process` `wait`, `kill`, `kill_group` | `pid <N>` |
+| `Process` `start`, `start_piped`, `start_group`, `read_*`, `write_stdin` | the command |
+| `Env.set_var`, `Env.unset_var` | the variable name |
+
+`Process.start*` reports a failed `fork` or `exec` as `Err` before returning a `Child`.
+
 ## Quick decision tree
 
 ```

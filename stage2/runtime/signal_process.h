@@ -318,9 +318,14 @@ static KaiValue *_kai_process_err_msg(KaiCont *k, const char *msg) {
     return kai_cont_resume(k, err);
 }
 
-static KaiValue *_kai_process_err(KaiCont *k, int saved_errno) {
-    const char *msg = strerror(saved_errno);
-    return _kai_process_err_msg(k, msg ? msg : "unknown error");
+static KaiValue *_kai_process_err(KaiCont *k, const char *subject, int err) {
+    return kai_cont_resume(k, _kai_fs_err(subject, strlen(subject), err));
+}
+
+static KaiValue *_kai_process_err_pid(KaiCont *k, int pid, int err) {
+    char who[32];
+    snprintf(who, sizeof who, "pid %d", pid);
+    return _kai_process_err(k, who, err);
 }
 
 static KaiValue *_kai_process_ok(KaiCont *k, KaiValue *payload) {
@@ -393,6 +398,7 @@ typedef struct KaiProcPipe {
     int out_fd;  /* parent reads the child's stdout; -1 = not piped */
     int err_fd;  /* parent reads the child's stderr; -1 = not piped */
     int own_group;
+    char *cmd;   /* argv[0], the subject of IO errors */
     struct KaiProcPipe *next;
 } KaiProcPipe;
 
@@ -417,25 +423,32 @@ static KaiProcPipe *_kai_proc_pipe_unlink(int pid) {
     return e;
 }
 
-/* A fresh child whose pid matches a stale entry reuses a reaped
- * leader's pid; the stale entry (fds already closed) must not make
- * the new child look like a group leader. */
-static void _kai_proc_pipe_forget(int pid) {
-    pthread_mutex_lock(&kai_proc_pipes_mu);
-    KaiProcPipe *e = _kai_proc_pipe_unlink(pid);
-    pthread_mutex_unlock(&kai_proc_pipes_mu);
+static void _kai_proc_pipe_free(KaiProcPipe *e) {
+    if (e) free(e->cmd);
     free(e);
 }
 
-static void _kai_proc_pipe_add(int pid, int in_fd, int out_fd, int err_fd, int own_group) {
+/* Replaces any stale entry for `pid`: a fresh child can reuse a reaped
+ * leader's pid and must not inherit its group-leader flag. */
+static void _kai_proc_pipe_add(int pid, int in_fd, int out_fd, int err_fd, int own_group, const char *cmd) {
     KaiProcPipe *e = (KaiProcPipe *) malloc(sizeof(KaiProcPipe));
     if (!e) { kai_eputs("kai: out of memory\n"); kai_exit(1); }
     e->pid = pid; e->in_fd = in_fd; e->out_fd = out_fd; e->err_fd = err_fd;
     e->own_group = own_group;
+    e->cmd = strdup(cmd);
     pthread_mutex_lock(&kai_proc_pipes_mu);
-    free(_kai_proc_pipe_unlink(pid));
+    _kai_proc_pipe_free(_kai_proc_pipe_unlink(pid));
     e->next = kai_proc_pipes;
     kai_proc_pipes = e;
+    pthread_mutex_unlock(&kai_proc_pipes_mu);
+}
+
+static void _kai_proc_pipe_cmd(int pid, char *out, size_t cap) {
+    out[0] = '\0';
+    pthread_mutex_lock(&kai_proc_pipes_mu);
+    for (KaiProcPipe *e = kai_proc_pipes; e; e = e->next) {
+        if (e->pid == pid) { if (e->cmd) snprintf(out, cap, "%s", e->cmd); break; }
+    }
     pthread_mutex_unlock(&kai_proc_pipes_mu);
 }
 
@@ -489,7 +502,7 @@ static void _kai_proc_pipe_drop(int pid) {
     }
     pthread_mutex_unlock(&kai_proc_pipes_mu);
     for (int i = 0; i < 3; ++i) if (fds[i] >= 0) close(fds[i]);
-    free(e);
+    _kai_proc_pipe_free(e);
 }
 
 /* One write attempt on the non-blocking stdin pipe; returns write(2)'s
@@ -519,63 +532,6 @@ static ssize_t _kai_proc_write_once(int fd, const char *buf, size_t len) {
 #endif
 }
 #endif
-
-/* start(cmd, args) -> Child. fork + execvp; on failure of either
- * primitive, panic with strerror — start has no Result wrapper in
- * v1 (see the divergence note in builtin_process_decl).
- *
- * Issue #611 — install the SIGCHLD handler before fork() so that
- * a fast-exiting child cannot deliver SIGCHLD to the kernel's
- * default disposition (zombie reaper only) before the reactor is
- * armed. Idempotent. */
-static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *args, KaiCont *k) {
-    (void) self;
-    if (!cmd || cmd->tag != KAI_STR) {
-        kai_eputs("kai: Process.start: cmd must be a String\n");
-        kai_exit(1);
-    }
-    kai_reactor_init();
-    /* cmd is heap-allocated by kai_str_from_bytes with a trailing
-     * NUL, so passing bytes directly to execvp is safe. */
-    const char *cmd_cstr = cmd->as.s.bytes ? cmd->as.s.bytes : "";
-    int argc = 0;
-    char **argv = _kai_process_build_argv(cmd_cstr, args, &argc);
-    if (!argv) {
-        kai_eputs("kai: Process.start: out of memory building argv\n");
-        kai_exit(1);
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        int e = kai_errno();
-        _kai_process_free_argv(argv, argc);
-        kai_eprintf("kai: Process.start: fork: %s\n", strerror(e));
-        kai_exit(1);
-    }
-    if (pid == 0) {
-        /* Child: replace image. execvp searches PATH for relative
-         * names; absolute paths bypass the search. On any failure
-         * exit 127, the shell convention for "command not found". */
-        _kai_process_child_reset_signals();
-        execvp(cmd_cstr, argv);
-        /* execvp only returns on failure. Async-signal-safe writers
-         * only — keep the message minimal. */
-        const char *prefix = "kai: Process.start: execvp: ";
-        const char *msg    = strerror(kai_errno());
-        ssize_t w;
-        w = write(2, prefix, strlen(prefix)); (void) w;
-        if (msg) { w = write(2, msg, strlen(msg)); (void) w; }
-        w = write(2, "\n", 1); (void) w;
-        _exit(127);
-    }
-    /* Parent: clean up argv copies and resume with the Child
-     * handle. The Child borrows nothing from argv — it carries
-     * just the pid. */
-    _kai_process_free_argv(argv, argc);
-    _kai_proc_pipe_forget((int) pid);
-    KaiValue *child = _kai_process_make_child((int) pid);
-    return kai_cont_resume(k, child);
-}
 
 /* wait(c) -> Result[Exit, String]. Issue #611 Phase R1: the wait
  * parks the calling fiber on the reactor's pid waiter map and the
@@ -624,7 +580,7 @@ KAI_SCHED_FN KaiValue *kai_default_process_wait(void *self, KaiValue *child, Kai
         } else if (rc < 0) {
             int e = kai_errno();
             if (!kai_reactor_take_child_exit(pid, &status)) {
-                return _kai_process_err(k, e);
+                return _kai_process_err_pid(k, pid, e);
             }
         }
     }
@@ -651,7 +607,7 @@ static KaiValue *kai_default_process_kill(void *self, KaiValue *child, KaiValue 
     }
     int signo = (kai_is_int(sig)) ? (int) kai_intf(sig) : 0;
     if (kill((pid_t) pid, signo) < 0) {
-        return _kai_process_err(k, kai_errno());
+        return _kai_process_err_pid(k, pid, kai_errno());
     }
     return _kai_process_ok(k, kai_unit());
 }
@@ -670,7 +626,7 @@ static KaiValue *kai_default_process_kill_group(void *self, KaiValue *child, Kai
     }
     int signo = (kai_is_int(sig)) ? (int) kai_intf(sig) : 0;
     if (kill(-(pid_t) pid, signo) < 0) {
-        return _kai_process_err(k, kai_errno());
+        return _kai_process_err_pid(k, pid, kai_errno());
     }
     return _kai_process_ok(k, kai_unit());
 }
@@ -742,33 +698,54 @@ static int _kai_proc_pipe_parent_read_end(int p[2]) {
     return p[0];
 }
 
+/* Pipe whose ends close on exec; the child writes its errno here when exec fails. */
+static int _kai_proc_cloexec_pipe(int p[2]) {
+#if defined(__linux__)
+    return pipe2(p, O_CLOEXEC);
+#else
+    if (pipe(p) != 0) return -1;
+    fcntl(p[0], F_SETFD, FD_CLOEXEC);
+    fcntl(p[1], F_SETFD, FD_CLOEXEC);
+    return 0;
+#endif
+}
+
 static int _kai_proc_want(KaiValue *flag) {
     return flag && flag->tag == KAI_BOOL && flag->as.b;
 }
 
-static KaiValue *_kai_process_spawn(KaiValue *cmd, KaiValue *args, KaiValue *pipe_in_v,
-                                    KaiValue *pipe_out_v, KaiValue *pipe_err_v,
+static KaiValue *_kai_process_spawn(KaiValue *cmd, KaiValue *args, int pipe_in,
+                                    int pipe_out, int pipe_err,
                                     int own_group, KaiCont *k) {
     if (!cmd || cmd->tag != KAI_STR) {
-        return _kai_process_err_msg(k, "start_piped: cmd must be a String");
+        return _kai_process_err_msg(k, "start: cmd must be a String");
     }
     int in_p[2]  = { -1, -1 };
     int out_p[2] = { -1, -1 };
     int err_p[2] = { -1, -1 };
-    int e = _kai_proc_pipe_open(_kai_proc_want(pipe_in_v), in_p);
-    if (!e) e = _kai_proc_pipe_open(_kai_proc_want(pipe_out_v), out_p);
-    if (!e) e = _kai_proc_pipe_open(_kai_proc_want(pipe_err_v), err_p);
+    int e = _kai_proc_pipe_open(pipe_in, in_p);
+    if (!e) e = _kai_proc_pipe_open(pipe_out, out_p);
+    if (!e) e = _kai_proc_pipe_open(pipe_err, err_p);
     if (e) {
         _kai_proc_pipe_close_pair(in_p);
         _kai_proc_pipe_close_pair(out_p);
         _kai_proc_pipe_close_pair(err_p);
-        return _kai_process_err(k, e);
+        return _kai_process_err(k, cmd->as.s.bytes ? cmd->as.s.bytes : "", e);
     }
     const char *cmd_cstr = cmd->as.s.bytes ? cmd->as.s.bytes : "";
     int argc = 0;
     char **argv = _kai_process_build_argv(cmd_cstr, args, &argc);
     if (!argv) { kai_eputs("kai: out of memory\n"); kai_exit(1); }
     kai_reactor_init();
+    int ex_p[2];
+    if (_kai_proc_cloexec_pipe(ex_p) != 0) {
+        e = kai_errno();
+        _kai_process_free_argv(argv, argc);
+        _kai_proc_pipe_close_pair(in_p);
+        _kai_proc_pipe_close_pair(out_p);
+        _kai_proc_pipe_close_pair(err_p);
+        return _kai_process_err(k, cmd_cstr, e);
+    }
     pid_t pid = fork();
     if (pid < 0) {
         e = kai_errno();
@@ -776,7 +753,8 @@ static KaiValue *_kai_process_spawn(KaiValue *cmd, KaiValue *args, KaiValue *pip
         _kai_proc_pipe_close_pair(in_p);
         _kai_proc_pipe_close_pair(out_p);
         _kai_proc_pipe_close_pair(err_p);
-        return _kai_process_err(k, e);
+        _kai_proc_pipe_close_pair(ex_p);
+        return _kai_process_err(k, cmd_cstr, e);
     }
     if (pid == 0) {
         if (own_group) setpgid(0, 0);
@@ -785,16 +763,25 @@ static KaiValue *_kai_process_spawn(KaiValue *cmd, KaiValue *args, KaiValue *pip
         _kai_proc_pipe_child_dup(out_p, 1, 1);
         _kai_proc_pipe_child_dup(err_p, 1, 2);
         execvp(cmd_cstr, argv);
-        /* Async-signal-safe writers only. 127 = command not found. */
-        const char *prefix = "kai: Process.start_piped: execvp: ";
-        const char *msg    = strerror(kai_errno());
-        ssize_t w;
-        w = write(2, prefix, strlen(prefix)); (void) w;
-        if (msg) { w = write(2, msg, strlen(msg)); (void) w; }
-        w = write(2, "\n", 1); (void) w;
+        int xe = kai_errno();
+        ssize_t w = write(ex_p[1], &xe, sizeof xe); (void) w;
         _exit(127);
     }
     _kai_process_free_argv(argv, argc);
+    close(ex_p[1]);
+    int xe = 0;
+    ssize_t xn;
+    do { xn = read(ex_p[0], &xe, sizeof xe); } while (xn < 0 && kai_errno() == EINTR);
+    close(ex_p[0]);
+    if (xn == (ssize_t) sizeof xe) {
+        int st = 0;
+        while (waitpid(pid, &st, 0) < 0 && kai_errno() == EINTR) {}
+        kai_reactor_take_child_exit((int) pid, &st);
+        _kai_proc_pipe_close_pair(in_p);
+        _kai_proc_pipe_close_pair(out_p);
+        _kai_proc_pipe_close_pair(err_p);
+        return _kai_process_err(k, cmd_cstr, xe);
+    }
     /* Also set from the parent: a `kill_group` issued before the child
      * runs its own setpgid must still find the group. EACCES after the
      * child's exec is harmless — the child already did it. */
@@ -810,7 +797,7 @@ static KaiValue *_kai_process_spawn(KaiValue *cmd, KaiValue *args, KaiValue *pip
 #endif
     }
     _kai_proc_pipe_add((int) pid, wr, _kai_proc_pipe_parent_read_end(out_p),
-                       _kai_proc_pipe_parent_read_end(err_p), own_group);
+                       _kai_proc_pipe_parent_read_end(err_p), own_group, cmd_cstr);
     return _kai_process_ok(k, _kai_process_make_child((int) pid));
 }
 
@@ -818,7 +805,14 @@ static KaiValue *kai_default_process_start_piped(void *self, KaiValue *cmd, KaiV
                                                  KaiValue *pipe_in_v, KaiValue *pipe_out_v,
                                                  KaiValue *pipe_err_v, KaiCont *k) {
     (void) self;
-    return _kai_process_spawn(cmd, args, pipe_in_v, pipe_out_v, pipe_err_v, 0, k);
+    return _kai_process_spawn(cmd, args, _kai_proc_want(pipe_in_v), _kai_proc_want(pipe_out_v),
+                              _kai_proc_want(pipe_err_v), 0, k);
+}
+
+/* start(cmd, args) -> Result[Child, String]. Inherits all three streams. */
+static KaiValue *kai_default_process_start(void *self, KaiValue *cmd, KaiValue *args, KaiCont *k) {
+    (void) self;
+    return _kai_process_spawn(cmd, args, 0, 0, 0, 0, k);
 }
 
 /* start_group(...) -> Result[Child, String]. `start_piped` with the
@@ -827,7 +821,8 @@ static KaiValue *kai_default_process_start_group(void *self, KaiValue *cmd, KaiV
                                                  KaiValue *pipe_in_v, KaiValue *pipe_out_v,
                                                  KaiValue *pipe_err_v, KaiCont *k) {
     (void) self;
-    return _kai_process_spawn(cmd, args, pipe_in_v, pipe_out_v, pipe_err_v, 1, k);
+    return _kai_process_spawn(cmd, args, _kai_proc_want(pipe_in_v), _kai_proc_want(pipe_out_v),
+                              _kai_proc_want(pipe_err_v), 1, k);
 }
 
 /* write_stdin(c, data) -> Result[Unit, String]. Writes every byte or
@@ -858,7 +853,11 @@ KAI_SCHED_FN KaiValue *kai_default_process_write_stdin(void *self, KaiValue *chi
         if (w >= 0) { off += (size_t) w; continue; }
         int e = kai_errno();
         if (e == EINTR) continue;
-        if (e != EAGAIN && e != EWOULDBLOCK) return _kai_process_err(k, e);
+        if (e != EAGAIN && e != EWOULDBLOCK) {
+            char who[KAI_PATH_BUF];
+            _kai_proc_pipe_cmd(pid, who, sizeof who);
+            return _kai_process_err(k, who, e);
+        }
         kai_reactor_park_socket_write(kai_current_fiber(), fd);
         fd = _kai_proc_pipe_fd(pid, 0);
         if (fd < 0) return _kai_process_err_msg(k, "write_stdin: stdin was closed");
@@ -918,8 +917,10 @@ static KaiValue *_kai_proc_read_chunk(KaiValue *child, int which, KaiCont *k) {
     }
     if (n < 0) {
         int e = kai_errno();
+        char who[KAI_PATH_BUF];
         free(buf);
-        return _kai_process_err(k, e);
+        _kai_proc_pipe_cmd(pid, who, sizeof who);
+        return _kai_process_err(k, who, e);
     }
     KaiValue *s = kai_str_from_bytes(buf, (size_t) n);
     free(buf);

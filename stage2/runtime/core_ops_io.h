@@ -700,17 +700,23 @@ KAI_SCHED_FN KaiValue *kai_core_mailbox_free(KaiValue *pid)
 
 /* ---------- core: file io ---------- */
 
-/* Err(`<path>: <strerror> (os error <errno>)`); `err` must be captured
- * right after the failing call, before any cleanup can clobber errno. */
-static KaiValue *_kai_fs_err(const char *path, size_t plen, int err) {
+/* String `<subject>: <strerror> (os error <errno>)`; an empty subject drops
+ * the prefix. `err` must be captured right after the failing call, before
+ * any cleanup can clobber errno. */
+static KaiValue *_kai_os_err_text(const char *subject, size_t slen, int err) {
     const char *why = strerror(err);
-    size_t n = plen + strlen(why) + 32;
+    size_t n = slen + strlen(why) + 32;
     char *buf = (char *) malloc(n);
     if (!buf) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
-    if (plen) snprintf(buf, n, "%.*s: %s (os error %d)", (int) plen, path, why, err);
+    if (slen) snprintf(buf, n, "%.*s: %s (os error %d)", (int) slen, subject, why, err);
     else snprintf(buf, n, "%s (os error %d)", why, err);
     KaiValue *msg = kai_str_dyn(buf);
     free(buf);
+    return msg;
+}
+
+static KaiValue *_kai_fs_err(const char *path, size_t plen, int err) {
+    KaiValue *msg = _kai_os_err_text(path, plen, err);
     return kai_variant_u(3, "Err", 1, 0, (KaiVarSlot[]){{.ptr = msg}});
 }
 
