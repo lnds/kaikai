@@ -84,6 +84,12 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.201.1 (2026-11-25)
+
+### Changed
+
+- **native**: nullary constructors are constant immortal cells with a static tag
+
 ## v0.201.0 (2026-11-25)
 
 ### BREAKING CHANGE
