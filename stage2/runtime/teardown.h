@@ -88,7 +88,9 @@ static char          **kai_slab_kept;
 static size_t          kai_slab_kept_n;
 
 /* A leaving thread's slabs stay for the process: their blocks migrate to other
- * threads, so none can be freed, and the list moves here to keep naming them. */
+ * threads, so none can be freed, and the list moves here to keep naming them.
+ * Slab state is thread-local: this activation never switches. */
+__attribute__((noinline))
 static void kai_slab_hand_over(void) {
     if (kai_slab_count == 0) return;
     pthread_mutex_lock(&kai_slab_kept_mu);
@@ -106,6 +108,17 @@ static void kai_slab_hand_over(void) {
 }
 #endif
 
+/* Reads thread-local state: this activation never switches. */
+__attribute__((noinline))
+static void kai_thread_pools_audit(int id) {
+    kai_teardown_expect(!kai_seg_pool, "a pooled stack segment");
+#ifdef KAI_CELL_POOL_ACTIVE
+    kai_teardown_expect(!kai_cell_pool, "a cell pool");
+    kai_teardown_expect(id == 0 || !kai_slab_list, "a worker's slab list");
+#endif
+    (void) id;
+}
+
 /* The calling thread's own holdings. Every fiber it ran has ended. The
  * signal stack goes last: the releases before it may still overflow. */
 KAI_SCHED_FN void kai_thread_release(KaiWorker *w) {
@@ -120,11 +133,7 @@ KAI_SCHED_FN void kai_thread_release(KaiWorker *w) {
     kai_teardown_expect(!w->pending_free && !w->pending_sched_drop, "a finished fiber");
     kai_teardown_expect(!w->main_fiber.unw_buf && !w->main_fiber.rframe_buf, "a root fiber's buffers");
     kai_teardown_expect(!atomic_load(&w->main_fiber.exit_rec), "a root fiber's exit record");
-    kai_teardown_expect(!kai_seg_pool, "a pooled stack segment");
-#ifdef KAI_CELL_POOL_ACTIVE
-    kai_teardown_expect(!kai_cell_pool, "a cell pool");
-    kai_teardown_expect(w->id == 0 || !kai_slab_list, "a worker's slab list");
-#endif
+    kai_thread_pools_audit(w->id);
     kai_teardown_expect(!w->sigalt_stack, "a signal stack");
 }
 
