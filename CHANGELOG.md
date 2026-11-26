@@ -84,6 +84,16 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.201.2 (2026-11-25)
+
+### Fixed
+
+- **parser**: accept the attributes of a declaration in any order
+
+### Changed
+
+- **compiler**: analyse only the registers a nullary constructor reaches
+
 ## v0.201.1 (2026-11-25)
 
 ### Changed
