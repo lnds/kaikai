@@ -1887,7 +1887,9 @@ endif
 # no second cache entry — the core was linked, not re-emitted; (4) a backend-tag
 # change (codegen level here, same mechanism as the runtime-bitcode ids) misses
 # and mints a SECOND core object — objects emitted under different backend
-# state must never collide on one key (#1641).
+# state must never collide on one key (#1641). (5) a compile that stores the
+# core object lowers the program twice, and reports what a compile that hits
+# the object reports.
 ifeq ($(KAI_LLVM),1)
 test-native-core-obj: $(TARGET) build
 	@set -e; \
@@ -1928,7 +1930,15 @@ test-native-core-obj: $(TARGET) build
 	  || { echo "native-core-obj: backend-tag change did not change the core key (tag not folded into the key)"; cat build/ncoreobj3.err; exit 1; }; \
 	[ "$$(ls $$cache/ncore-*.o | wc -l | tr -d ' ')" = "2" ] \
 	  && echo "native-core-obj OK: backend-tag change missed and minted a second core object" \
-	  || { echo "native-core-obj: expected two cached core objects after a backend-tag change"; ls $$cache; exit 1; }
+	  || { echo "native-core-obj: expected two cached core objects after a backend-tag change"; ls $$cache; exit 1; }; \
+	diag=$$(mktemp -d build/ncoreobj-diag.XXXXXX); cp ../examples/tco/tail_slot_mismatch.kai $$diag/; \
+	for run in cold warm; do \
+	  $(KAIC2) --emit=native --core-cache-dir $$diag/cache --toolchain-id nco-test --path ../stdlib --path $$diag $$diag/tail_slot_mismatch.kai > /dev/null 2> $$diag/$$run.err \
+	    || { echo "native-core-obj: $$run diagnostics EMIT FAIL"; cat $$diag/$$run.err; exit 1; }; \
+	done; \
+	[ "$$(grep -c 'guaranteed tail call' $$diag/cold.err)" = "2" ] && diff $$diag/cold.err $$diag/warm.err \
+	  && echo "native-core-obj OK: cold and warm builds report each warning once" \
+	  || { echo "native-core-obj: cold and warm diagnostics differ"; cat $$diag/cold.err; exit 1; }
 else
 test-native-core-obj:
 	@echo "native-core-obj SKIP (C-only build; native backend not compiled)"
