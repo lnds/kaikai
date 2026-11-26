@@ -1,0 +1,165 @@
+# Linked and monitored fibers end on different scheduler threads in every
+# order: the peer first, the watcher first, both at once, and the link placed
+# after the exit. The output is the same at any KAI_THREADS.
+
+import actor
+import spawn
+
+type Msg = Go | Stop
+
+# The peer links back to a trapping overseer that ends right after it.
+fn linked_worker(parent: Pid[String]) : Unit / Actor[Msg] + Link =
+  Link.link(parent)
+
+fn trapping_overseer() : Int / Actor[String] + Spawn + Link {
+  let _ = set_trap_exit(true)
+  let me = Actor.self()
+  let _ = spawn_actor(() => linked_worker(me))
+  if Actor.receive() == "Normal" { 1 } else { 0 }
+}
+
+fn panicking_worker(parent: Pid[String]) : Unit / Actor[Msg] + Link {
+  Link.link(parent)
+  panic("boom")
+}
+
+fn trap_overseer() : Int / Actor[String] + Spawn + Link {
+  let _ = set_trap_exit(true)
+  let me = Actor.self()
+  let _ = spawn_actor(() => panicking_worker(me))
+  if Actor.receive() == "Trapped: boom" { 1 } else { 0 }
+}
+
+# Without trap-exit the peer's exit cancels the overseer in its receive.
+fn plain_overseer() : Unit / Actor[String] + Spawn + Link {
+  let me = Actor.self()
+  let _ = spawn_actor(() => linked_worker(me))
+  let _ = Actor.receive()
+  ()
+}
+
+fn returns_at_once() : Unit / Actor[Msg] = ()
+
+fn await_end[msg](target: Pid[msg]) : Unit / Spawn + Monitor =
+  with_mailbox {
+    let _ = Monitor.monitor(target)
+    let _ = Actor.receive()
+    ()
+  }
+
+fn link_ended() : Int / Actor[String] + Spawn + Link + Monitor {
+  let _ = set_trap_exit(true)
+  let peer = spawn_actor(returns_at_once)
+  await_end(peer)
+  Link.link(peer)
+  if Actor.receive() == "Normal" { 1 } else { 0 }
+}
+
+# Each end links the other and returns without waiting; whichever exits first
+# cancels the other, if it is still running.
+type Peer = Meet(Pid[Peer])
+
+fn twin() : Unit / Actor[Peer] + Link =
+  match Actor.receive() {
+    Meet(other) -> Link.link(other)
+  }
+
+fn twins() : Int / Actor[Peer] + Spawn + Link + Monitor {
+  let a = spawn_actor(twin)
+  let b = spawn_actor(twin)
+  Actor.send(a, Meet(b))
+  Actor.send(b, Meet(a))
+  await_end(a)
+  await_end(b)
+  1
+}
+
+# The observer ends while its target is ending.
+fn observer(target: Pid[Msg]) : Unit / Actor[Pid[Msg]] + Monitor {
+  let _ = Monitor.monitor(target)
+  ()
+}
+
+fn demonitoring(target: Pid[Msg]) : Unit / Actor[Pid[Msg]] + Monitor {
+  let ref = Monitor.monitor(target)
+  Monitor.demonitor(ref)
+}
+
+fn short_observers() : Int / Spawn + Monitor + Link {
+  let target = spawn_actor(returns_at_once)
+  let o = spawn_actor(() => observer(target))
+  let d = spawn_actor(() => demonitoring(target))
+  await_end(target)
+  1
+}
+
+# Many peers edit one watcher's chains while it opens and closes mailboxes.
+fn crowd(parent: Pid[String], n: Int) : Unit / Spawn + Link =
+  if n > 0 {
+    let _ = spawn_actor(() => linked_worker(parent))
+    crowd(parent, n - 1)
+  } else {
+    ()
+  }
+
+# Each report lands in whichever mailbox is innermost at that moment, so the
+# watcher counts none of them.
+fn churn(n: Int) : Int / Spawn =
+  if n > 0 {
+    with_mailbox { returns_at_once() }
+    churn(n - 1)
+  } else {
+    1
+  }
+
+fn crowded() : Int / Actor[String] + Spawn + Link {
+  let _ = set_trap_exit(true)
+  crowd(Actor.self(), 32)
+  churn(64)
+}
+
+fn rounds(
+  n: Int,
+  acc: Int,
+  body: () -> Int / Spawn + Link + Monitor + Cancel
+) : Int / Spawn + Link + Monitor + Cancel =
+  if n > 0 {
+    let got = body()
+    rounds(n - 1, acc + got, body)
+  } else {
+    acc
+  }
+
+fn on_fiber[msg](
+  body: () -> Int / Actor[msg] + Spawn + Link + Monitor + Cancel
+) : Int / Spawn + Link + Monitor + Cancel =
+  nursery { k ->
+    let f = k.spawn(() => with_mailbox { body() })
+    k.await(f)
+  }
+
+fn cancelled_round() : Int / Spawn + Link + Monitor {
+  let o = spawn_actor(() => plain_overseer())
+  with_mailbox {
+    let _ = Monitor.monitor(o)
+    let _ = Actor.receive()
+    1
+  }
+}
+
+fn main() : Unit / Spawn + Link + Monitor + Cancel + Stdout {
+  let normal = rounds(400, 0, () => on_fiber(trapping_overseer))
+  Stdout.print("trapped normal exits: #{normal}")
+  let crashed = rounds(100, 0, () => on_fiber(trap_overseer))
+  Stdout.print("trapped panics: #{crashed}")
+  let cancelled = rounds(400, 0, cancelled_round)
+  Stdout.print("cancelled overseers: #{cancelled}")
+  let ended = rounds(200, 0, () => on_fiber(link_ended))
+  Stdout.print("links to ended peers: #{ended}")
+  let both = rounds(400, 0, () => on_fiber(twins))
+  Stdout.print("simultaneous exits: #{both}")
+  let observed = rounds(400, 0, short_observers)
+  Stdout.print("short observers: #{observed}")
+  let many = rounds(20, 0, () => on_fiber(crowded))
+  Stdout.print("watchers under churn: #{many}")
+}
