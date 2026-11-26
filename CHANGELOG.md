@@ -84,6 +84,14 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.201.4 (2026-11-26)
+
+### Fixed
+
+- **runtime**: classify the globals the shutdown path adds
+- **runtime**: hand slabs over in an activation that never switches
+- **runtime**: release per-thread and reactor allocations at shutdown
+
 ## v0.201.3 (2026-11-26)
 
 ### Fixed
