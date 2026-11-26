@@ -902,7 +902,7 @@ KAI_SCHED_FN KaiValue *kai_default_spawn_set_trap_exit(void *self, KaiValue *on,
     (void) self;
     KaiFiber *f = kai_current_fiber();
     int v = (on && on->tag == KAI_BOOL && on->as.b) ? 1 : 0;
-    f->trap_exit = v;
+    atomic_store(&kai_fiber_exit_of(f)->trap_exit, v);
     return kai_cont_resume(k, kai_unit());
 }
 #endif
@@ -1192,21 +1192,14 @@ static KaiValue *kai_default_cancel_raise(void *self, KaiCont *k) {
  * `Link.link(peer)` registers a bidirectional link between the
  * current fiber and the fiber that owns `peer`'s mailbox. On
  * either fiber's termination, the trampoline walks the linked
- * chain and sets cancel_requested on each peer (delivered at
- * that peer's next yield-point hook).
+ * chain and signals each peer.
  *
- * v1 simplifications:
- *  - `Pid[Nothing]` is the type-erased existential pid the typer
- *    uses for link/monitor ops; we resolve via the pid's exit record.
  *  - Self-links (a == b) are dropped.
  *  - A pid with no owner (mailbox alloc'd outside any fiber context)
  *    links nothing.
- *  - Duplicate links between the same pair are not de-dup'd; the
- *    propagation walk sets cancel_requested idempotently, so the
- *    duplicates are harmless beyond the wasted KaiLinkNode.
- *  - Spec specifies "crash → propagate cancel"; v1 propagates on
- *    both DONE and CANCELLED termination (BEAM-style trap-exit
- *    semantics queued for post-MVP). */
+ *  - Duplicate links between the same pair are not de-dup'd.
+ *
+ * The caller holds both records' locks. */
 static void kai_link_add_bidirectional(KaiFiber *a, KaiFiber *b) {
     if (!a || !b || a == b) return;
     KaiLinkNode *na = (KaiLinkNode *) calloc(1, sizeof(KaiLinkNode));
@@ -1215,20 +1208,10 @@ static void kai_link_add_bidirectional(KaiFiber *a, KaiFiber *b) {
         kai_eprintf("kai: out of memory (link)\n");
         kai_exit(1);
     }
-    na->peer = b; na->next = a->linked_head; a->linked_head = na;
-    nb->peer = a; nb->next = b->linked_head; b->linked_head = nb;
+    na->peer = kai_fiber_exit_ref(b); na->next = a->linked_head; a->linked_head = na;
+    nb->peer = kai_fiber_exit_ref(a); nb->next = b->linked_head; b->linked_head = nb;
 }
 
-/* Walk a fiber's linked chain at termination. For each peer:
- *   - if peer has trap_exit=1 AND a current mailbox, push a
- *     "Normal" or "Crashed" KAI_STR (per `reason`) into the
- *     mailbox. The peer learns of the termination in user code
- *     and is NOT cancelled.
- *   - otherwise, set cancel_requested (the v1 default — delivered
- *     at the peer's next yield-point hook).
- * In either branch, remove our back-link from the peer's chain so
- * the peer's own future termination doesn't re-enter our (now-
- * freed) chain. Each KaiLinkNode is freed as the walk passes it. */
 /* Deliver a system message (link trap-exit reason, monitor pid) into a
  * mailbox owned by an arbitrary fiber, consuming `msg`. Same copy rule as
  * kai_core_mailbox_send: an unconditional deep copy, because the peer's

@@ -26,14 +26,11 @@ static void kai_fiber_release(KaiFiber *f) {
     KaiLinkNode    *links;
     KaiMonitorNode *monitors;
     kai_fiber_detach_watchers(f, KAI_EXIT_NORMAL, &links, &monitors);
-    while (links != NULL) {
-        KaiLinkNode *next = links->next;
-        free(links);
-        links = next;
-    }
+    kai_link_chain_free(links);
     while (monitors != NULL) {
         KaiMonitorNode *next = monitors->next;
         if (monitors->target_pid) kai_decref(monitors->target_pid);
+        kai_fiber_exit_unref(monitors->observer);
         free(monitors);
         monitors = next;
     }

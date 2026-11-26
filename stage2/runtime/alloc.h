@@ -177,12 +177,9 @@ struct KaiFiber {
      * installed (main_fiber) a trap terminates the process. */
     int             trapped;
     const char     *trap_msg;
-    /* Phase 5 — intrusive list of linked peer fibers. Walked at
-     * trampoline termination (DONE or CANCELLED branches) to set
-     * cancel_requested on each peer. Owned by the fiber; nodes are
-     * freed during the propagation walk and as a safety net in
-     * kai_free_value's KAI_FIBER branch. */
-    KaiLinkNode    *linked_head;
+    /* Links to other fibers, guarded by the exit record's lock. Atomic so the
+     * owner can test for an empty chain without it. */
+    KaiLinkNode *_Atomic linked_head;
     /* Per-fiber dispatch state. Points at the evidence node whose clause
      * body is currently on this fiber's stack, or NULL otherwise.
      * `kai_evidence_lookup_node` skips it so a `Eff.op(...)` invoked from
@@ -205,31 +202,11 @@ struct KaiFiber {
      * still referenced from the run queue. NULL on a worker's root fiber,
      * which has no wrapper (it represents the OS thread). */
     KaiValue       *value;
-    /* Tier 2 — trap-exit semantics. When 0 (default), a linked peer's
-     * termination sets cancel_requested on this fiber (the v1 uniform
-     * propagation). When 1, the propagation walk pushes a String into
-     * this fiber's mailbox instead — "Normal" if the peer terminated
-     * via DONE, "Crashed" if via CANCELLED — and leaves
-     * cancel_requested untouched. Toggled by Spawn.set_trap_exit;
-     * spec: docs/actors.md §*Supervision: links and monitors* /
-     * *Trap-exit semantics*. The flag is per-fiber, not per-link, so
-     * it must be set before the link that should respect it; later
-     * toggles affect future propagations only. */
-    int             trap_exit;
     /* Innermost open mailbox this fiber owns; each one links to the
      * mailbox it shadows through `outer`, and closing one unlinks it.
      * Link/monitor deliveries to this fiber land here. */
     struct KaiMailbox *mailbox;
-    /* Tier 2 — intrusive list of fibers monitoring this one. Each
-     * Monitor.monitor(target_pid) call from an observer fiber
-     * appends a node here on the *target* fiber. At trampoline
-     * termination (DONE or CANCELLED) the walker pops every entry
-     * and pushes the original target_pid value into the observer's
-     * mailbox, leaving the observer's cancel_requested untouched
-     * (monitors do not propagate faults — `docs/actors.md` §*Fault
-     * propagation*). Owned by the target fiber; nodes are freed in
-     * the propagation walk and as a safety net in
-     * kai_free_value's KAI_FIBER branch. */
+    /* Fibers monitoring this one, guarded by the exit record's lock. */
     KaiMonitorNode *monitor_head;
     /* Issue #611 — Phase R1 reactor metadata. A parked fiber lives
      * on exactly one reactor list at a time (timer wheel, pid waiter

@@ -203,39 +203,22 @@ void kai_free_one(KaiValue *v, int depth, KaiFreeStack *st) {
             if (v->as.fib) {
                 kai_drop_child(v->as.fib->thunk, depth, st);
                 kai_drop_child(v->as.fib->result, depth, st);
-                /* Phase 5: free any remaining link nodes. Normally
-                 * the trampoline's kai_link_propagate_terminate
-                 * empties this chain; the safety net here covers
-                 * fibers that died without going through the
-                 * trampoline (or through this path before the
-                 * trampoline ran). */
-                {
-                    KaiLinkNode *ln = v->as.fib->linked_head;
-                    while (ln) {
-                        KaiLinkNode *next = ln->next;
-                        free(ln);
-                        ln = next;
-                    }
-                    v->as.fib->linked_head = NULL;
-                }
-                /* Tier 2 Monitor — same safety net as the link chain.
-                 * Each entry holds an owning ref on its target_pid via
-                 * kai_monitor_add; we release that ref before freeing
-                 * the node so values referenced only by the monitor
-                 * chain can be reclaimed. */
+                /* A fiber freed without terminating never ran to an exit:
+                 * its record must stop naming it before its chains go. */
+                kai_fiber_exit_orphan(v->as.fib);
+                kai_link_chain_free(v->as.fib->linked_head);
+                v->as.fib->linked_head = NULL;
                 {
                     KaiMonitorNode *mn = v->as.fib->monitor_head;
                     while (mn) {
                         KaiMonitorNode *next = mn->next;
                         if (mn->target_pid) kai_drop_child(mn->target_pid, depth, st);
+                        kai_fiber_exit_unref(mn->observer);
                         free(mn);
                         mn = next;
                     }
                     v->as.fib->monitor_head = NULL;
                 }
-                /* A fiber freed without terminating never ran to an exit;
-                 * its pids must not keep pointing at it. */
-                kai_fiber_exit_orphan(v->as.fib);
                 /* R4 fix — when the trampoline drops the scheduler's
                  * ref on its own wrapper at DONE/CANCELLED, the wrapper
                  * may go to RC=0 here while we are still running on
