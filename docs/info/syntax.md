@@ -378,6 +378,12 @@ plus the field-level `#[json(...)]` family.
 Attributes come BEFORE `pub`. An unrecognised attribute parses and is
 silently discarded — `#[deprecated]` does nothing.
 
+The attributes of one declaration are a set: write them in any order
+(`kai fmt` keeps yours, one per line). Each must fit the declaration, and
+only `#[must_use]` and unrecognised ones may repeat. The attribute that
+opens the run is a module doc if it is a `#[doc]` followed by a blank or
+comment line.
+
 ```kaikai
 #[doc("Adds one to its argument.")]            # item doc, single line
 pub fn addone(x: Int) : Int = x + 1

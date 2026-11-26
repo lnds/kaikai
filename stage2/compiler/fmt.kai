@@ -20,6 +20,7 @@ import compiler.ast_decl
 import compiler.ast_ids
 import compiler.symtab
 import compiler.local_names
+import compiler.fmt_attrs
 import compiler.fmt_writer
 import compiler.fmt_layout
 import compiler.fmt_expr
@@ -140,15 +141,15 @@ fn decl_line(d: Decl) : Int {
     DEffect(_, _, _, _, _, line, _, _, _, _) -> line
     DProtocol(_, _, _, _, line, _, _, _, _) -> line
     DImpl(_, _, _, _, line, _, _, _) -> line
-    DDerive(_, _, line, _) -> line
-    DUnstable(_, line, _) -> line
+    DDerive(_, _, _, _) -> attr_stack(d).first
+    DUnstable(_, _, _) -> attr_stack(d).first
     DProtoLaws(_, _, line, _, _) -> line
     DImplAxiom(_, _, line, _, _) -> line
-    DConstructor(_, line, _) -> line
-    DDoc(_, _, _, line, _) -> line
+    DConstructor(_, _, _) -> attr_stack(d).first
+    DDoc(_, _, _, _, _) -> attr_stack(d).first
     DModuleDoc(_, _, line, _) -> line
     DMustUse(_, _) -> 0
-    DAttr(_, _, line, _) -> line
+    DAttr(_, _, _, _) -> attr_stack(d).first
     DUnit(_, _, _, _, line, _, _) -> line
     DUse(_, line, _) -> line
     DUseKind(_, line, _, _) -> line
@@ -188,23 +189,16 @@ pub(pkg) fn fmt_decl(d: Decl, s: FmtSt) : FmtSt {
       fmt_protocol_decl(is_pub, fmt_decl_name(s, sym), tparams, ops, s)
     DImpl(proto, proto_args, target_ty, methods, _, _, impl_tps, _) ->
       fmt_impl_decl(fmt_ref_text(s, proto), proto_args, target_ty, methods, impl_tps, s)
-    # `#[derive(P, ...)] <inner_type_decl>`. Only the bracketed spelling
-    # is accepted by the parser.
-    DDerive(names, inner, _, _) ->
-      fmt_attr_wrapped(string_concat_all(["#[derive(", string_join(names, ", "), ")]"]), inner, s)
-    DUnstable(inner, _, _) -> fmt_attr_wrapped("#[unstable]", inner, s)
-    DConstructor(inner, _, _) -> fmt_attr_wrapped("#[constructor]", inner, s)
+    DDerive(_, _, _, _) -> fmt_attributed(d, s)
+    DUnstable(_, _, _) -> fmt_attributed(d, s)
+    DConstructor(_, _, _) -> fmt_attributed(d, s)
     # A theory-bound protocol: the clause is spelled `: Theory` in the
     # head (`protocol P[s: Shape] : Functorial { ... }`).
     DProtoLaws(thy, inner, _, _, _) -> fmt_proto_laws(thy, inner, s)
     # `impl { } axiom <Theory>` — format the impl then the clause.
     DImplAxiom(thy, inner, _, _, _) -> fmt_emit(fmt_decl(inner, s), concat_all([" axiom ", thy]))
-    # `#[doc("...")]` and any unknown attribute (`#[deprecated]`,
-    # `#[cfg(...)]`, custom) re-emit their raw byte span verbatim — no
-    # re-quoting, no auto-wrapping — so `kai fmt` is byte-identical on
-    # attribute text it does not understand.
-    DDoc(raw, _, inner, _, _) -> fmt_attr_wrapped(raw, inner, s)
-    DAttr(raw, inner, _, _) -> fmt_attr_wrapped(raw, inner, s)
+    DDoc(_, _, _, _, _) -> fmt_attributed(d, s)
+    DAttr(_, _, _, _) -> fmt_attributed(d, s)
     # Module-position `#[doc(...)]` — verbatim, stands alone (the
     # program walker adds the blank line separating decls).
     DModuleDoc(raw, _, _, _) ->
@@ -249,21 +243,23 @@ fn fmt_decl_name(s: FmtSt, sym: SymId) : String {
   }
 }
 
-# An attribute line above the declaration it wraps.
-fn fmt_attr_wrapped(raw: String, inner: Decl, s: FmtSt) : FmtSt {
-  if raw == pub_pkg_raw() {
-    let done = fmt_decl(inner, FmtSt { ...s, pkg_pub: true })
+# One attribute per line, in the order written, then the declaration.
+fn fmt_attributed(d: Decl, s: FmtSt) : FmtSt {
+  let run = attr_stack(d)
+  let s1 = foldl(run.lines, s, fmt_attr_line)
+  if run.pkg {
+    let done = fmt_attr_base(run.base, FmtSt { ...s1, pkg_pub: true })
     FmtSt { ...done, pkg_pub: false }
   } else {
-    fmt_attr_raw(raw, inner, s)
+    fmt_attr_base(run.base, s1)
   }
 }
 
-fn fmt_attr_raw(raw: String, inner: Decl, s: FmtSt) : FmtSt {
-  let s1 = fmt_emit(s, raw)
-  let s2 = fmt_newline(s1)
-  fmt_decl(inner, s2)
-}
+fn fmt_attr_line(s: FmtSt, a: AttrLine) : FmtSt =
+  fmt_newline(fmt_emit(fmt_drain_before(s, a.line), a.text))
+
+fn fmt_attr_base(base: Decl, s: FmtSt) : FmtSt =
+  fmt_decl(base, fmt_drain_before(s, decl_line(base)))
 
 fn fmt_proto_laws(thy: String, inner: Decl, s: FmtSt) : FmtSt = match inner {
   DProtocol(is_pub, sym, tparams, ops, _, _, _, _, _) ->
@@ -361,13 +357,9 @@ fn fmt_axiom_decl(
   line: Int,
   s: FmtSt
 ) : FmtSt {
-  let s_attr = match abi {
-    Some(AbiCNative) -> fmt_newline(fmt_emit(s, "#[native_stack]"))
-    _ -> s
-  }
   let s_pre = match abi {
     Some(a) -> {
-      let la = fmt_emit(s_attr, string_concat("extern ", extern_abi_literal(a)))
+      let la = fmt_emit(s, string_concat("extern ", extern_abi_literal(a)))
       let ls = if string_length(sym) > 0 {
         fmt_emit(la, string_concat_all(["(\"", sym, "\")"]))
       } else {
