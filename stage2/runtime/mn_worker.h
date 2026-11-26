@@ -639,8 +639,7 @@ static ucontext_t *kai_uc_link_target(void) {
     KaiWorker *w = kai_worker_here();
     if (!w->uc_link_ready) {
         if (getcontext(&w->uc_link_ctx) != 0) return &w->main_fiber.ctx;
-        w->uc_link_ctx.uc_stack.ss_sp   = w->uc_link_stack;
-        w->uc_link_ctx.uc_stack.ss_size = sizeof(w->uc_link_stack);
+        kai_ctx_set_stack(&w->uc_link_ctx, w->uc_link_stack, sizeof(w->uc_link_stack));
         w->uc_link_ctx.uc_link          = NULL;
         makecontext(&w->uc_link_ctx, kai_fiber_uc_link_landing, 0);
         w->uc_link_ready = 1;

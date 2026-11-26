@@ -152,7 +152,8 @@ KAI_SCHED_FN void *kai_native_stack_call(void *fn, void **args)
         kai_eprintf("kai: getcontext failed for a native-stack call\n");
         kai_exit(1);
     }
-    kai_ctx_set_stack(&ctx, (char *) w->ns_base - KAI_NS_WINDOW, KAI_NS_WINDOW);
+    kai_ctx_set_stack(&ctx, (char *) w->ns_base - KAI_NS_WINDOW - KAI_CTX_END_RECORD,
+                      KAI_NS_WINDOW + KAI_CTX_END_RECORD);
     ctx.uc_link = &back;
     makecontext(&ctx, kai_native_stack_entry, 0);
     w->ns_call = &call;

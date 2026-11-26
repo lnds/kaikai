@@ -753,12 +753,19 @@ static void kai_stack_unmap(void *base, size_t stack_size) {
 #endif
 
 #if KAI_HOST_FIBERS
-/* Point `c` at the usable stack [lo, lo + size). TRAP (macOS): makecontext
- * bzeroes the whole uc_stack, which commits every page of a reserved stack up
- * front. Hand it only the top window (the smallest the host accepts) instead;
- * the frames below grow on into the rest of the mapping, down to the guard
- * page. */
+#define KAI_CTX_END_RECORD 16
+
+/* Point `c` at the stack [lo, lo + size). Its top record is kept out of the
+ * context and zeroed: the entry's saved frame pointer leads there, and a
+ * frame walker stops on it instead of reading past the stack. TRAP (macOS):
+ * makecontext bzeroes the whole uc_stack, which commits every page of a
+ * reserved stack up front. Hand it only the top window (the smallest the host
+ * accepts) instead; the frames below grow on into the rest of the mapping,
+ * down to the guard page. */
 static void kai_ctx_set_stack(ucontext_t *c, void *lo, size_t size) {
+    uintptr_t end = (((uintptr_t) lo + size) & ~(uintptr_t) 15) - KAI_CTX_END_RECORD;
+    memset((void *) end, 0, KAI_CTX_END_RECORD);
+    size = end - (uintptr_t) lo;
 #if defined(__APPLE__)
     size_t window = 32 * 1024;
     if (size > window) {
