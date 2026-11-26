@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.201.3 (2026-11-26)
+
+### Fixed
+
+- **emit**: report a tail call once when the build stores the core object
+- **runtime**: end the frame chain at the top of every context stack
+
 ## v0.201.2 (2026-11-25)
 
 ### Fixed
