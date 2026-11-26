@@ -1,0 +1,404 @@
+#[doc("The run of `#[...]` attributes before a declaration: accepted in any order, each checked against the declaration and wrapped around it.")]
+
+import compiler.diag
+import compiler.lex
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.symtab
+import compiler.doc_attr
+import compiler.parse_state
+import compiler.parse_control
+import compiler.parse_type_decls
+import compiler.util
+
+type AttrKind
+  = AkDerive([String])
+  | AkUnstable
+  | AkDoc(String)
+  | AkMustUse
+  | AkConstructor
+  | AkNativeStack
+  | AkOther
+
+# Where an attribute stands in its run and how the declaration after the run is parsed.
+type Run = { opens: Bool, unstable: Bool, decl: (Parser, Bool) -> PDecl / Console }
+
+#[doc("Parses a run of attributes and what it precedes; `p` is past the first `#[`, and `decl` parses the declaration, told whether the run holds `#[unstable]`.")]
+pub fn parse_attributed(
+  p: Parser,
+  hash_tok: Token,
+  decl: (Parser, Bool) -> PDecl / Console
+) : PDecl / Console =
+  parse_attribute(p, hash_tok, Run { opens: true, unstable: false, decl: decl })
+
+# `p` is past `#[`; known attributes take their own body, any other is kept by its span.
+fn parse_attribute(p: Parser, hash_tok: Token, run: Run) : PDecl / Console {
+  let p0 = p_skip_newlines(p)
+  let id = p_peek(p0)
+  if not tk_is(id.kind, TkIdent) {
+    err_d(p_error(p0, id, "expected attribute name after `#[`"))
+  } else {
+    let name = tok_source(p0.src, id)
+    let p1 = p_advance(p0)
+    match name {
+      "derive" -> parse_attr_derive(p1, hash_tok, run)
+      "doc" -> parse_attr_doc(p1, hash_tok, run)
+      "must_use" -> parse_attr_must_use(p1, hash_tok, run)
+      "unstable" -> close_attr(
+        p1,
+        hash_tok,
+        AkUnstable,
+        run,
+        "expected `]` to close `#[unstable]` (the unstable attribute takes no arguments)"
+      )
+      "constructor" -> close_attr(
+        p1,
+        hash_tok,
+        AkConstructor,
+        run,
+        "expected `]` to close `#[constructor]` (the constructor attribute takes no arguments)"
+      )
+      "native_stack" -> close_attr(
+        p1,
+        hash_tok,
+        AkNativeStack,
+        run,
+        "expected `]` to close `#[native_stack]` (the native_stack attribute takes no arguments)"
+      )
+      other -> parse_attr_other(p1, other, hash_tok, run)
+    }
+  }
+}
+
+# `p` is at the closing `]`; the span up to it is what `kai fmt` re-emits.
+fn close_attr(
+  p: Parser,
+  hash_tok: Token,
+  kind: AttrKind,
+  run: Run,
+  msg: String
+) : PDecl / Console {
+  let close = p_peek(p)
+  let raw = string_slice(p.src, hash_tok.start, close.start + close.length - hash_tok.start)
+  let p1 = p_eat(p, TkRbracket, msg)
+  if p_failed(p1) {
+    err_d(p1)
+  } else if opens_module_doc(p1, kind, run) {
+    ok_d(p1, DModuleDoc(raw, doc_text(kind), hash_tok.line, hash_tok.col))
+  } else {
+    attach(parse_rest(p1, kind, run), kind, raw, hash_tok)
+  }
+}
+
+# A doc opening a run documents what follows only from the line above it; anywhere else it is the module's.
+fn opens_module_doc(p: Parser, kind: AttrKind, run: Run) : Bool = match kind {
+  AkDoc(_) -> run.opens and (not documents_next(p))
+  _ -> false
+}
+
+fn documents_next(p: Parser) : Bool {
+  let next = if p_at(p, TkNewline) { p_peek1(p) } else { p_peek(p) }
+  doc_head_starts_decl(next.kind)
+}
+
+fn doc_head_starts_decl(k: TokKind) : Bool =
+  match k {
+    TkPub -> true
+    TkFn -> true
+    TkType -> true
+    TkConst -> true
+    TkEffect -> true
+    TkProtocol -> true
+    TkAxiom -> true
+    TkImpl -> true
+    TkExtern -> true
+    TkHashOpen -> true
+    _ -> false
+  }
+
+fn doc_text(kind: AttrKind) : String = match kind {
+  AkDoc(text) -> text
+  _ -> ""
+}
+
+fn parse_rest(p: Parser, kind: AttrKind, run: Run) : PDecl / Console {
+  let unstable = run.unstable or is_unstable(kind)
+  let next = p_skip_newlines(p)
+  let head = p_peek(next)
+  if tk_is(head.kind, TkHashOpen) {
+    parse_attribute(p_advance(next), head, Run { ...run, opens: false, unstable: unstable })
+  } else {
+    let decl = run.decl
+    decl(next, unstable)
+  }
+}
+
+fn is_unstable(kind: AttrKind) : Bool = match kind {
+  AkUnstable -> true
+  _ -> false
+}
+
+fn parse_attr_derive(p: Parser, hash_tok: Token, run: Run) : PDecl / Console {
+  let p1 = p_eat(p, TkLparen, "expected `(` after `#[derive`")
+  if p_failed(p1) {
+    err_d(p1)
+  } else {
+    let nr = parse_derive_names(p_advance_nl(p), [])
+    match nr.r {
+      None -> err_d(nr.p)
+      Some(names) -> close_attr(
+        p_skip_newlines(nr.p),
+        hash_tok,
+        AkDerive(names),
+        run,
+        "expected `]` to close `#[derive(...)]`"
+      )
+    }
+  }
+}
+
+# The doc body is kept verbatim (CommonMark, no escape decoding).
+fn parse_attr_doc(p: Parser, hash_tok: Token, run: Run) : PDecl / Console {
+  let p1 =
+    p_eat(p, TkLparen, "expected `(` after `#[doc` — the doc attribute takes one string argument")
+  if p_failed(p1) {
+    err_d(p1)
+  } else {
+    let st = p_peek(p1)
+    if tk_is(st.kind, TkString) {
+      let text = doc_text_normalize(doc_unquote(tok_source(p1.src, st)))
+      let p2 = p_eat(
+        p_advance_nl(p1),
+        TkRparen,
+        "expected `)` to close `#[doc(...)]` — the doc attribute takes exactly one string argument"
+      )
+      close_attr(p2, hash_tok, AkDoc(text), run, "expected `]` to close `#[doc(...)]`")
+    } else {
+      err_d(
+        p_error(
+          p1,
+          st,
+          "expected a string literal in `#[doc(...)]` — bare-flag and key-value forms (`hidden`, `alias = ...`, `since = ...`) are not supported yet"
+        )
+      )
+    }
+  }
+}
+
+fn parse_attr_must_use(p: Parser, hash_tok: Token, run: Run) : PDecl / Console {
+  let has_arg = p_at(p, TkLparen)
+  let st = p_peek(p_advance(p))
+  if has_arg and (not tk_is(st.kind, TkString)) {
+    err_d(p_error(p, st, "expected a string literal in `#[must_use(...)]`"))
+  } else {
+    let p_args = if has_arg {
+      p_eat(p_advance(p_advance(p)), TkRparen, "expected `)` to close `#[must_use(...)]`")
+    } else {
+      p
+    }
+    close_attr(p_args, hash_tok, AkMustUse, run, "expected `]` to close `#[must_use]`")
+  }
+}
+
+fn parse_attr_other(p: Parser, name: String, hash_tok: Token, run: Run) : PDecl / Console {
+  let p_args = if p_at(p, TkLparen) { skip_balanced_parens(p_advance(p), 1) } else { p }
+  close_attr(
+    p_args,
+    hash_tok,
+    AkOther,
+    run,
+    concat_all(["expected `]` to close `#[", name, "(...)]`"])
+  )
+}
+
+# `inner` already carries every attribute written after this one.
+fn attach(inner: PDecl, kind: AttrKind, raw: String, t: Token) : PDecl / Console =
+  match inner.r {
+    None -> err_d(inner.p)
+    Some(d) -> match kind {
+      AkDoc(text) -> match doc_position(d) {
+        Some((l, c)) ->
+          err_d(
+            p_fail_at(
+              inner.p,
+              l,
+              c,
+              "duplicate `#[doc(...)]` on the same declaration — an item takes at most one doc attribute"
+            )
+          )
+        None -> ok_d_wrap(inner, DDoc(raw, text, d, t.line, t.col))
+      }
+      AkOther -> ok_d_wrap(inner, DAttr(raw, d, t.line, t.col))
+      AkMustUse ->
+        if is_some(wrapped_type_sym(d)) {
+          ok_d_wrap(inner, DAttr(raw, d, t.line, t.col))
+        } else {
+          misfit(inner, t, "`#[must_use]` must precede a `type` declaration")
+        }
+      AkDerive(names) -> attach_derive(inner, d, names, t)
+      AkUnstable -> attach_unstable(inner, d, t)
+      AkConstructor -> attach_constructor(inner, d, t)
+      AkNativeStack -> attach_native_stack(inner, d, raw, t)
+    }
+  }
+
+fn misfit(inner: PDecl, t: Token, msg: String) : PDecl / Console =
+  err_d(p_error(inner.p, t, msg))
+
+fn repeated(inner: PDecl, at: (Int, Int), msg: String) : PDecl / Console {
+  let (line, col) = at
+  err_d(p_fail_at(inner.p, line, col, msg))
+}
+
+fn attach_derive(inner: PDecl, d: Decl, names: [String], t: Token) : PDecl / Console =
+  match derive_position(d) {
+    Some(at) -> repeated(
+      inner,
+      at,
+      "duplicate `#[derive(...)]` on the same declaration — list every protocol in one"
+    )
+    None ->
+      if is_some(wrapped_type_sym(d)) {
+        ok_d_wrap(inner, under_marks(d, x => DDerive(names, x, t.line, t.col)))
+      } else {
+        misfit(inner, t, "`#[derive(...)]` must precede a `type` declaration")
+      }
+  }
+
+fn attach_unstable(inner: PDecl, d: Decl, t: Token) : PDecl / Console =
+  match unstable_position(d) {
+    Some(at) -> repeated(inner, at, "duplicate `#[unstable]` on the same declaration")
+    None -> match pub_head(d) {
+      PhStable -> ok_d_wrap(inner, under_outer(d, x => DUnstable(x, t.line, t.col)))
+      PhOtherPub -> misfit(
+        inner,
+        t,
+        "`#[unstable] pub` must be followed by `fn`, `type`, `const`, `effect`, or `protocol`"
+      )
+      PhNotPub -> misfit(
+        inner,
+        t,
+        "`#[unstable]` must precede a `pub fn`, `pub type`, `pub const`, `pub effect`, or `pub protocol` declaration"
+      )
+    }
+  }
+
+fn attach_constructor(inner: PDecl, d: Decl, t: Token) : PDecl / Console =
+  match constructor_position(d) {
+    Some(at) -> repeated(inner, at, "duplicate `#[constructor]` on the same declaration")
+    None ->
+      if constructor_wraps_fn(d) {
+        ok_d_wrap(inner, under_marks(d, x => DConstructor(x, t.line, t.col)))
+      } else {
+        misfit(inner, t, "`#[constructor]` must precede a `pub fn` returning the constructed type")
+      }
+  }
+
+fn attach_native_stack(inner: PDecl, d: Decl, raw: String, t: Token) : PDecl / Console =
+  match extern_abi_of(d) {
+    Some(AbiC) -> ok_d_wrap(inner, DAttr(raw, under_outer(d, native_stack_mark), t.line, t.col))
+    Some(AbiCNative) -> repeated(
+      inner,
+      unwrap_or(span_position(d, raw), (t.line, t.col)),
+      "duplicate `#[native_stack]` on the same declaration"
+    )
+    _ -> misfit(inner, t, "`#[native_stack]` must precede an `extern \"C\" fn` declaration")
+  }
+
+# Walkers match `DDerive` and `DConstructor` directly on their declaration and `DUnstable` on those,
+# so that nesting is fixed whatever the written order; the lines keep the order for `kai fmt`.
+fn under_outer(d: Decl, f: (Decl) -> Decl) : Decl = match d {
+  DDoc(raw, text, inner, l, c) -> DDoc(raw, text, under_outer(inner, f), l, c)
+  DAttr(raw, inner, l, c) -> DAttr(raw, under_outer(inner, f), l, c)
+  _ -> f(d)
+}
+
+fn under_marks(d: Decl, f: (Decl) -> Decl) : Decl = match d {
+  DDoc(raw, text, inner, l, c) -> DDoc(raw, text, under_marks(inner, f), l, c)
+  DAttr(raw, inner, l, c) -> DAttr(raw, under_marks(inner, f), l, c)
+  DUnstable(inner, l, c) -> DUnstable(under_marks(inner, f), l, c)
+  _ -> f(d)
+}
+
+fn native_stack_mark(d: Decl) : Decl = match d {
+  DAxiom(p, _, name, sym, tps, params, ret, row, l, c) ->
+    DAxiom(p, Some(AbiCNative), name, sym, tps, params, ret, row, l, c)
+  _ -> d
+}
+
+fn span_position(d: Decl, span: String) : Option[(Int, Int)] = match d {
+  DAttr(raw, inner, l, c) -> if raw == span { Some((l, c)) } else { span_position(inner, span) }
+  _ -> match decl_transparent_inner(d) {
+    Some(inner) -> span_position(inner, span)
+    None -> None
+  }
+}
+
+fn doc_position(d: Decl) : Option[(Int, Int)] = match d {
+  DDoc(_, _, _, l, c) -> Some((l, c))
+  _ -> match decl_transparent_inner(d) {
+    Some(inner) -> doc_position(inner)
+    None -> None
+  }
+}
+
+fn derive_position(d: Decl) : Option[(Int, Int)] = match d {
+  DDerive(_, _, l, c) -> Some((l, c))
+  _ -> match decl_transparent_inner(d) {
+    Some(inner) -> derive_position(inner)
+    None -> None
+  }
+}
+
+fn unstable_position(d: Decl) : Option[(Int, Int)] = match d {
+  DUnstable(_, l, c) -> Some((l, c))
+  _ -> match decl_transparent_inner(d) {
+    Some(inner) -> unstable_position(inner)
+    None -> None
+  }
+}
+
+fn constructor_position(d: Decl) : Option[(Int, Int)] = match d {
+  DConstructor(_, l, c) -> Some((l, c))
+  _ -> match decl_transparent_inner(d) {
+    Some(inner) -> constructor_position(inner)
+    None -> None
+  }
+}
+
+type PubHead = PhStable | PhOtherPub | PhNotPub
+
+# `pub(pkg)` is not a stability surface, so its wrapper reads as not `pub`.
+fn pub_head(d: Decl) : PubHead = match d {
+  DFn(is_pub, _, _, _, _, _, _, _, _, _, _, _) -> stable_if(is_pub)
+  DType(is_pub, _, _, _, _, _, _, _, _, _) -> stable_if(is_pub)
+  DConst(is_pub, _, _, _, _, _, _, _, _) -> stable_if(is_pub)
+  DEffect(is_pub, _, _, _, _, _, _, _, _, _) -> stable_if(is_pub)
+  DProtocol(is_pub, _, _, _, _, _, _, _, _) -> stable_if(is_pub)
+  DAxiom(true, _, _, _, _, _, _, _, _, _) -> PhOtherPub
+  DUnit(true, _, _, _, _, _, _) -> PhOtherPub
+  DKind(true, _, _, _, _, _, _, _) -> PhOtherPub
+  DAttr(raw, inner, _, _) -> if raw == pub_pkg_raw() { PhNotPub } else { pub_head(inner) }
+  _ -> match decl_transparent_inner(d) {
+    Some(inner) -> pub_head(inner)
+    None -> PhNotPub
+  }
+}
+
+fn stable_if(is_pub: Bool) : PubHead = if is_pub { PhStable } else { PhNotPub }
+
+fn constructor_wraps_fn(d: Decl) : Bool = match d {
+  DFn(is_pub, _, _, _, _, _, _, _, _, _, _, _) -> is_pub
+  _ -> match decl_transparent_inner(d) {
+    Some(inner) -> constructor_wraps_fn(inner)
+    None -> false
+  }
+}
+
+fn extern_abi_of(d: Decl) : Option[ExternAbi] = match d {
+  DAxiom(_, abi, _, _, _, _, _, _, _, _) -> abi
+  _ -> match decl_transparent_inner(d) {
+    Some(inner) -> extern_abi_of(inner)
+    None -> None
+  }
+}

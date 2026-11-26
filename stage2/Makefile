@@ -10773,8 +10773,8 @@ test-violations: $(TARGET) build
 
 # Issue #608 — `#[...]` attribute syntax. Each fixture in
 # examples/attributes/ has either an `.out.expected` (positive: compile,
-# run, diff) or an `.err.expected` (negative: kaic2 must reject; the
-# expected file's first line must appear in the error output as a
+# run, diff) or an `.err.expected` (negative: kaic2 must reject; every
+# line of the expected file must appear in the error output as a
 # substring). Stdlib prelude is loaded so `Show`/`Eq` resolve.
 test-attributes: $(TARGET) build
 	@set -e; \
@@ -10789,11 +10789,12 @@ test-attributes: $(TARGET) build
 	    if [ $$rc -eq 0 ]; then \
 	      echo "attributes FAIL $$name (expected error, got success)"; exit 1; \
 	    fi; \
-	    needle=$$(head -1 $$exp_err); \
-	    grep -qF "$$needle" build/attr-$$name.err \
-	      && echo "attributes OK $$name (rejection diagnostic matches)" \
-	      || { echo "attributes FAIL $$name (missing diagnostic: $$needle)"; \
-	           cat build/attr-$$name.err; exit 1; }; \
+	    while IFS= read -r needle; do \
+	      grep -qF -- "$$needle" build/attr-$$name.err \
+	        || { echo "attributes FAIL $$name (missing diagnostic: $$needle)"; \
+	             cat build/attr-$$name.err; exit 1; }; \
+	    done < $$exp_err; \
+	    echo "attributes OK $$name (rejection diagnostic matches)"; \
 	  elif [ -f $$exp_out ]; then \
 	    $(KAIC2) $(TEST_CORE_CACHE) --path ../stdlib $$preludes $$f > build/attr-$$name.c \
 	      || { echo "attributes FAIL $$name (kaic2 errored)"; exit 1; }; \
