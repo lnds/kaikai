@@ -29,7 +29,7 @@ static int chain_len(KaiFiber *f) {
 
 static int chain_has(KaiFiber *f, KaiFiber *target) {
     for (KaiLinkNode *ln = f->linked_head; ln; ln = ln->next) {
-        if (ln->peer == target) return 1;
+        if (ln->peer->fiber == target) return 1;
     }
     return 0;
 }
@@ -125,7 +125,7 @@ int main(void) {
 
         kai_worker_here()->active = &watcher;
         KaiMailbox *wmb = kai_mailbox_alloc();
-        watcher.trap_exit = 1;
+        atomic_store(&kai_fiber_exit_of(&watcher)->trap_exit, 1);
         check("watcher mailbox stamped", watcher.mailbox == wmb);
 
         kai_worker_here()->active = &dying;
@@ -172,7 +172,7 @@ int main(void) {
         KaiFiber dying = {0}, plain = {0};
         dying.state = KAI_FIBER_RUNNING;
         plain.state = KAI_FIBER_RUNNING;
-        plain.trap_exit = 0;
+        atomic_store(&kai_fiber_exit_of(&plain)->trap_exit, 0);
         kai_link_add_bidirectional(&dying, &plain);
         terminate(&dying, KAI_EXIT_CRASHED);
         check("plain peer cancel_requested",     plain.cancel_requested == 1);
@@ -184,7 +184,7 @@ int main(void) {
         KaiFiber dying = {0}, watcher = {0};
         dying.state   = KAI_FIBER_RUNNING;
         watcher.state = KAI_FIBER_RUNNING;
-        watcher.trap_exit = 1;
+        atomic_store(&kai_fiber_exit_of(&watcher)->trap_exit, 1);
         watcher.mailbox   = NULL;  /* explicit no-mailbox case */
         kai_link_add_bidirectional(&dying, &watcher);
         terminate(&dying, KAI_EXIT_NORMAL);

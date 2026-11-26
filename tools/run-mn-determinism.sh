@@ -114,6 +114,8 @@ FIXTURES=(
   # here every thread does so at once.
   "examples/effects/mn_first_variant_on_many_fibers.kai"
   "examples/effects/mn_first_variant_intern_race.kai"
+  # Linked and monitored fibers ending on different threads in every order.
+  "examples/effects/mn_link_exit_orders.kai"
   # A printed line's payload and its trailing newline are separate stdio
   # calls; the pair must land atomically when fibers print from different
   # scheduler threads. Cross-fiber order is unspecified, so this fixture is

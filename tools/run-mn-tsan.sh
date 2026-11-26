@@ -73,6 +73,10 @@ TSAN_CFLAGS="-std=c11 -Wno-unused-function -Wno-unused-variable -g -O1 -fsanitiz
 # once: the tag's name and slot mask are recorded right there, in tables every
 # thread reads on its drop path.
 #
+# The next ends linked and monitored fibers on different threads in every
+# order: link chains, monitor nodes and a peer's mailbox are all reached from
+# a thread other than their owner's.
+#
 # The rally makes nearly every message a cross-thread wake, so it drives the
 # idle path hard: spinning workers, parks, and the permit handoff between them.
 #
@@ -88,6 +92,7 @@ FIXTURES=(
   "examples/effects/mn_send_to_ended_mailbox_race.kai"
   "examples/effects/mn_first_variant_on_many_fibers.kai"
   "examples/effects/mn_first_variant_intern_race.kai"
+  "examples/effects/mn_link_exit_orders.kai"
   "examples/effects/mn_pingpong_no_false_deadlock.kai"
   "examples/effects/mn_recv_timeout_no_lost_wakeup.kai"
 )

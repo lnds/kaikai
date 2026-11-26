@@ -545,10 +545,12 @@ static KaiValue *kai_core_mailbox_alloc_unowned(void) {
 static KaiValue *kai_core_mailbox_assign_owner(KaiValue *pid, KaiValue *fiber) {
     if (pid && pid->tag == KAI_PID && pid->as.mb &&
         fiber && fiber->tag == KAI_FIBER && fiber->as.fib) {
+        if (!pid->as.pid.owner) pid->as.pid.owner = kai_fiber_exit_ref(fiber->as.fib);
+        KaiFiberExit *x = kai_fiber_own_lock(fiber->as.fib);
         pid->as.mb->owner_fiber = fiber->as.fib;
         pid->as.mb->outer       = fiber->as.fib->mailbox;
         fiber->as.fib->mailbox  = pid->as.mb;
-        if (!pid->as.pid.owner) pid->as.pid.owner = kai_fiber_exit_ref(fiber->as.fib);
+        kai_fiber_own_unlock(x);
     }
     /* m5.x flip Phase 3 closeout (issue #82): consume input refs. */
     if (pid)   kai_decref(pid);
