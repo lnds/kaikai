@@ -380,17 +380,23 @@ KAI_RT_SHARED void kai_cell_pool_relief(void) {
 #endif
 #endif
 }
-/* Return the whole pool, cells and table, to libc and ask the allocator to
- * hand the freed pages to the OS; the next push re-creates the table lazily. */
+/* Return the whole pool, cells and table, to libc; the next push re-creates
+ * the table lazily. */
+__attribute__((noinline))
+KAI_RT_SHARED void kai_cell_pool_release(void) {
+    if (!kai_cell_pool) return;
+    while (kai_cell_pool_n > 0) free(kai_cell_pool[--kai_cell_pool_n]);
+    free(kai_cell_pool);
+    kai_cell_pool = NULL;
+}
+/* Release the pool and ask the allocator to hand the freed pages to the OS. */
 __attribute__((noinline))
 KAI_RT_SHARED void kai_cell_pool_trim(void) {
     if (!kai_cell_pool) return;
 #ifdef KAI_CELL_POOL_TRACE
     fprintf(stderr, "cell-pool-trim %d\n", kai_cell_pool_n);
 #endif
-    while (kai_cell_pool_n > 0) free(kai_cell_pool[--kai_cell_pool_n]);
-    free(kai_cell_pool);
-    kai_cell_pool = NULL;
+    kai_cell_pool_release();
     kai_cell_pool_relief();
 }
 

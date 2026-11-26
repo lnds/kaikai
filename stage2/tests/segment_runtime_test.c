@@ -400,6 +400,7 @@ static KaiValue *mn_main(void) {
 
 static void test_migration(void) {
     kai_decref(kai_sched_bootstrap(mn_main));
+    kai_runtime_teardown();
     check("migrated segments resume in order", atomic_load(&mn_wrong) == 0);
     if (kai_nthreads > 1) {
         check("another worker stole the probe", probe_started_on > 0);

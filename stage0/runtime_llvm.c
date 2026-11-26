@@ -2834,6 +2834,7 @@ int main(int argc, char **argv) {
     kai_main_teardown_defaults();
     int status = kai_main_exit_status(result);
     kai_decref(result);
+    kai_runtime_teardown();
     return status;
 }
 #endif /* !KAI_HOT_ONLY */

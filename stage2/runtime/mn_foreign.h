@@ -124,6 +124,7 @@ static KaiUdSlot     **kai_ud_chunks;
 static uintptr_t       kai_ud_nchunks;
 static uintptr_t       kai_ud_count;
 static uintptr_t       kai_ud_free;
+static uintptr_t       kai_ud_first_gen = 1;
 
 static KaiUdSlot *kai_ud_slot(uintptr_t idx) {
     return &kai_ud_chunks[(idx - 1) / KAI_UD_CHUNK][(idx - 1) % KAI_UD_CHUNK];
@@ -165,7 +166,7 @@ KAI_SCHED_FN KaiValue *kai_ffi_retain(KaiValue *v)
             kai_ud_chunks[kai_ud_nchunks++] = chunk;
         }
         idx = ++kai_ud_count;
-        kai_ud_slot(idx)->gen = 1;
+        kai_ud_slot(idx)->gen = kai_ud_first_gen;
     }
     KaiUdSlot *s = kai_ud_slot(idx);
     s->v = copy;
