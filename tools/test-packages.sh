@@ -255,6 +255,9 @@ run_check_script "src_layout_imports" "src_layout_imports/check.sh"
 # The law checks of an impl in a non-root module read that module's names.
 run_check_script "module_law_checks" "module_law_checks/check.sh"
 
+# A native frame walk ends on every stack the runtime enters.
+run_check_script "native_backtrace" "native_backtrace/check.sh"
+
 # A user file named like a core module is the user's module.
 run_check_script "shadowed_core_names" "shadowed_core_names/check.sh"
 
