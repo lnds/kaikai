@@ -92,6 +92,7 @@
 #include "runtime/mn_foreign.h"
 #include "runtime/evidence.h"
 #include "runtime/segments.h"
+#include "runtime/teardown.h"
 
 #if defined(KAI_LLVM) || defined(KAI_LLVM_BRIDGE)
 #include "llvm/llvm_bridge.h"

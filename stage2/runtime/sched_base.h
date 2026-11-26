@@ -597,8 +597,8 @@ static void kai_fiber_sigsegv_handler(int sig, siginfo_t *info, void *ucp) {
  * fails with EINVAL and is fatal under ASAN. Adopting costs nothing:
  * SA_ONSTACK only needs a stack that is not the one that overflowed.
  *
- * Idempotent; an allocation we make stays owned by the worker for the
- * thread's life. */
+ * Idempotent; an allocation we make stays owned by the worker until the
+ * thread releases it. */
 static void kai_install_thread_sigaltstack(KaiWorker *w) {
     if (w->sigalt_ready) return;
 

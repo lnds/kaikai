@@ -251,6 +251,14 @@ pthread_t kai_worker_threads[KAI_MAX_THREADS];
 static pthread_t kai_worker_threads[KAI_MAX_THREADS];
 #endif
 
+/* Defined with the rest of the shutdown path. */
+KAI_SCHED_FN void kai_thread_release(KaiWorker *w);
+
+/* The fiber main runs on above one thread, until shutdown releases it. */
+#if !KAI_SCHED_DECL_ONLY
+static KaiFiber *kai_boot_root;
+#endif
+
 #if KAI_HOST_FIBERS
 /* Worker thread entry: adopt an id, anchor this thread's root fiber,
  * mark the slot live, and run the scheduler loop until shutdown. */
@@ -265,10 +273,7 @@ static void *kai_worker_thread_main(void *arg) {
     kai_sched_slots[w->id].live = 1;
     kai_rc_ledger_register();
     kai_worker_loop(w);
-    kai_seg_pool_drain();
-#ifdef KAI_CELL_POOL_ACTIVE
-    kai_cell_pool_trim();
-#endif
+    kai_thread_release(w);
     kai_rc_ledger_fold();
     return NULL;
 }
@@ -292,6 +297,7 @@ static void *kai_reactor_thread_main(void *arg) {
         if (kai_sched_shutting_down) break;
         kai_reactor_wait();
     }
+    kai_thread_release(w);
     kai_rc_ledger_fold();
     return NULL;
 }
@@ -460,6 +466,7 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     KaiFiber *root = (KaiFiber *) calloc(1, sizeof(KaiFiber));
     if (!root) { kai_eprintf("kai: out of memory\n"); kai_exit(1); }
     root->home_thread = 0;
+    kai_boot_root = root;
     /* Thread 0 IS the OS thread the process entered `main` on, so pinning
      * the entry fiber here is what makes `main` observably main-thread —
      * the guarantee a thread-affine C library (AppKit/GLFW/SDL/GTK) needs
@@ -495,10 +502,6 @@ KAI_SCHED_FN KaiValue *kai_sched_bootstrap(KaiValue *(*user_main)(void))
     if (atomic_load(&kai_workers_up))
         for (int i = 1; i < kai_nthreads; i++) pthread_join(kai_worker_threads[i], NULL);
     if (atomic_load(&kai_reactor_up)) pthread_join(kai_reactor_thread, NULL);
-    kai_fiber_exit_orphan(root);
-    free(root->unw_buf);
-    free(root->rframe_buf);
-    free(root);
     return kai_user_main_result;
 #else
     kai_fibers_absent();

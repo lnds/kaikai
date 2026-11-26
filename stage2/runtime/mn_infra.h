@@ -210,7 +210,7 @@ static void kai_drain_pending_free(KaiWorker *w) {
     if (!f) return;
     w->pending_free = NULL;
     /* thunk / result / linked_head were handled at wrapper-free time;
-     * only stack + struct remain. The stack is an mmap region of
+     * only stack, buffers and struct remain. The stack is an mmap region of
      * size stack_size + one guard page; pair the call with munmap
      * (free would corrupt the heap). */
 #if KAI_HOST_STACK_GUARD
@@ -221,6 +221,8 @@ static void kai_drain_pending_free(KaiWorker *w) {
     free(f->stack_base);
 #endif
     kai_tsan_fiber_free(f);
+    free(f->unw_buf);
+    free(f->rframe_buf);
     free(f->free_stack);
     free(f);
 }
