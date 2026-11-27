@@ -26,6 +26,7 @@ import compiler.monomorph
 import compiler.monomorph_subst
 import compiler.monomorph_discover
 import compiler.monomorph_growth
+import compiler.monomorph_instances
 import compiler.diag
 import compiler.diag_file
 import compiler.infer_state
@@ -50,7 +51,8 @@ pub(pkg) fn monomorphise(
   ps: PScope,
   target_mod: String
 ) : MonoOutput {
-  let polys = collect_poly_fns(tp.decls, target_mod, reg.ids)
+  let insts_ix = iix_build_mono(tp.insts)
+  let polys = collect_poly_fns(tp.decls, target_mod, reg.ids, instance_params(tp.decls, insts_ix))
   # `resolve_protocol_calls` retargets a dispatcher call to its impl
   # function AFTER `infer_program` has populated tp.insts, so no inst
   # names the impl. Discover the impl-side tuples by walking the decl
@@ -59,7 +61,6 @@ pub(pkg) fn monomorphise(
   # rewrite walker uses the same path inline so each call site
   # retargets to its own per-(tys, units) specialisation, even when
   # multiple calls share a (line, col) under string interpolation.
-  let insts_ix = iix_build_mono(tp.insts)
   let typer_tuples = collect_distinct_tuples(insts_ix, polys, [])
   let impl_tuples = collect_impl_tuples_in_decls(tp.decls, polys, ts_of(typer_tuples))
   let initial_tuples = list_append(typer_tuples, impl_tuples)
@@ -159,7 +160,8 @@ fn emit_spec(
   insts: InstIndex,
   polys: PolyIx,
   all_tuples: TupleSet,
-  reg: ProtocolReg
+  reg: ProtocolReg,
+  chain: [MonoTuple]
 ) : SpecEmitOut {
   match mt {
     MT(_, tys, units) -> {
@@ -177,12 +179,18 @@ fn emit_spec(
       # to a generic inside the spec body, look up the original CS, apply
       # sm, and collect concrete poly tuples not yet known.
       let new_tuples = discover_new_tuples_decl(spec1, insts, polys, all_tuples, sm)
-      let updated_tuples = ts_add_all(all_tuples, new_tuples)
+      # A tuple that grows is never emitted, so no call may name it.
+      let updated_tuples = ts_add_all(all_tuples, emittable(chain, new_tuples))
       let spec2 = rewrite_callsites_decl_sm(spec1, insts, updated_tuples, polys, sm)
       # A self-recursive call must name the spec itself: left on the
       # generic, TCO never fires on the spec (the loop lives in the
-      # generic) and every recursion bounces spec -> generic.
-      let spec3 = retarget_self_calls_decl(spec2)
+      # generic) and every recursion bounces spec -> generic. With an
+      # instance parameter a call the rewrite left is at another instance.
+      let spec3 = if poly_instance_params(polys, mt_sym(mt)) == [] {
+        retarget_self_calls_decl(spec2)
+      } else {
+        spec2
+      }
       let name = mono_mangle_name(tab, written_text(decl_name(tab, poly_decl_sym(d))), tys, units)
       # Invariant: no TyVarT/UVar of `sm`'s domain survives in the spec
       # body. Out-of-domain ids belong to unrelated free typer tyvars.
@@ -207,6 +215,9 @@ fn emit_spec(
     }
   }
 }
+
+fn emittable(chain: [MonoTuple], ts: [MonoTuple]) : [MonoTuple] =
+  filter(ts, t => is_none(growth_root(chain, t)))
 
 # Iterate spec emission to fixpoint. `worklist` holds tuples not yet
 # emitted; `all_tuples` is the running set used by per-spec rewrite to
@@ -242,12 +253,12 @@ fn generate_specs_iter(
         viols_acc
       )
       Some(d) -> {
-        let r = emit_spec(tab, d, t, insts, polys, all_tuples, reg)
+        let chain1 = [t, ...chain]
+        let r = emit_spec(tab, d, t, insts, polys, all_tuples, reg, chain1)
         match r {
           SEO(spec, new_ts, new_leaks, new_viols) -> {
-            let chain1 = [t, ...chain]
-            let grown = growth_violations(tab, insts, d, t, chain1, new_ts)
-            let ok_ts = filter(new_ts, nt => is_none(growth_root(chain1, nt)))
+            let grown = growth_violations(tab, insts, polys, d, t, chain1, new_ts)
+            let ok_ts = emittable(chain1, new_ts)
             let next_worklist = list_append(rest, map(ok_ts, nt => WI(nt, chain1)))
             let next_all = ts_add_all(all_tuples, ok_ts)
             let next_leaks = prepend_leaks(new_leaks, leaks_acc)
@@ -269,9 +280,12 @@ fn generate_specs_iter(
   }
 }
 
+# A cycle that only an inherited instance parameter specialises stays on the
+# generic, silently: the program is valid with its calls left unspecialised.
 fn growth_violations(
   tab: SymTab,
   insts: InstIndex,
+  polys: PolyIx,
   d: Decl,
   req: MonoTuple,
   chain: [MonoTuple],
@@ -279,7 +293,12 @@ fn growth_violations(
 ) : [BoundViolation] = flat_map(
   new_ts,
   nt => match growth_root(chain, nt) {
-    Some(root) -> [growth_violation(tab, insts, d, req, root, nt)]
+    Some(root) ->
+      if any(growth_cycle(chain, root, nt), t => inherited_spec(polys, t)) {
+        []
+      } else {
+        [growth_violation(tab, insts, d, req, root, nt)]
+      }
     None -> []
   }
 )

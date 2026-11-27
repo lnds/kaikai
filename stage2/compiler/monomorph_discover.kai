@@ -13,7 +13,6 @@ import compiler.infer_clause_holes
 import compiler.infer_env_exhaust
 import compiler.infer_index
 import compiler.monomorph_polys
-import compiler.effect_instance
 import compiler.monomorph
 import compiler.diag_type_text
 import compiler.monomorph_subst
@@ -145,8 +144,7 @@ fn collect_distinct_loop(
 }
 
 #[doc("""
-A generic whose `handle` takes a type parameter as its instance is
-specialised per instance even when another slot stays free: the handler's
+A generic with an instance parameter is specialised per instance even when another slot stays free: the handler's
 evidence label is that instance. The free slots that are not instances
 erase to `Any`.
 """)]
@@ -156,7 +154,7 @@ pub(pkg) fn inst_spec_tys(polys: PolyIx, s: SymId, tys: [Ty]) : [Ty] =
   } else {
     match lookup_poly_fn_sym(polys, s) {
       Some(d) -> {
-        let inst = handle_instance_tparams(d)
+        let inst = poly_instance_params(polys, s)
         if inst == [] { tys } else { erase_free_slots(sig_type_names(d), tys, inst) }
       }
       None -> tys
@@ -257,7 +255,8 @@ pub(pkg) fn resolve_call_inst(
     None -> None
   }
 
-fn resolve_call_inst_raw(
+#[doc("`resolve_call_inst` before the slots that are not instances erase.")]
+pub(pkg) fn resolve_call_inst_raw(
   insts: InstIndex,
   d: Decl,
   callee: Expr,
@@ -291,6 +290,39 @@ fn resolve_call_inst_first(
       Some(MIPair(tys, units))
     }
     [] -> synth_inst_pair(d, callee, args_, ret_ty, sm)
+  }
+}
+
+#[doc("The instance a reference to the generic `d` outside callee position stands for.")]
+pub(pkg) fn resolve_value_inst(
+  insts: InstIndex,
+  polys: PolyIx,
+  d: Decl,
+  ref_: Expr,
+  sm: SubstMap
+) : Option[MonoInstPair] =
+  match resolve_value_inst_raw(insts, d, ref_, sm) {
+    Some(MIPair(tys, units)) -> Some(MIPair(inst_spec_tys(polys, poly_decl_sym(d), tys), units))
+    None -> None
+  }
+
+#[doc("`resolve_value_inst` before the slots that are not instances erase.")]
+pub(pkg) fn resolve_value_inst_raw(
+  insts: InstIndex,
+  d: Decl,
+  ref_: Expr,
+  sm: SubstMap
+) : Option[MonoInstPair] {
+  let at_pos = find_mono_insts_at(insts, poly_decl_sym(d), ref_.line, ref_.col)
+  if at_pos == [] or mono_insts_collide(at_pos) {
+    match synthesize_inst_for_value(d, ref_) {
+      Some(RCS(_, _, _, tys, units, _, _, _)) -> Some(
+        MIPair(map(tys, t => subst_ty(t, sm)), map(units, u => unit_canon(subst_unit(u, sm))))
+      )
+      None -> None
+    }
+  } else {
+    resolve_call_inst_first(at_pos, d, ref_, [], None, sm)
   }
 }
 
@@ -380,27 +412,31 @@ fn discover_new_tuples_expr(
   let acc1 = discover_new_tuples_kind(e.kind, insts, polys, existing, sm, acc)
   match e.kind {
     ECall(callee, args_) -> match lookup_poly_fn_at(polys, callee) {
-      Some(d) -> discover_call_tuple(d, callee, args_, e.ty, insts, polys, existing, sm, acc1)
+      Some(d) -> add_new_tuple(
+        d,
+        resolve_call_inst(insts, polys, d, callee, args_, e.ty, sm),
+        existing,
+        acc1
+      )
+      None -> acc1
+    }
+    ESym(_, _) -> match lookup_instance_poly_at(polys, e) {
+      Some(d) -> add_new_tuple(d, resolve_value_inst(insts, polys, d, e, sm), existing, acc1)
       None -> acc1
     }
     _ -> acc1
   }
 }
 
-# The tuple a call to the generic `d` instantiates, when it is concrete
+# The tuple a reference to the generic `d` instantiates, when it is concrete
 # and not known yet.
-fn discover_call_tuple(
+fn add_new_tuple(
   d: Decl,
-  callee: Expr,
-  args_: [Expr],
-  ret_ty: Option[Ty],
-  insts: InstIndex,
-  polys: PolyIx,
+  found: Option[MonoInstPair],
   existing: TupleSet,
-  sm: SubstMap,
   acc1: [MonoTuple]
 ) : [MonoTuple] =
-  match resolve_call_inst(insts, polys, d, callee, args_, ret_ty, sm) {
+  match found {
     Some(MIPair(tys, units)) -> {
       let any_slot = list_length(tys) > 0 or list_length(units) > 0
       let concrete = any_slot and tuple_concrete(tys) and units_concrete(units)
@@ -455,7 +491,11 @@ fn discover_new_tuples_kind(
     EIntrinsic(_, args_) -> discover_new_tuples_args(args_, insts, polys, existing, sm, acc)
     ESurface(sf) -> discover_new_tuples_args(surface_children(sf), insts, polys, existing, sm, acc)
     ECall(callee, args_) -> {
-      let acc1 = discover_new_tuples_expr(callee, insts, polys, existing, sm, acc)
+      # A named callee is resolved with its arguments, by the caller.
+      let acc1 = match callee.kind {
+        ESym(_, _) -> acc
+        _ -> discover_new_tuples_expr(callee, insts, polys, existing, sm, acc)
+      }
       discover_new_tuples_args(args_, insts, polys, existing, sm, acc1)
     }
     EField(base, _) -> discover_new_tuples_expr(base, insts, polys, existing, sm, acc)
@@ -788,13 +828,34 @@ fn rewrite_callsites_expr_sm(
   polys: PolyIx,
   sm: SubstMap
 ) : Expr =
-  Expr {
-    kind: rewrite_callsites_kind_sm(e.kind, e.ty, insts, tuples, polys, sm),
-    line: e.line,
-    col: e.col,
-    ty: e.ty,
-    mode: e.mode,
-    site: e.site
+  match lookup_instance_poly_at(polys, e) {
+    Some(d) -> rewrite_instance_ref(d, e, insts, tuples, polys, sm)
+    None -> Expr {
+      kind: rewrite_callsites_kind_sm(e.kind, e.ty, insts, tuples, polys, sm),
+      line: e.line,
+      col: e.col,
+      ty: e.ty,
+      mode: e.mode,
+      site: e.site
+    }
+  }
+
+# A generic handed over as a value runs outside any call site, so the
+# reference itself names the spec.
+fn rewrite_instance_ref(
+  d: Decl,
+  ref_: Expr,
+  insts: InstIndex,
+  tuples: TupleSet,
+  polys: PolyIx,
+  sm: SubstMap
+) : Expr =
+  match resolve_value_inst(insts, polys, d, ref_, sm) {
+    Some(MIPair(tys, units)) -> {
+      let inst = ts_inst(tuples, MT(poly_decl_sym(d), tys, units))
+      if inst == spec_none() { ref_ } else { spec_callee(ref_, FnId(poly_decl_sym(d), inst)) }
+    }
+    None -> ref_
   }
 
 fn rewrite_callsites_kind_sm(
