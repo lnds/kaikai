@@ -84,6 +84,13 @@ is closed:
 [0.1.1]: https://github.com/lnds/kaikai/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/lnds/kaikai/releases/tag/v0.1.0
 
+## v0.201.5 (2026-11-27)
+
+### Fixed
+
+- **runtime**: make links and monitors safe across scheduler threads
+- **typer**: compare type variables by identity inside effect labels
+
 ## v0.201.4 (2026-11-26)
 
 ### Fixed
