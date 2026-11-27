@@ -834,6 +834,21 @@ expects), not the calling convention. Two copies with different rows have the sa
 ABI on their explicit arguments and differ only in their lowered
 IR.
 
+### Instance parameters
+
+A handler answers the effect instance its type arguments spell; left
+generic it answers every instance of the effect. So a type parameter
+that names a `handle`'s instance is an *instance parameter*, and so is
+one a function passes into a callee's instance parameter, through any
+number of calls or references. A function with one is specialised per
+instance even while another type or row slot stays free, and a
+reference to it as a value names the specialisation.
+
+> **v1 status (2026-11-27):** a recursion whose instance grows without
+> end (`f[a]` reaching `f[[a]]`) through a function that only inherits
+> an instance parameter stays generic from the growing step on, so a
+> handler it reaches answers every instance.
+
 ### Code size bound
 
 A function generic over a row variable and N concrete callers

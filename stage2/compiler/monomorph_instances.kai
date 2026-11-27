@@ -1,0 +1,148 @@
+#[doc("""
+Which type parameters of each function name an effect instance: those its
+own `handle`s take, and those it passes into such a parameter of a callee.
+A function with one is specialised per instance, because a handler left
+generic answers every instance of its effect.
+""")]
+
+import compiler.ast
+import compiler.ast_decl
+import compiler.ast_ids
+import compiler.effect_instance
+import compiler.expr_positions
+import compiler.infer_env_exhaust
+import compiler.infer_index
+import compiler.monomorph_discover
+import compiler.monomorph_polys
+import compiler.monomorph_subst
+
+# `caller` instantiates `callee` at `tys`, which may name the caller's parameters.
+type Edge = { caller: Decl, callee: Decl, tys: [Ty] }
+
+type Spread = { params: InstParams, grew: Bool }
+
+type EdgeCx = { insts: InstIndex, generics: NameIndex[Decl], caller: Decl }
+
+#[doc("The instance parameters of the functions among `ds`.")]
+pub(pkg) fn instance_params(ds: [Decl], insts: InstIndex) : InstParams {
+  let generics = filter(ds, d => sig_type_names(d) != [])
+  let handling = filter(generics, d => handle_instance_tparams(d) != [])
+  if handling == [] {
+    ip_empty()
+  } else {
+    let direct = foldl(
+      handling,
+      ip_empty(),
+      (ps, d) => ip_set(ps, poly_decl_sym(d), handle_instance_tparams(d))
+    )
+    let by_id = foldl(
+      generics,
+      idx_empty(),
+      (ix, d) => idx_prepend_sym(ix, poly_decl_sym(d), d)
+    )
+    spread(flat_map(generics, d => decl_edges(d, insts, by_id)), direct)
+  }
+}
+
+#[doc("True for a tuple that is concrete only because a free slot erased on the strength of an inherited instance parameter.")]
+pub(pkg) fn inherited_spec(polys: PolyIx, t: MonoTuple) : Bool = match t {
+  MT(s, tys, _) -> any(tys, is_erased)
+    and (match lookup_poly_fn_sym(polys, s) {
+      Some(d) -> handle_instance_tparams(d) == []
+      None -> false
+    })
+}
+
+fn is_erased(t: Ty) : Bool = match t {
+  TyAny -> true
+  _ -> false
+}
+
+fn spread(edges: [Edge], params: InstParams) : InstParams {
+  let r = foldl(edges, Spread { params: params, grew: false }, spread_edge)
+  if r.grew { spread(edges, r.params) } else { r.params }
+}
+
+fn spread_edge(acc: Spread, e: Edge) : Spread {
+  let wanted = instance_args(
+    sig_type_names(e.callee),
+    e.tys,
+    ip_of(acc.params, poly_decl_sym(e.callee))
+  )
+  if wanted == [] {
+    acc
+  } else {
+    let me = poly_decl_sym(e.caller)
+    let held = ip_of(acc.params, me)
+    let added = named_in(sig_type_names(e.caller), 0, wanted, held, [])
+    if added == [] {
+      acc
+    } else {
+      Spread { params: ip_set(acc.params, me, list_append(held, added)), grew: true }
+    }
+  }
+}
+
+# The type arguments that fill an instance parameter of the callee.
+fn instance_args(names: [TBinder], tys: [Ty], inst: [TBinder]) : [Ty] = match (names, tys) {
+  ([n, ...ns], [t, ...ts]) ->
+    if any(inst, i => tlocal_eq(i.id, n.id)) {
+      [t, ...instance_args(ns, ts, inst)]
+    } else {
+      instance_args(ns, ts, inst)
+    }
+  _ -> []
+}
+
+# A type parameter's variable is its position among them.
+fn named_in(
+  names: [TBinder],
+  i: Int,
+  tys: [Ty],
+  held: [TBinder],
+  acc: [TBinder]
+) : [TBinder] = match names {
+  [] -> list_reverse(acc)
+  [n, ...rest] -> {
+    let new_ = any(tys, t => count_tyvar_in_ty(t, [i], []) > 0)
+      and (not any(held, h => tlocal_eq(h.id, n.id)))
+    named_in(rest, i + 1, tys, held, if new_ { [n, ...acc] } else { acc })
+  }
+}
+
+fn decl_edges(d: Decl, insts: InstIndex, generics: NameIndex[Decl]) : [Edge] = match d {
+  DFn(_, _, _, _, _, _, body, _, _, _, _, _) ->
+    expr_edges(body, EdgeCx { insts: insts, generics: generics, caller: d }, [])
+  _ -> []
+}
+
+fn expr_edges(e: Expr, cx: EdgeCx, acc: [Edge]) : [Edge] = match e.kind {
+  ECall(f, args) -> match generic_at(cx, f) {
+    Some(g) -> {
+      let found = resolve_call_inst_raw(cx.insts, g, f, args, e.ty, subst_map_empty())
+      foldl(args, add_edge(cx, g, found, acc), (a, x) => expr_edges(x, cx, a))
+    }
+    None -> children_edges(e, cx, acc)
+  }
+  ESym(_, _) -> match generic_at(cx, e) {
+    Some(g) -> add_edge(cx, g, resolve_value_inst_raw(cx.insts, g, e, subst_map_empty()), acc)
+    None -> acc
+  }
+  _ -> children_edges(e, cx, acc)
+}
+
+fn children_edges(e: Expr, cx: EdgeCx, acc: [Edge]) : [Edge] =
+  foldl(xp_children(e), acc, (a, x) => expr_edges(x, cx, a))
+
+fn generic_at(cx: EdgeCx, e: Expr) : Option[Decl] = match e.kind {
+  ESym(s, _) -> match idx_chain_sym(cx.generics, s) {
+    [d, ..._] -> Some(d)
+    [] -> None
+  }
+  _ -> None
+}
+
+fn add_edge(cx: EdgeCx, g: Decl, found: Option[MonoInstPair], acc: [Edge]) : [Edge] = match found {
+  Some(MIPair(tys, _)) -> [Edge { caller: cx.caller, callee: g, tys: tys }, ...acc]
+  None -> acc
+}
