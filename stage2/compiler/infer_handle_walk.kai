@@ -25,7 +25,31 @@ import compiler.infer_state
 import compiler.infer_call_labels
 import compiler.infer_arms_vec
 
-pub(pkg) fn inf_row_suffix_ow(tab: SymTab, owners: [HeadOwnerEntry], r: Row) : String {
+#[doc("What a type prints against: the names, the contested head owners and the rigid parameters in scope.")]
+pub type TyShow = { tab: SymTab, owners: [HeadOwnerEntry], rigid: [RigidTv] }
+
+#[doc("The printing context of a typer state, qualifying contested heads.")]
+pub(pkg) fn ty_show_ow(env: TyEnv, sub: Subst) : TyShow =
+  TyShow { tab: env.tab, owners: env.head_owners, rigid: sub.rigid }
+
+#[doc("The printing context of a typer state, with bare heads.")]
+pub(pkg) fn st_show(st: InferState) : TyShow =
+  TyShow { tab: st.env.tab, owners: [], rigid: st.sub.rigid }
+
+#[doc("A type as a diagnostic of this state names it.")]
+pub(pkg) fn st_ty_text(st: InferState, t: Ty) : String = ty_show_text(st_show(st), t)
+
+#[doc("A type as a diagnostic of this state names it, qualifying contested heads.")]
+pub(pkg) fn st_ty_text_ow(st: InferState, t: Ty) : String =
+  ty_show_text(ty_show_ow(st.env, st.sub), t)
+
+fn ty_var_text(rs: [RigidTv], n: Int) : String = match rs {
+  [] -> cat2("?t", int_to_string(n))
+  [RigidTv(i, Some(b), _), ..._] if i == n -> tb_text(b)
+  [_, ...rest] -> ty_var_text(rest, n)
+}
+
+fn inf_row_suffix(sh: TyShow, r: Row) : String {
   # a row with no labels is treated as "pure" in display
   # form, whether its tail is None (truly closed empty) or Some(_)
   # (a free row var with no demand on it — the phantom that
@@ -40,7 +64,7 @@ pub(pkg) fn inf_row_suffix_ow(tab: SymTab, owners: [HeadOwnerEntry], r: Row) : S
     if labels_empty(r.labels) {
       ""
     } else {
-      let lbs = inf_join_with(map(r.labels, l => label_display(tab, owners, l)), " + ")
+      let lbs = inf_join_with(map(r.labels, l => label_display(sh, l)), " + ")
       let tail_s = match r.tail {
         None -> ""
         Some(v) -> {
@@ -53,24 +77,27 @@ pub(pkg) fn inf_row_suffix_ow(tab: SymTab, owners: [HeadOwnerEntry], r: Row) : S
   body
 }
 
-fn inf_ty_string_list(tab: SymTab, owners: [HeadOwnerEntry], ts: [Ty]) : [String] =
-  map(ts, t => inf_ty_to_string_ow(tab, owners, t))
+fn inf_ty_string_list(sh: TyShow, ts: [Ty]) : [String] = map(ts, t => ty_show_text(sh, t))
 
-fn inf_tycon_arg_to_string(tab: SymTab, owners: [HeadOwnerEntry], t: Ty) : String =
+fn inf_tycon_arg_to_string(sh: TyShow, t: Ty) : String =
   match inf_row_carrier_of(t) {
     Some(row) -> if labels_empty(row.labels) {
       "_"
     } else {
-      inf_join_with(map(row.labels, l => label_display(tab, owners, l)), " + ")
+      inf_join_with(map(row.labels, l => label_display(sh, l)), " + ")
     }
-    None -> inf_ty_to_string_ow(tab, owners, t)
+    None -> ty_show_text(sh, t)
   }
 
 #[doc("Render a resolved Ty as its surface display string (with a non-empty effect row suffix). Shared by the typed-AST dumps and consumers like kai lint.")]
 pub fn inf_ty_to_string(tab: SymTab, t: Ty) : String = inf_ty_to_string_ow(tab, [], t)
 
-#[doc("The one Ty display printer: a contested nominal head renders as the qualified form the user can write (`db.Item`), the owner coming from the head-owner table.")]
-pub fn inf_ty_to_string_ow(tab: SymTab, owners: [HeadOwnerEntry], t: Ty) : String {
+#[doc("Render a Ty outside any rigid scope, qualifying contested heads.")]
+pub fn inf_ty_to_string_ow(tab: SymTab, owners: [HeadOwnerEntry], t: Ty) : String =
+  ty_show_text(TyShow { tab: tab, owners: owners, rigid: [] }, t)
+
+#[doc("The one Ty display printer: a contested nominal head renders as the qualified form the user can write (`db.Item`), the owner coming from the head-owner table, and a rigid parameter renders as its declared name.")]
+pub(pkg) fn ty_show_text(sh: TyShow, t: Ty) : String {
   match t {
     TyInt -> "Int"
     TyReal -> "Real"
@@ -84,38 +111,38 @@ pub fn inf_ty_to_string_ow(tab: SymTab, owners: [HeadOwnerEntry], t: Ty) : Strin
     TyUInt64 -> "UInt64"
     TyInt128 -> "Int128"
     TyHandle -> "Handle"
-    TyListT(inner) -> cat3("[", inf_ty_to_string_ow(tab, owners, inner), "]")
+    TyListT(inner) -> cat3("[", ty_show_text(sh, inner), "]")
     TyFnT(ps, ret, row) -> concat_all([
       "(",
-      inf_join_with(inf_ty_string_list(tab, owners, ps), ", "),
+      inf_join_with(inf_ty_string_list(sh, ps), ", "),
       ") -> ",
-      inf_ty_to_string_ow(tab, owners, ret),
-      inf_row_suffix_ow(tab, owners, row)
+      ty_show_text(sh, ret),
+      inf_row_suffix(sh, row)
     ])
     TyCon(csym, tas) -> {
-      let shown = inf_tycon_display_ow(tab, owners, csym)
+      let shown = inf_tycon_display_ow(sh.tab, sh.owners, csym)
       match tas {
         [] -> shown
         _ -> concat_all([
           shown,
           "[",
           inf_join_with(
-            map(cont_shown_args(csym, tas), a => inf_tycon_arg_to_string(tab, owners, a)),
+            map(cont_shown_args(csym, tas), a => inf_tycon_arg_to_string(sh, a)),
             ", "
           ),
           "]"
         ])
       }
     }
-    TyVarT(n) -> cat2("?t", int_to_string(n))
+    TyVarT(n) -> ty_var_text(sh.rigid, n)
     TyShapeApp(sv, arg) ->
-      concat_all(["?s", int_to_string(sv), "[", inf_ty_to_string_ow(tab, owners, arg), "]"])
+      concat_all(["?s", int_to_string(sv), "[", ty_show_text(sh, arg), "]"])
     TyAny -> "?"
     TyNothing -> "Nothing"
     TyDimT(base, u) ->
-      concat_all([inf_ty_to_string_ow(tab, owners, base), "<", inf_unit_canon_display(u), ">"])
-    TyRefineT(base, _, _) -> concat_all([inf_ty_to_string_ow(tab, owners, base), " where <pred>"])
-    TyUnion(parts) -> inf_join_with(inf_ty_string_list(tab, owners, parts), " | ")
+      concat_all([ty_show_text(sh, base), "<", inf_unit_canon_display(u), ">"])
+    TyRefineT(base, _, _) -> concat_all([ty_show_text(sh, base), " where <pred>"])
+    TyUnion(parts) -> inf_join_with(inf_ty_string_list(sh, parts), " | ")
   }
 }
 
@@ -1062,10 +1089,10 @@ pub(pkg) fn blame_via_notes(blame: Option[MutBlame]) : [SpanNote] = match blame 
 # each ty_arg passed through `inf_ty_to_string` so unbound TyVars show as
 # `?tN`.
 #[doc("An effect label as the reader wrote it: the head shown as `mod.Eff` when its name is contested, its type arguments untouched.")]
-pub fn label_display(tab: SymTab, owners: [HeadOwnerEntry], l: Label) : String =
+pub(pkg) fn label_display(sh: TyShow, l: Label) : String =
   label_with_args(
-    inf_tycon_display_ow(tab, owners, l.sym),
-    map(l.ty_args, t => inf_ty_to_string(tab, t))
+    inf_tycon_display_ow(sh.tab, sh.owners, l.sym),
+    map(l.ty_args, t => ty_show_text(TyShow { ...sh, owners: [] }, t))
   )
 
 pub(pkg) fn label_with_args(head: String, args: [String]) : String = match args {
@@ -1075,7 +1102,11 @@ pub(pkg) fn label_with_args(head: String, args: [String]) : String = match args 
 
 #[doc("infer: an effect label as a diagnostic names it: the effect's declared name and its type arguments.")]
 pub fn label_to_string(tab: SymTab, l: Label) : String =
+  label_decl_text(TyShow { tab: tab, owners: [], rigid: [] }, l)
+
+#[doc("An effect label under its declared name, its arguments printed against `sh`.")]
+pub(pkg) fn label_decl_text(sh: TyShow, l: Label) : String =
   label_with_args(
-    written_text(decl_name(tab, l.sym)),
-    map(l.ty_args, t => inf_ty_to_string(tab, t))
+    written_text(decl_name(sh.tab, l.sym)),
+    map(l.ty_args, t => ty_show_text(sh, t))
   )
